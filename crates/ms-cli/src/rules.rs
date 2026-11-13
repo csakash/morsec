@@ -103,16 +103,19 @@ fn default_rules_path() -> Result<PathBuf, String> {
     }
 }
 
-/// `.morsec.toml` in `start` or a parent, stopping after the directory holding `.git`.
+/// `.morsec.toml` in `start` or a parent, up to and including the directory holding `.git`.
+/// Outside a git repository nothing is found: a stray file in a parent directory (another user's
+/// `/tmp`, the home directory) must not apply.
 fn find_project_file(start: &Path) -> Option<PathBuf> {
+    let mut found = None;
     let mut dir = Some(start);
     while let Some(d) = dir {
         let candidate = d.join(PROJECT_FILE);
-        if candidate.is_file() {
-            return Some(candidate);
+        if found.is_none() && candidate.is_file() {
+            found = Some(candidate);
         }
         if d.join(".git").exists() {
-            return None;
+            return found;
         }
         dir = d.parent();
     }
@@ -120,9 +123,18 @@ fn find_project_file(start: &Path) -> Option<PathBuf> {
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
-    let bytes = read_limited(path, MAX_FILE)
-        .map_err(|e| format!("morsec: can't read {}: {e}", path.display()))?;
-    String::from_utf8(bytes).map_err(|_| format!("morsec: {} is not UTF-8", path.display()))
+    let bytes = read_limited(path, MAX_FILE).map_err(|e| {
+        format!(
+            "morsec: can't read {}: {e}. Check the path and its permissions",
+            path.display()
+        )
+    })?;
+    String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "morsec: {} is not UTF-8. Save it as UTF-8 text",
+            path.display()
+        )
+    })
 }
 
 pub fn run(a: RulesArgs) -> ExitCode {
@@ -407,5 +419,10 @@ mod tests {
         assert_eq!(find_project_file(&sub), None);
         std::fs::write(repo.join(PROJECT_FILE), "").unwrap();
         assert_eq!(find_project_file(&sub), Some(repo.join(PROJECT_FILE)));
+        // Outside any repository nothing is picked up, even with a file right here.
+        let loose = d.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::write(loose.join(PROJECT_FILE), "").unwrap();
+        assert_eq!(find_project_file(&loose), None);
     }
 }

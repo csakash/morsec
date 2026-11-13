@@ -71,6 +71,12 @@ impl<'v> RulesStore<'v> {
     pub fn load(&self, min_version: u64) -> Result<Rules> {
         let text = match read_limited(&self.path, MAX_RULES_FILE) {
             Ok(t) => t,
+            // A file that existed (a version was seen) and is now gone was removed: tampering.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && min_version > 0 => {
+                return Err(RulesError::Tampered {
+                    why: "the rules file is missing".into(),
+                });
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(RulesError::NotInitialized {
                     path: self.path.display().to_string(),
@@ -125,23 +131,24 @@ impl<'v> RulesStore<'v> {
     /// current version plus one. Returns the saved rules.
     pub fn save(&self, new: &Rules, approved: bool, min_version: u64) -> Result<Rules> {
         let current = self.load(min_version)?;
-        let (change, loosened) = classify(&current, new);
+        let version = current
+            .version
+            .checked_add(1)
+            .ok_or_else(|| RulesError::Tampered {
+                why: "rules version overflow".into(),
+            })?;
+        // Validate exactly what will be written (same limits and per-mode checks as load), so a
+        // bad rule is refused here instead of locking every key out on the next load.
+        let mut draft = new.clone();
+        draft.version = version;
+        let next = Rules::from_toml(&draft.to_toml(), "the new rules")?;
+        let (change, loosened) = classify(&current, &next);
         if change == Change::Loosen && !approved {
             let keys: Vec<String> = loosened.iter().map(ToString::to_string).collect();
             return Err(RulesError::NeedsApproval {
                 keys: keys.join(", "),
             });
         }
-        let mut next = new.clone();
-        next.version = current
-            .version
-            .checked_add(1)
-            .ok_or_else(|| RulesError::Tampered {
-                why: "rules version overflow".into(),
-            })?;
-        next.stopped = false;
-        next.tampered = false;
-        next.notes.clear();
         self.write(&next)?;
         Ok(next)
     }
@@ -226,7 +233,18 @@ pub fn mac_path(path: &Path) -> PathBuf {
 
 /// Reads at most `limit` bytes; a longer file is an error rather than a truncated read.
 pub fn read_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    let f = fs::File::open(path)?;
+    // Non-blocking open so a FIFO swapped in for the file can't hang the reader; then refuse
+    // anything that is not a regular file.
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     let mut buf = Vec::new();
     f.take(limit + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > limit {
@@ -334,6 +352,7 @@ mod tests {
         let v = vault_with_key(7, 32);
         let s = RulesStore::new(d.path().join("rules.toml"), &v, mac_key());
         assert!(matches!(s.load(0), Err(RulesError::NotInitialized { .. })));
+        assert!(matches!(s.load(1), Err(RulesError::Tampered { .. })));
         let created = s.create(&sample()).unwrap();
         assert_eq!(created.version, 1);
         assert_eq!(s.load(1).unwrap(), created);
@@ -456,6 +475,18 @@ mod tests {
         assert_eq!(saved.version, 3);
         assert!(!saved.stopped);
 
+        // An invalid rule is refused before anything is written (no self-inflicted lockout).
+        let mut invalid = saved.clone();
+        invalid
+            .keys
+            .values_mut()
+            .for_each(|r| r.session_ttl_secs = 0);
+        assert!(matches!(
+            s.save(&invalid, true, 3),
+            Err(RulesError::Invalid { .. })
+        ));
+        assert_eq!(s.load(3).unwrap(), saved);
+
         // Saving over a tampered file is refused (no "repair by overwrite" without verification).
         fs::write(s.mac_path(), "00").unwrap();
         assert!(s.save(&saved, true, 3).is_err());
@@ -470,6 +501,14 @@ mod tests {
         let s = RulesStore::new(d.path().join("rules.toml"), &v, mac_key());
         s.create(&sample()).unwrap();
         fs::write(s.path(), vec![b'#'; (MAX_RULES_FILE + 1) as usize]).unwrap();
+        assert!(matches!(s.load(0), Err(RulesError::Io { .. })));
+        // A FIFO in place of the file is refused at once rather than blocking the reader.
+        fs::remove_file(s.path()).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(s.path())
+            .status()
+            .unwrap();
+        assert!(made.success());
         assert!(matches!(s.load(0), Err(RulesError::Io { .. })));
     }
 }

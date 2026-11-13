@@ -18,7 +18,7 @@ pub enum RulesError {
 
     /// The rules file failed its integrity check. Everything is denied until it is fixed.
     #[error(
-        "morsec: the rules file failed its integrity check ({why}); every key is blocked. Restore it with ms rules, or run ms init to start over"
+        "morsec: the rules file failed its integrity check ({why}); every key is blocked. Put back the last good rules.toml and rules.toml.mac, or run ms init to start over"
     )]
     Tampered {
         /// What failed.
@@ -51,7 +51,7 @@ pub enum RulesError {
     },
 
     /// Filesystem I/O failed.
-    #[error("morsec: {context}: {source}")]
+    #[error("morsec: {context}: {source}. Check the path and its permissions")]
     Io {
         /// What morsec was doing.
         context: String,

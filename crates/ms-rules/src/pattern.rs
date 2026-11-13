@@ -48,6 +48,12 @@ impl HostPattern {
             return Ok(HostPattern::Exact(ip.to_string()));
         }
         validate_dns_name(s)?;
+        // `127.1`, `2130706433` or `010.0.0.1` are not IPs to std but are to some resolvers.
+        if s.split('.').next_back().is_some_and(all_digits) {
+            return Err(format!(
+                "host \"{s}\" looks like an IP address but is not a plain dotted-quad or IPv6 literal"
+            ));
+        }
         Ok(HostPattern::Exact(s.to_owned()))
     }
 
@@ -473,6 +479,9 @@ mod tests {
             "a.com:443",
             "*.0.1",
             "*.10.0.0.1",
+            "127.1",
+            "2130706433",
+            "010.0.0.1",
             "a.com/",
             "",
         ] {

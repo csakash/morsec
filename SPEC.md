@@ -67,7 +67,12 @@ run and mint; target not allowed → same reasons; then `Tier::Test` → `Allow`
   pattern sets (a request matches the result iff it matches both), mint scopes intersected, TTL
   is the minimum, tier the maximum, `read_only` is OR. A project rule for a key the user rules do
   not have is ignored (it can't create keys). A different `mode` disables the key.
-- Property: for all user rules, project files and requests, `decide(merge(u, p))` is never more
+- Property: for all user rules, project files and requests, the merged rules are never more
+  permissive than the user rules judged on the full request: `decide_run(u)` for run requests
+  (argv known), `decide(u)` otherwise. (Amended in build after review R1: the hash-only
+  `decide` path matches only literal patterns, so a merge that narrows `["psql", "*"]` to the
+  literal `["psql", "a"]` lets `decide` match an argv the user rule already allowed.) Original
+  wording: `decide(merge(u, p))` is never more
   permissive than `decide(u)` (order: Deny < NeedsApproval < Allow).
 
 ### `ms rules` CLI (module `ms-cli/src/rules.rs`)
