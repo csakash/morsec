@@ -1,0 +1,80 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ms-core",
+    "crates/ms-ipc",
+    "crates/ms-session",
+    "crates/ms-vault",
+    "crates/ms-rules",
+    "crates/ms-receipts",
+    "crates/ms-import",
+    "crates/ms-proxy",
+    "crates/ms-run",
+    "crates/ms-mint",
+    "crates/ms-approve",
+    "crates/ms-connect",
+    "crates/ms-mcp",
+    "crates/msd",
+    "crates/ms-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+license = "LicenseRef-Proprietary"
+publish = false
+repository = "https://github.com/csakash/morsec"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "warn"
+
+# Declared once here so later loops add `foo = { workspace = true }` to their own crate
+# without editing this file. Heavy crates (hyper, rustls, rcgen, security-framework, rmcp,
+# aws-sdk-*) are added by the loop that owns them.
+[workspace.dependencies]
+ms-core = { path = "crates/ms-core" }
+ms-ipc = { path = "crates/ms-ipc" }
+ms-session = { path = "crates/ms-session" }
+ms-vault = { path = "crates/ms-vault" }
+ms-rules = { path = "crates/ms-rules" }
+ms-receipts = { path = "crates/ms-receipts" }
+ms-import = { path = "crates/ms-import" }
+ms-proxy = { path = "crates/ms-proxy" }
+ms-run = { path = "crates/ms-run" }
+ms-mint = { path = "crates/ms-mint" }
+ms-approve = { path = "crates/ms-approve" }
+ms-connect = { path = "crates/ms-connect" }
+ms-mcp = { path = "crates/ms-mcp" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "string"] }
+zeroize = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+tempfile = "3"
+proptest = "1"
+assert_cmd = "2"
+predicates = "3"
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+# panic stays "unwind": Drop must run on panic so SecretBytes buffers are zeroized.
+strip = "symbols"
