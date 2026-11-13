@@ -5,6 +5,9 @@
 //! terminal" is a process detached from this test's tree (reparented to PID 1); "inside an
 //! agent" is a copy of `ms` named `claude`, which morsec takes for a Claude Code session.
 
+// `ms connect --rules` (used here to feed test hosts) exists only in debug builds (SPEC A1).
+#![cfg(debug_assertions)]
+
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -329,4 +332,24 @@ fn refusals() {
     assert_eq!(code, 69);
     let (code, _, _) = fx.ms(&["connect", "nope"]);
     assert_eq!(code, 2);
+}
+
+// protects=review R10: a partial disconnect (unreadable ~/.claude.json) exits non-zero, says it
+// is partial, keeps the record, and `ms connect` lists it as partly disconnected;
+// fails_when=it reports success or the list says connected/not connected
+#[test]
+fn partial_disconnect_fails_loudly() {
+    let fx = Fx::new();
+    let (code, _, e) = fx.connect(&["--yes", "--with-mcp"]);
+    assert_eq!(code, 0, "{e}");
+    std::fs::write(fx.home().join(".claude.json"), "{ broken").unwrap();
+    let (code, text) = fx.own_terminal("disconnect claude-code --yes");
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("partly disconnected") && text.contains("keep "),
+        "{text}"
+    );
+    assert!(!fx.settings().exists(), "settings.json not restored");
+    let (_, stdout, _) = fx.ms(&["connect"]);
+    assert!(stdout.contains("partly disconnected"), "{stdout}");
 }

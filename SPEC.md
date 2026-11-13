@@ -214,4 +214,9 @@ msd's tunnel allowlist (D2); `ms run` and `ms mcp` themselves (L12, L14); Codex/
   `settings.json` even when `~/.claude.json` can't be read (the state file then keeps only what
   is left to undo there), and removes a `~/.claude.json` that connect created.
 - **A3 (R5, R7, R8):** `verify()` compares with the values recorded at connect; a re-run after
-  `--force` keeps forcing; an unknown agent is a usage error (exit 2).
+  `--force` may replace again only the exact value that was force-replaced, and only while
+  morsec's own value is still in place (a value the user set since needs a fresh `--force`);
+  an unknown agent is a usage error (exit 2).
+- **A4 (R10, R11):** a disconnect that could not finish `~/.claude.json` exits 1, says
+  "partly disconnected", keeps the record, and `ms connect` (list) and `verify()` report it;
+  the next disconnect finishes it without reading `settings.json`.

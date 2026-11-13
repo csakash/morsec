@@ -931,3 +931,93 @@ fn ms_path_with_equals_is_refused() {
     let c = ClaudeConnector::new(paths, "/opt/a=b/ms", SOCKET);
     assert!(c.mcp_entry().unwrap_err().to_string().contains("'='"));
 }
+
+// protects=review R9: a stored --force never replaces a value the user set after the forced
+// connect (even the same value); only a fresh --force does, and an agent can't pass one;
+// fails_when=a plain re-run (as an agent could run) overwrites the user's port or ms server
+#[test]
+fn stored_force_does_not_override_new_user_values() {
+    let forced = Options {
+        force: true,
+        ..Options::default()
+    };
+    for user_port in ["8080", "9000"] {
+        let h = Home::new();
+        std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+        std::fs::write(
+            h.settings(),
+            "{\"sandbox\": {\"network\": {\"httpProxyPort\": 8080}}}",
+        )
+        .unwrap();
+        connect(&h, forced);
+        // The user puts a port of their own back by hand.
+        let t = h.read(&h.settings()).unwrap().replace("4101", user_port);
+        std::fs::write(h.settings(), &t).unwrap();
+        let c = h.connector(Options::default());
+        let e = c.try_plan(&h.cfg(&c)).unwrap_err().to_string();
+        assert!(e.contains("--force"), "{user_port}: {e}");
+        assert_eq!(h.read(&h.settings()).unwrap(), t);
+    }
+    // Same for an "ms" MCP server the user re-added after a forced connect.
+    let h = Home::new();
+    std::fs::write(
+        h.claude_json(),
+        "{\"mcpServers\": {\"ms\": {\"command\": \"mine\"}}}",
+    )
+    .unwrap();
+    connect(
+        &h,
+        Options {
+            with_mcp: true,
+            force: true,
+            ..Options::default()
+        },
+    );
+    let mut v = json::parse(&h.read(&h.claude_json()).unwrap()).unwrap();
+    v.get_mut("mcpServers")
+        .unwrap()
+        .set("ms", json::parse("{\"command\": \"mine2\"}").unwrap());
+    std::fs::write(h.claude_json(), json::print_doc(&v, "  ", true)).unwrap();
+    let c = h.connector(Options {
+        with_mcp: true,
+        ..Options::default()
+    });
+    assert!(
+        c.try_plan(&h.cfg(&c))
+            .unwrap_err()
+            .to_string()
+            .contains("--force")
+    );
+}
+
+// protects=review R10/R11: a partly-disconnected record (unreadable ~/.claude.json) is reported
+// as such by is_partly_disconnected() and verify(), and the next disconnect ignores settings.json
+// even if it is broken; fails_when=the record claims "connected" or a broken settings.json blocks
+// the cleanup
+#[test]
+fn partial_disconnect_is_reported_and_finishable() {
+    let h = Home::new();
+    let opts = Options {
+        with_mcp: true,
+        ..Options::default()
+    };
+    connect(&h, opts);
+    let good = h.read(&h.claude_json()).unwrap();
+    std::fs::write(h.claude_json(), "{ broken").unwrap();
+    let c = h.connector(opts);
+    c.remove().unwrap();
+    assert!(c.is_partly_disconnected());
+    let v = c.verify();
+    assert!(
+        !v[0].ok && v[0].detail.contains("partly disconnected"),
+        "{v:?}"
+    );
+    // The user's settings.json is now broken too: disconnect still finishes ~/.claude.json.
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    std::fs::write(h.settings(), "{ also broken").unwrap();
+    std::fs::write(h.claude_json(), &good).unwrap();
+    c.remove().unwrap();
+    assert!(!c.is_connected());
+    assert!(!h.claude_json().exists(), "created file not removed");
+    assert_eq!(h.read(&h.settings()).as_deref(), Some("{ also broken"));
+}

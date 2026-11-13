@@ -294,16 +294,15 @@ fn session_env(c: &ClaudeConnector) -> ExitCode {
 }
 
 fn list() -> ExitCode {
-    let state = |id: &str| {
-        home()
-            .map(|h| h.join(format!(".morsec/connect/{id}.json")).exists())
-            .unwrap_or(false)
+    let claude = match connector(Options::default()) {
+        Ok(c) if c.is_partly_disconnected() => {
+            "partly disconnected (run: ms disconnect claude-code)"
+        }
+        Ok(c) if c.is_connected() => "connected",
+        Ok(_) => "not connected",
+        Err(_) => "unknown (HOME is not set)",
     };
-    let mark = |b: bool| if b { "connected" } else { "not connected" };
-    say(&format!(
-        "claude-code  {}",
-        mark(state(ms_connect::claude::ID))
-    ));
+    say(&format!("claude-code  {claude}"));
     say("codex        not built yet (L13)");
     say("cursor       not built yet (L22)");
     say("gemini       not built yet (L22)");
@@ -461,7 +460,14 @@ pub(crate) fn disconnect(a: &DisconnectArgs) -> ExitCode {
     for f in &plan.files {
         show_file(&f.path, f.before.as_deref(), f.after.as_deref(), &safe);
     }
-    say(&format!("remove {}", c.paths.state.display()));
+    if plan.state_after.is_some() {
+        say(&format!(
+            "keep {} (records what is left to undo)",
+            c.paths.state.display()
+        ));
+    } else {
+        say(&format!("remove {}", c.paths.state.display()));
+    }
     for n in &plan.notes {
         eprintln!("note: {}", terminal_safe(n));
     }
@@ -479,6 +485,13 @@ pub(crate) fn disconnect(a: &DisconnectArgs) -> ExitCode {
     }
     if let Err(e) = c.apply_remove(&plan) {
         return fail(&e.to_string());
+    }
+    if plan.state_after.is_some() {
+        // Review R10: a partial disconnect is not a success.
+        return fail(&format!(
+            "morsec: partly disconnected. Your Claude Code settings are restored, but morsec's changes in {} are still there (see the note above). Fix that file, then run: ms disconnect claude-code",
+            c.paths.claude_json.display()
+        ));
     }
     say("Disconnected Claude Code; its settings are back as they were.");
     ExitCode::SUCCESS

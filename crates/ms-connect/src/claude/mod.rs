@@ -107,6 +107,8 @@ pub struct ClaudeConnector {
     pub ca_pem: Option<String>,
     /// Options.
     pub opts: Options,
+    /// Values of the user's that an earlier `--force` already replaced: (path, value).
+    replaceable: Vec<(Vec<String>, Value)>,
 }
 
 /// A computed connect: the file changes, plus warnings to show.
@@ -152,8 +154,6 @@ struct State {
     claude_edits: Edits,
     proxy_port: u16,
     with_mcp: bool,
-    /// `--force` was used: a re-run keeps replacing the user's port or server (review R7).
-    forced: bool,
     /// `~/.claude.json` did not exist before connect created it.
     claude_created: bool,
 }
@@ -322,6 +322,7 @@ impl ClaudeConnector {
             socket_env: None,
             ca_pem: None,
             opts: Options::default(),
+            replaceable: Vec::new(),
         }
     }
 
@@ -417,6 +418,12 @@ impl ClaudeConnector {
         v
     }
 
+    /// True when an earlier disconnect restored the settings but left changes in an unreadable
+    /// `~/.claude.json` to undo (review R10).
+    pub fn is_partly_disconnected(&self) -> bool {
+        matches!(self.read_state(), Ok(Some(st)) if st.written.is_empty() && st.settings_edits.is_empty())
+    }
+
     /// True when a state file says this connector is applied.
     pub fn is_connected(&self) -> bool {
         self.paths.state.exists()
@@ -464,7 +471,6 @@ impl ClaudeConnector {
             claude_edits,
             proxy_port,
             with_mcp: flag("with_mcp"),
-            forced: flag("forced"),
             claude_created: flag("claude_created"),
         }))
     }
@@ -481,7 +487,6 @@ impl ClaudeConnector {
         v.set("agent", Value::str(ID));
         v.set("proxy_port", Value::int(i64::from(st.proxy_port)));
         v.set("with_mcp", Value::Bool(st.with_mcp));
-        v.set("forced", Value::Bool(st.forced));
         v.set("claude_created", Value::Bool(st.claude_created));
         v.set("settings", s);
         v.set("claude_json", edit::edits_to_value(&st.claude_edits));
@@ -536,15 +541,54 @@ impl ClaudeConnector {
         }
         let prev = self.read_state()?;
         let mut warnings = Vec::new();
-        // A run after `--force` keeps forcing: the user already chose to replace their port.
-        let forced = self.opts.force || prev.as_ref().is_some_and(|p| p.forced);
-        let this = ClaudeConnector {
-            opts: Options {
-                force: forced,
-                ..self.opts
-            },
-            ..self.clone()
-        };
+        // A re-run after `--force` may replace again exactly the value the user chose to replace
+        // then, and only while morsec's own value is still in place (so it is undo, not the user,
+        // that puts the old value back). Any value the user set since needs a fresh --force,
+        // which an agent can't give (review R7, R9).
+        let mut this = self.clone();
+        if let Some(p) = &prev {
+            let scur = fsio::read_text(&self.paths.settings).map_err(err)?;
+            let sdoc = match scur.as_deref() {
+                Some(t) if t == p.written => None,
+                t => t.and_then(|t| json::parse(t).ok()),
+            };
+            let still_ours_in_settings = |at: &[String], after: &Value| match (&scur, &sdoc) {
+                (Some(t), _) if *t == p.written => true,
+                (_, Some(d)) => d.at(at) == Some(after),
+                _ => false,
+            };
+            let cdoc = fsio::read_capped(&self.paths.claude_json, MAX_CLAUDE_JSON)
+                .ok()
+                .flatten()
+                .and_then(|t| json::parse(&t).ok());
+            for (edits, at, in_settings) in [
+                (
+                    &p.settings_edits,
+                    path(&["sandbox", "network", "httpProxyPort"]),
+                    true,
+                ),
+                (&p.claude_edits, path(&["mcpServers", "ms"]), false),
+            ] {
+                for c in &edits.changes {
+                    if let Change::Set {
+                        path: q,
+                        before: Some(b),
+                        after,
+                    } = c
+                        && *q == at
+                    {
+                        let ours = if in_settings {
+                            still_ours_in_settings(&at, after)
+                        } else {
+                            cdoc.as_ref().is_some_and(|d| d.at(&at) == Some(after))
+                        };
+                        if ours {
+                            this.replaceable.push((at.clone(), b.clone()));
+                        }
+                    }
+                }
+            }
+        }
 
         // settings.json
         let cur = fsio::read_text(&self.paths.settings).map_err(err)?;
@@ -588,7 +632,6 @@ impl ClaudeConnector {
             claude_edits: cedits,
             proxy_port: cfg.proxy_port,
             with_mcp: self.opts.with_mcp,
-            forced,
             claude_created,
         };
         let state_now = fsio::read_text(&self.paths.state).map_err(err)?;
@@ -628,6 +671,7 @@ impl ClaudeConnector {
         if let Some(p) = v.at(&port_path)
             && *p != Value::int(i64::from(cfg.proxy_port))
             && !self.opts.force
+            && !self.replaceable.contains(&(port_path.clone(), p.clone()))
         {
             return Err(err(format!(
                 "your Claude Code settings already send sandbox traffic to your own proxy (sandbox.network.httpProxyPort = {}). morsec needs that port for its proxy. Re-run with --force to replace it (ms disconnect puts yours back)",
@@ -883,6 +927,7 @@ impl ClaudeConnector {
             if let Some(cur) = v.at(&p)
                 && *cur != entry
                 && !self.opts.force
+                && !self.replaceable.contains(&(p.clone(), cur.clone()))
             {
                 return Err(err(format!(
                     "{} already has an MCP server named \"ms\" that morsec didn't add. Rename it, or re-run with --force to replace it (ms disconnect puts it back)",
@@ -972,7 +1017,13 @@ impl ClaudeConnector {
             return Ok(None);
         };
         let mut plan = RemovePlan::default();
-        let cur = fsio::read_text(&self.paths.settings).map_err(err)?;
+        // A partly-disconnected record has nothing left in settings.json (review R11).
+        let partial = st.written.is_empty() && st.settings_edits.is_empty();
+        let cur = if partial {
+            None
+        } else {
+            fsio::read_text(&self.paths.settings).map_err(err)?
+        };
         if !st.written.is_empty() && cur.as_deref() == Some(st.written.as_str()) {
             if cur != st.original {
                 plan.files.push(Restore {
@@ -981,7 +1032,7 @@ impl ClaudeConnector {
                     after: st.original.clone(),
                 });
             }
-        } else if let Some(c) = cur.as_deref() {
+        } else if let Some(c) = cur.as_deref().filter(|_| !st.settings_edits.is_empty()) {
             let mut v = parse_doc(&self.paths.settings, Some(c))?;
             let was = v.clone();
             let notes = undo(&mut v, &st.settings_edits);
@@ -1092,6 +1143,16 @@ impl ClaudeConnector {
                 detail: format!("not connected; {fix}"),
             }]);
         };
+        if st.written.is_empty() && st.settings_edits.is_empty() {
+            return Ok(vec![Check {
+                name: "Claude Code disconnected".into(),
+                ok: false,
+                detail: format!(
+                    "partly disconnected: morsec's changes in {} are still there; fix that file, then run: ms disconnect claude-code",
+                    self.paths.claude_json.display()
+                ),
+            }]);
+        }
         let v = parse_doc(
             &self.paths.settings,
             fsio::read_text(&self.paths.settings)
