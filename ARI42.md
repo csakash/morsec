@@ -5,7 +5,7 @@ ARI-42 skill and reviewed by people. Update it in the same change as the code.
 
 - **Last reviewed:** 2026-11-13
 - **Owner for AI security:** csakash (to confirm)
-- **Score:** 0 of 27 in-scope requirements met with evidence · 0 Risk · 19 Gap · 8 Partial
+- **Score:** 1 of 27 in-scope requirements met with evidence · 0 Risk · 17 Gap · 9 Partial
 
 ## What this project is, for scoping
 
@@ -87,13 +87,13 @@ Status: **Met** (enforced + passing check) · **Partial** · **Gap** · **Risk**
 | MCP-3 | Authenticate exposed MCP/agent APIs | Gap | `ms mcp`, proxy and broker socket: loopback/Unix socket only, per-session auth; not built |
 | MCP-4 | Sandbox MCP servers | Gap | `ms mcp` and other local MCP servers launched via `ms run` with explicit minimal env |
 | GW-1 | Protect provider keys | Gap | Core product function (keys never reach agent commands); test with canary key per agent |
-| GW-2 | Agent stack as critical supply chain | Gap | Signed releases, reproducible builds, lockfiles (PRD §9); no build yet |
+| GW-2 | Agent stack as critical supply chain | Partial | `Cargo.lock` committed; `--locked` builds; `cargo deny` (advisories, licences, crates.io-only sources) and `cargo audit` in `scripts/check.sh` (L00). Signed releases and reproducible builds still to come (L10) |
 | GW-3 | Pin models; evaluate before switching | N/A | No model in the product |
 | LOG-1 | Log every agent run | Gap | Hash-chained receipts (PRD §6); not built |
 | LOG-2 | Detect abnormal agent behaviour | Gap | Flag blocked-host attempts and denied approvals in receipts; not built |
 | LOG-3 | Plan for AI incidents | Human | Needs an incident plan (leaked key, broker compromise) |
 | LOG-4 | Customer access to agent records | Gap | `ms log --export` / `--ari42`; not built |
-| EVAL-1 | Gate releases on security evals | Gap | Release gate: canary leak tests per agent and mechanism; not built |
+| EVAL-1 | Gate releases on security evals | Gap | The local gate exists and gloop's build gate requires it (`scripts/check.sh` via `package.json`, L00); the security evals themselves (canary leak tests) come in L09 |
 | EVAL-2 | Independent adversarial testing | Human | PRD v0.3 exit test: one external security review |
 | EVAL-3 | Version prompts and config as code | N/A | No prompts; agent connector config is code-generated and versioned once built |
 | SDLC-1 | Approve coding assistants | Human | Confirm Claude Code and Codex are the approved assistants |
@@ -101,9 +101,9 @@ Status: **Met** (enforced + passing check) · **Partial** · **Gap** · **Risk**
 | SDLC-3 | Review AI-written code | Partial | gstack-loops: fresh-context and security review per loop, `REVIEW.md`, PR per feature; no branch protection yet |
 | SDLC-4 | Protect agent configuration | Partial | `.github/CODEOWNERS` covers agent config; needs branch protection requiring code-owner review to enforce |
 | SDLC-5 | Isolate CI agents | N/A | No CI workflows in the repo |
-| SDLC-6 | Block hallucinated packages | Gap | No package manifest yet; check every new dependency exists and isn't brand new |
+| SDLC-6 | Block hallucinated packages | Met | One manifest (Cargo workspace) with a committed `Cargo.lock`; `cargo deny check sources` allows crates.io only (no unknown registries or git), passing in `scripts/check.sh` (L00, `docs/evidence/foundation.md`). Age check for new crates is a reviewer step in `REVIEW.md` |
 
-In scope: 27 (19 Gap, 8 Partial, 0 Met). Human: 5. N/A: 10.
+In scope: 27 (17 Gap, 9 Partial, 1 Met). Human: 5. N/A: 10.
 
 ## Exceptions
 
@@ -124,3 +124,4 @@ In scope: 27 (19 Gap, 8 Partial, 0 Met). Human: 5. N/A: 10.
 | Date | Change | Requirements touched | Status after |
 |---|---|---|---|
 | 2026-11-13 | Installed ARI-42 1.0.1 (Claude Code, Codex, SessionStart hook); first scoping from the PRD; added CODEOWNERS | all (initial scoping) | 0 of 27 met; 8 Partial; 19 Gap |
+| 2026-11-13 | L00 foundation: Rust workspace with lockfile, cargo-deny/cargo-audit local gate (no hosted CI, D7), deny-by-default policy stub, `SecretBytes` that can't be serialized or printed | GW-2, SDLC-6, EVAL-1 | 1 of 27 met; 9 Partial; 17 Gap |
