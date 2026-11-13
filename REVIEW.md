@@ -10,6 +10,10 @@ here (or a lint rule) rather than paying for another review cycle.
 - A key goes only to its own hosts and commands; agent-supplied auth headers are stripped and redirects never carry credentials.
 - Production-tier approvals are bound to the exact command and arguments shown in the prompt.
 - `ms` and `mors` must behave identically (same binary, two names).
+- Secret material never reaches `Debug`, `Display`, `tracing` or any serde type. `SecretBytes` has no `Serialize`, `Clone` or `Display` on purpose; adding one is a defect.
+- `unsafe` only with a `// SAFETY:` comment and an explicit crate-level opt-out of the workspace `unsafe_code = "deny"` lint.
+- No new dependency unless `cargo deny` passes; no git or path dependency outside the workspace.
+- The frozen interfaces in `docs/PLAN.md` §4 (`ms-core` types and the `Vault`, `Approver`, `ReceiptSink`, `RunAdapter`, `Minter`, `Connector` traits, IPC v1) change only in a loop of their own.
 
 ## Do not nitpick
 - Formatting and naming the linter or formatter already enforces.

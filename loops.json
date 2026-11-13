@@ -9,9 +9,15 @@
       "baseBranch": "main",
       "basePort": 4000,
       "dev": [
-        "npm",
+        "cargo",
         "run",
-        "dev"
+        "-q",
+        "-p",
+        "msd",
+        "--",
+        "--foreground",
+        "--port",
+        "{{port}}"
       ],
       "env": {}
     }
@@ -34,7 +40,24 @@
       "**/install*",
       "**/vault/**",
       "**/broker/**",
-      "**/keychain/**"
+      "**/keychain/**",
+      "crates/ms-vault/**",
+      "crates/ms-proxy/**",
+      "crates/ms-run/**",
+      "crates/ms-approve/**",
+      "crates/ms-rules/**",
+      "crates/ms-ipc/**",
+      "apps/MorsecApprove/**",
+      "deny.toml",
+      "rust-toolchain.toml",
+      "scripts/check.sh",
+      "package.json",
+      "crates/**",
+      "Cargo.toml",
+      "Cargo.lock",
+      "**/build.rs",
+      ".cargo/**",
+      "scripts/**"
     ]
   },
   "hooks": {

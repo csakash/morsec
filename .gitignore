@@ -6,3 +6,7 @@ node_modules/
 dist/
 build/
 worktrees/
+target/
+proof/
+.gstack/
+.loops/

@@ -253,7 +253,7 @@ reports prompts per session and blocks per day.
 | Storage | JSONL receipts; TOML rules | Readable, diffable, easy to export. |
 | Linux vault | TPM2-sealed key encrypting a vault file owned by `_morsec`; falls back to a file readable only by `_morsec` when there's no TPM | PRD §6. |
 | Menu-bar app | SwiftUI, client of `msd` | v1.0. |
-| Release | GitHub Actions on macOS and Linux, Developer ID signing and notarization, Homebrew tap, SBOM, signed checksums | PRD §9 supply chain. |
+| Release | A local release script on macOS (no hosted CI in v1, D7): Developer ID signing and notarization, Homebrew tap, SBOM, signed checksums | PRD §9 supply chain. |
 
 ### 3.7 Repository layout (loop ownership)
 
@@ -334,6 +334,11 @@ IPC v1: length-prefixed JSON over the Unix socket. Messages: `Status`, `PutKey`,
 (needs Touch ID), `LogQuery`, `DoctorProbe`. There is deliberately **no message that returns a
 secret value**, and no `ms get` / `ms reveal` command.
 
+As frozen by L00: `Run` carries only `{ argv, cwd }`, not a client-built `RunCall`. The session
+is never taken from the client; the daemon derives it from the peer (L06), which is what AUTH-1
+requires. `RunStream` is added by L12 when output streaming lands. `PutKey`'s value travels in a
+separate raw frame after the JSON.
+
 ---
 
 ## 5. Loop cards
@@ -345,7 +350,7 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
 
 #### L00 `foundation` · M
 - **Depends on:** nothing. **Owns:** root `Cargo.toml`, `Cargo.lock`, `crates/*/` stubs,
-  `ms-core`, `ms-ipc`, the traits in §4, `ms-vault/memory`, `ms-cli` skeleton, `.github/workflows/ci.yml`,
+  `ms-core`, `ms-ipc`, the traits in §4, `ms-vault/memory`, `ms-cli` skeleton, `scripts/check.sh` + `package.json` (local gate),
   `loops.json`, `rust-toolchain.toml`, `deny.toml`.
 - **Build:**
   - Cargo workspace with every crate from §3.7 as a compiling stub, and `[workspace.dependencies]`
@@ -355,17 +360,18 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
   - The §4 traits, an in-memory vault, fake approver, fake minter and fake connector for tests.
   - IPC v1 framing, a client, and a server skeleton.
   - `ms` binary built with clap, with every PRD command stubbed so it prints "not yet built"; `mors` symlink.
-  - CI: fmt, clippy `-D warnings`, tests, `cargo deny` (licences, advisories, bans), `cargo audit`,
+  - Local gate `scripts/check.sh` (no hosted CI in v1, D7), wired into gloop's build gate through
+    `package.json`: fmt, build, clippy `-D warnings`, tests, `cargo deny` (licences, advisories, bans), `cargo audit`,
     `--locked` builds on macOS and Linux runners.
   - `loops.json`: dev command `cargo run -p msd -- --foreground --port {{port}}`; extend
     `sensitivePaths` with `crates/ms-vault/**`, `crates/ms-proxy/**`, `crates/ms-run/**`,
     `crates/ms-approve/**`, `crates/ms-rules/**`, `apps/MorsecApprove/**`.
   - `REVIEW.md` additions: unsafe Rust needs a justification comment; no `println!` or tracing of
     `SecretBytes`; `Debug` for secret types prints `[redacted]`.
-- **Verify:** workspace builds and CI passes; `SecretRef` parser property tests; a test that
+- **Verify:** workspace builds and `scripts/check.sh` passes; `SecretRef` parser property tests; a test that
   `format!("{:?}", secret)` contains no bytes of the value; IPC round-trip test.
 - **ARI-42:** GW-2 (lockfile, `--locked`, cargo-deny), SDLC-6 (every new crate passes cargo-deny and
-  an age/existence check in CI), EVAL-1 (CI job exists; made required where the plan allows).
+  an existence check in the local gate), EVAL-1 (the gate exists and gloop's build gate requires it).
 
 ### Wave 1 (parallel, 6 loops; run 4 at a time if you want to keep review load manageable)
 
@@ -382,7 +388,7 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
   - A vault HMAC key for rules and receipts, and the CA private key, as non-exportable items.
 - **Verify:** an unsigned or differently signed test binary can't read an item (ACL test); a
   production item needs user presence (manual check recorded); memory test with a canary value
-  and a core dump scan in CI where possible.
+  and a core dump scan in the local gate where possible.
 - **ARI-42:** GW-1, INJ-5.
 
 #### L02 `receipts` · M
@@ -463,6 +469,17 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
 - **Depends on:** L01, L02, L03, L05, L06. **Owns:** `crates/msd/`, `ms init`, `ms status`,
   `ms start`, `ms stop` CLI modules, LaunchAgent plist.
 - **Build:**
+  - **Keep the kill switch reachable (open from L00 security review, S6):** `ms-ipc` serves at most
+    64 connections, and the idle timeout only bounds the gap between frames, so a same-user process
+    that holds 64 connections open starves every other client. Before `Stop` ships: give each
+    connection a total lifetime or request cap, cap connections per peer after the peer check, and
+    reserve a slot (or a separate control socket) for `Stop`/`Status`. Test: 64 held connections do
+    not delay `ms stop`.
+  - **Harden socket setup first (open from L00 security review, S3):** `Server::bind` checks the
+    directory by path, then binds and chmods by path. Under a parent directory another user can
+    write, a rename between check and bind could redirect the socket. Open the directory with
+    `O_DIRECTORY|O_NOFOLLOW`, check uid and mode with `fstat` on that descriptor, bind under a
+    0077 umask, and re-check with `lstat` after binding. The default paths are not affected.
   - Assemble the services and the socket server with peer checks.
   - `ms init`: vault, HMAC keys, CA and its trust, LaunchAgent.
   - `ms status`: on/off and number of protected keys (the source of the mockup's pill).
@@ -499,12 +516,12 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
     (`~/.codex/sessions/**`) transcripts for any vault value and its base64, base64url, URL and
     hex encodings. Matching runs inside `msd`; output gives file:line only, never the value.
   - A real-agent job (manual or nightly) running `claude -p` and `codex exec` against a fixture repo.
-  - CI job `security-evals`, which is required.
+  - A `security-evals` step in `scripts/check.sh`, so the gloop build gate requires it (no hosted CI in v1, D7).
 - **Verify:** the suite itself; an intentionally leaky fixture is caught.
 - **ARI-42:** EVAL-1, GW-1 ("agent runs `env`, no key"), INJ-5.
 
 #### L10 `release-pipeline` · M
-- **Depends on:** L07. **Owns:** `packaging/`, `.github/workflows/release.yml`.
+- **Depends on:** L07. **Owns:** `packaging/`, `scripts/release.sh` (local; no hosted CI in v1, D7).
 - **Build:**
   - Reproducible builds (`SOURCE_DATE_EPOCH`, `--locked`, `--remap-path-prefix`).
   - Developer ID signing, hardened runtime and notarization for `ms`, `msd` and the helper app.
@@ -518,7 +535,7 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
 - **ARI-42:** GW-2.
 
 **v0.1 gate** (PRD: macOS; vault, import, swap, Claude Code connector, receipts): L00–L10 merged;
-`security-evals` green; a fresh install to the first protected Claude Code session takes under
+the `security-evals` step of `scripts/check.sh` green; a fresh install to the first protected Claude Code session takes under
 5 minutes (timed in the e2e run). **Human:** recruit 10 developers for 2 weeks of daily use.
 
 ### Wave 3 (v0.2)
@@ -543,6 +560,11 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
 #### L12 `run-core` · L
 - **Depends on:** L07. **Owns:** `crates/ms-run/` (except `adapters/`), `ms-shim`, `ms run` CLI module.
 - **Build:**
+  - **Decide first (open from L00 review):** `SecretRef::find_all` does not find a ref in a DSN
+    password slot (`postgres://app:ms://pg/staging@db/app`) or after `:` in a list, because `@ : ? #`
+    end a candidate so it agrees with `parse`. Either support the userinfo form explicitly in
+    `find_all` (with tests), or keep it and have `ms import` (L04) always rewrite the whole value to
+    `ms://…` and document that DSN passwords use the whole-value or `?password=` form.
   - The shim forwards to `msd` only when a ref is present, and otherwise execs the next real
     binary on `PATH` (checking it isn't another shim).
   - Runner: absolute binary from the key's command allowlist, `argv` array, minimal environment,
@@ -775,7 +797,7 @@ weeks (v0.1 at about 4 weeks, matching the PRD), wave 3 ≈ 3 weeks, wave 4 ≈ 
 |---|---|---|
 | Unit and property | parsers, policy, tighten-only merge, redactor, token binding | each crate |
 | Integration | in-memory vault + real proxy and runner against local TLS echo, Postgres in Docker, an SSH server in Docker | each crate's `tests/` |
-| End to end | fake agent with canary secrets; required CI job `security-evals` | `tests/e2e` (L09) |
+| End to end | fake agent with canary secrets; `security-evals` step in `scripts/check.sh` | `tests/e2e` (L09) |
 | Live agents | `claude -p` and `codex exec` against a fixture repo; `ms doctor --live` | nightly or manual (L09, L17) |
 | Fuzzing | dotenv, HTTP request head, IPC framing, catalog patterns | `fuzz/` (L04, L05, L24) |
 | Leak scan | `ms scan` over real transcripts (success measure: zero leaks) | L09 |
@@ -794,6 +816,7 @@ Every loop's `PROOF.md` lists the ARI-42 checks it ran and their results.
 | D4 | Rust core and Swift UI (vs Go) | Rust, for reliable zeroization and memory safety | L00 |
 | D5 | Homebrew tap now, homebrew-core later | Tap (`csakash/tap`) | L10 |
 | D6 | Approval scope default: "exact command once" (mockup) vs "once per session" (PRD §5) | Exact command once by default; "for this session" as an explicit choice in the dialog | L11 |
+| D7 | Hosted CI (GitHub Actions) in v1 | **Decided 2026-11-13: no.** All checks run locally in `scripts/check.sh`; gloop's build gate runs it via `package.json`. Revisit if the GitHub plan changes. | L00, L09, L10 |
 
 ## 9. Risks specific to the build
 

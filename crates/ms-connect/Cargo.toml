@@ -1,0 +1,14 @@
+[package]
+name = "ms-connect"
+description = "Connector trait and per-agent connectors (L08, L13, L22)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ms-core = { workspace = true }
