@@ -765,6 +765,15 @@ dependencies = [
 [[package]]
 name = "ms-session"
 version = "0.0.0"
+dependencies = [
+ "libc",
+ "ms-core",
+ "ms-ipc",
+ "rustix",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "ms-vault"

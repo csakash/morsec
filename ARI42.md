@@ -69,7 +69,7 @@ Status: **Met** (enforced + passing check) · **Partial** · **Gap** · **Risk**
 | DATA-3 | No provider training; bounded retention | N/A | No model provider |
 | DATA-4 | Control inference location | N/A | No inference |
 | DATA-5 | Isolate and purge agent memory | N/A | No memory, vector store or cache in the design |
-| AUTH-1 | Per-agent identity | Gap | PRD: each session gets its own grant and minted creds; not built |
+| AUTH-1 | Per-agent identity | Partial | L06 `ms-session`: session = outermost agent process `{agent, pid, start time}` derived from the kernel (Unix peer PID; loopback source port → PID for the proxy) plus proxy-username cross-check; tests: `crates/ms-session/tests/live.rs` (nested fake-agent trees, PID reuse, port→PID), unit tests in `walk.rs`/`port.rs`/`peer.rs`/`proxy.rs`. Still to do: daemon wiring and per-session grants/minted creds (L07+). Residual: same-user process can detach (Unattributed, never more rights) or exec a binary named like an agent; see `docs/evidence/session-identity.md` |
 | AUTH-2 | Never exceed the user's permissions | Gap | Run/mint modes must narrow each key; read-only roles for staging DB; not built |
 | AUTH-3 | Approval for consequential actions | Gap | Touch ID prompt rendered by broker from real argv, bound to it; test: changed arg voids approval |
 | AUTH-4 | Kill switch and hard limits | Gap | `ms stop`, per-session caps; not built |
