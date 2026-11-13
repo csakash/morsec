@@ -1,0 +1,56 @@
+# Verifying a morsec release
+
+Anyone can check that a release is the one the maintainer signed and that its binaries are what
+the source builds to.
+
+## 1. Checksums and their signature
+
+```bash
+minisign -Vm SHA256SUMS -p minisign.pub      # minisign.pub from packaging/ at the release tag
+shasum -a 256 -c SHA256SUMS
+```
+
+The trusted comment names the version, the full commit and the target.
+
+## 2. Code signature
+
+```bash
+tar -xzf morsec-<version>-aarch64-apple-darwin.tar.gz
+codesign --verify --strict --verbose=2 morsec-<version>/bin/ms morsec-<version>/bin/msd
+codesign -d --verbose=2 morsec-<version>/bin/msd   # Identifier=cc.morsec.msd, flags include runtime,
+                                                   # Authority=Developer ID Application: …, a Timestamp
+codesign -d --entitlements - morsec-<version>/bin/msd   # empty: morsec has no entitlements
+spctl --assess --type execute --verbose=4 morsec-<version>/bin/msd   # accepted, Notarized Developer ID
+```
+
+## 3. Rebuild and compare
+
+On an Apple silicon Mac with the toolchain from `rust-toolchain.toml` and the Xcode / SDK named
+in `BUILDINFO`:
+
+```bash
+git clone https://github.com/csakash/morsec && cd morsec
+git checkout <commit from BUILDINFO>
+scripts/release.sh build --out /tmp/rebuild
+diff <(grep -E '^(unsigned|code)_sha256' BUILDINFO) <(grep -E '^(unsigned|code)_sha256' /tmp/rebuild/BUILDINFO)
+```
+
+The two must match. Then tie the **signed** release binaries to your rebuild. A Developer ID
+signature carries a timestamp, so signed bytes never match a rebuild; compare the code digest,
+which covers every byte except the signature and the two size fields signing changes:
+
+```bash
+python3 -I packaging/lib/machocmp.py --same <release>/bin/msd /tmp/rebuild/…  # or:
+python3 -I packaging/lib/machocmp.py <release>/bin/ms <release>/bin/msd   # = code_sha256.* in BUILDINFO
+```
+
+Don't use `codesign --remove-signature` for this: it leaves a different `__LINKEDIT` size behind.
+
+What is and isn't reproducible:
+
+- `ms` and `msd` before signing, the SBOM and `BUILDINFO`: byte-identical across clean builds at
+  any path on the same toolchain and SDK (`scripts/release.sh verify-repro` proves it at release
+  time).
+- The tarball: identical when built from the same unsigned binaries with the same Python zlib.
+  A released tarball holds the signed binaries, so it can't match a rebuild; check it with steps
+  1 and 2 instead.
