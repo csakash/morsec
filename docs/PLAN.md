@@ -334,6 +334,11 @@ IPC v1: length-prefixed JSON over the Unix socket. Messages: `Status`, `PutKey`,
 (needs Touch ID), `LogQuery`, `DoctorProbe`. There is deliberately **no message that returns a
 secret value**, and no `ms get` / `ms reveal` command.
 
+As frozen by L00: `Run` carries only `{ argv, cwd }`, not a client-built `RunCall`. The session
+is never taken from the client; the daemon derives it from the peer (L06), which is what AUTH-1
+requires. `RunStream` is added by L12 when output streaming lands. `PutKey`'s value travels in a
+separate raw frame after the JSON.
+
 ---
 
 ## 5. Loop cards
