@@ -107,6 +107,17 @@ fn invoked_name() -> String {
         .to_owned()
 }
 
+/// Text from the daemon goes to a terminal: drop control characters (escape sequences,
+/// carriage returns, bidi overrides) so it can't rewrite what the user sees.
+fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .collect()
+}
+
 async fn status() -> ExitCode {
     let result = async {
         let path = ms_ipc::default_socket_path()?;
@@ -116,15 +127,15 @@ async fn status() -> ExitCode {
     .await;
     match result {
         Ok(ResponseBody::Status { version, .. }) => {
-            println!("morsec on · daemon {version}");
+            println!("morsec on · daemon {}", terminal_safe(&version));
             ExitCode::SUCCESS
         }
         Ok(ResponseBody::Error { message, .. }) => {
-            eprintln!("{message}");
+            eprintln!("{}", terminal_safe(&message));
             ExitCode::FAILURE
         }
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{}", terminal_safe(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -165,5 +176,21 @@ async fn main() -> ExitCode {
     match command {
         Command::Status => status().await,
         _ => unreachable!("every other command is a stub"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_safe;
+
+    // protects=escape sequences, CR/LF and bidi overrides from the daemon never reach the
+    // terminal; fails_when=any survives; no_claim=other output paths (each must use terminal_safe)
+    #[test]
+    fn strips_terminal_controls() {
+        let evil = "0.0.0\u{1b}[2J\u{1b}]0;pwned\u{7}\r\nfake line\u{202e}txt";
+        let safe = terminal_safe(evil);
+        assert!(!safe.chars().any(|c| c.is_control()), "{safe:?}");
+        assert!(!safe.contains('\u{202e}'));
+        assert!(safe.starts_with("0.0.0"));
     }
 }

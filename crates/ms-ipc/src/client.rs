@@ -30,6 +30,18 @@ impl Client {
             .await
             .map_err(|_| unavailable(format!("no answer on {} within 2s", path.display())))?
             .map_err(|e| unavailable(format!("{}: {e}", path.display())))?;
+        // Authenticate the server before sending anything (a key value, in put_key): it must
+        // run as this user. Another user's socket at the same path is not our daemon.
+        let server_uid = stream
+            .peer_cred()
+            .map_err(|e| {
+                unavailable(format!(
+                    "can't identify the server on {}: {e}",
+                    path.display()
+                ))
+            })?
+            .uid();
+        check_server_uid(server_uid, own_uid()?, path)?;
         Ok(Self { stream, next_id: 1 })
     }
 
@@ -79,5 +91,59 @@ impl Client {
             )));
         }
         Ok(env.body)
+    }
+}
+
+/// This process's effective uid, read from the kernel through a socket pair (no `unsafe`):
+/// the peer of our own pair is us.
+fn own_uid() -> Result<u32> {
+    let (a, _b) = UnixStream::pair().map_err(|e| Error::io("creating a socket pair", e))?;
+    Ok(a.peer_cred()
+        .map_err(|e| Error::io("reading own credentials", e))?
+        .uid())
+}
+
+fn check_server_uid(server_uid: u32, own: u32, path: &Path) -> Result<()> {
+    if server_uid == own {
+        Ok(())
+    } else {
+        Err(Error::DaemonUnavailable {
+            detail: format!(
+                "the socket {} belongs to uid {server_uid}, not to you; refusing to talk to it",
+                path.display()
+            ),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // protects=a server running as another user is refused before anything is sent, with the
+    // DaemonUnavailable fix text; fails_when=a mismatched uid is accepted; no_claim=a live
+    // second-user server (needs two uids; the comparison is what this pins)
+    #[test]
+    fn other_users_server_is_refused() {
+        let p = Path::new("/tmp/x.sock");
+        assert!(check_server_uid(501, 501, p).is_ok());
+        let err = check_server_uid(0, 501, p).unwrap_err();
+        assert!(matches!(err, Error::DaemonUnavailable { .. }));
+        assert!(
+            err.to_string().contains("belongs to uid 0") && err.to_string().contains("ms start"),
+            "{err}"
+        );
+    }
+
+    // protects=own_uid returns this process's uid, matching the owner of a file it creates;
+    // fails_when=it returns another uid; no_claim=setuid processes
+    #[tokio::test]
+    async fn own_uid_matches_created_file() {
+        use std::os::unix::fs::MetadataExt;
+        let f = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(
+            own_uid().unwrap(),
+            std::fs::metadata(f.path()).unwrap().uid()
+        );
     }
 }

@@ -42,10 +42,17 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8
     let Some(len) = read_len(r).await? else {
         return Ok(None);
     };
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)
+    // Grow the buffer as bytes arrive instead of allocating the claimed length up front, so a
+    // client that sends only a 1 MiB header pins almost no memory.
+    let mut buf = Vec::new();
+    let got = r
+        .take(len as u64)
+        .read_to_end(&mut buf)
         .await
         .map_err(|e| Error::io("reading frame body", e))?;
+    if got != len {
+        return Err(Error::Protocol("connection closed inside a frame".into()));
+    }
     Ok(Some(buf))
 }
 

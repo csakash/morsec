@@ -15,6 +15,8 @@ use crate::protocol::{ErrorCode, RequestBody, ResponseBody, decode, encode};
 
 /// How long a connection may sit between frames before it is closed.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Most connections served at once.
+pub const MAX_CONNECTIONS: usize = 64;
 
 /// Credentials of the connecting process, from the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,15 +183,31 @@ impl Server {
         shutdown: impl Future<Output = ()>,
     ) {
         tokio::pin!(shutdown);
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
+            // At most MAX_CONNECTIONS at once; further clients wait in the listen backlog.
+            let permit = tokio::select! {
+                () = &mut shutdown => break,
+                p = slots.clone().acquire_owned() => match p {
+                    Ok(p) => p,
+                    Err(_) => break, // semaphore closed: never happens, but don't spin
+                },
+            };
             tokio::select! {
                 () = &mut shutdown => break,
                 accepted = self.listener.accept() => match accepted {
                     Ok((stream, _)) => {
                         let (h, c) = (handler.clone(), check.clone());
-                        tokio::spawn(async move { serve_conn(stream, h, c).await });
+                        tokio::spawn(async move {
+                            serve_conn(stream, h, c).await;
+                            drop(permit);
+                        });
                     }
-                    Err(e) => tracing::warn!(error = %e, "accept failed"),
+                    Err(e) => {
+                        // EMFILE and friends: back off instead of spinning.
+                        tracing::warn!(error = %e, "accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 },
             }
         }
