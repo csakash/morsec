@@ -1,0 +1,15 @@
+[package]
+name = "ms-run"
+description = "Run mode: adapter trait, exec plans (runner in L12)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ms-core = { workspace = true }
+ms-vault = { workspace = true }
