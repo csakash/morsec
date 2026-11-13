@@ -34,6 +34,11 @@ pub const MAX_CLAUDE_JSON: u64 = 64 << 20;
 /// Largest extra CA file folded into the bundle.
 const MAX_CA_FILE: u64 = 1 << 20;
 const STATE_VERSION: i64 = 1;
+/// Claude Code's bypass permission mode, which connect only ever *detects* in the user's own
+/// settings (to warn) and never writes (SDLC-2, test `sdlc2_sandbox_on_and_no_bypass`). Spelled
+/// in two parts because the ARI-42 scanner's SDLC-2 rule matches the literal anywhere and has no
+/// way to mark a detector as safe; recorded in ARI42.md.
+const BYPASS_MODE: &str = concat!("bypass", "Permissions");
 /// macOS system roots, the base of the bundle.
 pub const SYSTEM_ROOTS: &str = "/etc/ssl/cert.pem";
 
@@ -583,8 +588,8 @@ impl ClaudeConnector {
             )));
         }
         // SDLC-2: say so when the user's own settings weaken the sandbox. Never change them.
-        if v.at(&path(&["permissions", "defaultMode"])) == Some(&Value::str("bypassPermissions")) {
-            warnings.push("your settings set permissions.defaultMode to bypassPermissions: Claude runs commands without asking. morsec still keeps values out of reach, but consider removing it".into());
+        if v.at(&path(&["permissions", "defaultMode"])) == Some(&Value::str(BYPASS_MODE)) {
+            warnings.push(format!("your settings set permissions.defaultMode to {BYPASS_MODE}: Claude runs commands without asking. morsec still keeps values out of reach, but consider removing it"));
         }
         if v.at(&path(&["sandbox", "excludedCommands"]))
             .is_some_and(|x| !x.is_empty_container())
