@@ -549,6 +549,11 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
 #### L12 `run-core` · L
 - **Depends on:** L07. **Owns:** `crates/ms-run/` (except `adapters/`), `ms-shim`, `ms run` CLI module.
 - **Build:**
+  - **Decide first (open from L00 review):** `SecretRef::find_all` does not find a ref in a DSN
+    password slot (`postgres://app:ms://pg/staging@db/app`) or after `:` in a list, because `@ : ? #`
+    end a candidate so it agrees with `parse`. Either support the userinfo form explicitly in
+    `find_all` (with tests), or keep it and have `ms import` (L04) always rewrite the whole value to
+    `ms://…` and document that DSN passwords use the whole-value or `?password=` form.
   - The shim forwards to `msd` only when a ref is present, and otherwise execs the next real
     binary on `PATH` (checking it isn't another shim).
   - Runner: absolute binary from the key's command allowlist, `argv` array, minimal environment,

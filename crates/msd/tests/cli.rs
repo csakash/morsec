@@ -36,11 +36,35 @@ fn tmpdir() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// Stops msd with SIGTERM so it removes its own socket; SIGKILL only if it doesn't exit in 5s.
 struct Daemon(Child);
 impl Drop for Daemon {
     fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.0.id().to_string()])
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = self.0.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// Waits until the daemon accepts connections; a socket file alone may be stale.
+fn wait_ready(socket: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(socket).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "msd is not accepting on {}",
+            socket.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -54,11 +78,7 @@ fn start_msd(socket: &Path) -> Daemon {
         .spawn()
         .unwrap();
     let d = Daemon(child);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(Instant::now() < deadline, "msd did not create its socket");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_ready(socket);
     d
 }
 
@@ -159,9 +179,10 @@ fn port_beats_exported_socket() {
     let exported = d.path().join("exported.sock");
     // A port unlikely to be used by another test run at the same time.
     let port = 40000 + (std::process::id() % 20000) as u16;
-    let expected = std::env::temp_dir()
-        .join(format!("morsec-dev-{port}"))
-        .join("msd.sock");
+    let dev_dir = std::env::temp_dir().join(format!("morsec-dev-{port}"));
+    let expected = dev_dir.join("msd.sock");
+    // A socket left by an earlier killed run would make the wait below pass too early.
+    let _ = std::fs::remove_dir_all(&dev_dir);
     let child = Command::new(msd())
         .args(["--foreground", "--port", &port.to_string()])
         .env("MORSEC_SOCKET", &exported)
@@ -170,16 +191,8 @@ fn port_beats_exported_socket() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let _d = Daemon(child);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !expected.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "no socket at {}",
-            expected.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let daemon = Daemon(child);
+    wait_ready(&expected);
     assert!(!exported.exists(), "msd bound the exported socket");
     let (code, out, err) = run(&ms(), &["status"], &expected);
     assert_eq!(
@@ -187,6 +200,10 @@ fn port_beats_exported_socket() {
         (0, "morsec on · daemon 0.0.0\n"),
         "{err}"
     );
+    // SIGTERM: msd removes its socket on a clean shutdown.
+    drop(daemon);
+    assert!(!expected.exists(), "socket left after SIGTERM");
+    let _ = std::fs::remove_dir(&dev_dir);
 }
 
 // protects=msd refuses to start without --foreground (no silent background mode before L07);

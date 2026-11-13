@@ -43,6 +43,11 @@ fn main() {
     if let Some(head) = git_path("HEAD") {
         watch(&head);
     }
+    // The per-worktree reflog gets a line on every commit, checkout and reset, even when the
+    // branch ref lives only in packed-refs and no loose ref file changes.
+    if let Some(reflog) = git_path("logs/HEAD") {
+        watch(&reflog);
+    }
     if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"]) {
         if let Some(p) = git_path(&reference) {
             watch(&p);

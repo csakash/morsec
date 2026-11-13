@@ -351,6 +351,9 @@ mod tests {
             "ms://stripe:443",
             "ms://stripe/test?x=1",
             "ms://stripe/test#f",
+            // A ref in a DSN password slot is deliberately not found yet (fails closed: the
+            // literal ref reaches the database and auth fails). L12 decides whether to support it;
+            // see docs/PLAN.md, L12 card.
             "postgres://u:ms://pg/x@h/db",
         ] {
             assert!(SecretRef::find_all(none).is_empty(), "matched in {none:?}");
