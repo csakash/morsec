@@ -1,0 +1,8 @@
+{
+  "name": "morsec-gate",
+  "private": true,
+  "description": "Not a Node project. gloop's build gate runs `npm run build`; this maps it to the Rust check gate so it can't silently pass.",
+  "scripts": {
+    "build": "bash scripts/check.sh"
+  }
+}
