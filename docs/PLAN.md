@@ -469,6 +469,11 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
 - **Depends on:** L01, L02, L03, L05, L06. **Owns:** `crates/msd/`, `ms init`, `ms status`,
   `ms start`, `ms stop` CLI modules, LaunchAgent plist.
 - **Build:**
+  - **Harden socket setup first (open from L00 security review, S3):** `Server::bind` checks the
+    directory by path, then binds and chmods by path. Under a parent directory another user can
+    write, a rename between check and bind could redirect the socket. Open the directory with
+    `O_DIRECTORY|O_NOFOLLOW`, check uid and mode with `fstat` on that descriptor, bind under a
+    0077 umask, and re-check with `lstat` after binding. The default paths are not affected.
   - Assemble the services and the socket server with peer checks.
   - `ms init`: vault, HMAC keys, CA and its trust, LaunchAgent.
   - `ms status`: on/off and number of protected keys (the source of the mockup's pill).
