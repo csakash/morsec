@@ -305,6 +305,29 @@ impl ClaudeConnector {
             .collect())
     }
 
+    /// The `--env` references the previous connect wrote, so re-running `ms connect` (for example
+    /// after adding a host) keeps them.
+    pub fn previous_env_refs(&self) -> Result<Vec<(String, String)>> {
+        let Some(st) = self.read_state()? else {
+            return Ok(Vec::new());
+        };
+        Ok(st
+            .settings_edits
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::Set {
+                    path,
+                    after: Value::String(v),
+                    ..
+                } if path.len() == 2 && path[0] == "env" => check_ref_env(&path[1], v)
+                    .ok()
+                    .map(|()| (path[1].clone(), v.clone())),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// True when a state file says this connector is applied.
     pub fn is_connected(&self) -> bool {
         self.paths.state.exists()
