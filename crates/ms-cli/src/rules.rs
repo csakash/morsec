@@ -1,8 +1,10 @@
-//! `ms rules`: show a key's effective rule, check a project file, and preview changes.
+//! `ms rules`: show a key's effective rule, check a project file, and change a rule.
 //!
-//! IPC v1 has no rules response and `RulesProposeLoosen` carries no rule, so this command reads
-//! the local files and never writes them: writing needs the vault MAC key, which only `msd` holds.
-//! It says so in its output, and the daemon verifies the MAC on every load (L07).
+//! The user rules come from msd (`RulesGet`), which verified their MAC; the project
+//! `.morsec.toml` is merged here, so msd never reads a path a client names. Changes go to msd as a
+//! proposed rule (`RulesProposeLoosen`, L07): msd classifies them, saves tightening at once, and
+//! needs an approval to loosen (until L11, `--at-terminal` from your own terminal). With msd down,
+//! or with `--rules <path>`, the file is read locally and labelled unverified; nothing is written.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -14,7 +16,9 @@ use ms_rules::{
     Change, CommandPattern, HostPattern, KeyRule, PROJECT_FILE, ProjectRules, Rules, classify_rule,
 };
 
-use crate::{EXIT_NOT_BUILT, terminal_safe};
+use ms_ipc::{Client, ErrorCode, RequestBody, ResponseBody};
+
+use crate::terminal_safe;
 
 /// Largest rules file read by the CLI, bytes.
 const MAX_FILE: u64 = 1 << 20;
@@ -60,6 +64,10 @@ pub struct RulesArgs {
     /// Propose read-write access.
     #[arg(long)]
     writable: bool,
+    /// Loosening without Touch ID (until loop L11): confirm at your own terminal, outside any
+    /// agent session.
+    #[arg(long)]
+    at_terminal: bool,
 }
 
 impl RulesArgs {
@@ -143,6 +151,123 @@ fn read_text(path: &Path) -> Result<String, String> {
     })
 }
 
+/// Exit code for a change that can't be sent (sysexits EX_USAGE).
+const EXIT_USAGE: u8 = 64;
+
+/// Where the user rules came from.
+enum Source {
+    /// msd, which checked the MAC.
+    Daemon,
+    /// A local file read by `ms`, unverified.
+    Local(PathBuf, &'static str),
+}
+
+impl Source {
+    fn label(&self) -> String {
+        match self {
+            Source::Daemon => "verified by msd".into(),
+            Source::Local(p, why) => format!("{} ({why}; MAC not checked by ms)", p.display()),
+        }
+    }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("morsec: starting the IPC client: {e}"))
+}
+
+fn ask(body: RequestBody) -> ms_core::Result<ResponseBody> {
+    let rt = runtime().map_err(ms_core::Error::Protocol)?;
+    rt.block_on(async {
+        let path = ms_ipc::default_socket_path()?;
+        Client::connect(&path).await?.request(body).await
+    })
+}
+
+/// The user rules: from msd, or (with `--rules`, or msd down) from a local file, unverified.
+fn load_user_rules(a: &RulesArgs) -> Result<(Rules, Source), ExitCode> {
+    let local = |path: PathBuf, why: &'static str| -> Result<(Rules, Source), ExitCode> {
+        match read_text(&path) {
+            Ok(t) => match Rules::from_toml(&t, &path.display().to_string()) {
+                Ok(r) => Ok((r, Source::Local(path, why))),
+                Err(e) => Err(err(&e.to_string())),
+            },
+            Err(_) if !path.exists() => Err(err(&format!(
+                "morsec: no rules file at {}. Create it with: ms init",
+                path.display()
+            ))),
+            Err(e) => Err(err(&e)),
+        }
+    };
+    if let Some(p) = &a.rules {
+        return local(p.clone(), "--rules");
+    }
+    match ask(RequestBody::RulesGet { key: None }) {
+        Ok(ResponseBody::Rules { toml, notes, .. }) => {
+            let r =
+                Rules::from_toml(&toml, "the rules from msd").map_err(|e| err(&e.to_string()))?;
+            for n in notes {
+                out(&format!("note: {n}"));
+            }
+            Ok((r, Source::Daemon))
+        }
+        Ok(ResponseBody::Error { message, .. }) => Err(err(&message)),
+        Ok(_) => Err(err(
+            "morsec: unexpected reply from the daemon. Make sure ms and msd are the same version (ms --version)",
+        )),
+        Err(ms_core::Error::DaemonUnavailable { .. }) => {
+            let path = default_rules_path().map_err(|e| err(&e))?;
+            local(path, "msd is not running")
+        }
+        Err(e) => Err(err(&e.to_string())),
+    }
+}
+
+/// Sends a proposed rule to msd.
+fn propose(name: &KeyName, user: &Rules, proposed: KeyRule, at_terminal: bool) -> ExitCode {
+    if at_terminal {
+        match crate::tty::confirm_at_terminal(&format!(
+            "Apply this change to {name} without Touch ID (until loop L11)?"
+        )) {
+            Ok(true) => {}
+            Ok(false) => return err("Cancelled. Nothing was changed."),
+            Err(e) => {
+                return err(&format!(
+                    "morsec: --at-terminal must be confirmed at your own terminal ({e})"
+                ));
+            }
+        }
+    }
+    let mut one = Rules {
+        version: user.version,
+        ..Rules::default()
+    };
+    one.keys.insert(name.clone(), proposed);
+    match ask(RequestBody::RulesProposeLoosen {
+        key: name.clone(),
+        rule: Some(one.to_toml()),
+        at_terminal,
+    }) {
+        Ok(ResponseBody::Ok { message }) => {
+            out(&message);
+            ExitCode::SUCCESS
+        }
+        Ok(ResponseBody::Error { code, message }) => {
+            if code == ErrorCode::NeedsApproval {
+                eprintln!("{}", terminal_safe(&message));
+                return ExitCode::FAILURE;
+            }
+            err(&message)
+        }
+        Ok(_) => err(
+            "morsec: unexpected reply from the daemon. Make sure ms and msd are the same version (ms --version)",
+        ),
+        Err(e) => err(&e.to_string()),
+    }
+}
+
 pub fn run(a: RulesArgs) -> ExitCode {
     if let Some(file) = &a.check {
         return check(file);
@@ -157,22 +282,9 @@ pub fn run(a: RulesArgs) -> ExitCode {
         );
     }
 
-    let rules_path = match a.rules.clone().map(Ok).unwrap_or_else(default_rules_path) {
-        Ok(p) => p,
-        Err(e) => return err(&e),
-    };
-    let user = match read_text(&rules_path) {
-        Ok(t) => match Rules::from_toml(&t, &rules_path.display().to_string()) {
-            Ok(r) => r,
-            Err(e) => return err(&e.to_string()),
-        },
-        Err(_) if !rules_path.exists() => {
-            return err(&format!(
-                "morsec: no rules file at {}. Create it with: ms init",
-                rules_path.display()
-            ));
-        }
-        Err(e) => return err(&e),
+    let (user, verified) = match load_user_rules(&a) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
 
     let project_path = if a.no_project {
@@ -200,9 +312,9 @@ pub fn run(a: RulesArgs) -> ExitCode {
     };
 
     out(&format!(
-        "rules version {} · {} (MAC not checked by ms; msd verifies it)",
+        "rules version {} · {}",
         user.version,
-        rules_path.display()
+        verified.label()
     ));
     match &project_path {
         Some(p) => out(&format!("project rules: {}", p.display())),
@@ -245,14 +357,16 @@ pub fn run(a: RulesArgs) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             Change::Tighten => out("this change tightens the rule."),
-            Change::Loosen => {
-                out("this change loosens the rule; applying it will need an approval (Touch ID).")
-            }
+            Change::Loosen => out("this change loosens the rule, so it needs an approval."),
         }
-        eprintln!(
-            "morsec: changes are applied by msd, which is not built yet (planned in loop L07 daemon)."
-        );
-        return ExitCode::from(EXIT_NOT_BUILT);
+        if !matches!(verified, Source::Daemon) {
+            eprintln!(
+                "morsec: changes are applied by msd, and these rules were read locally ({}). Start msd (ms start) and run this again without --rules",
+                verified.label()
+            );
+            return ExitCode::from(EXIT_USAGE);
+        }
+        return propose(&name, &user, proposed, a.at_terminal);
     }
     ExitCode::SUCCESS
 }

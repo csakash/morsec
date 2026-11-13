@@ -67,10 +67,7 @@ fn list_and_show() {
     let (code, out, err) = f.run(&f.repo(), &[]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("rules version 4"), "{out}");
-    assert!(
-        out.contains("MAC not checked by ms; msd verifies it"),
-        "{out}"
-    );
+    assert!(out.contains("(--rules; MAC not checked by ms)"), "{out}");
     assert!(out.contains("project rules: none"), "{out}");
     assert!(
         out.contains("stripe/test") && out.contains("2 host(s)"),
@@ -161,9 +158,10 @@ fn check_project_file() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("hostz"));
 }
 
-// protects=a proposed change is classified tighten vs loosen against the user rule and is never
-// written (ms has no MAC key); fails_when=a loosening is called tightening, the file changes, or
-// the exit isn't 69; no_claim=the approval flow (L07/L11)
+// protects=a proposed change is classified tighten vs loosen against the user rule and, read
+// locally with --rules (unverified), is never written or sent (ms has no MAC key; exit 64 with the
+// fix); fails_when=a loosening is called tightening, the file changes, or it exits 0;
+// no_claim=applying changes through msd (msd/tests/cli.rs)
 #[test]
 fn proposals_are_classified_and_not_written() {
     let f = Fixture::new();
@@ -189,12 +187,12 @@ fn proposals_are_classified_and_not_written() {
     ];
     for (args, want) in cases {
         let (code, out, err) = f.run(&f.repo(), args);
-        assert_eq!(code, 69, "{args:?}: {err}");
+        assert_eq!(code, 64, "{args:?}: {err}");
         assert!(
             out.contains(&format!("this change {want}")),
             "{args:?}: {out}"
         );
-        assert!(err.contains("L07"), "{err}");
+        assert!(err.contains("without --rules"), "{err}");
         assert_eq!(
             std::fs::read_to_string(f.path("rules.toml")).unwrap(),
             RULES

@@ -91,8 +91,7 @@ fn store_err(e: ms_core::Error) -> Error {
     Error::Store(msg.strip_prefix("morsec: ").unwrap_or(&msg).to_owned())
 }
 
-/// Every answer is a failure until msd can acknowledge: IPC v1's `ResponseBody` has no success
-/// reply for `ListKeys` or `PutKey` (L07 adds them). Fails closed.
+/// Any reply other than the expected success is a failure: fail closed.
 fn not_acknowledged(resp: ResponseBody, what: &str) -> Error {
     match resp {
         ResponseBody::Error { message, .. } => {
@@ -100,8 +99,7 @@ fn not_acknowledged(resp: ResponseBody, what: &str) -> Error {
             Error::Store(msg.strip_prefix("morsec: ").unwrap_or(&msg).to_owned())
         }
         _ => Error::Store(format!(
-            "the daemon did not acknowledge {what} (this IPC version has no reply for it; \
-             msd gets one in loop L07 daemon)"
+            "the daemon gave an unexpected reply to {what}; nothing was changed. Make sure ms and msd are the same version (ms --version)"
         )),
     }
 }
@@ -112,7 +110,10 @@ impl KeyStore for IpcStore {
             .rt
             .block_on(async { Self::connect().await?.request(RequestBody::ListKeys).await })
             .map_err(store_err)?;
-        Err(not_acknowledged(resp, "the key list"))
+        match resp {
+            ResponseBody::Keys { keys } => Ok(keys),
+            other => Err(not_acknowledged(other, "the key list")),
+        }
     }
 
     fn put(&self, name: &KeyName, value: SecretBytes, meta: KeyMeta) -> Result<(), Error> {
@@ -125,7 +126,10 @@ impl KeyStore for IpcStore {
                     .await
             })
             .map_err(store_err)?;
-        Err(not_acknowledged(resp, "the stored key"))
+        match resp {
+            ResponseBody::Ok { .. } => Ok(()),
+            other => Err(not_acknowledged(other, "the stored key")),
+        }
     }
 }
 

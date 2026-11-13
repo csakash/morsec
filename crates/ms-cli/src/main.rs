@@ -9,6 +9,7 @@
 mod add;
 mod import;
 mod log;
+mod service;
 mod stats;
 mod tty;
 
@@ -18,7 +19,6 @@ use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use ms_core::Error;
-use ms_ipc::{Client, RequestBody, ResponseBody};
 
 mod rules;
 
@@ -51,7 +51,7 @@ struct Rest {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Create the vault and start the daemon.
-    Init(Rest),
+    Init(service::InitArgs),
     /// Add a secret (hidden input, or from 1Password/Bitwarden).
     Add(add::AddArgs),
     /// Move a .env into the vault and rewrite it with references.
@@ -67,9 +67,9 @@ enum Command {
     /// Show receipts; --verify checks the chain; --export for a security review.
     Log(log::LogArgs),
     /// Revoke every grant now (kill switch).
-    Stop(Rest),
+    Stop,
     /// Resume after ms stop.
-    Start(Rest),
+    Start,
     /// Show whether morsec is on.
     Status,
     /// Check that every connected agent routes through morsec.
@@ -86,16 +86,16 @@ impl Command {
     /// (subcommand name, loop that builds it) for stubs; None when implemented.
     fn stub(&self) -> Option<(&'static str, &'static str)> {
         Some(match self {
-            Command::Init(_) => ("init", "L07 daemon"),
             Command::Connect(_) => ("connect", "L08 connect-claude"),
             Command::Disconnect(_) => ("disconnect", "L08 connect-claude"),
             Command::Run(_) => ("run", "L12 run-core"),
-            Command::Stop(_) => ("stop", "L07 daemon"),
-            Command::Start(_) => ("start", "L07 daemon"),
             Command::Doctor(_) => ("doctor", "L17 doctor"),
             Command::Mcp(_) => ("mcp", "L14 mcp-server"),
             Command::Scan(_) => ("scan", "L09 e2e-canary"),
             Command::Status
+            | Command::Init(_)
+            | Command::Stop
+            | Command::Start
             | Command::Add(_)
             | Command::Import(_)
             | Command::Rules(_)
@@ -134,29 +134,6 @@ fn on_own_thread(f: impl FnOnce() -> ExitCode + Send + 'static) -> ExitCode {
     std::thread::spawn(f).join().unwrap_or(ExitCode::FAILURE)
 }
 
-async fn status() -> ExitCode {
-    let result = async {
-        let path = ms_ipc::default_socket_path()?;
-        let mut client = Client::connect(&path).await?;
-        client.request(RequestBody::Status).await
-    }
-    .await;
-    match result {
-        Ok(ResponseBody::Status { version, .. }) => {
-            println!("morsec on · daemon {}", terminal_safe(&version));
-            ExitCode::SUCCESS
-        }
-        Ok(ResponseBody::Error { message, .. }) => {
-            eprintln!("{}", terminal_safe(&message));
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("{}", terminal_safe(&e.to_string()));
-            ExitCode::FAILURE
-        }
-    }
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let name = invoked_name();
@@ -190,10 +167,13 @@ async fn main() -> ExitCode {
         return ExitCode::from(EXIT_NOT_BUILT);
     }
     match command {
-        Command::Status => status().await,
+        Command::Status => service::status().await,
+        Command::Init(a) => service::init(&a).await,
+        Command::Stop => service::stop().await,
+        Command::Start => service::start().await,
         Command::Add(a) => on_own_thread(move || add::run(&a)),
         Command::Import(a) => on_own_thread(move || import::run(&a)),
-        Command::Rules(a) => rules::run(a),
+        Command::Rules(a) => on_own_thread(move || rules::run(a)),
         Command::Log(args) => log::run(&args),
         Command::Stats(args) => stats::run(&args),
         _ => unreachable!("every other command is a stub"),

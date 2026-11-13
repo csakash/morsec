@@ -416,12 +416,8 @@ fn every_variant_round_trips() {
         },
         RequestBody::RulesGet {
             key: Some(name.clone()),
-            cwd: None,
         },
-        RequestBody::RulesGet {
-            key: None,
-            cwd: Some("/repo".into()),
-        },
+        RequestBody::RulesGet { key: None },
         RequestBody::RulesProposeLoosen {
             key: name.clone(),
             rule: None,
@@ -429,7 +425,7 @@ fn every_variant_round_trips() {
         },
         RequestBody::RulesProposeLoosen {
             key: name.clone(),
-            rule: Some("mode = \"swap\"\ntier = \"test\"\n".into()),
+            rule: Some("version = 1\n[keys.\"stripe/live\"]\nmode = \"swap\"\n".into()),
             at_terminal: true,
         },
         RequestBody::Stop,
@@ -547,10 +543,7 @@ fn pre_l07_messages_still_parse() {
         ),
         (
             r#"{"v":1,"id":1,"body":{"type":"rules_get","key":null}}"#,
-            RequestBody::RulesGet {
-                key: None,
-                cwd: None,
-            },
+            RequestBody::RulesGet { key: None },
         ),
         (
             r#"{"v":1,"id":1,"body":{"type":"rules_propose_loosen","key":"a/b"}}"#,

@@ -65,17 +65,14 @@ pub enum RequestBody {
     RulesGet {
         /// Key, or all.
         key: Option<KeyName>,
-        /// Merge this directory's project `.morsec.toml` (L07). Absent: the user rules only.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd: Option<PathBuf>,
     },
     /// Propose a change to one key's rule. The daemon classifies it: tightening is saved at
     /// once, loosening needs an approval.
     RulesProposeLoosen {
         /// Key.
         key: KeyName,
-        /// The proposed rule for `key` as TOML (the `[keys."<key>"]` table's body). Absent:
-        /// remove the key's rule (L07).
+        /// The proposed rule for `key`, as a rules file (`rules.toml` format) holding only that
+        /// key; its `version` is ignored. Absent: remove the key's rule (L07).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rule: Option<String>,
         /// Pre-L11 recovery path: the user confirmed at their own terminal (L07 SPEC D-A).
@@ -187,7 +184,8 @@ pub enum ResponseBody {
         /// One entry per key.
         keys: Vec<KeyMeta>,
     },
-    /// Effective rules (`RulesGet`, L07). ms-ipc does not depend on ms-rules, so the rules
+    /// The user rules, MAC-verified by the daemon (`RulesGet`, L07). The client merges a
+    /// project `.morsec.toml` itself, so the daemon never reads a path a client names. ms-ipc does not depend on ms-rules, so the rules
     /// travel as the rules file's TOML.
     Rules {
         /// Rules version.

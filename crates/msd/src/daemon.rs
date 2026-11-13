@@ -803,7 +803,8 @@ impl Daemon {
             l.rules.stopped = true;
             l.rules.version
         };
-        self.rebuild_proxy();
+        // No proxy rebuild: the proxy's session resolver returns no session while stopped, so
+        // the next request is refused without the listener going away.
         let mut message =
             "morsec stopped: every agent request is now refused. Resume with: ms start".to_owned();
         if let Err(e) = self.persist_state(true) {
@@ -882,7 +883,6 @@ impl Daemon {
             l.rules.version
         };
         lock(&self.stopped_sessions).clear();
-        self.rebuild_proxy();
         if let Err(e) = self.record(
             session,
             &key,

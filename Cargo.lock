@@ -773,6 +773,7 @@ dependencies = [
 name = "ms-ipc"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "ms-core",
  "serde",
  "serde_json",
@@ -895,8 +896,19 @@ name = "msd"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "hex",
+ "libc",
+ "ms-approve",
  "ms-core",
+ "ms-import",
  "ms-ipc",
+ "ms-proxy",
+ "ms-receipts",
+ "ms-rules",
+ "ms-session",
+ "ms-vault",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

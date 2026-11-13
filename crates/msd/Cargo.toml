@@ -35,3 +35,11 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# End-to-end test that runs real `ms` commands inside a fake agent. It is its own fake agent:
+# copied as `claude`, it runs a shell command as its child (see the file), so it needs its own
+# main instead of libtest.
+[[test]]
+name = "agent_e2e"
+path = "tests/agent_e2e.rs"
+harness = false

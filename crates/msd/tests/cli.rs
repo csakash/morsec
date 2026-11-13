@@ -68,11 +68,28 @@ fn wait_ready(socket: &Path) {
     }
 }
 
-fn start_msd(socket: &Path) -> Daemon {
+/// A loopback port that was free a moment ago.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Starts an ephemeral msd (memory vault) with its socket at `socket`, its state next to it, and
+/// the proxy on `proxy_port`.
+fn start_msd_on(socket: &Path, proxy_port: u16) -> Daemon {
+    let state = socket.parent().unwrap().join("state");
     let child = Command::new(msd())
-        .args(["--foreground", "--socket"])
+        .args(["--foreground", "--vault", "memory", "--socket"])
         .arg(socket)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--proxy-port", &proxy_port.to_string()])
         .env("MORSEC_LOG", "warn")
+        .env_remove("SSL_CERT_FILE")
+        .env_remove("SSL_CERT_DIR")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -80,6 +97,10 @@ fn start_msd(socket: &Path) -> Daemon {
     let d = Daemon(child);
     wait_ready(socket);
     d
+}
+
+fn start_msd(socket: &Path) -> Daemon {
+    start_msd_on(socket, free_port())
 }
 
 fn run(bin: &Path, args: &[&str], socket: &Path) -> (i32, String, String) {
@@ -117,12 +138,9 @@ fn stubs_exit_69_and_name_their_loop() {
     let d = tmpdir();
     let sock = d.path().join("none.sock");
     let table = [
-        ("init", "L07 daemon"),
         ("connect", "L08 connect-claude"),
         ("disconnect", "L08 connect-claude"),
         ("run", "L12 run-core"),
-        ("stop", "L07 daemon"),
-        ("start", "L07 daemon"),
         ("doctor", "L17 doctor"),
         ("mcp", "L14 mcp-server"),
         ("scan", "L09 e2e-canary"),
@@ -140,9 +158,9 @@ fn stubs_exit_69_and_name_their_loop() {
     }
 }
 
-// protects=`ms status` reports the running daemon over IPC and exits 0; with no daemon it fails
-// closed with the ms start hint and exits 1; fails_when=status claims "on" without a daemon or
-// fails with one running; no_claim=launchd or the production socket path (L07)
+// protects=`ms status` reports the running daemon over IPC (on, protected-key count) and exits 0;
+// with no daemon it fails closed with the ms start hint and exits 1; fails_when=status claims "on"
+// without a daemon or fails with one running; no_claim=launchd or the production socket path
 #[test]
 fn status_with_and_without_daemon() {
     let d = tmpdir();
@@ -159,9 +177,12 @@ fn status_with_and_without_daemon() {
     let daemon = start_msd(&sock);
     let (code, out, err) = run(&ms(), &["status"], &sock);
     assert_eq!(code, 0, "{err}");
-    assert_eq!(out, "morsec on · daemon 0.0.0\n");
+    assert_eq!(out, "morsec on · 0 secrets protected\n");
     let (code, out, _) = run(&mors(d.path()), &["status"], &sock);
-    assert_eq!((code, out.as_str()), (0, "morsec on · daemon 0.0.0\n"));
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "morsec on · 0 secrets protected\n")
+    );
     drop(daemon);
 }
 
@@ -179,7 +200,13 @@ fn port_beats_exported_socket() {
     // A socket left by an earlier killed run would make the wait below pass too early.
     let _ = std::fs::remove_dir_all(&dev_dir);
     let child = Command::new(msd())
-        .args(["--foreground", "--port", &port.to_string()])
+        .args([
+            "--foreground",
+            "--vault",
+            "memory",
+            "--port",
+            &port.to_string(),
+        ])
         .env("MORSEC_SOCKET", &exported)
         .env("MORSEC_LOG", "warn")
         .stdout(Stdio::null())
@@ -192,19 +219,103 @@ fn port_beats_exported_socket() {
     let (code, out, err) = run(&ms(), &["status"], &expected);
     assert_eq!(
         (code, out.as_str()),
-        (0, "morsec on · daemon 0.0.0\n"),
+        (0, "morsec on · 0 secrets protected\n"),
         "{err}"
     );
     // SIGTERM: msd removes its socket on a clean shutdown.
     drop(daemon);
     assert!(!expected.exists(), "socket left after SIGTERM");
-    let _ = std::fs::remove_dir(&dev_dir);
+    let _ = std::fs::remove_dir_all(&dev_dir);
 }
 
-// protects=msd refuses to start without --foreground (no silent background mode before L07);
-// fails_when=it starts or exits 0; no_claim=service management
+// protects=msd refuses to start without --foreground (launchd runs it in the foreground; there
+// is no self-daemonizing mode); fails_when=it starts or exits 0; no_claim=service management
 #[test]
 fn msd_requires_foreground() {
     let st = Command::new(msd()).stderr(Stdio::null()).status().unwrap();
     assert_eq!(st.code(), Some(64));
+}
+
+const CANARY: &str = "sk_test_MSDCLI_CANARY_7c2f41";
+
+fn run_stdin(
+    bin: &Path,
+    args: &[&str],
+    socket: &Path,
+    cwd: &Path,
+    stdin: &[u8],
+) -> (i32, String, String) {
+    use std::io::Write;
+    let mut child = Command::new(bin)
+        .args(args)
+        .current_dir(cwd)
+        .env("MORSEC_SOCKET", socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+fn receipts_text(socket: &Path) -> String {
+    let dir = socket.parent().unwrap().join("state/receipts");
+    let mut s = String::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        s.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
+    }
+    s
+}
+
+// protects=L04's gap is closed: `ms add` and `ms import` store end to end through a running msd
+// (Ok/Keys replies), `ms rules` then shows the keys as verified by msd, `ms status` counts them,
+// and no value reaches stdout, stderr, the rewritten .env or the receipts; fails_when=either
+// command fails against a real daemon or a value leaks; no_claim=the keychain backend (manual QA)
+#[test]
+fn add_and_import_store_through_msd() {
+    let d = tmpdir();
+    let sock = d.path().join("run/msd.sock");
+    let _daemon = start_msd(&sock);
+    let (code, out, err) = run_stdin(
+        &ms(),
+        &["add", "openai/test", "--stdin", "--tier", "test"],
+        &sock,
+        d.path(),
+        CANARY.as_bytes(),
+    );
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("ms://openai/test"), "{out}");
+    let env = d.path().join(".env");
+    std::fs::write(
+        &env,
+        format!("STRIPE_SECRET_KEY={CANARY}_stripe\nPORT=3000\n"),
+    )
+    .unwrap();
+    let (code, out, err) = run_stdin(&ms(), &["import", ".env", "--yes"], &sock, d.path(), b"");
+    assert_eq!(code, 0, "{out}{err}");
+    let rewritten = std::fs::read_to_string(&env).unwrap();
+    assert!(rewritten.contains("ms://stripe/test"), "{rewritten}");
+    assert!(!rewritten.contains(CANARY));
+    let (code, out, err) = run(&ms(), &["rules"], &sock);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("verified by msd"), "{out}");
+    assert!(
+        out.contains("openai/test") && out.contains("stripe/test"),
+        "{out}"
+    );
+    assert!(out.contains("nothing allowed"), "{out}");
+    let (code, out, _) = run(&ms(), &["status"], &sock);
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "morsec on · 2 secrets protected\n")
+    );
+    for text in [&out, &err, &receipts_text(&sock)] {
+        assert!(!text.contains(CANARY), "value leaked: {text}");
+    }
 }

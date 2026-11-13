@@ -25,7 +25,7 @@ clap = { workspace = true }
 tokio = { workspace = true }
 ms-import = { workspace = true }
 zeroize = { workspace = true }
-rustix = { version = "1", default-features = false, features = ["std", "termios"] }
+rustix = { version = "1", default-features = false, features = ["std", "termios", "process"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

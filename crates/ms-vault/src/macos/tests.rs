@@ -951,9 +951,17 @@ fn put_internal_only_daemon_items() {
     t.vault
         .put_internal(&state, SecretBytes::new(b"running".to_vec()))
         .unwrap();
-    assert_eq!(t.vault.read_with(&state, |v| v.to_vec()).unwrap(), b"running");
+    assert_eq!(
+        t.vault.read_with(&state, |v| v.to_vec()).unwrap(),
+        b"running"
+    );
     assert!(t.vault.list().unwrap().is_empty());
-    for bad in [RECEIPTS_HMAC_KEY, RULES_HMAC_KEY, "morsec/other", "stripe/test"] {
+    for bad in [
+        RECEIPTS_HMAC_KEY,
+        RULES_HMAC_KEY,
+        "morsec/other",
+        "stripe/test",
+    ] {
         let k = KeyName::new(bad).unwrap();
         assert!(
             t.vault
@@ -963,5 +971,13 @@ fn put_internal_only_daemon_items() {
         );
     }
     // The ordinary path still refuses the daemon items.
-    assert!(t.vault.put(&state, SecretBytes::new(b"x".to_vec()), meta(&state, Tier::Test)).is_err());
+    assert!(
+        t.vault
+            .put(
+                &state,
+                SecretBytes::new(b"x".to_vec()),
+                meta(&state, Tier::Test)
+            )
+            .is_err()
+    );
 }
