@@ -7,6 +7,14 @@ use crate::error::SessionError;
 use crate::table::{OsProcessTable, ProcessTable};
 use crate::walk::{Caller, Resolver};
 
+/// Allowed gap between a process's computed start time and the accept time. Linux derives start
+/// time from a boot time read once plus 10 ms ticks, which drifts from the live wall clock; a
+/// small slack keeps that from refusing real clients. macOS start times are exact wall-clock.
+#[cfg(target_os = "linux")]
+const START_SLACK_MS: u64 = 2_000;
+#[cfg(not(target_os = "linux"))]
+const START_SLACK_MS: u64 = 0;
+
 /// Resolves a Unix-socket peer. The PID comes from the kernel (`LOCAL_PEERPID` /
 /// `SO_PEERCRED`), never from the client. The PID is refused as reused if the process now has
 /// a different uid from the one the kernel reported, or started after `accepted_unix_ms` (when
@@ -26,7 +34,9 @@ pub fn resolve_peer<T: ProcessTable>(
         .filter(|&p| p > 0)
         .ok_or(SessionError::NoPeerPid)?;
     let info = resolver.info(pid)?;
-    if info.uid != peer.uid || info.started_unix_ms > accepted_unix_ms {
+    if info.uid != peer.uid
+        || info.started_unix_ms > accepted_unix_ms.saturating_add(START_SLACK_MS)
+    {
         return Err(SessionError::PidChanged { pid });
     }
     resolver.resolve_from(info)

@@ -85,7 +85,13 @@ supply chain), `sysinfo` (no socket→PID, start time only in seconds), shelling
   give a never-seen session no standing grants, and must not let a fresh session escape a
   revoked or capped one; sensitive actions still need approval (AUTH-3).
 - Unix peer PID reused by a same-uid process before accept passes the checks (needs audit
-  token / pidfd, an ms-ipc change).
+  token / pidfd, an ms-ipc change). On Linux the post-accept check is also coarse: start time
+  is `btime` (whole seconds) plus 10 ms ticks, up to ~1 s early, so reuse within ~1 s of accept
+  can pass, and a 2 s slack (so clock drift can't refuse real clients) widens that to ~3 s.
+  Fix in L21 by comparing boot-relative ticks (`CLOCK_BOOTTIME`) or a pidfd.
+- Linux with `/proc` mounted `hidepid=invisible`: another user's ancestor reads as gone, not
+  unreadable, so the walk ends there instead of failing closed. Only matters if an agent's
+  descendant chain passes through another user's process. L21 to detect hidepid at startup.
 - Full scans cost ~2–5 ms and every distinct new connection can force one; an agent could load
   the daemon this way. L07 should run lookups off the async runtime (`spawn_blocking`) and cap
   concurrent scans. The same agent could also just `kill msd`.
