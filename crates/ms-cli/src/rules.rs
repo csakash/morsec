@@ -77,6 +77,9 @@ impl RulesArgs {
 
 /// Prints each line through the terminal filter, so file content can't inject escapes.
 fn out(s: &str) {
+    if s.is_empty() {
+        println!();
+    }
     for line in s.lines() {
         println!("{}", terminal_safe(line));
     }
@@ -326,7 +329,9 @@ fn show(name: &KeyName, r: &KeyRule) {
         ),
         ms_core::Mode::Mint => list("scopes", r.mint_scopes.clone()),
     }
-    list("hosts", r.hosts.iter().map(ToString::to_string).collect());
+    if r.mode == ms_core::Mode::Swap || !r.hosts.is_empty() {
+        list("hosts", r.hosts.iter().map(ToString::to_string).collect());
+    }
     out(&format!("  ttl        {} s", r.session_ttl_secs));
     out(&format!(
         "  read-only  {}",
@@ -380,7 +385,7 @@ fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRu
         r.read_only = false;
     }
     // Same limits and per-mode checks as the file.
-    r.normalise("the proposed change", name)
+    r.normalise("your proposed change", name)
         .map_err(|e| e.to_string())
 }
 

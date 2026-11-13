@@ -206,6 +206,14 @@ fn proposals_are_classified_and_not_written() {
     let (code, _, err) = f.run(&f.repo(), &["stripe/test", "--add-command", "psql"]);
     assert_eq!(code, 1);
     assert!(err.contains("JSON array"), "{err}");
+    let (code, _, err) = f.run(&f.repo(), &["stripe/test", "--add-command", r#"["curl"]"#]);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("your proposed change is not valid")
+            && err.contains("only allowed on a run-mode key")
+            && !err.contains("--check"),
+        "{err}"
+    );
     let (code, _, err) = f.run(&f.repo(), &["--tier", "test"]);
     assert_eq!(code, 1);
     assert!(err.contains("say which key"), "{err}");

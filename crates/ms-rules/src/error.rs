@@ -8,9 +8,7 @@ pub type Result<T, E = RulesError> = std::result::Result<T, E>;
 #[non_exhaustive]
 pub enum RulesError {
     /// A file did not parse or broke a rule of the format.
-    #[error(
-        "morsec: {file} is not valid: {why}. Fix the file, or check it with: ms rules --check {file}"
-    )]
+    #[error("morsec: {file} is not valid: {why}. Fix that and try again")]
     Invalid {
         /// Which file (or "rules" for in-memory input).
         file: String,
