@@ -1,0 +1,172 @@
+# morsec provider catalog (L04 import-env).
+#
+# Maps what a secret looks like to the provider it belongs to: how morsec uses it (mode), which
+# hosts it may go to, and where the credential sits in a request. `ms import` classifies .env
+# values with it; the swap proxy (L05) and the rules (L03) read hosts and locations from it.
+#
+# Compiled into the binary (include_str!) and validated when loaded; a bad entry fails the tests.
+#
+# Fields per provider:
+#   id          provider id, a key-name segment ([a-z0-9][a-z0-9-]*)
+#   name        display name
+#   mode        swap | run | mint
+#   hosts       hosts the key may be sent to (swap/mint); empty for run-mode providers
+#   key         key-name template; {tier} becomes "test" or "production" (default "{id}/{tier}")
+#   location    where the credential goes:
+#                 { kind = "header", name = "...", prefix = "Bearer " }
+#                 { kind = "basic_user" } | { kind = "basic_password" }
+#                 { kind = "url_path" } | { kind = "dsn" } | { kind = "sigv4" }
+#   prefixes    value prefixes, each { prefix, tier (optional hint), min_len (whole value) }
+#   url_schemes value is a URL with one of these schemes (lowercase, without "://")
+#   url_hosts   value is an https URL to one of these hosts
+#   env_names   variable names that identify the provider when the value has no prefix; a name
+#               matches exactly or with a _PREFIX / _SUFFIX (AWS_PROD_SECRET_ACCESS_KEY)
+
+version = 1
+
+# Values that look like a provider key but are public by design (publishable keys) and are
+# never imported.
+public_prefixes = ["pk_live_", "pk_test_"]
+
+# Variables bundlers ship to browsers. They are public by design, so they are kept, unless the
+# value matches a secret prefix above (a secret in a public variable is still imported).
+public_name_prefixes = [
+  "NEXT_PUBLIC_",
+  "NUXT_PUBLIC_",
+  "VITE_",
+  "PUBLIC_",
+  "EXPO_PUBLIC_",
+  "REACT_APP_",
+  "GATSBY_",
+]
+
+[[provider]]
+id = "stripe"
+name = "Stripe"
+mode = "swap"
+hosts = ["api.stripe.com"]
+location = { kind = "header", name = "Authorization", prefix = "Bearer " }
+prefixes = [
+  { prefix = "sk_live_", tier = "production", min_len = 20 },
+  { prefix = "rk_live_", tier = "production", min_len = 20 },
+  { prefix = "sk_test_", tier = "test", min_len = 20 },
+  { prefix = "rk_test_", tier = "test", min_len = 20 },
+]
+env_names = ["STRIPE_SECRET_KEY", "STRIPE_API_KEY", "STRIPE_RESTRICTED_KEY"]
+
+[[provider]]
+id = "openai"
+name = "OpenAI"
+mode = "swap"
+hosts = ["api.openai.com"]
+location = { kind = "header", name = "Authorization", prefix = "Bearer " }
+prefixes = [
+  { prefix = "sk-proj-", min_len = 40 },
+  { prefix = "sk-svcacct-", min_len = 40 },
+  { prefix = "sk-admin-", min_len = 40 },
+  { prefix = "sk-", min_len = 40 },
+]
+env_names = ["OPENAI_API_KEY"]
+
+[[provider]]
+id = "anthropic"
+name = "Anthropic"
+mode = "swap"
+hosts = ["api.anthropic.com"]
+location = { kind = "header", name = "x-api-key", prefix = "" }
+prefixes = [{ prefix = "sk-ant-", min_len = 40 }]
+env_names = ["ANTHROPIC_API_KEY"]
+
+[[provider]]
+id = "github"
+name = "GitHub"
+mode = "swap"
+hosts = ["api.github.com", "uploads.github.com"]
+location = { kind = "header", name = "Authorization", prefix = "Bearer " }
+prefixes = [
+  { prefix = "ghp_", min_len = 40 },
+  { prefix = "gho_", min_len = 40 },
+  { prefix = "ghu_", min_len = 40 },
+  { prefix = "ghs_", min_len = 40 },
+  { prefix = "ghr_", min_len = 40 },
+  { prefix = "github_pat_", min_len = 60 },
+]
+env_names = ["GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"]
+
+[[provider]]
+id = "slack"
+name = "Slack"
+mode = "swap"
+hosts = ["slack.com"]
+location = { kind = "header", name = "Authorization", prefix = "Bearer " }
+prefixes = [
+  { prefix = "xoxb-", min_len = 20 },
+  { prefix = "xoxp-", min_len = 20 },
+  { prefix = "xoxa-", min_len = 20 },
+  { prefix = "xoxe-", min_len = 20 },
+  { prefix = "xapp-", min_len = 20 },
+]
+env_names = ["SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_APP_TOKEN"]
+
+[[provider]]
+id = "slack-webhook"
+name = "Slack webhook"
+mode = "swap"
+hosts = ["hooks.slack.com"]
+key = "slack/webhook/{tier}"
+location = { kind = "url_path" }
+url_hosts = ["hooks.slack.com"]
+env_names = ["SLACK_WEBHOOK_URL"]
+
+[[provider]]
+id = "sendgrid"
+name = "SendGrid"
+mode = "swap"
+hosts = ["api.sendgrid.com"]
+location = { kind = "header", name = "Authorization", prefix = "Bearer " }
+prefixes = [{ prefix = "SG.", min_len = 60 }]
+env_names = ["SENDGRID_API_KEY"]
+
+[[provider]]
+id = "twilio"
+name = "Twilio"
+mode = "swap"
+hosts = ["api.twilio.com"]
+location = { kind = "basic_password" }
+env_names = ["TWILIO_AUTH_TOKEN", "TWILIO_API_SECRET", "TWILIO_API_KEY_SECRET"]
+
+[[provider]]
+id = "pg"
+name = "Postgres"
+mode = "run"
+location = { kind = "dsn" }
+url_schemes = ["postgres", "postgresql"]
+
+[[provider]]
+id = "mysql"
+name = "MySQL"
+mode = "run"
+location = { kind = "dsn" }
+url_schemes = ["mysql", "mysql2", "mysqlx"]
+
+[[provider]]
+id = "aws-access-key-id"
+name = "AWS access key id"
+mode = "mint"
+hosts = ["sts.amazonaws.com"]
+key = "aws/{tier}/access-key-id"
+location = { kind = "sigv4" }
+prefixes = [
+  { prefix = "AKIA", min_len = 20 },
+  { prefix = "ASIA", min_len = 20 },
+]
+env_names = ["AWS_ACCESS_KEY_ID"]
+
+[[provider]]
+id = "aws-secret-access-key"
+name = "AWS secret access key"
+mode = "mint"
+hosts = ["sts.amazonaws.com"]
+key = "aws/{tier}/secret-access-key"
+location = { kind = "sigv4" }
+env_names = ["AWS_SECRET_ACCESS_KEY"]
