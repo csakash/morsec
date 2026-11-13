@@ -276,18 +276,31 @@ pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
             .await
             .unwrap_or_else(|e| Err(e.to_string()));
         let bound = match built {
-            Ok((cfg, deps)) => Proxy::bind(cfg, deps).await.map_err(|e| e.to_string()),
+            Ok((cfg, deps)) => {
+                let current = cfg.bindings.clone();
+                Proxy::bind(cfg, deps)
+                    .await
+                    .map(|p| (p, current))
+                    .map_err(|e| e.to_string())
+            }
             Err(e) => Err(e),
         };
         match bound {
-            Ok(proxy) => {
+            Ok((proxy, current)) => {
                 tracing::info!(addr = %listen, "swap proxy listening");
-                let (mut c, mut s) = (changes.clone(), shutdown.clone());
+                let (mut c, mut s, dd) = (changes.clone(), shutdown.clone(), d.clone());
+                // Rebinding briefly closes the port, so only rebuild when the bindings change;
+                // policy and the stop flag are read live and need no rebuild.
                 proxy
                     .serve(async move {
-                        tokio::select! {
-                            _ = c.changed() => {},
-                            _ = s.changed() => {},
+                        loop {
+                            tokio::select! {
+                                r = c.changed() => if r.is_err() { return },
+                                _ = s.changed() => return,
+                            }
+                            if bindings(&dd.rules()).0 != current {
+                                return;
+                            }
                         }
                     })
                     .await;
