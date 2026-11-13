@@ -1,0 +1,26 @@
+[package]
+name = "msd"
+description = "The morsec broker daemon. In L00 a dev stub that serves Status over IPC."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "msd"
+path = "src/main.rs"
+
+[dependencies]
+ms-core = { workspace = true }
+ms-ipc = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
