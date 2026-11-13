@@ -148,7 +148,7 @@ pub(crate) async fn send_tls(
     port: u16,
     addrs: &[SocketAddr],
     connect_timeout: Duration,
-    mut req: Request<Full<Bytes>>,
+    req: Request<Full<Bytes>>,
 ) -> Result<Response<Incoming>, UpstreamError> {
     let reused = match cache {
         Some(c) => {
@@ -165,11 +165,52 @@ pub(crate) async fn send_tls(
         }
         None => None,
     };
+    let was_reused = reused.is_some();
     let sender = match reused {
         Some(s) => s,
         None => dial_tls(tls, host, addrs, connect_timeout).await?,
     };
-    let err = |e: hyper::Error| UpstreamError(e.to_string());
+    match send_on(sender, cache, req, host, port).await {
+        Ok(resp) => Ok(resp),
+        // A reused connection the upstream closed while idle: the request was never written,
+        // so send it once more on a fresh connection.
+        Err(Retry::Unsent(req, _)) if was_reused => {
+            let fresh = dial_tls(tls, host, addrs, connect_timeout).await?;
+            send_on(fresh, cache, *req, host, port)
+                .await
+                .map_err(Retry::into_error)
+        }
+        Err(e) => Err(e.into_error()),
+    }
+}
+
+enum Retry {
+    Unsent(Box<Request<Full<Bytes>>>, hyper::Error),
+    Failed(hyper::Error),
+}
+
+impl Retry {
+    fn into_error(self) -> UpstreamError {
+        match self {
+            Self::Unsent(_, e) | Self::Failed(e) => UpstreamError(e.to_string()),
+        }
+    }
+}
+
+fn retry(mut e: hyper::client::conn::TrySendError<Request<Full<Bytes>>>) -> Retry {
+    match e.take_message() {
+        Some(req) => Retry::Unsent(Box::new(req), e.into_error()),
+        None => Retry::Failed(e.into_error()),
+    }
+}
+
+async fn send_on(
+    sender: Sender,
+    cache: Option<&Cache>,
+    mut req: Request<Full<Bytes>>,
+    host: &str,
+    port: u16,
+) -> Result<Response<Incoming>, Retry> {
     match sender {
         Sender::H2(mut s) => {
             shape(&mut req, true, host, port, "https");
@@ -179,12 +220,14 @@ pub(crate) async fn send_tls(
                     *g = Some(Sender::H2(s.clone()));
                 }
             }
-            s.send_request(req).await.map_err(err)
+            s.try_send_request(req).await.map_err(retry)
         }
         Sender::H1(mut s) => {
             shape(&mut req, false, host, port, "https");
-            s.ready().await.map_err(err)?;
-            let resp = s.send_request(req).await.map_err(err)?;
+            if let Err(e) = s.ready().await {
+                return Err(Retry::Unsent(Box::new(req), e));
+            }
+            let resp = s.try_send_request(req).await.map_err(retry)?;
             if let Some(c) = cache {
                 let mut g = c.lock().await;
                 if g.is_none() {

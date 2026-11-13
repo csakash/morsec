@@ -54,8 +54,8 @@ fn session() -> SessionId {
 #[derive(Debug)]
 struct FakePolicy(Mutex<Decision>);
 impl Policy for FakePolicy {
-    fn decide(&self, _: &SessionId, _: &PolicyRequest) -> Decision {
-        self.0.lock().unwrap().clone()
+    fn decide(&self, _: &SessionId, _: &PolicyRequest) -> (Decision, u64) {
+        (self.0.lock().unwrap().clone(), 7)
     }
     fn version(&self) -> u64 {
         7
@@ -246,6 +246,8 @@ struct Opts {
     max_body: usize,
     extra_names: Vec<(&'static str, IpAddr)>,
     upstream_h1_only: bool,
+    max_connections: usize,
+    tunnel_idle: Duration,
 }
 
 impl Default for Opts {
@@ -257,6 +259,8 @@ impl Default for Opts {
             max_body: 1024 * 1024,
             extra_names: Vec::new(),
             upstream_h1_only: false,
+            max_connections: 256,
+            tunnel_idle: Duration::from_secs(300),
         }
     }
 }
@@ -334,6 +338,8 @@ async fn harness(o: Opts) -> H {
         "github.com".into(),
     ];
     cfg.limits.max_body_bytes = o.max_body;
+    cfg.limits.max_connections = o.max_connections;
+    cfg.limits.tunnel_idle_timeout = o.tunnel_idle;
     cfg.upstream_roots = UpstreamRoots::Only(vec![up.root.clone()]);
     let mut deps = Deps::new(
         vault,
@@ -864,6 +870,71 @@ async fn allowlisted_host_tunnelled() {
     assert!(h.receipts.events().is_empty());
 }
 
+// protects=R1/S1: CONNECT tunnels hold a connection permit for their whole life, so the
+// max_connections cap bounds tunnels, and an idle tunnel is closed; fails_when=a third tunnel
+// is accepted while two are open, or an idle tunnel stays open; no_claim=h2 stream limits
+#[tokio::test]
+async fn tunnels_are_bounded_and_idle_closed() {
+    let h = harness(Opts {
+        max_connections: 2,
+        tunnel_idle: Duration::from_millis(400),
+        ..Opts::default()
+    })
+    .await;
+    let target = format!("allowed.example.com:{}", h.up.port);
+    let (c1, _, t1) = connect(h.proxy, &target, "").await;
+    let (c2, _, _t2) = connect(h.proxy, &target, "").await;
+    assert_eq!((c1, c2), (200, 200));
+    // A third connection is not served while both tunnels live.
+    let third =
+        tokio::time::timeout(Duration::from_millis(250), connect(h.proxy, &target, "")).await;
+    assert!(
+        third.is_err(),
+        "a third tunnel was served past max_connections"
+    );
+    // Idle tunnels close on their own, freeing the permits.
+    let mut t1 = t1;
+    let mut b = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(3), t1.read(&mut b)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "idle tunnel stayed open: {closed:?}"
+    );
+    let (c3, msg, _) = tokio::time::timeout(Duration::from_secs(3), connect(h.proxy, &target, ""))
+        .await
+        .expect("permit freed after idle close");
+    assert_eq!(c3, 200, "{msg}");
+}
+
+// protects=R2: a plain-http body over the limit is never silently truncated: a ref in the
+// prefix still gets a receipt, and an allowlisted forward gets 413; fails_when=the receipt is
+// missing or the request is forwarded empty; no_claim=chunked framing edge cases
+#[tokio::test]
+async fn oversized_plain_bodies() {
+    let h = harness(Opts {
+        max_body: 1024,
+        ..Opts::default()
+    })
+    .await;
+    let mut body = b"data=ms://stripe/test&pad=".to_vec();
+    body.resize(4096, b'x');
+    let mut req = format!(
+        "POST http://paste.example.net/ HTTP/1.1\r\nHost: paste.example.net\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(&body);
+    let resp = raw(h.proxy, &req).await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    assert_eq!(h.receipts.events().len(), 1);
+
+    let mut req = b"POST http://allowed.example.com/ HTTP/1.1\r\nHost: allowed.example.com\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n"
+        .to_vec();
+    req.extend_from_slice(&[b'y'; 4096]);
+    let resp = raw(h.proxy, &req).await;
+    assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+}
+
 // protects=AC7: a 302 from upstream reaches the agent with its Location unchanged, and the
 // proxy makes exactly one upstream request; fails_when=the proxy follows it; no_claim=client
 #[tokio::test]
@@ -1276,7 +1347,12 @@ proptest::proptest! {
             let _ = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut out)).await;
             out
         });
-        proptest::prop_assert!(!String::from_utf8_lossy(&resp).contains("CANARY"));
+        // The one legitimate way to see the value is the echo upstream reflecting a real
+        // base-URL swap; anything else carrying it is a leak.
+        let text = String::from_utf8_lossy(&resp);
+        let legit = input.windows(10).any(|w| w == b"/p/stripe/")
+            && input.windows(39).any(|w| w == b"Authorization: Bearer ms://stripe/test\r\n");
+        proptest::prop_assert!(legit || !text.contains("CANARY"), "{}", text);
         let alive = rt().block_on(raw(h.proxy, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
         proptest::prop_assert!(alive.starts_with("HTTP/1.1 400"), "{}", alive);
     }

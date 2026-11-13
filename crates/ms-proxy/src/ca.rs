@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use ms_core::{KeyMeta, KeyName, SecretBytes};
 use ms_vault::{Vault, VaultExt};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-    GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    NameConstraints,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use time::OffsetDateTime;
@@ -67,7 +68,18 @@ fn ca_params(hosts: &BTreeSet<String>) -> CertificateParams {
             .iter()
             .map(|h| GeneralSubtree::DnsName(h.clone()))
             .collect(),
-        excluded_subtrees: Vec::new(),
+        // A DNS-only constraint leaves iPAddress SANs unconstrained (RFC 5280), so exclude all
+        // of them: a leaked CA key still can't sign for an IP literal.
+        excluded_subtrees: vec![
+            GeneralSubtree::IpAddress(CidrSubnet::from_addr_prefix(
+                std::net::Ipv4Addr::UNSPECIFIED.into(),
+                0,
+            )),
+            GeneralSubtree::IpAddress(CidrSubnet::from_addr_prefix(
+                std::net::Ipv6Addr::UNSPECIFIED.into(),
+                0,
+            )),
+        ],
     });
     let now = OffsetDateTime::now_utc();
     p.not_before = now - time::Duration::hours(1);
@@ -265,6 +277,15 @@ mod tests {
         for h in ["api.stripe.com", "api.openai.com"] {
             assert!(der.windows(h.len()).any(|w| w == h.as_bytes()), "{h}");
         }
+        // Excluded iPAddress subtrees: [7] 0.0.0.0/0 and [7] ::/0 (address + mask, all zero).
+        assert!(
+            der.windows(10)
+                .any(|w| w == [0x87, 8, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert!(
+            der.windows(34)
+                .any(|w| w[0] == 0x87 && w[1] == 32 && w[2..].iter().all(|b| *b == 0))
+        );
     }
 
     // protects=the CA key round-trips only through the vault, and a mismatched cert is refused;

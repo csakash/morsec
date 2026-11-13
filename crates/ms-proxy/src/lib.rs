@@ -14,6 +14,7 @@ mod ca;
 mod config;
 mod deps;
 mod error;
+mod idle;
 mod rewrite;
 mod server;
 pub mod ssrf;

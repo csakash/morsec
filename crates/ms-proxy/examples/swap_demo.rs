@@ -20,8 +20,8 @@ use ms_vault::memory::MemoryVault;
 #[derive(Debug)]
 struct AllowAll;
 impl Policy for AllowAll {
-    fn decide(&self, _: &SessionId, _: &Request) -> Decision {
-        Decision::Allow
+    fn decide(&self, _: &SessionId, _: &Request) -> (Decision, u64) {
+        (Decision::Allow, 1)
     }
     fn version(&self) -> u64 {
         1

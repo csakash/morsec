@@ -12,7 +12,7 @@ use bytes::Bytes;
 use http::request::Parts;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -22,12 +22,13 @@ use ms_core::{
     SessionId,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::config::{Binding, ProxyConfig};
 use crate::deps::{BlockEvent, BlockKind, Deps};
 use crate::error::ProxyError;
+use crate::idle::{Activity, IdleIo, until_idle};
 use crate::rewrite::{self, Plan};
 use crate::ssrf::{self, Checked};
 use crate::upstream::{self, Cache, UpstreamError};
@@ -48,8 +49,21 @@ struct Inner {
     cfg: ProxyConfig,
     deps: Deps,
     client_tls: Arc<rustls::ClientConfig>,
+    /// Bytes (in KiB) that inspected request bodies may hold in memory at once.
+    body_budget: Arc<Semaphore>,
     #[cfg(test)]
     loopback_ok: bool,
+}
+
+/// How long a request waits for room in the body budget before `503`.
+const BUDGET_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A request body read by the proxy, with the budget it holds.
+#[derive(Debug)]
+struct Collected {
+    bytes: Bytes,
+    overflow: bool,
+    _budget: OwnedSemaphorePermit,
 }
 
 /// One terminated CONNECT tunnel to a bound host.
@@ -121,6 +135,11 @@ impl Proxy {
     pub async fn bind(cfg: ProxyConfig, deps: Deps) -> Result<Self, ProxyError> {
         cfg.validate(deps.ca.hosts())?;
         let client_tls = crate::tls::client_config(&cfg.upstream_roots)?;
+        let budget_kib = cfg
+            .limits
+            .max_buffered_bytes
+            .div_ceil(1024)
+            .min(Semaphore::MAX_PERMITS);
         let listener = TcpListener::bind(cfg.listen)
             .await
             .map_err(|source| ProxyError::Io {
@@ -133,6 +152,7 @@ impl Proxy {
                 cfg,
                 deps,
                 client_tls,
+                body_budget: Arc::new(Semaphore::new(budget_kib)),
                 #[cfg(test)]
                 loopback_ok: false,
             }),
@@ -171,10 +191,10 @@ impl Proxy {
             match accepted {
                 Ok((tcp, peer)) => {
                     let inner = self.inner.clone();
-                    tokio::spawn(async move {
-                        inner.connection(tcp, peer).await;
-                        drop(permit);
-                    });
+                    // The permit travels into any tunnel this connection becomes, so CONNECT
+                    // tunnels count against max_connections for as long as they live.
+                    let permit = Arc::new(permit);
+                    tokio::spawn(inner.connection(tcp, peer, permit));
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "morsec proxy accept failed");
@@ -213,6 +233,7 @@ impl Inner {
         host: &str,
         result: ReceiptResult,
         approval_id: Option<String>,
+        rule_version: u64,
     ) -> ms_core::Result<()> {
         self.deps
             .receipts
@@ -223,7 +244,7 @@ impl Inner {
                 mode: Mode::Swap,
                 target: printable(host),
                 argv_hash: None,
-                rule_version: self.deps.policy.version(),
+                rule_version,
                 approval_id,
                 result,
             })
@@ -239,6 +260,7 @@ impl Inner {
                 host,
                 ReceiptResult::Blocked(Reason::HostNotAllowed),
                 None,
+                self.deps.policy.version(),
             ) {
                 tracing::error!(error = %e, "morsec proxy could not record a block receipt");
             }
@@ -254,12 +276,18 @@ impl Inner {
         )
     }
 
-    async fn connection(self: Arc<Self>, tcp: TcpStream, peer: SocketAddr) {
+    async fn connection(
+        self: Arc<Self>,
+        tcp: TcpStream,
+        peer: SocketAddr,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) {
         let limits = &self.cfg.limits;
         let me = self.clone();
         let svc = service_fn(move |req: Request<Incoming>| {
             let me = me.clone();
-            async move { Ok::<_, Infallible>(me.front(req, peer).await) }
+            let permit = permit.clone();
+            async move { Ok::<_, Infallible>(me.front(req, peer, permit).await) }
         });
         let mut b = hyper::server::conn::http1::Builder::new();
         b.timer(TokioTimer::new())
@@ -272,7 +300,12 @@ impl Inner {
     }
 
     /// A request on the proxy port: CONNECT, absolute-form `http://`, or base-URL mode.
-    async fn front(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
+    async fn front(
+        self: Arc<Self>,
+        req: Request<Incoming>,
+        peer: SocketAddr,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) -> Response<Body> {
         let (parts, body) = req.into_parts();
         let user = proxy_user(&parts);
         let Some(session) = self.deps.sessions.resolve(peer, user.as_deref()) else {
@@ -285,7 +318,7 @@ impl Inner {
         };
         if parts.method == Method::CONNECT {
             let req = Request::from_parts(parts, body);
-            return self.connect(req, session).await;
+            return self.connect(req, session, permit).await;
         }
         if parts.uri.scheme().is_some() {
             return self.plain(parts, body, session).await;
@@ -347,6 +380,7 @@ impl Inner {
         self: Arc<Self>,
         mut req: Request<Incoming>,
         session: SessionId,
+        permit: Arc<OwnedSemaphorePermit>,
     ) -> Response<Body> {
         let Some(auth) = req.uri().authority().cloned() else {
             return text(StatusCode::BAD_REQUEST, "morsec: CONNECT needs host:port");
@@ -381,6 +415,7 @@ impl Inner {
                 if let Ok(up) = upgrade.await {
                     me.mitm(up, tunnel).await;
                 }
+                drop(permit);
             });
         } else {
             let mut up_tcp =
@@ -393,11 +428,15 @@ impl Inner {
                         );
                     }
                 };
+            let idle = self.cfg.limits.tunnel_idle_timeout;
             tokio::spawn(async move {
                 if let Ok(up) = upgrade.await {
-                    let mut agent = TokioIo::new(up);
-                    let _ = tokio::io::copy_bidirectional(&mut agent, &mut up_tcp).await;
+                    let act = Activity::new();
+                    let mut agent = IdleIo::new(TokioIo::new(up), act.clone());
+                    let pipe = tokio::io::copy_bidirectional(&mut agent, &mut up_tcp);
+                    until_idle(pipe, act, idle).await;
                 }
+                drop(permit);
             });
         }
         Response::new(
@@ -409,9 +448,10 @@ impl Inner {
 
     async fn mitm(self: Arc<Self>, up: hyper::upgrade::Upgraded, t: Arc<Tunnel>) {
         let limits = &self.cfg.limits;
+        let act = Activity::new();
         let acceptor = tokio_rustls::LazyConfigAcceptor::new(
             rustls::server::Acceptor::default(),
-            TokioIo::new(up),
+            IdleIo::new(TokioIo::new(up), act.clone()),
         );
         let Ok(Ok(start)) = timeout(limits.header_read_timeout, acceptor).await else {
             return;
@@ -456,8 +496,14 @@ impl Inner {
         b.http2()
             .timer(TokioTimer::new())
             .max_header_list_size(limits.max_head_bytes.try_into().unwrap_or(u32::MAX))
-            .max_concurrent_streams(64);
-        let _ = b.serve_connection(TokioIo::new(tls), svc).await;
+            .max_concurrent_streams(32)
+            .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
+            .keep_alive_timeout(std::time::Duration::from_secs(20));
+        // Boxed with an explicit output type: hyper-util's connection future otherwise trips a
+        // higher-ranked `From` inference inside `tokio::spawn`.
+        let conn: std::pin::Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + '_>> =
+            Box::pin(b.serve_connection(TokioIo::new(tls), svc));
+        until_idle(conn, act, limits.tunnel_idle_timeout).await;
     }
 
     /// A request inside a terminated tunnel to a bound host.
@@ -528,24 +574,69 @@ impl Inner {
             .await
     }
 
-    async fn collect(&self, body: Incoming) -> Result<Bytes, Response<Body>> {
-        match Limited::new(body, self.cfg.limits.max_body_bytes)
-            .collect()
-            .await
+    /// Reads up to `max_body_bytes` of `body`, holding that much of the global buffer budget.
+    /// Never fails on size: `overflow` says the body was longer and only a prefix was kept.
+    async fn collect(
+        &self,
+        parts: &Parts,
+        mut body: Incoming,
+    ) -> Result<Collected, Response<Body>> {
+        let max = self.cfg.limits.max_body_bytes;
+        let declared = parts
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let reserve = declared.unwrap_or(max).min(max);
+        let kib = u32::try_from(reserve.div_ceil(1024).max(1)).unwrap_or(u32::MAX);
+        let budget = match timeout(
+            BUDGET_WAIT,
+            self.body_budget.clone().acquire_many_owned(kib),
+        )
+        .await
         {
-            Ok(c) => Ok(c.to_bytes()),
-            Err(e) if e.is::<http_body_util::LengthLimitError>() => Err(text(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!(
-                    "morsec: request body is over the {} byte limit for requests that carry a key",
-                    self.cfg.limits.max_body_bytes
-                ),
-            )),
-            Err(_) => Err(text(
-                StatusCode::BAD_REQUEST,
-                "morsec: could not read the request body",
-            )),
+            Ok(Ok(p)) => p,
+            _ => {
+                return Err(text(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "morsec: too many large requests in flight; nothing was sent. Retry shortly",
+                ));
+            }
+        };
+        let mut buf = Vec::with_capacity(reserve.min(64 * 1024));
+        let mut overflow = false;
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else {
+                return Err(text(
+                    StatusCode::BAD_REQUEST,
+                    "morsec: could not read the request body",
+                ));
+            };
+            if let Ok(data) = frame.into_data() {
+                let room = reserve.saturating_sub(buf.len());
+                if data.len() > room {
+                    buf.extend_from_slice(&data[..room]);
+                    overflow = true;
+                    break;
+                }
+                buf.extend_from_slice(&data);
+            }
         }
+        Ok(Collected {
+            bytes: Bytes::from(buf),
+            overflow,
+            _budget: budget,
+        })
+    }
+
+    fn too_large(&self) -> Response<Body> {
+        text(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "morsec: request body is over the {} byte limit for requests the proxy inspects; nothing was sent",
+                self.cfg.limits.max_body_bytes
+            ),
+        )
     }
 
     /// Decides, swaps and forwards one request to a bound host.
@@ -560,10 +651,14 @@ impl Inner {
         addrs: Option<&Vec<SocketAddr>>,
         cache: Option<&Cache>,
     ) -> Response<Body> {
-        let body = match self.collect(body).await {
-            Ok(b) => b,
+        let collected = match self.collect(&parts, body).await {
+            Ok(c) => c,
             Err(r) => return r,
         };
+        if collected.overflow {
+            return self.too_large();
+        }
+        let body = collected.bytes.clone();
         let local = self.bound(host, port);
         let binding = match rewrite::plan(host, port, &parts, &body, &self.cfg.bindings) {
             Plan::Block(keys) => return self.refuse_refs(session, &keys, host),
@@ -592,7 +687,9 @@ impl Inner {
                     key: b.key.clone(),
                     host: host.to_owned(),
                 };
-                match self.deps.policy.decide(session, &preq) {
+                let (decision, version) = self.deps.policy.decide(session, &preq);
+                let rule_version = version;
+                match decision {
                     Decision::Allow => {}
                     Decision::Deny { reason } => {
                         let _ = self.receipt(
@@ -601,6 +698,7 @@ impl Inner {
                             host,
                             ReceiptResult::Blocked(reason.clone()),
                             None,
+                            rule_version,
                         );
                         return text(
                             StatusCode::FORBIDDEN,
@@ -632,6 +730,7 @@ impl Inner {
                                     host,
                                     ReceiptResult::Denied,
                                     None,
+                                    rule_version,
                                 );
                                 return text(
                                     StatusCode::FORBIDDEN,
@@ -670,6 +769,7 @@ impl Inner {
                         host,
                         ReceiptResult::Failed("no value".into()),
                         None,
+                        rule_version,
                     );
                     return text(StatusCode::BAD_GATEWAY, format!("{e}; nothing was sent"));
                 }
@@ -682,7 +782,9 @@ impl Inner {
                         ),
                     );
                 }
-                if let Err(e) = self.receipt(session, &b.key, host, result, approval_id) {
+                if let Err(e) =
+                    self.receipt(session, &b.key, host, result, approval_id, rule_version)
+                {
                     tracing::error!(error = %e, "morsec proxy could not record a receipt");
                     return text(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -721,7 +823,11 @@ impl Inner {
         };
         let (host, port) = split_authority(&auth, 80);
         // Scan the head and as much body as the limit allows; refs found here are blocked.
-        let body = (self.collect(body).await).unwrap_or_default();
+        let collected = match self.collect(&parts, body).await {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+        let body = collected.bytes.clone();
         let refs: Vec<KeyName> = rewrite::scan(&parts, &body, &self.cfg.bindings)
             .into_iter()
             .collect();
@@ -745,6 +851,9 @@ impl Inner {
                     printable(&host)
                 ),
             );
+        }
+        if collected.overflow {
+            return self.too_large();
         }
         let addrs = match self.check(&host, port, &session).await {
             Ok(a) => a,

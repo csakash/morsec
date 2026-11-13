@@ -14,9 +14,10 @@ use crate::ssrf::{Resolve, SystemResolver};
 
 /// Policy as the proxy sees it. L07 implements it with `ms_rules::decide` over the live rules.
 pub trait Policy: Send + Sync + std::fmt::Debug {
-    /// Decides one swap.
-    fn decide(&self, session: &SessionId, request: &Request) -> Decision;
-    /// Version of the rules in force, recorded in receipts.
+    /// Decides one swap, returning the decision and the version of the rules that made it (so
+    /// a reload between deciding and recording can't mislabel the receipt).
+    fn decide(&self, session: &SessionId, request: &Request) -> (Decision, u64);
+    /// Version of the rules in force, for receipts of blocks that needed no decision.
     fn version(&self) -> u64;
 }
 

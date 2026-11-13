@@ -91,6 +91,11 @@ pub struct Limits {
     pub upstream_connect_timeout: Duration,
     /// How long a person has to answer an approval.
     pub approval_timeout: Duration,
+    /// A tunnel (inspected or not) with no bytes moving for this long is closed.
+    pub tunnel_idle_timeout: Duration,
+    /// Total bytes all inspected request bodies may hold in memory at once. At least
+    /// `max_body_bytes`.
+    pub max_buffered_bytes: usize,
 }
 
 impl Default for Limits {
@@ -102,6 +107,8 @@ impl Default for Limits {
             max_body_bytes: 16 * 1024 * 1024,
             upstream_connect_timeout: Duration::from_secs(15),
             approval_timeout: Duration::from_secs(120),
+            tunnel_idle_timeout: Duration::from_secs(300),
+            max_buffered_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -221,8 +228,14 @@ impl ProxyConfig {
         for a in &self.allow {
             validate_host(a.strip_prefix("*.").unwrap_or(a))?;
         }
-        if self.limits.max_connections == 0 || self.limits.max_body_bytes == 0 {
+        let l = &self.limits;
+        if l.max_connections == 0 || l.max_body_bytes == 0 || l.tunnel_idle_timeout.is_zero() {
             return Err(ProxyError::Config("limits must be above zero".into()));
+        }
+        if l.max_buffered_bytes < l.max_body_bytes {
+            return Err(ProxyError::Config(
+                "max_buffered_bytes must be at least max_body_bytes".into(),
+            ));
         }
         Ok(())
     }
@@ -328,6 +341,9 @@ mod tests {
         let mut bad = c.clone();
         bad.bindings[0].hosts = vec!["evil.example.com".into()];
         assert!(bad.validate(&ca).unwrap_err().to_string().contains("CA"));
+        let mut bad = c.clone();
+        bad.limits.max_buffered_bytes = bad.limits.max_body_bytes - 1;
+        assert!(bad.validate(&ca).is_err(), "budget below one body");
         let mut bad = c.clone();
         bad.bindings.push(b);
         assert!(bad.validate(&ca).is_err(), "duplicate provider");

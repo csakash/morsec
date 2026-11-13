@@ -18,6 +18,16 @@ pub(crate) fn client_config(
     let mut store = rustls::RootCertStore::empty();
     match roots {
         UpstreamRoots::System => {
+            // rustls-native-certs replaces the OS store with these files when either is set.
+            // Connectors set them for the agent, and the agent can write files they point at, so
+            // the broker refuses to start with them rather than trust agent-controlled roots.
+            for var in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
+                if std::env::var_os(var).is_some() {
+                    return Err(ProxyError::Tls(format!(
+                        "{var} is set in the broker's environment, so upstream roots could come from a file the agent controls. Start msd without {var}"
+                    )));
+                }
+            }
             let found = rustls_native_certs::load_native_certs();
             for c in found.certs {
                 // A malformed system root is skipped, not fatal; it just can't verify anything.
