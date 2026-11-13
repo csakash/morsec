@@ -7,7 +7,7 @@ Full outputs are kept outside the repo in `.loops/runs/import-env/interactive/pr
 ## Gate
 
 `npm run build` → `bash scripts/check.sh`, exit 0. All 8 steps passed: fmt; build; clippy
-`-D warnings`; 86 tests passed, 0 failed (workspace); cargo deny (advisories, bans, licences,
+`-D warnings`; 86 tests passed, 0 failed (workspace; gate re-run at 484eb72); cargo deny (advisories, bans, licences,
 sources ok); cargo audit (0 vulnerabilities); supply-chain check (15 path packages, all members);
 ARI-42 scan (0 findings).
 
@@ -38,8 +38,15 @@ ARI-42 scan (0 findings).
 | R4 (important) | proptests never generated line breaks | fixed 811cdeb |
 | R5 (nit) | same-value rule rewrites config values | decided, amendment A6 |
 | R6 (nits) | prompt text, buffer growth, control keys, test wording | fixed 811cdeb (A8) |
+| R3 (round 2) | bare CR after a closing quote still passed | fixed c6aed7c |
+| N1 (nit) | inline-comment rule skipped same-value rows | fixed c6aed7c |
+| N2 (important) | `--exclude` ignored on same-value rows | fixed 484eb72 |
 
-Security re-review of the fixes: no issues.
+Security re-review of every fix commit: no issues. Code review: no issues after 484eb72.
+**Budget note:** the loop's review budget is 2 fix rounds; N2 surfaced in the round-2 re-review
+and needed a third, three-line fix, which the same fresh-context reviewer then checked (no
+issues). QA (`qa.md`) ran at 811cdeb; later commits only tighten parsing and planning and are
+covered by the tests above.
 
 ## Not proven here
 
