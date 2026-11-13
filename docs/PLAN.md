@@ -469,6 +469,12 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
 - **Depends on:** L01, L02, L03, L05, L06. **Owns:** `crates/msd/`, `ms init`, `ms status`,
   `ms start`, `ms stop` CLI modules, LaunchAgent plist.
 - **Build:**
+  - **Keep the kill switch reachable (open from L00 security review, S6):** `ms-ipc` serves at most
+    64 connections, and the idle timeout only bounds the gap between frames, so a same-user process
+    that holds 64 connections open starves every other client. Before `Stop` ships: give each
+    connection a total lifetime or request cap, cap connections per peer after the peer check, and
+    reserve a slot (or a separate control socket) for `Stop`/`Status`. Test: 64 held connections do
+    not delay `ms stop`.
   - **Harden socket setup first (open from L00 security review, S3):** `Server::bind` checks the
     directory by path, then binds and chmods by path. Under a parent directory another user can
     write, a rename between check and bind could redirect the socket. Open the directory with
