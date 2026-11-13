@@ -245,6 +245,14 @@ new_out() { # new_out <dir>: refuses to reuse a non-empty directory
   (cd "$1" && pwd -P)
 }
 
+# A fresh temp dir by its real path: the path remaps must match the paths cargo and the linker
+# see, and $TMPDIR may end in "/" and sits behind the /var -> /private/var symlink.
+new_work() {
+  local d
+  d="$(mktemp -d "${TMPDIR:-/tmp}/$1.XXXXXX")"
+  (cd "$d" && pwd -P)
+}
+
 work=""
 cleanup() {
   if [ -n "$work" ]; then rm -rf "$work"; fi
@@ -264,7 +272,7 @@ cmd_build() { # cmd_build <mode> [--out DIR]
   if [ "$mode" = release ]; then release_preflight; fi
   [ -n "$out" ] || out="$root/dist/$(workspace_version "$root")"
   out="$(new_out "$out")"
-  work="$(mktemp -d "${TMPDIR:-/tmp}/morsec-release.XXXXXX")"
+  work="$(new_work morsec-release)"
   trap cleanup EXIT
   build_release "$work" "$out" "$id" "$mode"
 }
@@ -272,7 +280,7 @@ cmd_build() { # cmd_build <mode> [--out DIR]
 cmd_verify_repro() {
   [ $# -eq 0 ] || usage
   check_host
-  work="$(mktemp -d "${TMPDIR:-/tmp}/morsec-repro.XXXXXX")"
+  work="$(new_work morsec-repro)"
   trap cleanup EXIT
   # Different path lengths on purpose, so a leaked path would show.
   local a="$work/a" b="$work/build-two-at-a-longer-path"
