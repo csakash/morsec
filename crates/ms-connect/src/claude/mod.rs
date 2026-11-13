@@ -9,6 +9,7 @@ pub mod diff;
 pub mod edit;
 pub mod fsio;
 pub mod json;
+pub mod skel;
 
 use std::path::{Path, PathBuf};
 
@@ -146,16 +147,27 @@ pub struct RemovePlan {
 /// Previous connect, from the state file.
 #[derive(Debug, Clone)]
 struct State {
-    /// Settings file text before the first connect (None: no file).
-    original: Option<String>,
-    /// Settings file text this connect wrote.
+    /// The settings file before the first connect, without its values (None: no file).
+    original: Option<skel::Skeleton>,
+    /// SHA-256 of the settings text this connect wrote; empty for a partly-disconnected record.
     written: String,
     settings_edits: Edits,
     claude_edits: Edits,
     proxy_port: u16,
     with_mcp: bool,
+    /// `--wrap` was used.
+    wrap: bool,
+    /// `--statusline` was used.
+    statusline: bool,
     /// `~/.claude.json` did not exist before connect created it.
     claude_created: bool,
+}
+
+impl State {
+    /// True when `cur` is exactly the settings text this connect wrote.
+    fn is_written(&self, cur: Option<&str>) -> bool {
+        !self.written.is_empty() && cur.is_some_and(|c| skel::sha256(c) == self.written)
+    }
 }
 
 /// A connector error. `ms-core`'s `Error` is frozen (PLAN §4) and has no general variant, so the
@@ -424,6 +436,19 @@ impl ClaudeConnector {
         matches!(self.read_state(), Ok(Some(st)) if st.written.is_empty() && st.settings_edits.is_empty())
     }
 
+    /// The opt-in parts the previous connect used, so a plain re-run keeps them: dropping one is
+    /// a partial disconnect, which only `ms disconnect` does (security review S2).
+    pub fn previous_options(&self) -> Result<Options> {
+        Ok(self
+            .read_state()?
+            .map_or_else(Options::default, |st| Options {
+                with_mcp: st.with_mcp,
+                wrap: st.wrap,
+                statusline: st.statusline,
+                force: false,
+            }))
+    }
+
     /// True when a state file says this connector is applied.
     pub fn is_connected(&self) -> bool {
         self.paths.state.exists()
@@ -445,14 +470,44 @@ impl ClaudeConnector {
         }
         let s = v.get("settings").ok_or_else(|| bad("no settings"))?;
         let original = match s.get("original") {
-            Some(Value::String(t)) => Some(t.clone()),
             Some(Value::Null) => None,
-            _ => return Err(bad("no original")),
+            Some(o) => {
+                let text = o
+                    .get("skeleton")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| bad("no skeleton"))?
+                    .to_owned();
+                let sha256 = o
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| bad("no sha256"))?
+                    .to_owned();
+                let mut literals = Vec::new();
+                for l in o
+                    .get("literals")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| bad("no literals"))?
+                {
+                    let pair = l.as_array().filter(|a| a.len() == 2);
+                    let (Some(Value::Number(i)), Some(Value::String(t))) =
+                        (pair.and_then(|a| a.first()), pair.and_then(|a| a.get(1)))
+                    else {
+                        return Err(bad("bad literal"));
+                    };
+                    literals.push((i.parse().map_err(|_| bad("bad literal"))?, t.clone()));
+                }
+                Some(skel::Skeleton {
+                    text,
+                    literals,
+                    sha256,
+                })
+            }
+            None => return Err(bad("no original")),
         };
         let written = s
-            .get("written")
+            .get("written_sha256")
             .and_then(Value::as_str)
-            .ok_or_else(|| bad("no written"))?
+            .ok_or_else(|| bad("no written_sha256"))?
             .to_owned();
         let settings_edits = edit::edits_from_value(s).map_err(|e| bad(&e))?;
         let claude_edits = match v.get("claude_json") {
@@ -471,6 +526,8 @@ impl ClaudeConnector {
             claude_edits,
             proxy_port,
             with_mcp: flag("with_mcp"),
+            wrap: flag("wrap"),
+            statusline: flag("statusline"),
             claude_created: flag("claude_created"),
         }))
     }
@@ -479,18 +536,52 @@ impl ClaudeConnector {
         let mut s = edit::edits_to_value(&st.settings_edits);
         s.set(
             "original",
-            st.original.clone().map_or(Value::Null, Value::String),
+            st.original.as_ref().map_or(Value::Null, |sk| {
+                let mut o = Value::object();
+                o.set("sha256", Value::str(sk.sha256.clone()));
+                o.set("skeleton", Value::str(sk.text.clone()));
+                o.set(
+                    "literals",
+                    Value::Array(
+                        sk.literals
+                            .iter()
+                            .map(|(i, t)| {
+                                Value::Array(vec![
+                                    Value::int(i64::try_from(*i).unwrap_or(i64::MAX)),
+                                    Value::str(t.clone()),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                );
+                o
+            }),
         );
-        s.set("written", Value::str(st.written.clone()));
+        s.set("written_sha256", Value::str(st.written.clone()));
         let mut v = Value::object();
         v.set("version", Value::int(STATE_VERSION));
         v.set("agent", Value::str(ID));
         v.set("proxy_port", Value::int(i64::from(st.proxy_port)));
         v.set("with_mcp", Value::Bool(st.with_mcp));
+        v.set("wrap", Value::Bool(st.wrap));
+        v.set("statusline", Value::Bool(st.statusline));
         v.set("claude_created", Value::Bool(st.claude_created));
         v.set("settings", s);
         v.set("claude_json", edit::edits_to_value(&st.claude_edits));
         json::print_doc(&v, "  ", true)
+    }
+
+    /// The settings document with this connect undone, and the text to restore: the original
+    /// bytes when the skeleton rebuilds them exactly (S1), else the document in the original
+    /// layout. `cur` is the text this connect wrote.
+    fn unwritten(&self, st: &State, cur: &str) -> Result<(Value, Option<String>, Vec<String>)> {
+        let mut v = parse_doc(&self.paths.settings, Some(cur))?;
+        let notes = undo(&mut v, &st.settings_edits);
+        let text = st
+            .original
+            .as_ref()
+            .map(|sk| skel::rebuild(sk, &v).unwrap_or_else(|| render(&v, Some(&sk.text))));
+        Ok((v, text, notes))
     }
 
     /// The settings document as it would be without morsec, and its original text.
@@ -500,11 +591,11 @@ impl ClaudeConnector {
         prev: Option<&State>,
     ) -> Result<(Value, Option<String>, Vec<String>)> {
         match prev {
-            Some(st) if cur == Some(st.written.as_str()) => Ok((
-                parse_doc(&self.paths.settings, st.original.as_deref())?,
-                st.original.clone(),
-                Vec::new(),
-            )),
+            Some(st) if st.is_written(cur) => {
+                // A re-plan undoes in memory only; its notes would describe a disconnect.
+                let (v, text, _) = self.unwritten(st, cur.unwrap_or_default())?;
+                Ok((v, text, Vec::new()))
+            }
             Some(st) => {
                 let mut v = parse_doc(&self.paths.settings, cur)?;
                 let was = v.clone();
@@ -548,14 +639,10 @@ impl ClaudeConnector {
         let mut this = self.clone();
         if let Some(p) = &prev {
             let scur = fsio::read_text(&self.paths.settings).map_err(err)?;
-            let sdoc = match scur.as_deref() {
-                Some(t) if t == p.written => None,
-                t => t.and_then(|t| json::parse(t).ok()),
-            };
-            let still_ours_in_settings = |at: &[String], after: &Value| match (&scur, &sdoc) {
-                (Some(t), _) if *t == p.written => true,
-                (_, Some(d)) => d.at(at) == Some(after),
-                _ => false,
+            let sdoc = scur.as_deref().and_then(|t| json::parse(t).ok());
+            let still_ours_in_settings = |at: &[String], after: &Value| {
+                p.is_written(scur.as_deref())
+                    || sdoc.as_ref().is_some_and(|d| d.at(at) == Some(after))
             };
             let cdoc = fsio::read_capped(&self.paths.claude_json, MAX_CLAUDE_JSON)
                 .ok()
@@ -626,12 +713,14 @@ impl ClaudeConnector {
         let claude_created = prev.as_ref().is_some_and(|p| p.claude_created)
             || (ccur.is_none() && claude_change.is_some());
         let state = State {
-            original,
-            written: settings_text.clone(),
+            original: original.as_deref().map(skel::skeletonize),
+            written: skel::sha256(&settings_text),
             settings_edits: sedits,
             claude_edits: cedits,
             proxy_port: cfg.proxy_port,
             with_mcp: self.opts.with_mcp,
+            wrap: self.opts.wrap,
+            statusline: self.opts.statusline,
             claude_created,
         };
         let state_now = fsio::read_text(&self.paths.state).map_err(err)?;
@@ -709,7 +798,24 @@ impl ClaudeConnector {
 
         set(v, &path(&["env", MARKER]), Value::str(ID), e).map_err(err)?;
         for (name, value) in &cfg.env {
-            set(v, &path(&["env", name]), Value::str(value.clone()), e).map_err(err)?;
+            let p = path(&["env", name]);
+            let new = Value::str(value.clone());
+            match v.at(&p).cloned() {
+                // A value of the user's under a name an --env ref takes over: not kept (S1).
+                Some(old) if old != new && !CA_VARS.contains(&name.as_str()) => {
+                    edit::ensure_object(v, &path(&["env"]), e).map_err(err)?;
+                    if let Some(env) = v.get_mut("env") {
+                        env.set(name, new.clone());
+                    }
+                    e.changes.push(Change::SetRedacted {
+                        path: p,
+                        before_sha256: edit::value_sha256(&old),
+                        after: new,
+                    });
+                    warnings.push(format!("env.{name} held a value of yours; it is replaced by the reference, and morsec doesn't keep the old value (ms disconnect removes the entry instead of putting it back)"));
+                }
+                _ => set(v, &p, new, e).map_err(err)?,
+            }
         }
         if let Some(s) = &self.socket_env {
             set(
@@ -797,54 +903,44 @@ impl ClaudeConnector {
         Some(argv)
     }
 
+    /// Wraps `o` (a command hook or stdio server) in place; returns the record to undo it.
+    fn wrap_one(&self, o: &mut Value, at: &[String]) -> Option<Change> {
+        let had_args = o.get("args").is_some();
+        let argv = self.wrapped(o.get("command")?, o.get("args"))?;
+        let shell = !had_args && argv.get(2) == Some(&Value::str("/bin/sh"));
+        o.set("command", Value::str(self.ms.clone()));
+        // Exec form: `shell` is ignored with `args`, so nothing else changes.
+        o.set("args", Value::Array(argv));
+        Some(Change::Wrap {
+            path: at.to_vec(),
+            sha256: edit::value_sha256(o),
+            shell,
+            had_args,
+        })
+    }
+
     fn wrap_hooks(&self, v: &mut Value, e: &mut Edits) -> Result<()> {
-        let Some(Value::Object(events)) = v.get("hooks").cloned() else {
-            return Ok(());
+        let events: Vec<String> = match v.get("hooks") {
+            Some(Value::Object(m)) => m.iter().map(|(k, _)| k.clone()).collect(),
+            _ => return Ok(()),
         };
-        for (event, groups) in events {
-            let Value::Array(groups) = groups else {
+        for event in events {
+            let at = path(&["hooks", &event]);
+            let Some(Value::Array(groups)) = v.at_mut(&at) else {
                 continue;
             };
-            for g in groups {
-                let Some(Value::Array(hooks)) = g.get("hooks") else {
+            for g in groups.iter_mut() {
+                let Some(Value::Array(hooks)) = g.get_mut("hooks") else {
                     continue;
                 };
-                let mut new_hooks = Vec::new();
-                let mut changed = false;
-                for h in hooks {
-                    let skip = h.get("type") != Some(&Value::str("command"))
-                        || h.get("shell") == Some(&Value::str("powershell"));
-                    let w = if skip {
-                        None
-                    } else {
-                        h.get("command")
-                            .and_then(|c| self.wrapped(c, h.get("args")))
-                    };
-                    match w {
-                        Some(argv) => {
-                            let mut nh = h.clone();
-                            nh.set("command", Value::str(self.ms.clone()));
-                            // Exec form: `shell` is ignored with `args`, so drop nothing.
-                            nh.set("args", Value::Array(argv));
-                            new_hooks.push(nh);
-                            changed = true;
-                        }
-                        None => new_hooks.push(h.clone()),
-                    }
-                }
-                if changed {
-                    let mut ng = g.clone();
-                    ng.set("hooks", Value::Array(new_hooks));
-                    let p = path(&["hooks", &event]);
-                    if let Some(Value::Array(arr)) = v.at_mut(&p)
-                        && let Some(slot) = arr.iter_mut().find(|x| **x == g)
+                for h in hooks.iter_mut() {
+                    if h.get("type") != Some(&Value::str("command"))
+                        || h.get("shell") == Some(&Value::str("powershell"))
                     {
-                        *slot = ng.clone();
-                        e.changes.push(Change::Replace {
-                            path: p,
-                            before: g.clone(),
-                            after: ng,
-                        });
+                        continue;
+                    }
+                    if let Some(c) = self.wrap_one(h, &at) {
+                        e.changes.push(c);
                     }
                 }
             }
@@ -881,32 +977,40 @@ impl ClaudeConnector {
     }
 
     fn wrap_servers(&self, v: &mut Value, base: &[String], e: &mut Edits) -> Result<()> {
-        let Some(Value::Object(servers)) = v.at(base).cloned() else {
-            return Ok(());
+        let names: Vec<String> = match v.at(base) {
+            Some(Value::Object(m)) => m.iter().map(|(k, _)| k.clone()).collect(),
+            _ => return Ok(()),
         };
-        for (name, s) in servers {
+        for name in names {
             if name == "ms" {
                 continue;
             }
-            if !s.get("type").is_none_or(|t| *t == Value::str("stdio")) {
+            let mut at = base.to_vec();
+            at.push(name);
+            let Some(s) = v.at_mut(&at) else { continue };
+            if !matches!(s, Value::Object(_))
+                || !s.get("type").is_none_or(|t| *t == Value::str("stdio"))
+            {
                 continue;
             }
-            let Some(cmd) = s.get("command") else {
-                continue;
-            };
-            let args = s.get("args");
-            // A stdio server with no args runs `command` directly, so wrap it as exec form.
-            let argv = match args {
-                None => self.wrapped(cmd, Some(&Value::Array(Vec::new()))),
-                Some(a) => self.wrapped(cmd, Some(a)),
-            };
-            if let Some(argv) = argv {
-                let mut ns = s.clone();
-                ns.set("command", Value::str(self.ms.clone()));
-                ns.set("args", Value::Array(argv));
-                let mut p = base.to_vec();
-                p.push(name);
-                set(v, &p, ns, e).map_err(err)?;
+            // A stdio server with no args runs `command` directly: wrap it as exec form.
+            if s.get("args").is_none() {
+                let Some(cmd) = s.get("command").cloned() else {
+                    continue;
+                };
+                let Some(argv) = self.wrapped(&cmd, Some(&Value::Array(Vec::new()))) else {
+                    continue;
+                };
+                s.set("command", Value::str(self.ms.clone()));
+                s.set("args", Value::Array(argv));
+                e.changes.push(Change::Wrap {
+                    path: at.clone(),
+                    sha256: edit::value_sha256(s),
+                    shell: false,
+                    had_args: false,
+                });
+            } else if let Some(c) = self.wrap_one(s, &at) {
+                e.changes.push(c);
             }
         }
         Ok(())
@@ -1024,12 +1128,14 @@ impl ClaudeConnector {
         } else {
             fsio::read_text(&self.paths.settings).map_err(err)?
         };
-        if !st.written.is_empty() && cur.as_deref() == Some(st.written.as_str()) {
-            if cur != st.original {
+        if st.is_written(cur.as_deref()) {
+            let (_, after, notes) = self.unwritten(&st, cur.as_deref().unwrap_or_default())?;
+            plan.notes.extend(notes);
+            if cur != after {
                 plan.files.push(Restore {
                     path: self.paths.settings.clone(),
                     before: cur.clone(),
-                    after: st.original.clone(),
+                    after,
                 });
             }
         } else if let Some(c) = cur.as_deref().filter(|_| !st.settings_edits.is_empty()) {

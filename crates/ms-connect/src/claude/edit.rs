@@ -25,15 +25,61 @@ pub enum Change {
         /// Element appended.
         value: Value,
     },
-    /// An element of the array at `path` equal to `before` was replaced by `after`.
-    Replace {
-        /// Path of the array.
+    /// The object member at `path` was set to `after`; it held a value of the user's that is
+    /// not kept (only its hash), so undo removes the member (security review S1).
+    SetRedacted {
+        /// Object keys from the root.
         path: Vec<String>,
-        /// Element before.
-        before: Value,
-        /// Element after.
+        /// SHA-256 of the previous value, printed compactly.
+        before_sha256: String,
+        /// Value written.
         after: Value,
     },
+    /// A command (hook or stdio MCP server) was wrapped as `ms run -- …` in place. Only what is
+    /// needed to unwrap it is kept, never the command itself (security review S1).
+    Wrap {
+        /// For a server: the server object. For hooks: `["hooks", <event>]`, whose groups'
+        /// `hooks` lists hold the wrapped hook.
+        path: Vec<String>,
+        /// SHA-256 of the wrapped object, printed compactly.
+        sha256: String,
+        /// It was shell form (`command` string, no `args`): unwrap from `/bin/sh -c`.
+        shell: bool,
+        /// It had an `args` member before.
+        had_args: bool,
+    },
+}
+
+/// SHA-256 of a value printed compactly, hex.
+pub fn value_sha256(v: &Value) -> String {
+    super::skel::sha256(&super::json::print(v, ""))
+}
+
+/// Unwraps `ms run -- …` in `o` per a [`Change::Wrap`]. False when `o` isn't such a wrap.
+fn unwrap_command(o: &mut Value, shell: bool, had_args: bool) -> bool {
+    let Some(argv) = o.get("args").and_then(Value::as_array).cloned() else {
+        return false;
+    };
+    let strs: Option<Vec<&str>> = argv.iter().map(Value::as_str).collect();
+    let Some(a) = strs else { return false };
+    if a.len() < 3 || a[0] != "run" || a[1] != "--" {
+        return false;
+    }
+    if shell {
+        if a.len() != 5 || a[2] != "/bin/sh" || a[3] != "-c" {
+            return false;
+        }
+        o.set("command", Value::str(a[4]));
+        o.remove("args");
+    } else {
+        o.set("command", Value::str(a[2]));
+        if had_args {
+            o.set("args", Value::Array(argv[3..].to_vec()));
+        } else {
+            o.remove("args");
+        }
+    }
+    true
 }
 
 /// The changes made to one document, plus the containers created for them.
@@ -184,21 +230,51 @@ pub fn undo(root: &mut Value, edits: &Edits) -> Vec<String> {
                     dotted(path)
                 ));
             }
-            Change::Replace {
-                path,
-                before,
-                after,
-            } => {
-                if let Some(Value::Array(a)) = root.at_mut(path)
-                    && let Some(e) = a.iter_mut().find(|e| *e == after)
-                {
-                    *e = before.clone();
+            Change::SetRedacted { path, after, .. } => {
+                let Some((key, parent)) = path.split_last() else {
+                    continue;
+                };
+                if root.at(path) != Some(after) {
+                    notes.push(format!(
+                        "{} was changed after ms connect; left as it is now",
+                        dotted(path)
+                    ));
                     continue;
                 }
+                if let Some(obj) = root.at_mut(parent) {
+                    obj.remove(key);
+                }
                 notes.push(format!(
-                    "an entry morsec changed in {} was edited after ms connect; left as it is now",
+                    "{} held a value of yours before ms connect; morsec never keeps values, so it was removed, not put back. Set it again if you still need it",
                     dotted(path)
                 ));
+            }
+            Change::Wrap {
+                path,
+                sha256,
+                shell,
+                had_args,
+            } => {
+                let hit = |o: &Value| value_sha256(o) == *sha256;
+                let done = match root.at_mut(path) {
+                    Some(Value::Array(groups)) => groups
+                        .iter_mut()
+                        .filter_map(|g| match g.get_mut("hooks") {
+                            Some(Value::Array(hs)) => Some(hs),
+                            _ => None,
+                        })
+                        .flat_map(|hs| hs.iter_mut())
+                        .find(|h| hit(h))
+                        .is_some_and(|h| unwrap_command(h, *shell, *had_args)),
+                    Some(o @ Value::Object(_)) if hit(o) => unwrap_command(o, *shell, *had_args),
+                    _ => false,
+                };
+                if !done {
+                    notes.push(format!(
+                        "a command morsec wrapped in {} was edited after ms connect; left as it is now",
+                        dotted(path)
+                    ));
+                }
             }
         }
     }
@@ -263,15 +339,27 @@ pub fn edits_to_value(e: &Edits) -> Value {
                     o.set("path", path_value(path));
                     o.set("value", value.clone());
                 }
-                Change::Replace {
+                Change::SetRedacted {
                     path,
-                    before,
+                    before_sha256,
                     after,
                 } => {
-                    o.set("op", Value::str("replace"));
+                    o.set("op", Value::str("set_redacted"));
                     o.set("path", path_value(path));
-                    o.set("before", before.clone());
+                    o.set("before_sha256", Value::str(before_sha256.clone()));
                     o.set("after", after.clone());
+                }
+                Change::Wrap {
+                    path,
+                    sha256,
+                    shell,
+                    had_args,
+                } => {
+                    o.set("op", Value::str("wrap"));
+                    o.set("path", path_value(path));
+                    o.set("sha256", Value::str(sha256.clone()));
+                    o.set("shell", Value::Bool(*shell));
+                    o.set("had_args", Value::Bool(*had_args));
                 }
             }
             o
@@ -300,6 +388,12 @@ pub fn edits_from_value(v: &Value) -> Result<Edits, String> {
                 .cloned()
                 .ok_or_else(|| format!("state: change is missing {k}"))
         };
+        let need_str = |k: &str| {
+            c.get(k)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("state: change is missing {k}"))
+        };
         e.changes.push(match c.get("op").and_then(Value::as_str) {
             Some("set") => Change::Set {
                 path,
@@ -310,10 +404,16 @@ pub fn edits_from_value(v: &Value) -> Result<Edits, String> {
                 path,
                 value: need("value")?,
             },
-            Some("replace") => Change::Replace {
+            Some("set_redacted") => Change::SetRedacted {
                 path,
-                before: need("before")?,
+                before_sha256: need_str("before_sha256")?,
                 after: need("after")?,
+            },
+            Some("wrap") => Change::Wrap {
+                path,
+                sha256: need_str("sha256")?,
+                shell: c.get("shell") == Some(&Value::Bool(true)),
+                had_args: c.get("had_args") == Some(&Value::Bool(true)),
             },
             _ => return Err("state: unknown change".into()),
         });
@@ -333,7 +433,7 @@ mod tests {
     use super::super::json::parse;
     use super::*;
 
-    // protects=undo removes exactly what set/add_unique/Replace recorded, prunes containers it
+    // protects=undo removes exactly what set/add_unique recorded, prunes containers it
     // created, and leaves a value the user changed since; fails_when=a user edit is reverted or
     // an empty created container stays
     #[test]

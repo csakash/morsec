@@ -743,9 +743,11 @@ dependencies = [
 name = "ms-connect"
 version = "0.0.0"
 dependencies = [
+ "hex",
  "libc",
  "ms-core",
  "proptest",
+ "sha2",
  "tempfile",
 ]
 

@@ -353,3 +353,21 @@ fn partial_disconnect_fails_loudly() {
     let (_, stdout, _) = fx.ms(&["connect"]);
     assert!(stdout.contains("partly disconnected"), "{stdout}");
 }
+
+// protects=security review S2: a plain re-run keeps the opt-in parts of the last connect, so an
+// agent's plain `ms connect` can't strip them (that is a partial disconnect); fails_when=the
+// re-run removes the ms MCP server
+#[test]
+fn plain_rerun_keeps_opt_ins() {
+    let fx = Fx::new();
+    let (code, _, e) = fx.connect(&["--yes", "--with-mcp"]);
+    assert_eq!(code, 0, "{e}");
+    let cj = std::fs::read_to_string(fx.home().join(".claude.json")).unwrap();
+    let (code, stdout, e) = fx.connect(&["--yes"]);
+    assert_eq!(code, 0, "{e}");
+    assert!(stdout.contains("already connected"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(fx.home().join(".claude.json")).unwrap(),
+        cj
+    );
+}

@@ -1021,3 +1021,76 @@ fn partial_disconnect_is_reported_and_finishable() {
     assert!(!h.claude_json().exists(), "created file not removed");
     assert_eq!(h.read(&h.settings()).as_deref(), Some("{ also broken"));
 }
+
+// protects=security review S1: the state file never holds a value from the user's settings (a
+// plaintext token there is not copied into ~/.morsec), and restore is still byte-exact;
+// fails_when=the canary appears in any file under ~/.morsec or the restore differs
+#[test]
+fn state_file_holds_no_user_values() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    let text = "{\n  \"env\": {\n    \"GITHUB_TOKEN\": \"ghp_CANARY_S1_token\"\n  },\n  \"hooks\": {\"Stop\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"curl -H 'Authorization: Bearer CANARY_S1_hook' x\"}]}]}\n}\n";
+    std::fs::write(h.settings(), text).unwrap();
+    let opts = Options {
+        wrap: true,
+        ..Options::default()
+    };
+    connect(&h, opts);
+    let mut files = Vec::new();
+    walk(&h.home().join(".morsec"), &mut files);
+    for f in &files {
+        let t = std::fs::read_to_string(f).unwrap();
+        assert!(
+            !t.contains("CANARY_S1"),
+            "{} holds a user value",
+            f.display()
+        );
+    }
+    h.connector(opts).remove().unwrap();
+    assert_eq!(h.read(&h.settings()).as_deref(), Some(text));
+}
+
+// protects=security review S1: when an --env ref takes over a variable that held a raw value,
+// the value is never stored; disconnect removes the entry and says so; fails_when=the raw value
+// lands in ~/.morsec or is silently dropped without a note
+#[test]
+fn replaced_raw_env_value_is_not_kept() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    std::fs::write(
+        h.settings(),
+        "{\"env\": {\"STRIPE_API_KEY\": \"sk_live_CANARY_S1b\"}}",
+    )
+    .unwrap();
+    let c = h.connector(Options::default());
+    let p = c.try_plan(&h.cfg(&c)).unwrap();
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("doesn't keep the old value")),
+        "{:?}",
+        p.warnings
+    );
+    c.apply(&p.diff).unwrap();
+    let mut files = Vec::new();
+    walk(&h.home().join(".morsec"), &mut files);
+    for f in &files {
+        assert!(
+            !std::fs::read_to_string(f).unwrap().contains("CANARY_S1b"),
+            "{}",
+            f.display()
+        );
+    }
+    let plan = c.plan_remove().unwrap().unwrap();
+    assert!(
+        plan.notes.iter().any(|n| n.contains("never keeps values")),
+        "{:?}",
+        plan.notes
+    );
+    c.apply_remove(&plan).unwrap();
+    let after = h.read(&h.settings()).unwrap();
+    assert!(
+        !after.contains("STRIPE_API_KEY") && !after.contains("ms://"),
+        "{after}"
+    );
+}

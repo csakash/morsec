@@ -117,13 +117,32 @@ fn home() -> Result<PathBuf, String> {
 }
 
 /// The `ms` path to write into settings: the first `ms` on PATH that is this binary (a stable
-/// Homebrew link survives upgrades), else this binary (SPEC D12).
+/// Homebrew link survives upgrades), else this binary (SPEC D12). A PATH entry counts only in a
+/// directory outside HOME and the current directory that no other user can write (security
+/// review S4): the link is run outside the sandbox at every session start, so it must not live
+/// where a repo checkout or a temp dir could repoint it.
 fn ms_path() -> Result<String, String> {
     let me = std::env::current_exe().map_err(|e| format!("morsec: finding ms: {e}"))?;
     let real = std::fs::canonicalize(&me).unwrap_or_else(|_| me.clone());
+    let home = home().ok().and_then(|h| std::fs::canonicalize(h).ok());
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|d| std::fs::canonicalize(d).ok());
+    let stable_dir = |d: &Path| {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(cd) = std::fs::canonicalize(d) else {
+            return false;
+        };
+        let under = |base: &Option<PathBuf>| base.as_ref().is_some_and(|b| cd.starts_with(b));
+        let uid = rustix::process::getuid().as_raw();
+        !under(&home)
+            && !under(&cwd)
+            && std::fs::metadata(&cd)
+                .is_ok_and(|m| m.mode() & 0o022 == 0 && (m.uid() == uid || m.uid() == 0))
+    };
     let on_path = std::env::var_os("PATH").and_then(|p| {
         std::env::split_paths(&p)
-            .filter(|d| d.is_absolute())
+            .filter(|d| d.is_absolute() && stable_dir(d))
             .map(|d| d.join("ms"))
             .find(|c| std::fs::canonicalize(c).is_ok_and(|r| r == real))
     });
@@ -327,6 +346,17 @@ pub(crate) fn connect(a: &ConnectArgs) -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
+    // A plain re-run keeps the opt-in parts the last connect used (security review S2);
+    // dropping one is a partial disconnect, which is `ms disconnect`'s job.
+    match c.previous_options() {
+        Ok(p) => {
+            c.opts.with_mcp |= p.with_mcp;
+            c.opts.wrap |= p.wrap;
+            c.opts.statusline |= p.statusline;
+        }
+        Err(e) if !a.session_env => return fail(&e.to_string()),
+        Err(_) => {}
+    }
     if a.session_env {
         return session_env(&c);
     }
