@@ -1,8 +1,8 @@
 //! `ms import` and `ms add` end to end, under both names, against no daemon and a stub daemon.
 //!
-//! IPC v1 has no success reply for `ListKeys`/`PutKey` yet (L07), so every path that would
-//! store must fail closed here: the file stays byte-identical and no value is printed. The
-//! storing path itself is proven in `ms-import` against the in-memory vault.
+//! These cover the failure paths: with no daemon, or one that refuses, nothing is stored, the file
+//! stays byte-identical and no value is printed. Storing through a real msd is proven in
+//! `crates/msd/tests/cli.rs` (`add_and_import_store_through_msd`).
 
 use std::fs;
 use std::io::Write;

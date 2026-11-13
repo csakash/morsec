@@ -70,6 +70,21 @@ const SEAL_PIN: &str = "morsec/seal-id";
 /// Pins the CA key the same way.
 const CA_PIN: &str = "morsec/ca-id";
 
+/// The daemon's persistent state (the `ms stop` flag), written by msd with
+/// [`KeychainVault::put_internal`] (L07).
+pub const DAEMON_STATE_KEY: &str = "morsec/daemon-state";
+
+/// The swap proxy's CA private key (PEM), written by msd with [`KeychainVault::put_internal`]
+/// (L07). Kept in a sealed item only msd can read.
+pub const CA_PEM_KEY: &str = "morsec/ca";
+
+/// The proxy CA certificate and its host list (public, but kept here so no same-user process can
+/// substitute them), written by msd with [`KeychainVault::put_internal`] (L07).
+pub const CA_CERT_KEY: &str = "morsec/ca-cert";
+
+/// The only reserved names [`KeychainVault::put_internal`] writes.
+pub const INTERNAL_WRITABLE: [&str; 3] = [DAEMON_STATE_KEY, CA_PEM_KEY, CA_CERT_KEY];
+
 /// Length of each internal HMAC key, in bytes.
 pub const HMAC_KEY_LEN: usize = 32;
 
@@ -569,6 +584,25 @@ impl KeychainVault {
         let _q = quiet()?;
         let kc = login_keychain()?;
         self.reset_pinned_key(&kc, &self.ca_label(), CA_PIN)
+    }
+
+    /// Writes one of morsec's own items: only the names in [`INTERNAL_WRITABLE`] (the daemon state
+    /// and the proxy CA key, L07). [`Vault::put`] refuses every `morsec/` name so no client can
+    /// overwrite these; this is the daemon's own path. The item is sealed and ACL-bound to the
+    /// signed msd like any other, so another binary can neither read nor rewrite it unnoticed.
+    pub fn put_internal(&self, name: &KeyName, value: SecretBytes) -> Result<()> {
+        if !INTERNAL_WRITABLE.contains(&name.as_str()) {
+            return Err(reserved_error(name));
+        }
+        let meta = KeyMeta {
+            name: name.clone(),
+            mode: ms_core::Mode::Swap,
+            tier: ms_core::Tier::Production,
+            created_unix_ms: 0,
+        };
+        let _q = quiet()?;
+        let kc = login_keychain()?;
+        self.replace_locked(&kc, name, &value, &meta)
     }
 
     /// Deletes the CA key pair and its pin. No error when there is none.

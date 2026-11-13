@@ -339,6 +339,24 @@ is never taken from the client; the daemon derives it from the peer (L06), which
 requires. `RunStream` is added by L12 when output streaming lands. `PutKey`'s value travels in a
 separate raw frame after the JSON.
 
+Added by L07, backwards-compatible within v1 (new request fields are optional and default to the
+old behaviour; a default-valued field is not written, so old messages are byte-identical):
+
+- Replies: `Ok { message }` (`PutKey`, `Stop`, `Start`, a saved rules change), `Keys { keys }`
+  (`ListKeys`, metadata only, `morsec/` keys never listed), `Rules { version, toml, notes }`
+  (`RulesGet`: the user rules as `rules.toml` text, MAC-verified by msd; the client merges a
+  project `.morsec.toml` itself, so msd never reads a path a client names).
+- `Status` gains optional `running`, `keys`, `proxy_port` and `alerts`.
+- `RulesProposeLoosen` gains `rule` (a rules file holding only that key; absent = remove the
+  key's rule) and `at_terminal`. msd classifies the change: tightening is saved, loosening needs
+  an approval. `Start` gains `at_terminal`.
+- `at_terminal` is the pre-L11 recovery path (L07 SPEC D-A): msd accepts it only from a caller
+  outside every agent session, after `ms` confirmed on `/dev/tty`. L11 replaces it with Touch ID.
+- Error codes `busy`, `denied`, `needs_approval`, `not_initialized`, `invalid`.
+- The server keeps reserved slots for `Status`/`Stop` when its 64 general slots are full, caps
+  connections per peer process (8), and caps each connection's lifetime (10 min) and requests
+  (1024), so a same-user process can't starve the kill switch.
+
 ---
 
 ## 5. Loop cards

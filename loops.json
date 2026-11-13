@@ -16,6 +16,8 @@
         "msd",
         "--",
         "--foreground",
+        "--vault",
+        "memory",
         "--port",
         "{{port}}"
       ],

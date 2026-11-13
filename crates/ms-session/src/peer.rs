@@ -104,7 +104,12 @@ mod tests {
     use crate::walk::fake::FakeTable;
 
     fn peer(uid: u32, pid: Option<i32>) -> PeerInfo {
-        PeerInfo { uid, gid: 20, pid }
+        PeerInfo {
+            uid,
+            gid: 20,
+            pid,
+            accepted_unix_ms: 0,
+        }
     }
 
     impl SessionPeerCheck<FakeTable> {

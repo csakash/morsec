@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for signing msd with the hardened runtime (codesign -o runtime), used by L10's
+  release script. Deliberately empty: no com.apple.security.get-task-allow (so no same-user
+  process can attach a debugger and read values from memory), no JIT, no unsigned executable
+  memory, no library-validation exemption, no dyld environment variables.
+-->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>

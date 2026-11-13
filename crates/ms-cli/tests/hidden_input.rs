@@ -1,7 +1,7 @@
 //! Hidden terminal input (`ms add` without `--stdin`) on a real pseudo-terminal.
 //!
-//! `ms add` only prompts once the daemon can list keys, which IPC v1 can't answer yet (L07), so
-//! this drives `read_hidden` directly: the test re-runs itself as a child whose stdin is the pty's
+//! `ms add` only prompts once the daemon can list keys, so rather than run a daemon this drives
+//! `read_hidden` directly: the test re-runs itself as a child whose stdin is the pty's
 //! terminal side, types into the controller side, and checks what the terminal showed.
 
 #![allow(clippy::print_stdout)]
