@@ -141,7 +141,14 @@ impl<'v> RulesStore<'v> {
         // bad rule is refused here instead of locking every key out on the next load.
         let mut draft = new.clone();
         draft.version = version;
-        let next = Rules::from_toml(&draft.to_toml(), "the new rules")?;
+        let text = draft.to_toml();
+        if text.len() as u64 > MAX_RULES_FILE {
+            return Err(RulesError::invalid(
+                "the new rules",
+                format!("larger than {MAX_RULES_FILE} bytes; remove keys or patterns"),
+            ));
+        }
+        let next = Rules::from_toml(&text, "the new rules")?;
         let (change, loosened) = classify(&current, &next);
         if change == Change::Loosen && !approved {
             let keys: Vec<String> = loosened.iter().map(ToString::to_string).collect();
@@ -483,6 +490,20 @@ mod tests {
             .for_each(|r| r.session_ttl_secs = 0);
         assert!(matches!(
             s.save(&invalid, true, 3),
+            Err(RulesError::Invalid { .. })
+        ));
+        assert_eq!(s.load(3).unwrap(), saved);
+        // Rules too big to load again are refused before writing.
+        let mut huge = saved.clone();
+        for i in 0..4000 {
+            let mut r = KeyRule::new(Mode::Swap, Tier::Test);
+            r.hosts = (0..4)
+                .map(|j| HostPattern::parse(&format!("{}{j}.example.com", "a".repeat(60))).unwrap())
+                .collect();
+            huge.keys.insert(KeyName::new(&format!("k{i}")).unwrap(), r);
+        }
+        assert!(matches!(
+            s.save(&huge, true, 3),
             Err(RulesError::Invalid { .. })
         ));
         assert_eq!(s.load(3).unwrap(), saved);

@@ -124,6 +124,12 @@ fn find_project_file(start: &Path) -> Option<PathBuf> {
 
 fn read_text(path: &Path) -> Result<String, String> {
     let bytes = read_limited(path, MAX_FILE).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            return format!(
+                "morsec: {} is a pipe or device, not a file. Save it to a regular file and pass that",
+                path.display()
+            );
+        }
         format!(
             "morsec: can't read {}: {e}. Check the path and its permissions",
             path.display()

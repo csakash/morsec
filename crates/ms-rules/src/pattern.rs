@@ -32,7 +32,7 @@ impl HostPattern {
     pub fn parse(s: &str) -> Result<Self, String> {
         if let Some(suffix) = s.strip_prefix("*.") {
             validate_dns_name(suffix)?;
-            if suffix.split('.').next_back().is_some_and(all_digits) {
+            if suffix.split('.').next_back().is_some_and(numeric_label) {
                 return Err(format!(
                     "wildcard host \"*.{suffix}\" ends in a numeric label; wildcards are for DNS names only"
                 ));
@@ -49,7 +49,7 @@ impl HostPattern {
         }
         validate_dns_name(s)?;
         // `127.1`, `2130706433` or `010.0.0.1` are not IPs to std but are to some resolvers.
-        if s.split('.').next_back().is_some_and(all_digits) {
+        if s.split('.').next_back().is_some_and(numeric_label) {
             return Err(format!(
                 "host \"{s}\" looks like an IP address but is not a plain dotted-quad or IPv6 literal"
             ));
@@ -143,8 +143,13 @@ fn parse_ip(s: &str) -> Option<IpAddr> {
         .ok()
 }
 
-fn all_digits(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+/// A label some resolvers read as a number (`inet_aton`, WHATWG "ends in a number"): decimal
+/// digits, or `0x` followed by hex digits.
+fn numeric_label(s: &str) -> bool {
+    let hex = s
+        .strip_prefix("0x")
+        .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+    hex || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `host` is `<one or more labels>.<suffix>`.
@@ -482,6 +487,9 @@ mod tests {
             "127.1",
             "2130706433",
             "010.0.0.1",
+            "0x7f000001",
+            "0x7f.0x0.0x0.0x1",
+            "*.0x7f",
             "a.com/",
             "",
         ] {
