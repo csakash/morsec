@@ -73,34 +73,55 @@ pub struct Server {
 }
 
 impl Server {
-    /// Binds `path`, creating its directory with mode 0700 and setting the socket to 0600.
+    /// Binds `path` and sets the socket to 0600.
     ///
-    /// Refuses when another daemon answers on `path`, when `path` exists and is not a socket, or
-    /// when the directory belongs to another user. A stale socket left by a crashed daemon is
-    /// removed.
+    /// A missing directory is created with mode 0700. An existing directory is never modified: it
+    /// must already be private (no group or other bits) or `bind` refuses, so pointing `--socket`
+    /// at `~/` or `/tmp/` can't silently change those directories. Also refuses when another
+    /// daemon answers on `path`, when `path` exists and is not a socket, or when the directory
+    /// belongs to another user. A stale socket left by a crashed daemon is removed.
     pub fn bind(path: &Path) -> Result<Self> {
         let dir = path
             .parent()
             .filter(|d| !d.as_os_str().is_empty())
             .ok_or_else(|| {
-                Error::Protocol(format!("socket path {} has no directory", path.display()))
+                Error::Socket(format!(
+                    "socket path {} has no directory; pass a path like ~/Library/Application Support/morsec/msd.sock",
+                    path.display()
+                ))
             })?;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(|e| Error::io(format!("creating {}", dir.display()), e))?;
+        match std::fs::metadata(dir) {
+            Ok(m) if !m.is_dir() => {
+                return Err(Error::Socket(format!(
+                    "{} is not a directory; choose another socket path",
+                    dir.display()
+                )));
+            }
+            Ok(m) if m.permissions().mode() & 0o077 != 0 => {
+                return Err(Error::Socket(format!(
+                    "{} is readable or writable by other users (mode {:o}); use a private directory, or run: chmod 700 {}",
+                    dir.display(),
+                    m.permissions().mode() & 0o7777,
+                    dir.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)
+                    .map_err(|e| Error::io(format!("creating {}", dir.display()), e))?;
+            }
+            Err(e) => return Err(Error::io(format!("checking {}", dir.display()), e)),
+        }
         let dir_meta = std::fs::metadata(dir)
             .map_err(|e| Error::io(format!("checking {}", dir.display()), e))?;
-        if dir_meta.permissions().mode() & 0o077 != 0 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| Error::io(format!("restricting {} to 0700", dir.display()), e))?;
-        }
 
         match std::fs::symlink_metadata(path) {
             Ok(m) if m.file_type().is_socket() => {
                 if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                    return Err(Error::Protocol(format!(
+                    return Err(Error::Socket(format!(
                         "another msd is already running on {}. Stop it first, or pass --socket",
                         path.display()
                     )));
@@ -110,7 +131,7 @@ impl Server {
                 })?;
             }
             Ok(_) => {
-                return Err(Error::Protocol(format!(
+                return Err(Error::Socket(format!(
                     "{} exists and is not a socket; refusing to replace it",
                     path.display()
                 )));
@@ -133,7 +154,7 @@ impl Server {
         };
         if dir_meta.uid() != owner_uid {
             // Dropping `server` removes the socket.
-            return Err(Error::PeerRejected(format!(
+            return Err(Error::Socket(format!(
                 "{} belongs to another user; choose a socket directory you own",
                 dir.display()
             )));
@@ -199,6 +220,12 @@ async fn serve_conn<H: Handler, P: PeerCheck>(
             gid: c.gid(),
             pid: c.pid(),
         },
+        // A client that connects and hangs up at once (such as `bind`'s liveness probe) has no
+        // credentials left to read. That is not an attack signal, so it is not a warning.
+        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+            tracing::debug!("client left before sending anything");
+            return;
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no peer credentials; closing");
             return;

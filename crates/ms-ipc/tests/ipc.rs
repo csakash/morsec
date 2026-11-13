@@ -282,12 +282,55 @@ async fn bind_refuses_live_socket_and_regular_file() {
     r.shutdown().await;
 }
 
-// protects=a PutKey value travels only in its raw frame: it reaches the handler intact, and no
-// JSON message on the wire (request or response) contains it; also every Request/Response variant
-// serializes without it; fails_when=the canary appears in any JSON; no_claim=memory wiping
+/// Frames seen by the relay: (client-to-server?, bytes).
+type Wire = Arc<Mutex<Vec<(bool, Vec<u8>)>>>;
+
+async fn pump(
+    mut from: tokio::net::unix::OwnedReadHalf,
+    mut to: tokio::net::unix::OwnedWriteHalf,
+    upstream: bool,
+    log: Wire,
+) {
+    while let Ok(Some(f)) = read_frame(&mut from).await {
+        log.lock().unwrap().push((upstream, f.clone()));
+        if write_frame(&mut to, &f).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// A byte-recording relay between one client and the server, so a test sees exactly what
+/// crossed the socket in each direction.
+fn relay(listen: &Path, target: PathBuf, log: Wire) -> tokio::task::JoinHandle<()> {
+    let l = tokio::net::UnixListener::bind(listen).unwrap();
+    tokio::spawn(async move {
+        let (client, _) = l.accept().await.unwrap();
+        let server = UnixStream::connect(&target).await.unwrap();
+        let (cr, cw) = client.into_split();
+        let (sr, sw) = server.into_split();
+        let up = tokio::spawn(pump(cr, sw, true, log.clone()));
+        let down = tokio::spawn(pump(sr, cw, false, log));
+        let _ = tokio::join!(up, down);
+    })
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+// protects=on the real wire, a PutKey value crosses exactly once, as its own raw frame
+// right after the PutKey JSON; every other frame in both directions is JSON without the value;
+// and the handler receives it intact; fails_when=the client also puts the value in a JSON frame,
+// the server echoes it, or the value frame is missing or altered; no_claim=memory wiping, or
+// other transports
 #[tokio::test]
-async fn value_never_in_json() {
+async fn value_crosses_the_wire_only_as_raw_frame() {
     let r = start().await;
+    let relay_dir = tmpdir();
+    let relay_path = relay_dir.path().join("relay.sock");
+    let wire: Wire = Arc::default();
+    let relay_task = relay(&relay_path, r.path.clone(), wire.clone());
+
     let name = KeyName::new("stripe/live").unwrap();
     let meta = KeyMeta {
         name: name.clone(),
@@ -295,32 +338,67 @@ async fn value_never_in_json() {
         tier: Tier::Production,
         created_unix_ms: 1,
     };
-
-    // Over a real client: the handler gets the value and the response doesn't echo it.
-    let mut c = Client::connect(&r.path).await.unwrap();
+    let mut c = Client::connect(&relay_path).await.unwrap();
     let resp = c
-        .put_key(
-            name.clone(),
-            meta.clone(),
-            SecretBytes::from(CANARY.to_owned()),
-        )
+        .put_key(name, meta, SecretBytes::from(CANARY.to_owned()))
         .await
         .unwrap();
-    assert!(!format!("{resp:?}").contains("CANARY"));
+    assert!(matches!(
+        resp,
+        ResponseBody::Error {
+            code: ErrorCode::NotImplemented,
+            ..
+        }
+    ));
+    // A second exchange on the same connection: the stream stays in sync after the value frame.
+    assert!(matches!(
+        c.request(RequestBody::Status).await.unwrap(),
+        ResponseBody::Status { .. }
+    ));
+    drop(c);
+    relay_task.await.unwrap();
+
     assert_eq!(
         r.handler.values.lock().unwrap().as_slice(),
         [CANARY.as_bytes().to_vec()]
     );
+    let frames = wire.lock().unwrap().clone();
+    let dirs: Vec<bool> = frames.iter().map(|(up, _)| *up).collect();
+    assert_eq!(
+        dirs,
+        [true, true, false, true, false],
+        "unexpected frame sequence"
+    );
+    for (i, (up, bytes)) in frames.iter().enumerate() {
+        if i == 1 {
+            assert!(*up);
+            assert_eq!(bytes.as_slice(), CANARY.as_bytes(), "value frame altered");
+            continue;
+        }
+        assert!(
+            !contains(bytes, CANARY.as_bytes()),
+            "value in frame {i}: {}",
+            String::from_utf8_lossy(bytes)
+        );
+        assert!(!contains(bytes, b"CANARY"), "partial value in frame {i}");
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .unwrap_or_else(|e| panic!("frame {i} is not JSON: {e}"));
+    }
+    r.shutdown().await;
+}
 
-    // The JSON frame the client sends for PutKey, byte for byte.
-    let put_json = encode(
-        1,
-        &RequestBody::PutKey {
-            name: name.clone(),
-            meta: meta.clone(),
-        },
-    )
-    .unwrap();
+// protects=every Request and Response variant round-trips through encode/decode; fails_when=a
+// variant fails to encode, decode or changes; no_claim=that secrets can't enter a message (that is
+// a type guarantee: SecretBytes has no Serialize) or what goes over a socket (see the relay test)
+#[test]
+fn every_variant_round_trips() {
+    let name = KeyName::new("stripe/live").unwrap();
+    let meta = KeyMeta {
+        name: name.clone(),
+        mode: Mode::Swap,
+        tier: Tier::Production,
+        created_unix_ms: 1,
+    };
     let all_requests = [
         RequestBody::Status,
         RequestBody::PutKey {
@@ -353,24 +431,45 @@ async fn value_never_in_json() {
         },
         ResponseBody::error(ErrorCode::Internal, "x"),
     ];
-    let mut blobs = vec![put_json];
     for (i, b) in all_requests.iter().enumerate() {
         let bytes = encode(i as u64, b).unwrap();
-        assert_eq!(
-            decode::<RequestBody>(&bytes).unwrap().body,
-            *b,
-            "round trip"
-        );
-        blobs.push(bytes);
+        let env = decode::<RequestBody>(&bytes).unwrap();
+        assert_eq!((env.id, &env.body), (i as u64, b), "round trip");
     }
     for b in &all_responses {
-        blobs.push(encode(0, b).unwrap());
+        let bytes = encode(7, b).unwrap();
+        assert_eq!(&decode::<ResponseBody>(&bytes).unwrap().body, b);
     }
-    for blob in blobs {
-        let s = String::from_utf8(blob).unwrap();
-        assert!(!s.contains("CANARY"), "{s}");
-    }
-    r.shutdown().await;
+}
+
+// protects=bind never changes a directory it did not create: an existing group/other-accessible
+// directory is refused with a chmod hint and left exactly as it was; an existing private directory
+// is used as is; fails_when=the mode changes or bind succeeds in an open directory;
+// no_claim=directories owned by another user (needs a second uid)
+#[tokio::test]
+async fn bind_leaves_existing_directories_alone() {
+    let d = tmpdir();
+    let open = d.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = Server::bind(&open.join("msd.sock")).unwrap_err();
+    assert!(
+        matches!(err, Error::Socket(ref m) if m.contains("chmod 700")),
+        "{err}"
+    );
+    let mode = std::fs::metadata(&open).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755, "bind changed an existing directory");
+    assert!(!open.join("msd.sock").exists());
+
+    let private = d.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let s = Server::bind(&private.join("msd.sock")).unwrap();
+    assert_eq!(
+        std::fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    drop(s);
 }
 
 // protects=unimplemented requests answer not_implemented naming their loop; fails_when=a request

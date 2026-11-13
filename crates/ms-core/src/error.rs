@@ -51,6 +51,10 @@ pub enum Error {
     #[error("morsec: no key named {0}. List keys with: ms rules")]
     NoSuchKey(String),
 
+    /// The daemon socket can't be set up safely. The message already carries the fix.
+    #[error("morsec: {0}")]
+    Socket(String),
+
     /// The command or request is planned but not built yet.
     #[error("morsec: '{command}' is not built yet (planned in loop {loop_id}).")]
     NotImplemented {
