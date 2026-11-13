@@ -253,7 +253,10 @@ pub fn classify(catalog: &Catalog, entry: &Entry) -> Class {
             .as_ref()
             .and_then(|u| host_tier(&u.host))
             .or(tier_from_name);
-        let shown = url.map(|u| format!("{}://", u.scheme)).unwrap_or_default();
+        let shown = url
+            .filter(|u| shown_scheme(catalog, &u.scheme))
+            .map(|u| format!("{}://", u.scheme))
+            .unwrap_or_default();
         return Class::Secret(Secret {
             provider: None,
             tier_hint: tier,
@@ -261,6 +264,46 @@ pub fn classify(catalog: &Catalog, entry: &Entry) -> Class {
         });
     }
     Class::NotSecret
+}
+
+/// Well-known URL schemes that may be shown in the review table. Anything before `://` in an
+/// unknown value could be the secret itself, so only these (and the catalog's) are shown.
+const SHOWN_SCHEMES: &[&str] = &[
+    "http",
+    "https",
+    "redis",
+    "rediss",
+    "mongodb",
+    "mongodb+srv",
+    "amqp",
+    "amqps",
+    "ftp",
+    "sftp",
+    "ftps",
+    "smtp",
+    "smtps",
+    "ldap",
+    "ldaps",
+    "ssh",
+    "git",
+    "nats",
+    "mqtt",
+    "mqtts",
+    "sqlserver",
+    "mssql",
+    "jdbc",
+    "s3",
+    "gs",
+    "wss",
+    "ws",
+];
+
+fn shown_scheme(catalog: &Catalog, scheme: &str) -> bool {
+    SHOWN_SCHEMES.contains(&scheme)
+        || catalog
+            .providers
+            .iter()
+            .any(|p| p.url_schemes.iter().any(|s| s == scheme))
 }
 
 fn secret(p: &Provider, tier_hint: Option<Tier>, shown_prefix: String) -> Class {
@@ -428,6 +471,18 @@ mod tests {
             class_of(&format!("STRIPE_PUBLISHABLE_KEY=pk_live_{x40}")),
             Class::Public
         );
+    }
+
+    // protects=only known schemes are shown for unknown secrets; fails_when=text before '://'
+    // that is not a known scheme reaches the table; no_claim=provider rows (catalog prefixes)
+    #[test]
+    fn unknown_scheme_not_shown() {
+        let shown = |line: &str| match class_of(line) {
+            Class::Secret(s) => s.shown_prefix,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(shown("API_SECRET=Zq9Xw2Lk7Pm4Rt8Vb3Nc6Yh1Jg5Fd0Sa://x"), "");
+        assert_eq!(shown("REDIS_URL=redis://:pw@cache.example.com"), "redis://");
     }
 
     // protects=the URL helper finds scheme, host and passwords; fails_when=a password in

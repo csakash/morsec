@@ -18,8 +18,7 @@ use crate::dotenv::{self, Entry, MAX_ENV_FILE_BYTES};
 use crate::plan::Plan;
 use crate::{Error, KeyStore};
 
-/// A `.env` read into zeroizing memory and parsed.
-#[derive(Debug)]
+/// A `.env` read into zeroizing memory and parsed. `Debug` leaves out the file text.
 pub struct EnvFile {
     path: PathBuf,
     shown: String,
@@ -28,6 +27,16 @@ pub struct EnvFile {
     dev: u64,
     ino: u64,
     mode: u32,
+}
+
+impl std::fmt::Debug for EnvFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvFile")
+            .field("path", &self.path)
+            .field("src", &format_args!("[redacted; {} bytes]", self.src.len()))
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What [`commit`] did.
@@ -379,6 +388,16 @@ mod tests {
             }
             KeyStore::put(&self.inner, n, v, m)
         }
+    }
+
+    // protects=Debug of a read file shows no value; fails_when=the file text is printed
+    #[test]
+    fn envfile_debug_redacted() {
+        let (_d, p) = setup(&env_text(), 0o600);
+        let f = EnvFile::read(&p, ".env").unwrap();
+        let dbg = format!("{f:?} {f:#?}");
+        assert!(!dbg.contains("CANARY"), "{dbg}");
+        assert!(dbg.contains("redacted"), "{dbg}");
     }
 
     // protects=a store failure part-way leaves the file byte-identical and names stored keys;

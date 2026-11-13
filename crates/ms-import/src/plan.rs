@@ -334,6 +334,20 @@ pub fn plan(
         rows.push(row);
     }
 
+    // An unquoted value cut at ` #` may continue into the comment for some loaders; rewriting
+    // only the part before it could leave the rest of a secret in the file.
+    if let Some(r) = rows
+        .iter()
+        .find(|r| r.action.rewrites() && entries[r.entry].inline_comment)
+    {
+        return Err(Error::Usage(format!(
+            "{} (line {}): the unquoted value is followed by ' #...', which some loaders read as \
+             part of the value. Quote the value or move the comment to its own line, or skip it \
+             with --exclude {}",
+            r.var, r.line, r.var
+        )));
+    }
+
     // A kept row holding the same value as an imported secret would leave that secret in the
     // file under another name: it gets the same reference.
     for i in 0..rows.len() {
@@ -531,6 +545,26 @@ mod tests {
                 row("DB_PASSWORD", "import", "env/db-password"),
             ]
         );
+    }
+
+    // protects=a secret whose unquoted value is followed by ' #' is refused (part of it could
+    // stay behind), while a quoted one or a kept row with a comment is fine; fails_when=the
+    // import proceeds; no_claim=which loader reads the comment
+    #[test]
+    fn inline_comment_on_secret_refused() {
+        let e = plan_of("A_SECRET=abc #def\n", &[], &Options::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("A_SECRET (line 1)") && !e.contains("abc"), "{e}");
+        plan_of(
+            "A_SECRET=\"abc\" # ok\nPORT=3000 # ok\n",
+            &[],
+            &Options::default(),
+        )
+        .unwrap();
+        let mut o = Options::default();
+        o.exclude.insert("A_SECRET".into());
+        plan_of("A_SECRET=abc #def\n", &[], &o).unwrap();
     }
 
     // protects=slugs and suffixes always yield valid key names, even for long or odd variable

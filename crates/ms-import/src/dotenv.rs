@@ -3,17 +3,18 @@
 //! Grammar (one entry per logical line):
 //!
 //! ```text
-//! [spaces] [export <spaces>] NAME [spaces] = [spaces] VALUE [spaces] [# comment]
-//! NAME  = [A-Za-z_][A-Za-z0-9_.]*
+//! [spaces] [export <spaces>] NAME [spaces] ( = | : <space> ) [spaces] VALUE [spaces] [# comment]
+//! NAME  = [A-Za-z0-9_.-]+          (what Node's dotenv accepts, so no entry it reads is missed)
 //! VALUE = 'single, literal, may span lines'
 //!       | "double, \n \r \t \" \\ \$ decoded, may span lines"
 //!       | `backtick, literal, may span lines`
 //!       | unquoted, to end of line or to a '#' that follows a space or tab
 //! ```
 //!
-//! Everything that is not an entry (comments, blank lines, junk) is kept byte for byte. An
-//! unterminated quote or text after a closing quote is an error: the import stops rather than
-//! guess where a value ends.
+//! Comments, blank lines and `export NAME` lines are kept byte for byte. Any other line
+//! is an error, as are an unterminated quote and text after a closing quote: a line some loader
+//! might read as a secret must never be skipped silently and left in plaintext, so the import
+//! stops rather than guess.
 
 use std::fmt;
 use std::ops::Range;
@@ -62,6 +63,9 @@ pub struct Entry {
     pub quote: Quote,
     /// The value uses `${…}` or `$NAME` and is left alone.
     pub interpolated: bool,
+    /// An unquoted value was cut at ` #`. Some loaders (docker `env_file`) read the comment as
+    /// part of the value, so importing it could leave part of a secret behind.
+    pub inline_comment: bool,
     value: SecretBytes,
 }
 
@@ -80,6 +84,7 @@ impl fmt::Debug for Entry {
             .field("value_span", &self.value_span)
             .field("quote", &self.quote)
             .field("interpolated", &self.interpolated)
+            .field("inline_comment", &self.inline_comment)
             .field("value", &self.value)
             .finish()
     }
@@ -102,18 +107,27 @@ pub enum ParseError {
         /// Line of the closing quote.
         line: usize,
     },
+    /// A line that is neither a comment, blank, nor a `NAME=value` entry.
+    #[error(
+        "line {line} is not a NAME=value entry or a # comment, and a loader might still read it as one"
+    )]
+    NotAnEntry {
+        /// The line.
+        line: usize,
+    },
 }
 
 fn is_hspace(b: u8) -> bool {
     b == b' ' || b == b'\t'
 }
 
-fn is_name_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
+fn is_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
 }
 
-fn is_name_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
+/// Start of a shell variable name, for `$NAME` interpolation.
+fn is_var_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
 }
 
 /// Index of the `\n` ending the line that contains `i`, or `len`.
@@ -141,7 +155,7 @@ fn has_interpolation(raw: &[u8], escapes: bool) -> bool {
             b'\\' if escapes => i += 2,
             b'$' => {
                 if let Some(&n) = raw.get(i + 1)
-                    && (n == b'{' || is_name_start(n))
+                    && (n == b'{' || is_var_start(n))
                 {
                     return true;
                 }
@@ -195,6 +209,13 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
         while j < eol && is_hspace(b[j]) {
             j += 1;
         }
+        let line_content_end = content_end(b, i, eol);
+        // Blank lines and comments are kept.
+        if j >= line_content_end || b[j] == b'#' {
+            i = eol + 1;
+            continue;
+        }
+        let mut exported = false;
         // `export ` only counts when a name follows.
         if b[j..eol].starts_with(b"export") {
             let mut k = j + 6;
@@ -202,14 +223,17 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
                 while k < eol && is_hspace(b[k]) {
                     k += 1;
                 }
-                if k < eol && is_name_start(b[k]) {
+                if k < eol && is_name_char(b[k]) {
                     j = k;
+                    exported = true;
                 }
             }
         }
-        if j >= eol || !is_name_start(b[j]) {
-            i = eol + 1;
-            continue;
+        let not_an_entry = ParseError::NotAnEntry {
+            line: line_of(b, i),
+        };
+        if !is_name_char(b[j]) {
+            return Err(not_an_entry);
         }
         let name_start = j;
         while j < eol && is_name_char(b[j]) {
@@ -219,9 +243,20 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
         while j < eol && is_hspace(b[j]) {
             j += 1;
         }
-        if j >= eol || b[j] != b'=' {
+        // `export NAME` holds no value: keep it. A bare word on its own line could be a pasted
+        // token, so it is refused like any other unknown line.
+        if j >= line_content_end {
+            if !exported {
+                return Err(not_an_entry);
+            }
             i = eol + 1;
             continue;
+        }
+        match b[j] {
+            b'=' => {}
+            // `NAME: value` (YAML style, read by Node's dotenv) needs a space or the line end.
+            b':' if j + 1 >= line_content_end || is_hspace(b[j + 1]) => {}
+            _ => return Err(not_an_entry),
         }
         j += 1;
         let after_eq = j;
@@ -236,7 +271,7 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
             Some(b'`') if j < eol => Quote::Backtick,
             _ => Quote::None,
         };
-        let (span, value, interpolated, next) = match quote.char() {
+        let (span, value, interpolated, inline_comment, next) = match quote.char() {
             Some(q) => {
                 let q = q as u8;
                 let open = j;
@@ -275,7 +310,7 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
                 } else {
                     (Zeroizing::new(raw.to_vec()), false)
                 };
-                (open..close + 1, value, interpolated, close_eol + 1)
+                (open..close + 1, value, interpolated, false, close_eol + 1)
             }
             None => {
                 let end = content_end(b, i, eol);
@@ -304,6 +339,7 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
                     start..ve,
                     Zeroizing::new(raw.to_vec()),
                     has_interpolation(raw, false),
+                    !comment_at_start && stop < end,
                     eol + 1,
                 )
             }
@@ -315,6 +351,7 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
             value_span: span,
             quote,
             interpolated,
+            inline_comment,
             value: SecretBytes::new(std::mem::take(&mut *value)),
         });
         i = next;
@@ -393,7 +430,7 @@ mod tests {
                    J=${OTHER}/x\n\
                    K=\"$OTHER\"\n\
                    L='$OTHER'\n\
-                   not an entry\n\
+                   export BARE\n\
                    exportM=1\n\
                    export N=2\n\
                    dotted.name=3\n\
@@ -430,6 +467,52 @@ mod tests {
                 2, 3, 4, 5, 7, 8, 9, 10, 11, 13, 14, 15, 17, 18, 19, 20, 21, 22
             ]
         );
+    }
+
+    // protects=the forms Node's dotenv also reads (NAME: value, dashes, leading digits) are
+    // entries, and inline comments on unquoted values are flagged; fails_when=one is skipped
+    // (it would stay in plaintext) or a flag is wrong; no_claim=every loader's quirks
+    #[test]
+    fn loader_compatible_forms() {
+        let e =
+            parse("STRIPE_SECRET_KEY: sk_live_x\nopenai-api-key=sk\n1X=2\nY:\nP=abc #def\nQ=#x\n")
+                .unwrap();
+        let got: Vec<(&str, &[u8], bool)> = e
+            .iter()
+            .map(|e| (e.name.as_str(), e.value(), e.inline_comment))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("STRIPE_SECRET_KEY", &b"sk_live_x"[..], false),
+                ("openai-api-key", b"sk", false),
+                ("1X", b"2", false),
+                ("Y", b"", false),
+                ("P", b"abc", true),
+                ("Q", b"#x", false),
+            ]
+        );
+    }
+
+    // protects=a line that is not blank, a comment, a bare name or an entry stops the import with
+    // its line number and never its text; fails_when=it is skipped silently (a loader might read a
+    // secret from it) or the text is echoed; no_claim=which loader would have read it
+    #[test]
+    fn unknown_lines_refused() {
+        for (src, line) in [
+            ("A=1\nsk_live_CANARY_on_its_own\n", 2),
+            ("NAME\n", 1),
+            ("A=1\n\nKEY:sk_live_CANARY\n", 3),
+            ("KEY sk_live_CANARY\n", 1),
+            ("  \"QUOTED\"=x\n", 1),
+            ("https://x.example/CANARY\n", 1),
+        ] {
+            let e = parse(src).unwrap_err();
+            assert_eq!(e, ParseError::NotAnEntry { line }, "{src:?}");
+            assert!(!e.to_string().contains("CANARY"));
+        }
+        // Blank, comment-only and `export NAME` lines are fine.
+        assert!(parse("\n  \n\t# c\n#\nexport NAME\r\n").unwrap().is_empty());
     }
 
     // protects=an unclosed quote or junk after a closing quote stops the import with a line
@@ -491,6 +574,7 @@ mod tests {
             "[A-Z_][A-Z0-9_]{0,6}=[ -~]{0,20}",
             "export [A-Z_]{1,4}=\"[ -~\\n]{0,12}\"",
             "[A-Z]{1,3}='[^']{0,12}'",
+            "[a-z0-9-]{1,5}: [ -~]{0,12}",
             "# [ -~]{0,20}",
             "[ -~]{0,20}",
             "",
