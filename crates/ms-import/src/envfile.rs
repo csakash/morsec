@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use ms_core::{KeyMeta, KeyName, SecretBytes};
-use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::dotenv::{self, Entry, MAX_ENV_FILE_BYTES};
@@ -26,7 +25,6 @@ pub struct EnvFile {
     shown: String,
     src: Zeroizing<String>,
     entries: Vec<Entry>,
-    digest: [u8; 32],
     dev: u64,
     ino: u64,
     mode: u32,
@@ -98,15 +96,10 @@ fn snapshot(path: &Path, shown: &str) -> Result<Snapshot, Error> {
     })
 }
 
-fn digest(b: &[u8]) -> [u8; 32] {
-    Sha256::digest(b).into()
-}
-
 impl EnvFile {
     /// Reads and parses `path`. `shown` is how the path is printed in messages.
     pub fn read(path: &Path, shown: &str) -> Result<EnvFile, Error> {
         let mut snap = snapshot(path, shown)?;
-        let digest = digest(&snap.bytes);
         let bytes = std::mem::take(&mut *snap.bytes);
         let src = match String::from_utf8(bytes) {
             Ok(s) => Zeroizing::new(s),
@@ -124,7 +117,6 @@ impl EnvFile {
             shown: shown.to_owned(),
             src,
             entries,
-            digest,
             dev: snap.dev,
             ino: snap.ino,
             mode: snap.mode,
@@ -232,7 +224,7 @@ pub fn commit(
 
     // The file must be the one we read, unchanged, right before it is replaced.
     let now = snapshot(&file.path, &file.shown).map_err(|e| fail(e.to_string()))?;
-    if now.dev != file.dev || now.ino != file.ino || digest(&now.bytes) != file.digest {
+    if now.dev != file.dev || now.ino != file.ino || now.bytes.as_slice() != file.src.as_bytes() {
         return Err(fail(format!(
             "{} changed while importing. Run the import again",
             file.shown
