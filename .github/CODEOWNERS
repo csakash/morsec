@@ -1,0 +1,9 @@
+# Agent configuration and skills (ARI-42 SDLC-4): changes need the owner's review.
+/AGENTS.md          @csakash
+/CLAUDE.md          @csakash
+/REVIEW.md          @csakash
+/ARI42.md           @csakash
+/loops.json         @csakash
+/.claude/           @csakash
+/.agents/           @csakash
+/.github/           @csakash
