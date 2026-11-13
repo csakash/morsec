@@ -420,6 +420,9 @@ fn apply_refuses_a_file_changed_since_plan() {
         h.read(&h.settings()).as_deref(),
         Some("{\"concurrent\": true}")
     );
+    // Nothing else was written either (review R1): no state, no bundle, still not connected.
+    assert!(!h.home().join(".morsec").exists());
+    assert!(c.plan_remove().unwrap().is_none());
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -735,8 +738,8 @@ fn wrap_keeps_argv_and_restores() {
     );
 }
 
-// protects=--with-mcp with no ~/.claude.json creates one holding only the server, and
-// disconnect leaves an empty object; re-connect without --with-mcp removes the server;
+// protects=--with-mcp with no ~/.claude.json creates one holding only the server; re-connect
+// without --with-mcp removes the server, and disconnect removes the file it created (R4);
 // fails_when=the server lingers after it is no longer requested
 #[test]
 fn mcp_toggle() {
@@ -751,6 +754,7 @@ fn mcp_toggle() {
     assert!(!h.read(&h.claude_json()).unwrap().contains("\"ms\""));
     h.connector(Options::default()).remove().unwrap();
     assert!(!h.settings().exists());
+    assert!(!h.claude_json().exists());
 }
 
 // protects=the bundle holds system roots, the daemon's CA (from Status, not ca.pem) and only the
@@ -786,4 +790,144 @@ fn bundle_copies_only_certificates() {
 fn env_names_and_refs() {
     assert!(check_ref_env("GITHUB_TOKEN", "ms://github/ci").is_ok());
     assert!(check_ref_env("GITHUB_TOKEN", "ghp_xxx").is_err());
+}
+
+// protects=review R1: disconnect never rewrites a settings file that holds nothing of morsec's
+// (formatting kept byte for byte), and a disconnect refused part-way changes no file;
+// fails_when=an untouched file is re-rendered or one file is restored while another is refused
+#[test]
+fn disconnect_leaves_untouched_files_alone() {
+    let h = Home::new();
+    let opts = Options {
+        with_mcp: true,
+        ..Options::default()
+    };
+    connect(&h, opts);
+    // The user replaces the whole file with their own, in their own formatting.
+    std::fs::write(h.settings(), "{\"mine\":1}").unwrap();
+    let c = h.connector(opts);
+    let plan = c.plan_remove().unwrap().unwrap();
+    assert!(
+        plan.files.iter().all(|f| f.path != h.settings()),
+        "{:?}",
+        plan.files
+    );
+    // ~/.claude.json changes between plan and apply: nothing at all is written.
+    let cj = h.read(&h.claude_json()).unwrap();
+    std::fs::write(h.claude_json(), cj.replacen("{", "{\"numStartups\": 2,", 1)).unwrap();
+    // Make the plan touch settings too, so a partial write would show.
+    let mut plan2 = plan.clone();
+    plan2.files.push(ms_connect::claude::Restore {
+        path: h.settings(),
+        before: Some("{\"mine\":1}".into()),
+        after: Some("{}".into()),
+    });
+    plan2.files.rotate_right(1);
+    assert!(
+        c.apply_remove(&plan2)
+            .unwrap_err()
+            .to_string()
+            .contains("changed while")
+    );
+    assert_eq!(h.read(&h.settings()).as_deref(), Some("{\"mine\":1}"));
+    assert!(h.home().join(".morsec/connect/claude-code.json").exists());
+    c.remove().unwrap();
+    assert_eq!(h.read(&h.settings()).as_deref(), Some("{\"mine\":1}"));
+    assert!(!h.read(&h.claude_json()).unwrap().contains("\"ms\""));
+}
+
+// protects=review R3: an unreadable ~/.claude.json never blocks restoring settings.json; the
+// leftover MCP changes stay recorded so a later disconnect finishes the job; fails_when=the
+// sandbox settings stay because of ~/.claude.json, or the leftover record is lost
+#[test]
+fn bad_claude_json_does_not_block_disconnect() {
+    let h = Home::new();
+    h.load("typical");
+    let before = h.snapshot();
+    let opts = Options {
+        with_mcp: true,
+        ..Options::default()
+    };
+    connect(&h, opts);
+    let good = h.read(&h.claude_json()).unwrap();
+    // Claude Code wrote something morsec's parser refuses (a lone surrogate escape).
+    std::fs::write(
+        h.claude_json(),
+        good.replacen("{", "{\"x\": \"\\ud83d\",", 1),
+    )
+    .unwrap();
+    let c = h.connector(opts);
+    let plan = c.plan_remove().unwrap().unwrap();
+    assert!(plan.state_after.is_some());
+    assert!(
+        plan.notes.iter().any(|n| n.contains("by hand")),
+        "{:?}",
+        plan.notes
+    );
+    c.apply_remove(&plan).unwrap();
+    assert_eq!(
+        h.read(&h.settings()),
+        before.0,
+        "settings.json not restored"
+    );
+    assert!(h.home().join(".morsec/connect/claude-code.json").exists());
+    // Once the file is readable again, a second disconnect removes the server and the record.
+    std::fs::write(h.claude_json(), &good).unwrap();
+    c.remove().unwrap();
+    assert_eq!(h.read(&h.settings()), before.0);
+    // ~/.claude.json is restored structurally (SPEC D7): same content, Claude Code's format.
+    let parsed = |t: Option<String>| json::parse(&t.unwrap()).unwrap();
+    assert_eq!(parsed(h.read(&h.claude_json())), parsed(before.1.clone()));
+    assert!(!h.home().join(".morsec/connect/claude-code.json").exists());
+}
+
+// protects=review R5/R7: verify compares with what was written, not with this process's
+// environment; a re-run after --force keeps forcing; fails_when=verify reports false drift or
+// the re-run refuses
+#[test]
+fn verify_uses_record_and_forced_rerun() {
+    let h = Home::new();
+    let opts = Options {
+        with_mcp: true,
+        ..Options::default()
+    };
+    let mut c = h.connector(opts);
+    c.socket_env = Some("/tmp/dev.sock".into());
+    let p = c.try_plan(&h.cfg(&c)).unwrap();
+    c.apply(&p.diff).unwrap();
+    let later = h.connector(opts);
+    assert!(later.verify().iter().all(|k| k.ok), "{:?}", later.verify());
+    later.remove().unwrap();
+    assert!(!h.claude_json().exists());
+
+    let h = Home::new();
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    let mine = "{\"sandbox\": {\"network\": {\"httpProxyPort\": 8080}}}";
+    std::fs::write(h.settings(), mine).unwrap();
+    connect(
+        &h,
+        Options {
+            force: true,
+            ..Options::default()
+        },
+    );
+    let c = h.connector(Options::default());
+    let mut cfg = h.cfg(&c);
+    cfg.proxy_port = 4301;
+    let p = c.try_plan(&cfg).unwrap();
+    c.apply(&p.diff).unwrap();
+    assert!(h.read(&h.settings()).unwrap().contains("4301"));
+    c.remove().unwrap();
+    assert_eq!(h.read(&h.settings()).as_deref(), Some(mine));
+}
+
+// protects=review R6: an ms path containing '=' is refused for the MCP entry (env would read it
+// as an assignment); fails_when=such an entry is written
+#[test]
+fn ms_path_with_equals_is_refused() {
+    let h = Home::new();
+    let mut paths = Paths::for_home(h.home(), None);
+    paths.system_roots = golden_dir().join("roots.pem");
+    let c = ClaudeConnector::new(paths, "/opt/a=b/ms", SOCKET);
+    assert!(c.mcp_entry().unwrap_err().to_string().contains("'='"));
 }

@@ -266,8 +266,8 @@ fn connect_and_disconnect_end_to_end() {
     assert!(text.contains("not connected"), "{text}");
 }
 
-// protects=SPEC D10 / SDLC-4: an agent can't remove its own sandbox: `ms disconnect` and
-// `ms connect --force` refuse inside an agent session and change nothing; fails_when=either runs
+// protects=SPEC D10 / SDLC-4: an agent can't remove its own sandbox or change the user's own
+// settings: `ms disconnect`, `ms connect --force` and `--wrap` refuse inside an agent session and change nothing; fails_when=either runs
 // from inside an agent
 #[test]
 fn agent_cannot_disconnect_or_force() {
@@ -290,6 +290,19 @@ fn agent_cannot_disconnect_or_force() {
     ]));
     assert_eq!(code, 1);
     assert!(stderr.contains("--force"), "{stderr}");
+    let (code, _, stderr) = out(fx.cmd(&agent).args([
+        "connect",
+        "claude-code",
+        "--wrap",
+        "--yes",
+        "--rules",
+        rules.to_str().unwrap(),
+    ]));
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("--wrap") && stderr.contains("inside an agent"),
+        "{stderr}"
+    );
     assert_eq!(std::fs::read_to_string(fx.settings()).unwrap(), before);
 }
 
@@ -315,5 +328,5 @@ fn refusals() {
     let (code, _, _) = fx.ms(&["connect", "codex"]);
     assert_eq!(code, 69);
     let (code, _, _) = fx.ms(&["connect", "nope"]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 2);
 }

@@ -136,6 +136,9 @@ pub struct RemovePlan {
     pub files: Vec<Restore>,
     /// Notes (changes left in place because the user edited them).
     pub notes: Vec<String>,
+    /// What to leave in the state file: None removes it (and the bundle); Some keeps a record of
+    /// what could not be undone yet (an unreadable `~/.claude.json`), so a later disconnect can.
+    pub state_after: Option<String>,
 }
 
 /// Previous connect, from the state file.
@@ -149,6 +152,10 @@ struct State {
     claude_edits: Edits,
     proxy_port: u16,
     with_mcp: bool,
+    /// `--force` was used: a re-run keeps replacing the user's port or server (review R7).
+    forced: bool,
+    /// `~/.claude.json` did not exist before connect created it.
+    claude_created: bool,
 }
 
 /// A connector error. `ms-core`'s `Error` is frozen (PLAN §4) and has no general variant, so the
@@ -238,6 +245,23 @@ pub fn check_ref_env(name: &str, value: &str) -> std::result::Result<(), String>
             "the value for {name} must be a morsec reference like ms://stripe/test. Store the secret with ms add first; a value is never written into agent settings"
         )),
     }
+}
+
+/// The value morsec recorded appending at `p` (verify compares against what was written, not
+/// against what this process would write now: review R5).
+fn recorded_add(e: &Edits, p: &[&str]) -> Option<Value> {
+    e.changes.iter().find_map(|c| match c {
+        Change::Add { path: q, value } if *q == path(p) => Some(value.clone()),
+        _ => None,
+    })
+}
+
+/// The value morsec recorded setting at `p`.
+fn recorded_set(e: &Edits, p: &[&str]) -> Option<Value> {
+    e.changes.iter().find_map(|c| match c {
+        Change::Set { path: q, after, .. } if *q == path(p) => Some(after.clone()),
+        _ => None,
+    })
 }
 
 /// The certificate blocks of a PEM text.
@@ -432,14 +456,16 @@ impl ClaudeConnector {
             Some(Value::Number(n)) => n.parse().map_err(|_| bad("proxy_port"))?,
             _ => return Err(bad("proxy_port")),
         };
-        let with_mcp = matches!(v.get("with_mcp"), Some(Value::Bool(true)));
+        let flag = |k: &str| matches!(v.get(k), Some(Value::Bool(true)));
         Ok(Some(State {
             original,
             written,
             settings_edits,
             claude_edits,
             proxy_port,
-            with_mcp,
+            with_mcp: flag("with_mcp"),
+            forced: flag("forced"),
+            claude_created: flag("claude_created"),
         }))
     }
 
@@ -455,6 +481,8 @@ impl ClaudeConnector {
         v.set("agent", Value::str(ID));
         v.set("proxy_port", Value::int(i64::from(st.proxy_port)));
         v.set("with_mcp", Value::Bool(st.with_mcp));
+        v.set("forced", Value::Bool(st.forced));
+        v.set("claude_created", Value::Bool(st.claude_created));
         v.set("settings", s);
         v.set("claude_json", edit::edits_to_value(&st.claude_edits));
         json::print_doc(&v, "  ", true)
@@ -474,8 +502,14 @@ impl ClaudeConnector {
             )),
             Some(st) => {
                 let mut v = parse_doc(&self.paths.settings, cur)?;
+                let was = v.clone();
                 let notes = undo(&mut v, &st.settings_edits);
-                let text = cur.map(|c| render(&v, Some(c)));
+                // Keep the user's bytes when nothing of ours was there to undo (review R1).
+                let text = if v == was {
+                    cur.map(str::to_owned)
+                } else {
+                    cur.map(|c| render(&v, Some(c)))
+                };
                 Ok((v, text, notes))
             }
             None => Ok((
@@ -502,6 +536,15 @@ impl ClaudeConnector {
         }
         let prev = self.read_state()?;
         let mut warnings = Vec::new();
+        // A run after `--force` keeps forcing: the user already chose to replace their port.
+        let forced = self.opts.force || prev.as_ref().is_some_and(|p| p.forced);
+        let this = ClaudeConnector {
+            opts: Options {
+                force: forced,
+                ..self.opts
+            },
+            ..self.clone()
+        };
 
         // settings.json
         let cur = fsio::read_text(&self.paths.settings).map_err(err)?;
@@ -509,7 +552,7 @@ impl ClaudeConnector {
         warnings.extend(notes);
         let mut after = base.clone();
         let mut sedits = Edits::default();
-        let extra_ca = self.plan_settings(&mut after, cfg, &mut sedits, &mut warnings)?;
+        let extra_ca = this.plan_settings(&mut after, cfg, &mut sedits, &mut warnings)?;
         let settings_text = render(&after, original.as_deref().or(cur.as_deref()));
 
         // ~/.claude.json
@@ -524,7 +567,7 @@ impl ClaudeConnector {
             if let Some(pe) = prev_c {
                 warnings.extend(undo(&mut cv, pe));
             }
-            self.plan_claude_json(&mut cv, &mut cedits)?;
+            this.plan_claude_json(&mut cv, &mut cedits)?;
             let text = render(&cv, ccur.as_deref());
             if ccur.as_deref() != Some(text.as_str()) {
                 claude_change = Some(FileChange {
@@ -536,6 +579,8 @@ impl ClaudeConnector {
         }
 
         let bundle = self.bundle_text(&extra_ca, &mut warnings)?;
+        let claude_created = prev.as_ref().is_some_and(|p| p.claude_created)
+            || (ccur.is_none() && claude_change.is_some());
         let state = State {
             original,
             written: settings_text.clone(),
@@ -543,6 +588,8 @@ impl ClaudeConnector {
             claude_edits: cedits,
             proxy_port: cfg.proxy_port,
             with_mcp: self.opts.with_mcp,
+            forced,
+            claude_created,
         };
         let state_now = fsio::read_text(&self.paths.state).map_err(err)?;
         let bundle_now = fsio::read_capped(&self.paths.bundle, MAX_CLAUDE_JSON).map_err(err)?;
@@ -764,6 +811,13 @@ impl ClaudeConnector {
     /// The `ms mcp` server entry: a minimal explicit environment (SPEC D4, MCP-4).
     pub fn mcp_entry(&self) -> Result<Value> {
         let home = as_str_path(&self.paths.home)?;
+        // `env` takes any argument with '=' as an assignment, so such a path would not run ms.
+        if self.ms.contains('=') {
+            return Err(err(format!(
+                "the path of ms ({}) contains '=', which /usr/bin/env would misread; install ms elsewhere",
+                self.ms
+            )));
+        }
         let mut args = vec![
             Value::str("-i"),
             Value::str(format!("HOME={home}")),
@@ -888,14 +942,17 @@ impl ClaudeConnector {
     /// Writes a plan's changes. Each file must still hold the content the plan was computed
     /// from; otherwise nothing more is written.
     pub fn apply_changes(&self, diff: &ConfigDiff) -> Result<()> {
+        // Check every file before writing any, so a refusal leaves nothing half-applied (R1).
         for c in &diff.changes {
             let now = fsio::read_capped(&c.path, MAX_CLAUDE_JSON).map_err(err)?;
             if now != c.before {
                 return Err(err(format!(
-                    "{} changed while ms connect was running. Run it again",
+                    "{} changed while ms connect was running. Nothing was changed; run it again",
                     c.path.display()
                 )));
             }
+        }
+        for c in &diff.changes {
             let mode = if c.path == self.paths.bundle {
                 0o644
             } else {
@@ -907,31 +964,39 @@ impl ClaudeConnector {
     }
 
     /// Computes a disconnect without writing anything. `Ok(None)`: not connected.
+    ///
+    /// `settings.json` is always restored, even when `~/.claude.json` can't be read (review R3):
+    /// then the state file is kept, holding only what is left to undo there.
     pub fn plan_remove(&self) -> Result<Option<RemovePlan>> {
         let Some(st) = self.read_state()? else {
             return Ok(None);
         };
         let mut plan = RemovePlan::default();
         let cur = fsio::read_text(&self.paths.settings).map_err(err)?;
-        if cur.as_deref() == Some(st.written.as_str()) {
-            plan.files.push(Restore {
-                path: self.paths.settings.clone(),
-                before: cur,
-                after: st.original.clone(),
-            });
+        if !st.written.is_empty() && cur.as_deref() == Some(st.written.as_str()) {
+            if cur != st.original {
+                plan.files.push(Restore {
+                    path: self.paths.settings.clone(),
+                    before: cur.clone(),
+                    after: st.original.clone(),
+                });
+            }
         } else if let Some(c) = cur.as_deref() {
             let mut v = parse_doc(&self.paths.settings, Some(c))?;
-            plan.notes.extend(undo(&mut v, &st.settings_edits));
-            plan.notes.push(format!(
-                "{} was edited after ms connect, so morsec removed only its own changes and kept yours",
-                self.paths.settings.display()
-            ));
-            let after = if st.original.is_none() && v.is_empty_container() {
-                None
-            } else {
-                Some(render(&v, Some(c)))
-            };
-            if after.as_deref() != Some(c) {
+            let was = v.clone();
+            let notes = undo(&mut v, &st.settings_edits);
+            // Rewrite only when something of ours was there to undo (review R1).
+            if v != was {
+                plan.notes.extend(notes);
+                plan.notes.push(format!(
+                    "{} was edited after ms connect, so morsec removed only its own changes and kept yours",
+                    self.paths.settings.display()
+                ));
+                let after = if st.original.is_none() && v.is_empty_container() {
+                    None
+                } else {
+                    Some(render(&v, Some(c)))
+                };
                 plan.files.push(Restore {
                     path: self.paths.settings.clone(),
                     before: cur.clone(),
@@ -939,41 +1004,82 @@ impl ClaudeConnector {
                 });
             }
         }
-        if !st.claude_edits.is_empty() {
-            let ccur = fsio::read_capped(&self.paths.claude_json, MAX_CLAUDE_JSON).map_err(err)?;
-            if let Some(c) = ccur.as_deref() {
-                let mut v = parse_doc(&self.paths.claude_json, Some(c))?;
-                plan.notes.extend(undo(&mut v, &st.claude_edits));
-                let after = render(&v, Some(c));
-                if after != c {
+        if !st.claude_edits.is_empty() || st.claude_created {
+            let undone = fsio::read_capped(&self.paths.claude_json, MAX_CLAUDE_JSON)
+                .map_err(err)
+                .and_then(|ccur| {
+                    let Some(c) = ccur.as_deref() else {
+                        return Ok(None);
+                    };
+                    let mut v = parse_doc(&self.paths.claude_json, Some(c))?;
+                    let was = v.clone();
+                    let notes = undo(&mut v, &st.claude_edits);
+                    let drop_file = st.claude_created && v.is_empty_container();
+                    if v == was && !drop_file {
+                        return Ok(None);
+                    }
+                    let after = if drop_file {
+                        None
+                    } else {
+                        Some(render(&v, Some(c)))
+                    };
+                    Ok(Some((ccur.clone(), after, notes)))
+                });
+            match undone {
+                Ok(Some((before, after, notes))) => {
+                    plan.notes.extend(notes);
                     plan.files.push(Restore {
                         path: self.paths.claude_json.clone(),
-                        before: ccur.clone(),
-                        after: Some(after),
+                        before,
+                        after,
                     });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    plan.notes.push(format!(
+                        "{e}. Your settings are restored, but the MCP changes in {} are still there; fix the file and run ms disconnect claude-code again, or remove the \"ms\" server and the `ms run --` wrapping by hand",
+                        self.paths.claude_json.display()
+                    ));
+                    let rest = State {
+                        original: None,
+                        written: String::new(),
+                        settings_edits: Edits::default(),
+                        ..st.clone()
+                    };
+                    // `written` empty never matches a settings file, and with no recorded
+                    // settings changes the next disconnect leaves settings.json alone.
+                    plan.state_after = Some(self.state_text(&rest));
                 }
             }
         }
         Ok(Some(plan))
     }
 
-    /// Writes a disconnect, then removes the bundle and the state file.
+    /// Writes a disconnect, then removes the bundle and the state file (or keeps what is left).
     pub fn apply_remove(&self, plan: &RemovePlan) -> Result<()> {
+        // Check every file before writing any (review R1).
         for f in &plan.files {
             let now = fsio::read_capped(&f.path, MAX_CLAUDE_JSON).map_err(err)?;
             if now != f.before {
                 return Err(err(format!(
-                    "{} changed while ms disconnect was running. Run it again",
+                    "{} changed while ms disconnect was running. Nothing was changed; run it again",
                     f.path.display()
                 )));
             }
+        }
+        for f in &plan.files {
             match &f.after {
                 Some(t) => fsio::atomic_write(&f.path, t, 0o600).map_err(err)?,
                 None => fsio::remove(&f.path).map_err(err)?,
             }
         }
-        fsio::remove(&self.paths.bundle).map_err(err)?;
-        fsio::remove(&self.paths.state).map_err(err)?;
+        match &plan.state_after {
+            Some(t) => fsio::atomic_write(&self.paths.state, t, 0o600).map_err(err)?,
+            None => {
+                fsio::remove(&self.paths.bundle).map_err(err)?;
+                fsio::remove(&self.paths.state).map_err(err)?;
+            }
+        }
         Ok(())
     }
 
@@ -1033,7 +1139,12 @@ impl ClaudeConnector {
             "Claude Code puts the shims on PATH",
             v.at(&path(&["hooks", "SessionStart"]))
                 .and_then(Value::as_array)
-                .is_some_and(|a| a.contains(&self.session_hook())),
+                .is_some_and(|a| {
+                    a.contains(
+                        &recorded_add(&st.settings_edits, &["hooks", "SessionStart"])
+                            .unwrap_or_else(|| self.session_hook()),
+                    )
+                }),
             "the SessionStart hook is missing",
         );
         if st.with_mcp {
@@ -1041,7 +1152,13 @@ impl ClaudeConnector {
             let cv = parse_doc(&self.paths.claude_json, c.as_deref())?;
             check(
                 "Claude Code has the ms MCP server",
-                cv.at(&path(&["mcpServers", "ms"])) == Some(&self.mcp_entry()?),
+                cv.at(&path(&["mcpServers", "ms"]))
+                    == Some(
+                        &match recorded_set(&st.claude_edits, &["mcpServers", "ms"]) {
+                            Some(v) => v,
+                            None => self.mcp_entry()?,
+                        },
+                    ),
                 "mcpServers.ms is missing or changed in ~/.claude.json",
             );
         }

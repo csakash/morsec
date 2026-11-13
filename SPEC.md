@@ -202,3 +202,16 @@ hook is present; `mcpServers.ms` present when it was requested. Each failing che
 
 msd's tunnel allowlist (D2); `ms run` and `ms mcp` themselves (L12, L14); Codex/Cursor/Gemini
 (L13, L22); managed (root-owned) settings; Windows; the desktop app's "saved local environment".
+
+## Amendments made during the build (from the fresh-context review)
+
+- **A1 (R2, tightens D10):** `--wrap` is refused inside an agent session too, like `--force`
+  (while `ms run` is a stub, wrapping makes a blocking hook stop blocking), and prints a warning
+  when used. The hidden `--rules FILE` test option exists only in debug builds; a release `ms`
+  takes hosts only from msd's MAC-verified rules.
+- **A2 (R1, R3, R4):** connect and disconnect check every file before writing any. Disconnect
+  never rewrites a settings file that holds nothing of morsec's, always restores
+  `settings.json` even when `~/.claude.json` can't be read (the state file then keeps only what
+  is left to undo there), and removes a `~/.claude.json` that connect created.
+- **A3 (R5, R7, R8):** `verify()` compares with the values recorded at connect; a re-run after
+  `--force` keeps forcing; an unknown agent is a usage error (exit 2).

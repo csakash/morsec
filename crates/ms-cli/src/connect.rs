@@ -41,7 +41,9 @@ pub struct ConnectArgs {
     /// Replace a sandbox proxy port or an "ms" MCP server you set yourself.
     #[arg(long)]
     force: bool,
-    /// Read rules from this file instead of msd (tests; the MAC is not checked).
+    /// Read rules from this file instead of msd (tests; the MAC is not checked). Debug builds
+    /// only: a release `ms` takes the hosts only from msd's MAC-verified rules (review R2).
+    #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
     rules: Option<PathBuf>,
     /// Used by the Claude Code SessionStart hook: put the shims first on PATH.
@@ -81,11 +83,20 @@ fn agent_id(name: &str) -> Result<&'static str, ExitCode> {
         "claude-code" | "claude" => Ok(ms_connect::claude::ID),
         "codex" => Err(not_built("codex", "L13 connect-codex")),
         "cursor" | "gemini" => Err(not_built(name, "L22 connect-cursor-gemini")),
-        other => Err(fail(&format!(
-            "morsec: unknown agent \"{other}\". Agents: claude-code, codex, cursor, gemini"
-        ))),
+        other => {
+            eprintln!(
+                "{}",
+                terminal_safe(&format!(
+                    "morsec: unknown agent \"{other}\". Agents: claude-code, codex, cursor, gemini"
+                ))
+            );
+            Err(ExitCode::from(EXIT_USAGE))
+        }
     }
 }
+
+/// Usage error, as clap reports one.
+const EXIT_USAGE: u8 = 2;
 
 fn not_built(agent: &str, loop_id: &'static str) -> ExitCode {
     eprintln!(
@@ -320,12 +331,21 @@ pub(crate) fn connect(a: &ConnectArgs) -> ExitCode {
     if a.session_env {
         return session_env(&c);
     }
-    if a.force
+    // Options that can loosen what the user set up are for the user, not an agent (SPEC D10).
+    // --force replaces the user's own proxy or server; --wrap changes how every hook runs, and
+    // while `ms run` is a stub a blocking hook would stop blocking (review R2).
+    if (a.force || a.wrap)
         && let Some(who) = inside_agent()
     {
+        let flag = if a.force { "--force" } else { "--wrap" };
         return fail(&format!(
-            "morsec: --force replaces settings you made yourself, so it can't run inside an agent session ({who}). Run it from your own terminal"
+            "morsec: {flag} changes settings you made yourself, so it can't run inside an agent session ({who}). Run it from your own terminal"
         ));
+    }
+    if a.wrap {
+        eprintln!(
+            "warning: --wrap runs your hooks and MCP servers through `ms run`, which is not built yet (L12): until it is, they fail, and a hook that blocks a tool stops blocking. Undo with: ms disconnect claude-code"
+        );
     }
     let mut env = match c.ca_env() {
         Ok(e) => e,
@@ -360,7 +380,11 @@ pub(crate) fn connect(a: &ConnectArgs) -> ExitCode {
         Err(e) => return fail(&e),
     };
     c.ca_pem = ca_pem;
-    let hosts = match rule_hosts(a.rules.as_deref()) {
+    #[cfg(debug_assertions)]
+    let rules_file = a.rules.as_deref();
+    #[cfg(not(debug_assertions))]
+    let rules_file: Option<&Path> = None;
+    let hosts = match rule_hosts(rules_file) {
         Ok(h) => h,
         Err(e) => return fail(&e),
     };
