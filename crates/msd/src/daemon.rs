@@ -494,6 +494,21 @@ impl Daemon {
             } => self.propose(&session, unattributed, &key, rule.as_deref(), at_terminal),
             RequestBody::Stop => self.stop(&session),
             RequestBody::Start { at_terminal } => self.start(&session, unattributed, at_terminal),
+            // A scan answers "is this value in a file I can write?": an oracle for short values,
+            // so only the user's own terminal may ask (L09 SPEC D-3).
+            RequestBody::Scan if in_agent => reply_err(
+                ErrorCode::Denied,
+                "morsec: ms scan can't run inside an agent session. Run it from your own terminal",
+            ),
+            RequestBody::Scan => match self.list_keys() {
+                Ok(keys) => crate::scan::scan(
+                    &*self.vault,
+                    keys.into_iter().map(|m| m.name).collect(),
+                    &crate::scan::roots(),
+                    crate::scan::SCAN_BUDGET,
+                ),
+                Err(e) => reply_err(ErrorCode::Internal, e.to_string()),
+            },
             other => reply_err(
                 ErrorCode::NotImplemented,
                 format!(
@@ -1455,6 +1470,21 @@ mod tests {
             ResponseBody::Status { .. }
         ));
         assert!(is_ok(&h.as_(terminal()).put("x/y", Tier::Test)));
+    }
+
+    // protects=L09 SPEC D-3: ms scan (a guessing oracle for short values) is refused inside an
+    // agent session and for an unidentified caller; fails_when=either gets a scan report;
+    // no_claim=the terminal path (scan.rs tests and tests/e2e run it; here it would read the
+    // real home directory)
+    #[test]
+    fn scan_refused_inside_agent() {
+        let h = fresh();
+        assert!(is_ok(&h.put("stripe/test", Tier::Test)));
+        let r = h.as_(agent()).req(RequestBody::Scan);
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        assert!(msg(&r).contains("your own terminal"), "{r:?}");
+        *lock(&h.who) = None;
+        assert_eq!(code(&h.req(RequestBody::Scan)), Some(ErrorCode::Denied));
     }
 
     // protects=R1: a caller that can't be identified (the connecting process exited and a child

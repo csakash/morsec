@@ -94,6 +94,9 @@ pub enum RequestBody {
     },
     /// `ms doctor --probe` report from inside an agent.
     DoctorProbe,
+    /// Search the agent transcripts msd knows about for vault values (`ms scan`, L09). No
+    /// fields: msd picks the directories itself, so a client can't point it at a file.
+    Scan,
 }
 
 impl RequestBody {
@@ -119,6 +122,7 @@ impl RequestBody {
             RequestBody::Stop | RequestBody::Start { .. } => "L07 daemon",
             RequestBody::LogQuery { .. } => "L02 receipts",
             RequestBody::DoctorProbe => "L17 doctor",
+            RequestBody::Scan => "L09 e2e-canary",
         }
     }
 }
@@ -147,6 +151,21 @@ pub enum ErrorCode {
     NotInitialized,
     /// The request was well formed but its content is not acceptable (L07).
     Invalid,
+}
+
+/// Where a vault value was found (`ScanReport`, L09). Location and key name only: there is no
+/// field that could carry the value or the text around it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanFinding {
+    /// The transcript file (lossy UTF-8).
+    pub file: String,
+    /// 1-based line number.
+    pub line: u64,
+    /// The key whose value was found.
+    pub key: KeyName,
+    /// How it appeared: `raw`, `json-escaped`, `url-encoded`, `hex`, `base64`, `base64url`.
+    pub encoding: String,
 }
 
 /// Responses from the daemon. No variant can hold a secret value.
@@ -203,6 +222,25 @@ pub enum ResponseBody {
         /// Notes from the project merge and integrity state, for display.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         notes: Vec<String>,
+    },
+    /// The result of a transcript scan (`Scan`, L09).
+    ScanReport {
+        /// Every place a value was found, sorted by file and line.
+        findings: Vec<ScanFinding>,
+        /// Transcript files read.
+        files_scanned: u64,
+        /// Bytes read.
+        bytes_scanned: u64,
+        /// Keys searched for.
+        keys_checked: u32,
+        /// Keys not searched for because their values are too short to match reliably.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped_keys: Vec<KeyName>,
+        /// The directories searched, and anything else worth showing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notes: Vec<String>,
+        /// False when the scan stopped early (time budget, file cap, unreadable files).
+        complete: bool,
     },
     /// An error; `message` is shown to people as is.
     Error {

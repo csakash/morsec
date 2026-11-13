@@ -755,6 +755,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-e2e"
+version = "0.0.0"
+
+[[package]]
 name = "ms-import"
 version = "0.0.0"
 dependencies = [
@@ -865,6 +869,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-scan"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "libc",
+ "memchr",
+ "proptest",
+ "serde_json",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "ms-session"
 version = "0.0.0"
 dependencies = [
@@ -905,6 +923,7 @@ dependencies = [
  "ms-proxy",
  "ms-receipts",
  "ms-rules",
+ "ms-scan",
  "ms-session",
  "ms-vault",
  "serde",

@@ -1,0 +1,23 @@
+[package]
+name = "ms-scan"
+description = "Finds secret values, in raw and encoded forms, in agent transcripts. Runs inside msd for ms scan (L09)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+memchr = "2"
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

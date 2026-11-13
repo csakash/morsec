@@ -24,6 +24,7 @@ ms-proxy = { workspace = true }
 ms-session = { workspace = true }
 ms-approve = { workspace = true }
 ms-import = { workspace = true }
+ms-scan = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
