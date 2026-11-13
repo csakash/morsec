@@ -526,6 +526,8 @@ impl Daemon {
             Ok(k) => k,
             Err(e) => return reply_err(ErrorCode::Internal, e.to_string()),
         };
+        // A stop during the scan withholds the report even if morsec was resumed since (review F2).
+        let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
         let report = crate::scan::scan(
             &*self.vault,
             keys.iter().map(|m| m.name.clone()).collect(),
@@ -562,7 +564,7 @@ impl Daemon {
         }
         // `ms stop` during the scan: the report is not delivered (security re-check N-B). The
         // receipts above still record that the values were read.
-        if self.is_stopped() {
+        if self.is_stopped() || self.stops.load(std::sync::atomic::Ordering::SeqCst) != stops_seen {
             return reply_err(
                 ErrorCode::Denied,
                 "morsec: morsec was stopped (ms stop) during the scan, so its result is withheld",

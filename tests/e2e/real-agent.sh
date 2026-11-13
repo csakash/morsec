@@ -97,8 +97,8 @@ for a in "${agents[@]}"; do
   if [ -n "${CODEX_HOME:-}" ]; then agent_env+=(CODEX_HOME="$CODEX_HOME"); fi
   mkdir -p "$work/tmp"
   case "$a" in
-    claude) root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" ;;
-    codex)  root="${CODEX_HOME:-$HOME/.codex}/sessions" ;;
+    claude) troot="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" ;;
+    codex)  troot="${CODEX_HOME:-$HOME/.codex}/sessions" ;;
   esac
   arc=0
   case "$a" in
@@ -113,8 +113,8 @@ for a in "${agents[@]}"; do
     echo "real-agent: INCONCLUSIVE: $a exited $arc (is it logged in?); see $a's output:" >&2
     tail -5 "$out" >&2 || true
     fail=1
-  elif [ -z "$(find "$root" -newer "$started" -type f -name '*.jsonl' 2>/dev/null | head -1)" ]; then
-    echo "real-agent: INCONCLUSIVE: $a left no new transcript under $root" >&2
+  elif [ -z "$(find -H "$troot" -newer "$started" -type f -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+    echo "real-agent: INCONCLUSIVE: $a left no new transcript under $troot" >&2
     fail=1
   fi
   for v in "$stripe" "$db" "$gh"; do
