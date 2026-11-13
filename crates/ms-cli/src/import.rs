@@ -271,7 +271,7 @@ pub(crate) fn run(a: &ImportArgs) -> ExitCode {
             eprintln!(
                 "note: could not read the vault's keys ({}); key names may change when \
                  they are stored",
-                terminal_safe(&e.to_string())
+                terminal_safe(e.to_string().trim_start_matches("morsec: "))
             );
             Vec::new()
         }
