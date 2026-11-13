@@ -137,7 +137,9 @@ notarize() { # notarize <dir with bin/> <work> <out dir>: the notarytool record 
   for f in "$1"/bin/*; do
     # `--type execute` is for app bundles and rejects a bare tool; `install` assesses its signature
     # and notarization ("source=Notarized Developer ID").
-    spctl --assess --type install --verbose=4 "$f" || die "$f: spctl rejects it"
+    local verdict
+    verdict="$(spctl --assess --type install --verbose=4 "$f" 2>&1)" || die "$f: spctl rejects it: $verdict"
+    grep -q 'source=Notarized Developer ID' <<<"$verdict" || die "$f: spctl does not report it as notarized: $verdict"
   done
 }
 
@@ -164,12 +166,13 @@ build_release() {
 
   say "building morsec $version for $TARGET (SOURCE_DATE_EPOCH=$epoch)"
   mkdir -p "$work/tmp"
-  local sep=$'\x1f'
+  local sep=$'\x1f' devdir
+  devdir="$(xcode-select -p)" || die "no Xcode developer directory selected (xcode-select -p)"
   # The build sees only this environment (env -i): no inherited RUSTFLAGS, wrappers, RUSTC,
   # linker, CC or CFLAGS overrides, and no RUSTUP_TOOLCHAIN (rust-toolchain.toml decides).
   local -a benv=(
     env -i "PATH=$PATH" "HOME=$HOME" "TMPDIR=$work/tmp" "CARGO_HOME=$cargo_home"
-    "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "DEVELOPER_DIR=$(xcode-select -p)"
+    "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "DEVELOPER_DIR=$devdir"
     "SOURCE_DATE_EPOCH=$epoch" CARGO_INCREMENTAL=0 ZERO_AR_DATE=1
     "MACOSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET" "CARGO_TARGET_DIR=$work/target"
     # No host path in the binaries: rustc paths, C paths (ring), and the linker's debug-map
@@ -212,8 +215,8 @@ build_release() {
   local rustc_v cargo_v sdk_v clang_v
   rustc_v="$(cd "$src" && "${benv[@]}" rustc --version)"
   cargo_v="$(cd "$src" && "${benv[@]}" cargo --version)"
-  sdk_v="$(xcrun --show-sdk-version)"
-  clang_v="$(clang --version | head -1)"
+  sdk_v="$("${benv[@]}" xcrun --show-sdk-version)"
+  clang_v="$("${benv[@]}" clang --version | head -1)"
   local -a hashes=()
   local u c
   for b in ms msd; do
