@@ -107,7 +107,7 @@ impl Command {
 }
 
 /// The name this binary was invoked as: `ms` or `mors` (or whatever the symlink is called).
-fn invoked_name() -> String {
+pub(crate) fn invoked_name() -> String {
     std::env::args_os()
         .next()
         .as_deref()

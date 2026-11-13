@@ -91,7 +91,7 @@ fn not_built(agent: &str, loop_id: &'static str) -> ExitCode {
     eprintln!(
         "{}",
         Error::NotImplemented {
-            command: format!("ms connect {agent}"),
+            command: format!("{} connect {agent}", crate::invoked_name()),
             loop_id
         }
     );
