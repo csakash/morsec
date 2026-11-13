@@ -320,8 +320,12 @@ impl KeychainVault {
         };
         for key in find_private_keys(kc, label)? {
             let k = CaKey { key };
-            if k.public_hash_locked().is_some_and(|h| h == want.expose())
+            // The pin binds the label too, so one pin can't stand in for the other; and a probe
+            // signature verified against the public key we hashed proves the private key found is
+            // really its pair.
+            if k.pin_hash_locked(label).is_some_and(|h| h == want.expose())
                 && k.is_non_extractable_locked()
+                && k.proves_pair_locked()
             {
                 return Ok(k);
             }
@@ -338,7 +342,7 @@ impl KeychainVault {
     fn reset_pinned_key(&self, kc: &SecKeychain, label: &str, pin: &str) -> Result<CaKey> {
         delete_keys_locked(kc, label)?;
         let key = generate_key(kc, label)?;
-        let hash = key.public_hash_locked().ok_or_else(|| {
+        let hash = key.pin_hash_locked(label).ok_or_else(|| {
             Error::io(
                 "pinning a new signing key",
                 std::io::Error::other("the keychain returned no public key. Run: ms doctor"),
@@ -637,6 +641,10 @@ fn login_keychain() -> Result<SecKeychain> {
     let home = ffi::home_dir_from_passwd().ok_or_else(|| {
         fail("no home directory in the user database. Run msd as a logged-in user")
     })?;
+    // The home directory itself may sit under a system symlink (/var -> /private/var); what must
+    // not be a symlink is anything from the home directory down to the keychain file.
+    let home = std::fs::canonicalize(&home)
+        .map_err(|_| fail("the home directory in the user database does not exist"))?;
     let path = home.join("Library/Keychains/login.keychain-db");
     match std::fs::canonicalize(&path) {
         Ok(real) if real == path => {}
@@ -758,6 +766,8 @@ impl Vault for KeychainVault {
             Err(e) if e.code() == ERR_NOT_FOUND => return Ok(Vec::new()),
             Err(e) => return Err(keychain_error("listing keys", "", e)),
         };
+        // A missing or replaced seal key is an error ("run ms init"), not an empty list.
+        self.seal_key_locked(&kc)?;
         let mut out: Vec<KeyMeta> = items
             .iter()
             .filter(|item| matches!(item, SearchResult::Dict(_)))
@@ -767,9 +777,21 @@ impl Vault for KeychainVault {
                 if reserved(&name) {
                     return None;
                 }
-                self.read_locked(&kc, &name).ok().map(|o| o.meta.clone())
+                Some(self.read_locked(&kc, &name).map(|o| o.meta.clone()))
             })
-            .collect();
+            .filter_map(|r| match r {
+                Ok(meta) => Some(Ok(meta)),
+                // Skip items that fail their seal or vanished mid-list; a bad item can't hide the
+                // rest. Anything else (locked keychain, missing seal key) is an error, not "no keys".
+                Err(Error::NoSuchKey(_)) => None,
+                Err(Error::Io { ref source, .. })
+                    if source.kind() == std::io::ErrorKind::InvalidData =>
+                {
+                    None
+                }
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<_>>()?;
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
@@ -823,11 +845,25 @@ impl CaKey {
             })
     }
 
-    /// SHA-256 of the public key (SEC1), used to pin the key.
-    fn public_hash_locked(&self) -> Option<[u8; 32]> {
+    /// The pin: SHA-256 over a domain tag, the key's label and its public key (SEC1).
+    fn pin_hash_locked(&self, label: &str) -> Option<[u8; 32]> {
         use sha2::{Digest, Sha256};
         let pubkey = self.key.public_key()?.external_representation()?;
-        Some(Sha256::digest(pubkey.bytes()).into())
+        let mut h = Sha256::new();
+        h.update(b"morsec-pin-v1\0");
+        h.update((label.len() as u64).to_be_bytes());
+        h.update(label.as_bytes());
+        h.update(pubkey.bytes());
+        Some(h.finalize().into())
+    }
+
+    /// Signs a probe and verifies it with the public key: true only when this binary may sign
+    /// with the key and the private key is the pair of the public key we pinned.
+    fn proves_pair_locked(&self) -> bool {
+        // A fixed digest is fine: only that the signature verifies matters.
+        let digest = [0x5a_u8; 32];
+        self.sign_digest_locked(&digest)
+            .is_ok_and(|sig| self.verify_digest_locked(&digest, &sig))
     }
 
     fn verify_digest_locked(&self, digest: &[u8; 32], sig: &[u8]) -> bool {

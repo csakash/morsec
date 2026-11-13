@@ -64,7 +64,7 @@ Conclusions:
 | 1 fmt | clean |
 | 2 build | 0 warnings |
 | 3 clippy `-D warnings` | 0 warnings |
-| 4 tests | all pass; `ms-vault`: 17 passed, 3 ignored (child processes and `core_dump_scan`) |
+| 4 tests | all pass; `ms-vault`: 18 passed, 3 ignored (child processes and `core_dump_scan`) |
 | 5 cargo-deny | advisories, bans, licenses and sources ok (new: `security-framework` 3.7.0, `security-framework-sys` 2.17.0, `core-foundation` 0.10, all MIT/Apache-2.0) |
 | 6 cargo-audit | 0 vulnerabilities |
 | 7 supply chain | no patches or overrides |
@@ -87,7 +87,7 @@ cc.morsec.test` returns 0. Raw outputs are kept outside the repo in
 | 6 memory | `Debug`, error and `list` canary checks in `round_trip` and `run_child` (asserts the child never prints the value). `core_dump_scan` **not run**: `/cores` is `root:wheel 0755` on this Mac. To run it: `sudo chmod 1777 /cores`, then `cargo test -p ms-vault core_dump_scan -- --ignored`. Expected residual: Security.framework's own `CFData` copies |
 | 7 user presence | not applicable on this backend (S4); open item |
 | 8 gate | above |
-| 9 tampering | `acl_other_binary_is_denied` (direct updates), `planted_items_are_replaced`, `seal_failures_fail_closed`, `ca_rejects_planted_keys`, `home_env_is_ignored` |
+| 9 tampering | `acl_other_binary_is_denied` (direct updates), `pin_overwrite_fails_closed`, `planted_items_are_replaced`, `seal_failures_fail_closed`, `ca_rejects_planted_keys`, `home_env_is_ignored` |
 
 ## Review record
 
@@ -97,7 +97,9 @@ Fresh-context reviewers, read-only, three rounds.
 |---|---|---|---|
 | 1 | 6 (2 medium, 4 low) | 9 (1 critical, 2 high, 2 medium, 4 low) | `f85a30c`: pin the login keychain; add-only writes; seal; planted-key checks; `reset_*`; list skips bad items; `unsafe fn constant`; unbuffered stdin; cleanup guards |
 | 2 | 4 (1 high, 1 medium, 2 low) | 6 (2 high, 2 medium, 2 low) | next commit: pin signing keys by public-key hash; create them only at init; `list()` from sealed metadata; verify before parse; keep the real add error; home directory from `getpwuid_r` with no symlinks |
-| 3 | see below | see below | |
+| 3 | 2 low | 3 low; security review states it has converged | next commit: `list()` errors on a missing seal key and skips only items that fail their own seal; the home directory is canonicalized before the symlink check; pins are domain-separated by label; a probe signature is verified against the pinned key; new `pin_overwrite_fails_closed` test |
+
+Round 3 found no critical, high or medium issues; both reviews have converged. Note carried to L07: msd's resolver must refuse `ms://morsec/...` references from agents (`with_secret` serves the reserved names so L02/L03 can read the HMAC keys).
 
 Accepted residuals, documented in the module docs, SPEC.md and ARI42 GW-1:
 - Security.framework's `CFData` copies are not wiped.

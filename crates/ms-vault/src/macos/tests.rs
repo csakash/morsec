@@ -844,9 +844,10 @@ fn seal_failures_fail_closed() {
     }
     let e = t.vault.read_with(&k, |b| b.len()).unwrap_err().to_string();
     assert!(e.contains("missing or replaced"), "{e}");
+    let e = t.vault.list().unwrap_err().to_string();
     assert!(
-        t.vault.list().unwrap().is_empty(),
-        "unverifiable items are not listed"
+        e.contains("ms init"),
+        "a missing seal key is an error, not an empty list: {e}"
     );
 }
 
@@ -890,4 +891,44 @@ fn home_env_is_ignored() {
         stdout.contains(&format!("ACL_RESULT=READ {} bytes", CANARY.len())),
         "{stdout}"
     );
+}
+
+// protects=the pins can't be swapped (round-3 review): another binary overwriting the CA or seal
+// pin's data never makes msd trust a key of its choosing; the vault fails closed;
+// fails_when=ensure_ca_key or a read succeeds after the pin was overwritten; no_claim=a future
+// macOS where an overwritten item stays readable by its creator (this test would catch it)
+#[test]
+fn pin_overwrite_fails_closed() {
+    if skip() {
+        return;
+    }
+    let t = TestVault::new();
+    let k = key("stripe/test");
+    t.vault
+        .put(
+            &k,
+            SecretBytes::from(CANARY.to_owned()),
+            meta(&k, Tier::Test),
+        )
+        .unwrap();
+    t.vault.reset_ca_key().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let other = signed_copy(dir.path(), "other", "-", "cc.morsec.test.attacker");
+
+    let r = run_child(&other, &t.service, CA_PIN, "update-data");
+    assert!(r == "UPDATED" || r.starts_with("DENIED"), "{r}");
+    if r == "UPDATED" {
+        assert!(
+            t.vault.ensure_ca_key().is_err(),
+            "CA pin overwritten, CA must fail closed"
+        );
+    }
+    let r = run_child(&other, &t.service, SEAL_PIN, "update-data");
+    assert!(r == "UPDATED" || r.starts_with("DENIED"), "{r}");
+    if r == "UPDATED" {
+        assert!(
+            t.vault.read_with(&k, |b| b.len()).is_err(),
+            "seal pin overwritten"
+        );
+    }
 }

@@ -15,7 +15,7 @@ planted-key checks, all added after the security review.
 - `npm run build` (`scripts/check.sh`) exits 0 and all 8 steps pass: fmt, build, clippy
   `-D warnings`, tests, cargo-deny, cargo-audit, the supply-chain check, and the ARI-42 scan
   (0 findings).
-- `ms-vault` runs 16 tests against the real login keychain. Each test uses its own service name,
+- `ms-vault` runs 18 tests against the real login keychain. Each test uses its own service name,
   cleans up after itself, and never raises a dialog. No test items remain afterwards
   (`security dump-keychain | grep -c cc.morsec.test` → 0).
   - `acl_other_binary_is_denied`: a copy of the test binary, re-signed ad hoc under another
@@ -30,7 +30,11 @@ planted-key checks, all added after the security review.
     - Items planted with `security -A` or without a seal are replaced by `put` and `reset_*`, and
       are refused by reads.
     - A foreign CA key, or a second one, makes `ensure_ca_key` fail closed.
-    - Without the seal key, nothing reads.
+    - Without the seal key, nothing reads. Signing keys are pinned by a label-bound public-key
+      hash, so a key planted under the label is ignored, even one this binary may sign with. A
+      pin overwritten by another binary fails closed (`pin_overwrite_fails_closed`).
+    - `home_env_is_ignored`: with `HOME` pointing at an attacker directory, the real login
+      keychain is still used.
   - `ca_key`: the CA private key is non-extractable, its signatures verify, and it is reused.
   - `round_trip`, `put_replaces_value_and_meta`, `missing_key`, `meta_name_must_match`,
     `internal_keys`, `error_messages`: trait semantics, the reserved `morsec/` names, and error
@@ -39,8 +43,10 @@ planted-key checks, all added after the security review.
   root-owned `/cores`. Run it by hand after `sudo chmod 1777 /cores`.
 - Not applicable on this backend: the manual check that production items need user presence.
   The Keychain can't enforce it here (SPEC S4).
-- Reviews: one fresh-context correctness review and one security review, two rounds each. Round 1
-  found 15 issues; all are fixed or recorded, as listed in `docs/evidence/vault-macos.md`.
+- Reviews: one fresh-context correctness review and one security review, three rounds each.
+  - Round 1: 15 findings (1 critical). Round 2: 10 (3 high). Round 3: 5, all low.
+  - Every finding is fixed or recorded as a residual. Both reviews converged with no critical,
+    high or medium findings left. Details are in `docs/evidence/vault-macos.md`.
 - ARI-42: GW-1 moves from Gap to Partial; INJ-5 gets L01 evidence and stays Gap until L09.
 
 ## Risk
@@ -65,8 +71,10 @@ planted-key checks, all added after the security review.
   `crates/ms-vault/Cargo.toml`, `Cargo.lock`, my own `ARI42.md` rows and score line, and
   `docs/evidence/vault-macos.md`.
 - **Wiring for L07:**
-  - At `ms init`, call `reset_internal_keys()` and `reset_ca_key()`.
+  - At `ms init`, call `reset_internal_keys()` and `reset_ca_key()`. Signing keys are created
+    only there.
   - At start, call `ensure_internal_keys()` and `ensure_ca_key()`.
+  - The resolver must refuse `ms://morsec/...` references from agents.
   - Disable keychain dialogs for the life of the process.
   - The HMAC key names are `morsec/receipts-hmac` (as L02 asked) and `morsec/rules-hmac` (L03).
 
