@@ -6,6 +6,9 @@
 // A CLI prints to its terminal.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod log;
+mod stats;
+
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
@@ -54,8 +57,8 @@ enum Command {
     Run(Rest),
     /// Show or change a key's hosts, commands, tier and session length.
     Rules(Rest),
-    /// Show receipts; --export for a security review.
-    Log(Rest),
+    /// Show receipts; --verify checks the chain; --export for a security review.
+    Log(log::LogArgs),
     /// Revoke every grant now (kill switch).
     Stop(Rest),
     /// Resume after ms stop.
@@ -69,7 +72,7 @@ enum Command {
     /// Scan agent transcripts for leaked secret values.
     Scan(Rest),
     /// Prompts per session, blocks and approvals.
-    Stats(Rest),
+    Stats(stats::StatsArgs),
 }
 
 impl Command {
@@ -83,14 +86,12 @@ impl Command {
             Command::Disconnect(_) => ("disconnect", "L08 connect-claude"),
             Command::Run(_) => ("run", "L12 run-core"),
             Command::Rules(_) => ("rules", "L03 rules-policy"),
-            Command::Log(_) => ("log", "L02 receipts"),
             Command::Stop(_) => ("stop", "L07 daemon"),
             Command::Start(_) => ("start", "L07 daemon"),
             Command::Doctor(_) => ("doctor", "L17 doctor"),
             Command::Mcp(_) => ("mcp", "L14 mcp-server"),
             Command::Scan(_) => ("scan", "L09 e2e-canary"),
-            Command::Stats(_) => ("stats", "L02 receipts"),
-            Command::Status => return None,
+            Command::Status | Command::Log(_) | Command::Stats(_) => return None,
         })
     }
 }
@@ -175,6 +176,8 @@ async fn main() -> ExitCode {
     }
     match command {
         Command::Status => status().await,
+        Command::Log(args) => log::run(&args),
+        Command::Stats(args) => stats::run(&args),
         _ => unreachable!("every other command is a stub"),
     }
 }

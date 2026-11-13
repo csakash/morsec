@@ -18,6 +18,8 @@ path = "src/main.rs"
 [dependencies]
 ms-core = { workspace = true }
 ms-ipc = { workspace = true }
+ms-receipts = { workspace = true }
+serde_json = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 
@@ -25,3 +27,4 @@ tokio = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
+ms-vault = { workspace = true }
