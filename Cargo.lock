@@ -385,10 +385,14 @@ dependencies = [
  "assert_cmd",
  "clap",
  "ms-core",
+ "ms-import",
  "ms-ipc",
+ "ms-vault",
  "predicates",
+ "rustix",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

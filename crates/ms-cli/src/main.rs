@@ -6,6 +6,10 @@
 // A CLI prints to its terminal.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod add;
+mod import;
+mod tty;
+
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
@@ -43,9 +47,9 @@ enum Command {
     /// Create the vault and start the daemon.
     Init(Rest),
     /// Add a secret (hidden input, or from 1Password/Bitwarden).
-    Add(Rest),
+    Add(add::AddArgs),
     /// Move a .env into the vault and rewrite it with references.
-    Import(Rest),
+    Import(import::ImportArgs),
     /// Set up a coding agent (claude-code, codex, cursor, gemini).
     Connect(Rest),
     /// Remove a coding agent's morsec settings.
@@ -77,8 +81,6 @@ impl Command {
     fn stub(&self) -> Option<(&'static str, &'static str)> {
         Some(match self {
             Command::Init(_) => ("init", "L07 daemon"),
-            Command::Add(_) => ("add", "L04 import-env"),
-            Command::Import(_) => ("import", "L04 import-env"),
             Command::Connect(_) => ("connect", "L08 connect-claude"),
             Command::Disconnect(_) => ("disconnect", "L08 connect-claude"),
             Command::Run(_) => ("run", "L12 run-core"),
@@ -90,7 +92,7 @@ impl Command {
             Command::Mcp(_) => ("mcp", "L14 mcp-server"),
             Command::Scan(_) => ("scan", "L09 e2e-canary"),
             Command::Stats(_) => ("stats", "L02 receipts"),
-            Command::Status => return None,
+            Command::Status | Command::Add(_) | Command::Import(_) => return None,
         })
     }
 }
@@ -109,13 +111,19 @@ fn invoked_name() -> String {
 
 /// Text from the daemon goes to a terminal: drop control characters (escape sequences,
 /// carriage returns, bidi overrides) so it can't rewrite what the user sees.
-fn terminal_safe(s: &str) -> String {
+pub(crate) fn terminal_safe(s: &str) -> String {
     s.chars()
         .filter(|c| {
             !c.is_control()
                 && !matches!(*c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         })
         .collect()
+}
+
+/// Runs a blocking command on a plain thread. These commands drive their own IPC runtime, which
+/// can't start inside this one.
+fn on_own_thread(f: impl FnOnce() -> ExitCode + Send + 'static) -> ExitCode {
+    std::thread::spawn(f).join().unwrap_or(ExitCode::FAILURE)
 }
 
 async fn status() -> ExitCode {
@@ -175,6 +183,8 @@ async fn main() -> ExitCode {
     }
     match command {
         Command::Status => status().await,
+        Command::Add(a) => on_own_thread(move || add::run(&a)),
+        Command::Import(a) => on_own_thread(move || import::run(&a)),
         _ => unreachable!("every other command is a stub"),
     }
 }
