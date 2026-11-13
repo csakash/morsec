@@ -187,15 +187,18 @@ pub fn effective(
     };
     match ProjectRules::from_toml(text, file) {
         Ok(p) => (merge(user, &p), None),
-        Err(e) => {
-            let mut out = user.clone();
-            out.keys.values_mut().for_each(disable);
-            out.notes.push(format!(
-                "every key is disabled in this project because {file} is not valid"
-            ));
-            (out, Some(e))
-        }
+        Err(e) => (disable_all(user, file), Some(e)),
     }
+}
+
+/// `user` with every key disabled, for a project file that is invalid or unreadable.
+pub fn disable_all(user: &Rules, file: &str) -> Rules {
+    let mut out = user.clone();
+    out.keys.values_mut().for_each(disable);
+    out.notes.push(format!(
+        "every key is disabled in this project because {file} is not valid"
+    ));
+    out
 }
 
 #[cfg(test)]
