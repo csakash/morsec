@@ -1,0 +1,4 @@
+your settings set permissions.defaultMode to bypassPermissions: Claude runs commands without asking. morsec still keeps values out of reach, but consider removing it
+sandbox.excludedCommands lists commands that run outside the sandbox; they won't go through morsec, so references in them won't resolve
+your settings had the sandbox turned off; ms connect turns it on (ms disconnect turns it back off)
+you already have a status line, so morsec didn't add one; add `ms status` to yours if you like

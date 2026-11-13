@@ -1,0 +1,40 @@
+{
+  "env": {
+    "MORSEC_CONNECTED": "claude-code",
+    "SSL_CERT_FILE": "$HOME/.morsec/ca-bundle.pem",
+    "REQUESTS_CA_BUNDLE": "$HOME/.morsec/ca-bundle.pem",
+    "CURL_CA_BUNDLE": "$HOME/.morsec/ca-bundle.pem",
+    "NODE_EXTRA_CA_CERTS": "$HOME/.morsec/ca-bundle.pem",
+    "STRIPE_API_KEY": "ms://stripe/test"
+  },
+  "sandbox": {
+    "enabled": true,
+    "network": {
+      "httpProxyPort": 4101,
+      "allowedDomains": [
+        "api.stripe.com",
+        "*.stripe.com"
+      ],
+      "allowUnixSockets": [
+        "/Users/u/Library/Application Support/morsec/msd.sock"
+      ]
+    }
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/ms",
+            "args": [
+              "connect",
+              "claude-code",
+              "--session-env"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

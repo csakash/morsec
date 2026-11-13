@@ -740,7 +740,10 @@ dependencies = [
 name = "ms-connect"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "ms-core",
+ "proptest",
+ "tempfile",
 ]
 
 [[package]]

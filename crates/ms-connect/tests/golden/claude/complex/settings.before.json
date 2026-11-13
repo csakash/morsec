@@ -1,0 +1,40 @@
+{
+    "$schema": "https://json.schemastore.org/claude-code-settings.json",
+    "env": {
+        "NODE_EXTRA_CA_CERTS": "CORP_CA_PATH",
+        "API_TIMEOUT_MS": "1200000",
+        "GREETING": "héllo \"world\" \\ 😀\t\u0001"
+    },
+    "permissions": {
+        "defaultMode": "bypassPermissions",
+        "allow": []
+    },
+    "sandbox": {
+        "enabled": false,
+        "excludedCommands": ["docker"],
+        "network": {
+            "allowedDomains": ["github.com", "api.stripe.com"],
+            "allowLocalBinding": true
+        }
+    },
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {"type": "command", "command": "echo 'pre' | tee -a /tmp/log", "timeout": 30},
+                    {"type": "command", "command": "node", "args": ["/opt/hooks/check.js", "--strict"]},
+                    {"type": "http", "url": "https://hooks.example.com/x"},
+                    {"type": "command", "command": "Write-Host hi", "shell": "powershell"}
+                ]
+            }
+        ],
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": "~/bin/setup-env.sh"}]}
+        ]
+    },
+    "statusLine": {"type": "command", "command": "~/.claude/statusline.sh", "padding": 0},
+    "cleanupPeriodDays": 99999999999999999999,
+    "ratio": 1.50e+10,
+    "enabledPlugins": {"formatter@acme": true}
+}

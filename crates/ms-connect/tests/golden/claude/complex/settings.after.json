@@ -1,0 +1,116 @@
+{
+    "$schema": "https://json.schemastore.org/claude-code-settings.json",
+    "env": {
+        "NODE_EXTRA_CA_CERTS": "$HOME/.morsec/ca-bundle.pem",
+        "API_TIMEOUT_MS": "1200000",
+        "GREETING": "héllo \"world\" \\ 😀\t\u0001",
+        "MORSEC_CONNECTED": "claude-code",
+        "SSL_CERT_FILE": "$HOME/.morsec/ca-bundle.pem",
+        "REQUESTS_CA_BUNDLE": "$HOME/.morsec/ca-bundle.pem",
+        "CURL_CA_BUNDLE": "$HOME/.morsec/ca-bundle.pem",
+        "STRIPE_API_KEY": "ms://stripe/test"
+    },
+    "permissions": {
+        "defaultMode": "bypassPermissions",
+        "allow": []
+    },
+    "sandbox": {
+        "enabled": true,
+        "excludedCommands": [
+            "docker"
+        ],
+        "network": {
+            "allowedDomains": [
+                "github.com",
+                "api.stripe.com",
+                "*.stripe.com"
+            ],
+            "allowLocalBinding": true,
+            "httpProxyPort": 4101,
+            "allowUnixSockets": [
+                "/Users/u/Library/Application Support/morsec/msd.sock"
+            ]
+        }
+    },
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/opt/homebrew/bin/ms",
+                        "timeout": 30,
+                        "args": [
+                            "run",
+                            "--",
+                            "/bin/sh",
+                            "-c",
+                            "echo 'pre' | tee -a /tmp/log"
+                        ]
+                    },
+                    {
+                        "type": "command",
+                        "command": "/opt/homebrew/bin/ms",
+                        "args": [
+                            "run",
+                            "--",
+                            "node",
+                            "/opt/hooks/check.js",
+                            "--strict"
+                        ]
+                    },
+                    {
+                        "type": "http",
+                        "url": "https://hooks.example.com/x"
+                    },
+                    {
+                        "type": "command",
+                        "command": "Write-Host hi",
+                        "shell": "powershell"
+                    }
+                ]
+            }
+        ],
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/opt/homebrew/bin/ms",
+                        "args": [
+                            "run",
+                            "--",
+                            "/bin/sh",
+                            "-c",
+                            "~/bin/setup-env.sh"
+                        ]
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "/opt/homebrew/bin/ms",
+                        "args": [
+                            "connect",
+                            "claude-code",
+                            "--session-env"
+                        ]
+                    }
+                ]
+            }
+        ]
+    },
+    "statusLine": {
+        "type": "command",
+        "command": "~/.claude/statusline.sh",
+        "padding": 0
+    },
+    "cleanupPeriodDays": 99999999999999999999,
+    "ratio": 1.50e+10,
+    "enabledPlugins": {
+        "formatter@acme": true
+    }
+}

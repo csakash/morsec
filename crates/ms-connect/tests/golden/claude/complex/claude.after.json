@@ -1,0 +1,61 @@
+{
+  "numStartups": 42,
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/"
+    },
+    "db": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/ms",
+      "args": [
+        "run",
+        "--",
+        "npx",
+        "-y",
+        "@bytebase/dbhub"
+      ],
+      "env": {
+        "DSN": "ms://pg/staging"
+      }
+    },
+    "local": {
+      "command": "/opt/homebrew/bin/ms",
+      "args": [
+        "run",
+        "--",
+        "/opt/mcp/server"
+      ]
+    },
+    "ms": {
+      "type": "stdio",
+      "command": "/usr/bin/env",
+      "args": [
+        "-i",
+        "HOME=$HOME",
+        "PATH=/usr/bin:/bin",
+        "/opt/homebrew/bin/ms",
+        "mcp"
+      ],
+      "env": {}
+    }
+  },
+  "projects": {
+    "/Users/u/repo": {
+      "allowedTools": [],
+      "mcpServers": {
+        "repo-tool": {
+          "type": "stdio",
+          "command": "/opt/homebrew/bin/ms",
+          "args": [
+            "run",
+            "--",
+            "python3",
+            "tools/server.py"
+          ],
+          "env": {}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "numStartups": 42,
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/"
+    },
+    "db": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@bytebase/dbhub"
+      ],
+      "env": {
+        "DSN": "ms://pg/staging"
+      }
+    },
+    "local": {
+      "command": "/opt/mcp/server"
+    }
+  },
+  "projects": {
+    "/Users/u/repo": {
+      "allowedTools": [],
+      "mcpServers": {
+        "repo-tool": {
+          "type": "stdio",
+          "command": "python3",
+          "args": [
+            "tools/server.py"
+          ],
+          "env": {}
+        }
+      }
+    }
+  }
+}
