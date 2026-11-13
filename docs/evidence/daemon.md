@@ -20,16 +20,8 @@ Full outputs are kept outside the repo in `.loops/runs/daemon/interactive/proof/
   `morsec.invalid` keeps the proxy listening (and refusing).
 - **D-E:** IPC stays v1 and changes additively (see `docs/PLAN.md` §4).
 
-Spec amendments made while building (the spec text is otherwise unchanged):
-- `RulesGet` has no `cwd`: the client merges the project `.morsec.toml`, so msd never reads a
-  path a client names (no file-read oracle for a sandboxed agent).
-- The proposed rule travels as a one-key rules file, not a table body.
-- The socket bind uses a descriptor check plus a post-bind inode check instead of a process-wide
-  `umask` (the workspace forbids `unsafe`; the directory is verified private, so nobody can reach
-  the socket before the `chmod`).
-- Only `ca.pem` is written; the trust bundle with system roots is L08's (connectors).
-- Restart persistence of `ms stop` is proven at the daemon level with a shared vault; the dev
-  memory vault is ephemeral, so the binary-level test can't restart.
+Spec amendments made while building are listed in `SPEC.md` ("Amendments made during the
+build"; `SPEC.md` itself goes into the PR body).
 
 ## Gate
 
@@ -49,6 +41,17 @@ See `PROOF.md` for the final run. `npm run build` → `scripts/check.sh`, all 8 
 | 8 rules over IPC | `daemon::tests::rules_changes`; `agent_e2e` (terminal path from a detached process applies a loosening; from inside the fake agent it is refused) |
 | 9 swap through the daemon | `agent_e2e` (placeholder to an unbound host: 403 and a `host_not_allowed` receipt; after `ms stop`: refused) ; `proxy::tests::bindings_from_rules` |
 | 10 reviews, QA, proof, ARI-42 | below; `ARI42.md` AUTH-1, AUTH-3, AUTH-4, MCP-3, LOG-2 rows |
+
+## Review record
+
+| Id | Finding | Resolution |
+|---|---|---|
+| R1 (important) | a caller msd could no longer identify (connecting PID exited, child kept the fd) was treated as a non-agent: could replace keys and slip out of a LOG-2 stop | fixed 4625c1b: accept time carried in `PeerInfo`; unidentified callers get only status/stop (`unidentified_caller_is_refused`) |
+| R2 (important) | `ms stop` and `ms start` not serialized: a racing start could undo a stop that reported success | fixed 4625c1b: one lock across flag and vault write (`stop_and_start_are_serialized`) |
+| S1 (important) | `ms init --trust` trusted `ca.pem`, which an agent can replace with its own unconstrained CA | fixed 4625c1b: `Status` carries the CA msd loaded and key-checked; `--trust` uses that via a private temp file |
+| S2 (important) | an agent could run `msd --init` directly, resetting keys and clearing `ms stop` | fixed 4625c1b: refuses inside an agent tree, asks on `/dev/tty`, real state dir only, never clears a stop (`agent_e2e`); archiving the old receipts key on `--force` deferred to L24 |
+| S3 (important) | rules rollback by deleting the receipts (the floor lived only there) | fixed 4625c1b: floor also in the vault state item (`tampered_and_rolled_back_rules_fail_closed`) |
+| R-N1/S-N1..N4, R-N2..N6 (nits) | reserved-slot parking, spec drift, compat comment, wipe-before-bind, stale alerts, resume hint, drift reader, D-A wording | fixed 4625c1b, except stale skipped-binding alerts (kept; cleared on restart) |
 
 ## QA
 

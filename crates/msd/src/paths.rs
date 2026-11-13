@@ -17,10 +17,8 @@ pub struct Paths {
     pub rules: PathBuf,
     /// Receipts directory.
     pub receipts: PathBuf,
-    /// The proxy CA certificate, PEM (public).
+    /// The proxy CA certificate, PEM: an export for connectors, never read back by msd.
     pub ca_pem: PathBuf,
-    /// The host list the CA was issued for, JSON.
-    pub ca_hosts: PathBuf,
 }
 
 impl Paths {
@@ -31,7 +29,6 @@ impl Paths {
             rules: state.join("rules.toml"),
             receipts: state.join("receipts"),
             ca_pem: state.join("ca.pem"),
-            ca_hosts: state.join("ca-hosts.json"),
             state,
         }
     }

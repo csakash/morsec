@@ -907,6 +907,7 @@ dependencies = [
  "ms-rules",
  "ms-session",
  "ms-vault",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

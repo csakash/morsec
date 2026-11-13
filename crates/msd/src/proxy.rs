@@ -17,9 +17,10 @@ use ms_rules::{HostPattern, Rules, is_reserved};
 use ms_session::{OsProcessTable, PortResolver, cross_check};
 use tokio::sync::watch;
 
-use crate::backend::{CA_PEM_KEY, CaKeyWriter};
+use crate::backend::{CA_CERT_KEY, CA_PEM_KEY, CaKeyWriter};
 use crate::daemon::Daemon;
 use crate::paths::atomic_write;
+use ms_vault::VaultExt;
 
 /// The host a CA is issued for when nothing is bound: a reserved TLD, never trusted or stored.
 const PLACEHOLDER_HOST: &str = "morsec.invalid";
@@ -192,46 +193,74 @@ pub fn bindings(rules: &Rules) -> (Vec<Binding>, Vec<String>) {
     (out, skipped)
 }
 
-/// The CA for `hosts`: the stored one when it covers them, else a new one (stored in the vault,
-/// certificate written to the state directory). With no hosts, a throwaway CA for a reserved name.
-fn ensure_ca(d: &Daemon, hosts: &BTreeSet<String>) -> Result<Ca, String> {
+/// The CA certificate and its hosts, as kept in the vault ([`CA_CERT_KEY`]).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CaRecord {
+    cert_pem: String,
+    hosts: Vec<String>,
+}
+
+/// The CA for `hosts`: the stored one when it covers them, else a new one. The private key, the
+/// certificate and the host list all live in the vault (security review S1: a certificate read
+/// from disk could be swapped for one that merely embeds our public key). `ca.pem` in the state
+/// directory is only an export for connectors and is never read back. With no hosts, a throwaway
+/// CA for a reserved name.
+pub(crate) fn ensure_ca(d: &Daemon, hosts: &BTreeSet<String>) -> Result<Ca, String> {
     if hosts.is_empty() {
         return Ca::generate([PLACEHOLDER_HOST]).map_err(|e| e.to_string());
     }
-    let paths = d.paths();
-    let name = KeyName::new(CA_PEM_KEY).map_err(|e| e.to_string())?;
-    let stored: Option<(String, BTreeSet<String>)> = (|| {
-        let pem = std::fs::read_to_string(&paths.ca_pem).ok()?;
-        let list: Vec<String> =
-            serde_json::from_slice(&std::fs::read(&paths.ca_hosts).ok()?).ok()?;
-        Some((pem, list.into_iter().collect()))
-    })();
-    if let Some((pem, covered)) = stored
-        && hosts.is_subset(&covered)
-    {
-        match Ca::load(&*d.vault(), &name, &pem, &covered) {
-            Ok(ca) => return Ok(ca),
-            Err(e) => tracing::warn!(error = %e, "stored CA unusable; issuing a new one"),
+    let key_name = KeyName::new(CA_PEM_KEY).map_err(|e| e.to_string())?;
+    let cert_name = KeyName::new(CA_CERT_KEY).map_err(|e| e.to_string())?;
+    let stored: Option<CaRecord> = d
+        .vault()
+        .read_with(&cert_name, |v| serde_json::from_slice::<CaRecord>(v).ok())
+        .ok()
+        .flatten();
+    if let Some(rec) = stored {
+        let covered: BTreeSet<String> = rec.hosts.into_iter().collect();
+        if hosts.is_subset(&covered) {
+            match Ca::load(&*d.vault(), &key_name, &rec.cert_pem, &covered) {
+                Ok(ca) => {
+                    export_pem(d, ca.cert_pem());
+                    return Ok(ca);
+                }
+                Err(e) => tracing::warn!(error = %e, "stored CA unusable; issuing a new one"),
+            }
         }
     }
     let ca = Ca::generate(hosts).map_err(|e| e.to_string())?;
     let meta = KeyMeta {
-        name: name.clone(),
+        name: key_name.clone(),
         mode: Mode::Swap,
         tier: Tier::Production,
         created_unix_ms: 0,
     };
-    ca.store(&CaKeyWriter(d.backend()), &name, meta)
+    ca.store(&CaKeyWriter(d.backend()), &key_name, meta)
         .map_err(|e| e.to_string())?;
-    let list: Vec<&String> = hosts.iter().collect();
-    let json = serde_json::to_vec(&list).map_err(|e| e.to_string())?;
-    atomic_write(&paths.ca_pem, ca.cert_pem().as_bytes(), 0o644).map_err(|e| e.to_string())?;
-    atomic_write(&paths.ca_hosts, &json, 0o600).map_err(|e| e.to_string())?;
+    let rec = CaRecord {
+        cert_pem: ca.cert_pem().to_owned(),
+        hosts: hosts.iter().cloned().collect(),
+    };
+    let json = serde_json::to_vec(&rec).map_err(|e| e.to_string())?;
+    d.backend()
+        .put_internal(&cert_name, ms_core::SecretBytes::new(json))
+        .map_err(|e| e.to_string())?;
+    export_pem(d, ca.cert_pem());
     d.alert(format!(
         "the morsec CA was issued for {} host(s); tools that use the system trust store need it trusted again: ms init --trust",
         hosts.len()
     ));
     Ok(ca)
+}
+
+/// Writes the CA certificate to `ca.pem` for connectors (public; never read back by msd).
+fn export_pem(d: &Daemon, pem: &str) {
+    if std::fs::read_to_string(&d.paths().ca_pem).ok().as_deref() == Some(pem) {
+        return;
+    }
+    if let Err(e) = atomic_write(&d.paths().ca_pem, pem.as_bytes(), 0o644) {
+        tracing::warn!(error = %e, "could not export ca.pem");
+    }
 }
 
 /// Builds a proxy config and its dependencies from the daemon's current state.

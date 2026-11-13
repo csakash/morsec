@@ -20,6 +20,8 @@ pub const RULES_HMAC_KEY: &str = "morsec/rules-hmac";
 pub const DAEMON_STATE_KEY: &str = "morsec/daemon-state";
 /// The swap proxy CA private key, PEM (SPEC D-C, D-D).
 pub const CA_PEM_KEY: &str = "morsec/ca";
+/// The swap proxy CA certificate and host list, JSON (security review S1: never read from disk).
+pub const CA_CERT_KEY: &str = "morsec/ca-cert";
 
 const HMAC_LEN: usize = 32;
 
@@ -113,7 +115,7 @@ impl Backend {
     /// Writes one of the daemon's own items ([`DAEMON_STATE_KEY`], [`CA_PEM_KEY`]). Every other
     /// write path refuses `morsec/` names.
     pub fn put_internal(&self, name: &KeyName, value: SecretBytes) -> Result<()> {
-        if name.as_str() != DAEMON_STATE_KEY && name.as_str() != CA_PEM_KEY {
+        if ![DAEMON_STATE_KEY, CA_PEM_KEY, CA_CERT_KEY].contains(&name.as_str()) {
             return Err(Error::io(
                 format!("refusing to write {name}"),
                 std::io::Error::new(

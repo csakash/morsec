@@ -78,8 +78,12 @@ pub const DAEMON_STATE_KEY: &str = "morsec/daemon-state";
 /// (L07). Kept in a sealed item only msd can read.
 pub const CA_PEM_KEY: &str = "morsec/ca";
 
+/// The proxy CA certificate and its host list (public, but kept here so no same-user process can
+/// substitute them), written by msd with [`KeychainVault::put_internal`] (L07).
+pub const CA_CERT_KEY: &str = "morsec/ca-cert";
+
 /// The only reserved names [`KeychainVault::put_internal`] writes.
-pub const INTERNAL_WRITABLE: [&str; 2] = [DAEMON_STATE_KEY, CA_PEM_KEY];
+pub const INTERNAL_WRITABLE: [&str; 3] = [DAEMON_STATE_KEY, CA_PEM_KEY, CA_CERT_KEY];
 
 /// Length of each internal HMAC key, in bytes.
 pub const HMAC_KEY_LEN: usize = 32;

@@ -147,7 +147,6 @@ fn prepare_memory_state(paths: &Paths) -> Result<(), String> {
         paths.rules.clone(),
         ms_rules::store::mac_path(&paths.rules),
         paths.ca_pem.clone(),
-        paths.ca_hosts.clone(),
     ];
     if !marker.exists() {
         if ours.iter().any(|p| p.exists()) || paths.receipts.exists() {
@@ -272,9 +271,7 @@ fn init(args: &Args) -> ExitCode {
                         .map_err(|e| format!("morsec: moving {} aside: {e}", p.display()))?;
                 }
             }
-            for p in [&paths.ca_pem, &paths.ca_hosts] {
-                let _ = std::fs::remove_file(p);
-            }
+            let _ = std::fs::remove_file(&paths.ca_pem);
         }
         b.reset().map_err(|e| e.to_string())?;
         b.put_internal(

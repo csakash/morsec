@@ -219,28 +219,30 @@ impl Daemon {
         let state_key = KeyName::new(DAEMON_STATE_KEY)?;
         let (stopped, vault_floor) = match vault.read_with(&state_key, <[u8]>::to_vec) {
             Ok(v) => match parse_state(&v) {
-                Some(state) => state,
+                Some((stopped, floor)) => (stopped, Some(floor)),
                 None => {
-                    alerts.push("the stop flag in the vault is unreadable, so morsec stays stopped. Resume with: ms init --resume".into());
-                    (true, u64::MAX)
+                    alerts.push("the stop flag in the vault is unreadable, so morsec stays stopped and every key is denied. Resume with: ms init --resume, then restart msd".into());
+                    (true, None)
                 }
             },
             Err(ms_core::Error::NoSuchKey(_)) if backend.is_memory() => {
                 backend.put_internal(&state_key, SecretBytes::new(encode_state(false, 0)))?;
-                (false, 0)
+                (false, Some(0))
             }
             Err(e) => {
                 alerts.push(format!(
-                    "the stop flag could not be read from the vault ({e}), so morsec stays stopped. Resume with: ms init --resume"
+                    "the stop flag could not be read from the vault ({e}), so morsec stays stopped and every key is denied. Resume with: ms init --resume, then restart msd"
                 ));
-                (true, u64::MAX)
+                (true, None)
             }
         };
 
         // The rollback floor: the higher of the vault's and the receipt chain's, read before the
-        // store is opened for appending. An unreadable vault state gives u64::MAX: fail closed.
+        // store is opened for appending. With the vault's floor unknown the rules are treated as
+        // tampered (fail closed) but the floor kept is the receipts' one, never a sentinel: it is
+        // what the next persist writes back (code review R7).
         let floor = match max_rule_version(&paths.receipts) {
-            Ok(v) => Some(v.max(vault_floor)),
+            Ok(v) => Some(v.max(vault_floor.unwrap_or(0))),
             Err(e) => {
                 alerts.push(format!(
                     "the receipts could not be read ({e}); every key is denied until this is fixed"
@@ -255,6 +257,7 @@ impl Daemon {
         let store = RulesStore::new(&paths.rules, &*vault, mac_key.clone());
         let (mut rules, min_version) = match floor {
             None => (Rules::tampered(), 0),
+            Some(floor) if vault_floor.is_none() => (Rules::tampered(), floor),
             Some(floor) => match store.load(floor) {
                 Ok(r) => {
                     let v = r.version.max(floor);
@@ -892,8 +895,6 @@ impl Daemon {
     }
 
     fn start(&self, session: &SessionId, unattributed: bool, at_terminal: bool) -> ResponseBody {
-        // Held through the approval and both writes, so a concurrent `ms stop` can't be undone.
-        let _f = lock(&self.flag);
         if !self.is_stopped() {
             return ResponseBody::Ok {
                 message: "morsec is already on".into(),
@@ -933,6 +934,14 @@ impl Daemon {
                 };
             }
         };
+        // The approval happens outside the lock (a Touch ID prompt must not hold up ms stop);
+        // the flag is re-checked under it, so a concurrent stop can't be undone.
+        let _f = lock(&self.flag);
+        if !self.is_stopped() {
+            return ResponseBody::Ok {
+                message: "morsec is already on".into(),
+            };
+        }
         // Persist first: if the vault write fails, stay stopped.
         if let Err(e) = self.persist_state(false) {
             return reply_err(
@@ -1503,6 +1512,56 @@ mod tests {
         for bad in [&b"garbage"[..], b"running v=x", b"stopped v=", b""] {
             assert_eq!(parse_state(bad), None);
         }
+    }
+
+    // protects=R7: an unreadable state item keeps msd stopped with every key denied, but never
+    // persists a sentinel floor: after a stop and a resume, a restart loads the rules again;
+    // fails_when=u64::MAX (or any unknown floor) is written and the rules stay tampered forever;
+    // no_claim=rollback resistance while the state item is unreadable (documented residual)
+    #[test]
+    fn unreadable_state_never_persists_a_sentinel_floor() {
+        let h = fresh();
+        h.put("stripe/test", Tier::Test);
+        let state = KeyName::new(DAEMON_STATE_KEY).unwrap();
+        h.backend
+            .put_internal(&state, SecretBytes::new(b"garbage".to_vec()))
+            .unwrap();
+        let h = restart(h);
+        assert!(h.d.is_stopped() && h.d.rules().tampered);
+        assert!(is_ok(&h.req(RequestBody::Stop)));
+        assert!(is_ok(
+            &h.as_(terminal())
+                .req(RequestBody::Start { at_terminal: true })
+        ));
+        let saved = h.backend.vault().read_with(&state, <[u8]>::to_vec).unwrap();
+        let (_, floor) = parse_state(&saved).unwrap();
+        assert!(floor < 100, "sentinel floor persisted: {floor}");
+        let h = restart(h);
+        assert!(!h.d.is_stopped());
+        assert!(!h.d.rules().tampered, "rules stuck tampered");
+    }
+
+    // protects=S1: the proxy CA certificate and hosts come from the vault, never from ca.pem; a
+    // planted certificate in ca.pem is ignored (and overwritten by the export), and the same CA is
+    // reused across calls; fails_when=a file on disk decides which certificate msd serves or
+    // trusts; no_claim=rcgen/X.509 parsing
+    #[test]
+    fn ca_comes_from_the_vault_not_the_file() {
+        let h = fresh();
+        let hosts: std::collections::BTreeSet<String> = ["api.stripe.com".to_owned()].into();
+        let first = crate::proxy::ensure_ca(&h.d, &hosts).unwrap();
+        let pem = first.cert_pem().to_owned();
+        let file = h.dir.path().join("ca.pem");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), pem);
+        std::fs::write(
+            &file,
+            "-----BEGIN CERTIFICATE-----\nATTACKER\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let again = crate::proxy::ensure_ca(&h.d, &hosts).unwrap();
+        assert_eq!(again.cert_pem(), pem, "the planted file was used");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), pem);
+        assert!(!h.dir.path().join("ca-hosts.json").exists());
     }
 
     // protects=an unreadable stop flag fails closed: msd starts stopped with an alert;
