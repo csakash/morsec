@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for msd. `ms init` fills in @MSD@ (the absolute path of msd) and @LOG@, writes it to
+  ~/Library/LaunchAgents/cc.morsec.msd.plist and loads it with launchctl bootstrap gui/<uid>.
+  No EnvironmentVariables: msd must not inherit SSL_CERT_FILE or anything an agent could set.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>cc.morsec.msd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@MSD@</string>
+    <string>--foreground</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG@</string>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+</dict>
+</plist>
