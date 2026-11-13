@@ -12,6 +12,8 @@ steps are yours, below.
    `Developer ID Application: <Name> (<TEAMID>)`.
    The team must never change: the keychain trusts `msd` by identifier `cc.morsec.msd` plus this
    team, so a different team locks every user out of their stored keys after an upgrade.
+   Commit the team ID (the 10 characters in parentheses) as `packaging/macos/team-id` through a
+   loop. `release` refuses to sign with any other team.
 2. **Notary profile.** Make an app-specific password at appleid.apple.com, then store it in your
    keychain (you type it; nothing else sees it):
    `xcrun notarytool store-credentials morsec-notary --apple-id <you> --team-id <TEAMID>`
@@ -39,8 +41,8 @@ steps are yours, below.
    scripts/release.sh release
    ```
 
-   It refuses to start without every one of these, a committed `packaging/minisign.pub`, a
-   clean tree and the `v<version>` tag on `HEAD`. It signs `ms` and `msd` (hardened runtime,
+   It refuses to start without every one of these, a committed `packaging/minisign.pub` and
+   `packaging/macos/team-id` matching the identity's team, a clean tree and the `v<version>` tag on `HEAD`. It signs `ms` and `msd` (hardened runtime,
    secure timestamp, no entitlements), checks that signing changed only the signature,
    notarizes, runs `spctl`, writes the SBOM, `BUILDINFO`, `SHA256SUMS` and
    `SHA256SUMS.minisig` to `dist/<version>/`, and renders the formula into

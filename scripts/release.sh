@@ -5,6 +5,7 @@
 #   scripts/release.sh verify-repro          two clean builds at different paths, same hashes
 #   scripts/release.sh release [--out DIR]   the real release; fails closed without credentials
 #   scripts/release.sh formula --version V --sha256 H [--url U] [--out FILE]
+#   scripts/release.sh check-build-root DIR  checks DIR is safe to build under (see new_work)
 #
 # It never uploads, tags, pushes or publishes anything, and never asks for, prints or stores a
 # credential. Credentials come from the environment, by reference only:
@@ -30,7 +31,7 @@ say() { printf '== %s\n' "$*"; }
 py() { python3 -I "$@"; }
 
 usage() {
-  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -58,6 +59,16 @@ sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
 dev_id_re='^Developer ID Application: .+ \(([A-Z0-9]{10})\)$'
 
+# The Developer ID team every release is signed by. The keychain trusts msd by identifier plus
+# team (L01), so a release from another team would lock users out of their keys.
+pinned_team() {
+  local t
+  [ -f "$pk/macos/team-id" ] || return 1
+  t="$(tr -d '[:space:]' <"$pk/macos/team-id")"
+  [[ "$t" =~ ^[A-Z0-9]{10}$ ]] || return 1
+  printf '%s\n' "$t"
+}
+
 # Everything `release` needs, checked before anything is built. Fails closed: no skip flags.
 release_preflight() {
   local id="${MORSEC_SIGN_IDENTITY:-}"
@@ -74,6 +85,10 @@ release_preflight() {
   v="$(workspace_version "$root")"
   [ "$v" != "0.0.0" ] || die "the workspace version is 0.0.0; bump it in Cargo.toml and tag v<version> first"
   [ -f "$pk/minisign.pub" ] || die "packaging/minisign.pub is missing; commit the release public key first"
+  local pinned
+  pinned="$(pinned_team)" || die "packaging/macos/team-id is missing or malformed; commit your 10-character Developer ID team ID first"
+  [[ "$id" =~ $dev_id_re ]]
+  [ "${BASH_REMATCH[1]}" = "$pinned" ] || die "MORSEC_SIGN_IDENTITY is team ${BASH_REMATCH[1]}, but releases are pinned to team $pinned (packaging/macos/team-id); the keychain trusts msd only from that team"
   [ -z "$(git -C "$root" status --porcelain)" ] || die "the working tree is not clean"
   git -C "$root" tag --points-at HEAD | grep -qx "v$v" || die "HEAD is not tagged v$v"
 }
@@ -94,6 +109,10 @@ sign() {
     local team="${BASH_REMATCH[1]}"
     grep -qx "Authority=Developer ID Application: .*" <<<"$info" || die "$f: not signed by a Developer ID Application certificate"
     grep -qx "TeamIdentifier=$team" <<<"$info" || die "$f: team is not $team"
+    local pinned
+    if pinned="$(pinned_team)"; then
+      [ "$team" = "$pinned" ] || die "$f: team $team is not the pinned release team $pinned"
+    fi
     grep -q '^Timestamp=' <<<"$info" || die "$f: no secure timestamp"
   fi
   # No entitlements at all: hardened runtime with no exceptions.
@@ -102,8 +121,8 @@ sign() {
   fi
 }
 
-notarize() { # notarize <dir with bin/> <work>
-  local zip="$2/notarize.zip" out="$2/notary.json"
+notarize() { # notarize <dir with bin/> <work> <out dir>: the notarytool record stays in <out dir>
+  local zip="$2/notarize.zip" out="$3/notary.json"
   ditto -c -k --keepParent "$1/bin" "$zip"
   say "notarizing (this waits for Apple)"
   xcrun notarytool submit "$zip" --keychain-profile "$MORSEC_NOTARY_PROFILE" --wait \
@@ -138,18 +157,21 @@ build_release() {
   version="$(workspace_version "$src")"
 
   say "building morsec $version for $TARGET (SOURCE_DATE_EPOCH=$epoch)"
+  mkdir -p "$work/tmp"
   local sep=$'\x1f'
-  (
-    cd "$src"
-    unset RUSTFLAGS CARGO_BUILD_RUSTFLAGS RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER
-    export SOURCE_DATE_EPOCH="$epoch" CARGO_INCREMENTAL=0 ZERO_AR_DATE=1
-    export MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" CARGO_TARGET_DIR="$work/target"
+  # The build sees only this environment (env -i): no inherited RUSTFLAGS, wrappers, RUSTC,
+  # linker, CC or CFLAGS overrides, and no RUSTUP_TOOLCHAIN (rust-toolchain.toml decides).
+  local -a benv=(
+    env -i "PATH=$PATH" "HOME=$HOME" "TMPDIR=$work/tmp" "CARGO_HOME=$cargo_home"
+    "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "DEVELOPER_DIR=$(xcode-select -p)"
+    "SOURCE_DATE_EPOCH=$epoch" CARGO_INCREMENTAL=0 ZERO_AR_DATE=1
+    "MACOSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET" "CARGO_TARGET_DIR=$work/target"
     # No host path in the binaries: rustc paths, C paths (ring), and the linker's object paths
     # (which feed the Mach-O UUID).
-    export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$src=/morsec${sep}--remap-path-prefix=$cargo_home=/cargo${sep}-Clink-arg=-Wl,-oso_prefix,$work/"
-    export CFLAGS="-ffile-prefix-map=$src=/morsec -ffile-prefix-map=$cargo_home=/cargo"
-    cargo build --release --locked -p ms-cli -p msd --target "$TARGET"
+    "CARGO_ENCODED_RUSTFLAGS=--remap-path-prefix=$src=/morsec${sep}--remap-path-prefix=$cargo_home=/cargo${sep}-Clink-arg=-Wl,-oso_prefix,$work/"
+    "CFLAGS=-ffile-prefix-map=$src=/morsec -ffile-prefix-map=$cargo_home=/cargo"
   )
+  (cd "$src" && "${benv[@]}" cargo build --release --locked -p ms-cli -p msd --target "$TARGET")
 
   local rel="$work/target/$TARGET/release" stage="$work/stage" unsigned="$work/unsigned"
   mkdir -p "$stage/bin" "$stage/share/morsec" "$unsigned"
@@ -160,7 +182,7 @@ build_release() {
   done
 
   say "SBOM (CycloneDX 1.5) and auto-update check"
-  (cd "$src" && cargo metadata --format-version 1 --locked --filter-platform "$TARGET") |
+  (cd "$src" && "${benv[@]}" cargo metadata --format-version 1 --locked --filter-platform "$TARGET") |
     py "$pk/lib/sbom.py" --lock "$src/Cargo.lock" --version "$version" --commit "$commit" \
       --epoch "$epoch" --root ms-cli --root msd --out "$stage/share/morsec/morsec.cdx.json"
 
@@ -185,8 +207,8 @@ build_release() {
     echo "target=$TARGET"
     echo "source_date_epoch=$epoch"
     echo "macosx_deployment_target=$DEPLOYMENT_TARGET"
-    echo "rustc=$(cd "$src" && rustc --version)"
-    echo "cargo=$(cd "$src" && cargo --version)"
+    echo "rustc=$(cd "$src" && "${benv[@]}" rustc --version)"
+    echo "cargo=$(cd "$src" && "${benv[@]}" cargo --version)"
     echo "sdk=macosx $(xcrun --show-sdk-version 2>/dev/null || echo unknown)"
     echo "clang=$(clang --version 2>/dev/null | head -1)"
     for b in ms msd; do
@@ -195,7 +217,7 @@ build_release() {
     done
   } >"$stage/share/morsec/BUILDINFO"
 
-  if [ "$mode" = release ]; then notarize "$stage" "$work"; fi
+  if [ "$mode" = release ]; then notarize "$stage" "$work" "$out"; fi
 
   local tarball="morsec-$version-$TARGET.tar.gz"
   mkdir -p "$out"
@@ -230,6 +252,7 @@ build_release() {
   py "$pk/lib/formula.py" --template "$pk/homebrew/morsec.rb.in" --version "$version" \
     --sha256 "$sha" --url "$URL_BASE/v$version/$tarball" --out "$out/homebrew-tap/Formula/morsec.rb"
   if [ "$mode" = release ]; then
+    mkdir -p "$pk/homebrew/Formula"
     cp "$out/homebrew-tap/Formula/morsec.rb" "$pk/homebrew/Formula/morsec.rb"
   fi
 
@@ -245,11 +268,32 @@ new_out() { # new_out <dir>: refuses to reuse a non-empty directory
   (cd "$1" && pwd -P)
 }
 
-# A fresh temp dir by its real path: the path remaps must match the paths cargo and the linker
-# see, and $TMPDIR may end in "/" and sits behind the /var -> /private/var symlink.
+# check_build_root <dir>: cargo reads .cargo/config.toml from every parent of the build, so a
+# build under a directory another user can write (/tmp) would run their linker or rustc wrapper
+# and the result would then be signed. Every directory from <dir> up to / must be owned by root
+# or by us, not writable by group or others, and hold no .cargo.
+check_build_root() {
+  local p me owner mode
+  p="$(cd "$1" && pwd -P)" || die "no such directory: $1"
+  me="$(id -un)"
+  while :; do
+    owner="$(stat -f '%Su' "$p")"
+    mode="$(stat -f '%Lp' "$p")"
+    [ "$owner" = root ] || [ "$owner" = "$me" ] || die "unsafe build location: $p is owned by $owner"
+    (( (8#$mode & 8#022) == 0 )) || die "unsafe build location: $p is writable by group or others (mode $mode)"
+    [ ! -e "$p/.cargo" ] || die "unsafe build location: $p/.cargo would configure the build"
+    [ "$p" = / ] && break
+    p="$(dirname "$p")"
+  done
+}
+
+# A fresh build dir in the per-user temp dir (not $TMPDIR, which may be unset or point at /tmp),
+# by its real path: the path remaps must match the paths cargo and the linker see.
 new_work() {
-  local d
-  d="$(mktemp -d "${TMPDIR:-/tmp}/$1.XXXXXX")"
+  local base d
+  base="$(getconf DARWIN_USER_TEMP_DIR)" || die "no per-user temp dir (getconf DARWIN_USER_TEMP_DIR)"
+  check_build_root "$base"
+  d="$(mktemp -d "$base/$1.XXXXXX")"
   (cd "$d" && pwd -P)
 }
 
@@ -325,6 +369,7 @@ case "$sub" in
   build) cmd_build build "$@" ;;
   release) cmd_build release "$@" ;;
   verify-repro) cmd_verify_repro "$@" ;;
+  check-build-root) [ $# -eq 1 ] || usage; check_build_root "$1"; echo "ok: $1" ;;
   formula) cmd_formula "$@" ;;
   -h | --help | help) usage ;;
   *) usage ;;

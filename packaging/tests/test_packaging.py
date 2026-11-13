@@ -355,7 +355,21 @@ class ReleaseScriptTests(unittest.TestCase):
         # missing minisign.pub, a dirty tree or a missing tag later) before building.
         r = self.run_release(MORSEC_SIGN_IDENTITY="Developer ID Application: A B (ABCDE12345)",
                              MORSEC_NOTARY_PROFILE="morsec", MORSEC_MINISIGN_KEY=self.key)
-        self.assertRefused(r, "0.0.0|minisign.pub|not clean|not tagged")
+        self.assertRefused(r, "0.0.0|minisign.pub|team-id|pinned to team|not clean|not tagged")
+
+    def test_build_root_must_not_be_shared(self):
+        # cargo reads .cargo/config.toml from every parent of the build dir.
+        r = subprocess.run(["bash", RELEASE, "check-build-root", "/private/tmp"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("writable by group or others", r.stderr)
+        r = subprocess.run(["bash", RELEASE, "check-build-root", self.tmp], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        os.mkdir(os.path.join(self.tmp, ".cargo"))
+        child = os.path.join(self.tmp, "child")
+        os.mkdir(child)
+        r = subprocess.run(["bash", RELEASE, "check-build-root", child], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(".cargo would configure the build", r.stderr)
 
     def test_formula_subcommand_refuses_bad_url(self):
         r = subprocess.run(["bash", RELEASE, "formula", "--version", "0.1.0", "--sha256", "a" * 64,

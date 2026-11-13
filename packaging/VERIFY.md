@@ -18,7 +18,8 @@ The trusted comment names the version, the full commit and the target.
 tar -xzf morsec-<version>-aarch64-apple-darwin.tar.gz
 codesign --verify --strict --verbose=2 morsec-<version>/bin/ms morsec-<version>/bin/msd
 codesign -d --verbose=2 morsec-<version>/bin/msd   # Identifier=cc.morsec.msd, flags include runtime,
-                                                   # Authority=Developer ID Application: …, a Timestamp
+                                                   # Authority=Developer ID Application: …, a Timestamp,
+                                                   # TeamIdentifier = packaging/macos/team-id at the tag
 codesign -d --entitlements - morsec-<version>/bin/msd   # empty: morsec has no entitlements
 spctl --assess --type execute --verbose=4 morsec-<version>/bin/msd   # accepted, Notarized Developer ID
 ```
