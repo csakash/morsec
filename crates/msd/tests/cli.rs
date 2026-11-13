@@ -150,6 +150,45 @@ fn status_with_and_without_daemon() {
     drop(daemon);
 }
 
+// protects=--port picks the per-port dev socket even when MORSEC_SOCKET is exported, so parallel
+// loops never share one socket; fails_when=msd binds $MORSEC_SOCKET instead; no_claim=the
+// --socket flag (it always wins, by construction)
+#[test]
+fn port_beats_exported_socket() {
+    let d = tmpdir();
+    let exported = d.path().join("exported.sock");
+    // A port unlikely to be used by another test run at the same time.
+    let port = 40000 + (std::process::id() % 20000) as u16;
+    let expected = std::env::temp_dir()
+        .join(format!("morsec-dev-{port}"))
+        .join("msd.sock");
+    let child = Command::new(msd())
+        .args(["--foreground", "--port", &port.to_string()])
+        .env("MORSEC_SOCKET", &exported)
+        .env("MORSEC_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _d = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !expected.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "no socket at {}",
+            expected.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!exported.exists(), "msd bound the exported socket");
+    let (code, out, err) = run(&ms(), &["status"], &expected);
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "morsec on · daemon 0.0.0\n"),
+        "{err}"
+    );
+}
+
 // protects=msd refuses to start without --foreground (no silent background mode before L07);
 // fails_when=it starts or exits 0; no_claim=service management
 #[test]

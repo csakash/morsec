@@ -19,7 +19,8 @@ struct Args {
     /// Proxy port. Recorded only until L05 adds the proxy. Also picks a per-port dev socket.
     #[arg(long)]
     port: Option<u16>,
-    /// Socket path. Defaults to $MORSEC_SOCKET, then a per-port dev socket, then the platform path.
+    /// Socket path. Without it: a per-port dev socket when --port is given, else $MORSEC_SOCKET,
+    /// else the platform path.
     #[arg(long)]
     socket: Option<PathBuf>,
 }
@@ -57,15 +58,19 @@ fn socket_path(args: &Args) -> ms_core::Result<PathBuf> {
     if let Some(p) = &args.socket {
         return Ok(p.clone());
     }
-    if std::env::var_os(ms_ipc::paths::SOCKET_ENV).is_some_and(|v| !v.is_empty()) {
-        return ms_ipc::default_socket_path();
-    }
+    // --port before $MORSEC_SOCKET: parallel loops each pass their own port, and must not all
+    // land on one exported socket.
     if let Some(port) = args.port {
-        return Ok(std::env::temp_dir()
-            .join(format!("morsec-dev-{port}"))
-            .join("msd.sock"));
+        return Ok(dev_socket(port));
     }
     ms_ipc::default_socket_path()
+}
+
+/// The per-port dev socket: `$TMPDIR/morsec-dev-<port>/msd.sock`.
+fn dev_socket(port: u16) -> PathBuf {
+    std::env::temp_dir()
+        .join(format!("morsec-dev-{port}"))
+        .join("msd.sock")
 }
 
 async fn shutdown_signal() {
