@@ -8,11 +8,17 @@ use crate::table::{OsProcessTable, ProcessTable};
 use crate::walk::{Caller, Resolver};
 
 /// Resolves a Unix-socket peer. The PID comes from the kernel (`LOCAL_PEERPID` /
-/// `SO_PEERCRED`), never from the client. The process's current uid must still be the uid the
-/// kernel reported at connect, otherwise the PID was reused and the peer is refused.
+/// `SO_PEERCRED`), never from the client. The PID is refused as reused if the process now has
+/// a different uid from the one the kernel reported, or started after `accepted_unix_ms` (when
+/// the daemon accepted the connection).
+///
+/// Residual risk: a same-uid process that reuses the PID *before* the connection was accepted
+/// passes both checks. Closing that needs the audit token's PID version (macOS) or a pidfd
+/// (Linux), which ms-ipc does not expose in IPC v1.
 pub fn resolve_peer<T: ProcessTable>(
     resolver: &Resolver<T>,
     peer: &PeerInfo,
+    accepted_unix_ms: u64,
 ) -> std::result::Result<Caller, SessionError> {
     let pid = peer
         .pid
@@ -20,7 +26,7 @@ pub fn resolve_peer<T: ProcessTable>(
         .filter(|&p| p > 0)
         .ok_or(SessionError::NoPeerPid)?;
     let info = resolver.info(pid)?;
-    if info.uid != peer.uid {
+    if info.uid != peer.uid || info.started_unix_ms > accepted_unix_ms {
         return Err(SessionError::PidChanged { pid });
     }
     resolver.resolve_from(info)
@@ -50,19 +56,36 @@ impl<T: ProcessTable> SessionPeerCheck<T> {
         }
     }
 
-    /// The caller behind `peer`, after the same checks as [`PeerCheck::check`].
-    pub fn caller(&self, peer: &PeerInfo) -> std::result::Result<Caller, SessionError> {
+    /// The caller behind `peer`, for a connection accepted at `accepted_unix_ms`. Handlers
+    /// should record the accept time and pass it here.
+    pub fn caller(
+        &self,
+        peer: &PeerInfo,
+        accepted_unix_ms: u64,
+    ) -> std::result::Result<Caller, SessionError> {
         if peer.uid != self.uid {
             return Err(SessionError::WrongUser { uid: peer.uid });
         }
-        resolve_peer(&self.resolver, peer)
+        resolve_peer(&self.resolver, peer, accepted_unix_ms)
     }
 }
 
 impl<T: ProcessTable + 'static> PeerCheck for SessionPeerCheck<T> {
     fn check(&self, peer: &PeerInfo) -> Result<()> {
-        self.caller(peer).map(|_| ()).map_err(Into::into)
+        // `check` runs right after accept, so now is the accept time.
+        self.caller(peer, now_unix_ms())
+            .map(|_| ())
+            .map_err(Into::into)
     }
+}
+
+/// Wall-clock now, Unix milliseconds.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -72,6 +95,12 @@ mod tests {
 
     fn peer(uid: u32, pid: Option<i32>) -> PeerInfo {
         PeerInfo { uid, gid: 20, pid }
+    }
+
+    impl SessionPeerCheck<FakeTable> {
+        fn caller2(&self, p: &PeerInfo) -> std::result::Result<Caller, SessionError> {
+            self.caller(p, 1_000)
+        }
     }
 
     fn check() -> SessionPeerCheck<FakeTable> {
@@ -90,7 +119,7 @@ mod tests {
         let c = check();
         assert!(c.check(&peer(501, Some(11))).is_ok());
         assert_eq!(
-            c.caller(&peer(501, Some(11)))
+            c.caller2(&peer(501, Some(11)))
                 .unwrap()
                 .session()
                 .unwrap()
@@ -98,19 +127,19 @@ mod tests {
             10
         );
         assert!(matches!(
-            c.caller(&peer(502, Some(11))),
+            c.caller2(&peer(502, Some(11))),
             Err(SessionError::WrongUser { uid: 502 })
         ));
         assert!(matches!(
-            c.caller(&peer(501, None)),
+            c.caller2(&peer(501, None)),
             Err(SessionError::NoPeerPid)
         ));
         assert!(matches!(
-            c.caller(&peer(501, Some(-1))),
+            c.caller2(&peer(501, Some(-1))),
             Err(SessionError::NoPeerPid)
         ));
         assert!(matches!(
-            c.caller(&peer(501, Some(999))),
+            c.caller2(&peer(501, Some(999))),
             Err(SessionError::Unreadable { pid: 999, .. })
         ));
         let e = c.check(&peer(501, Some(999))).unwrap_err();
@@ -119,6 +148,19 @@ mod tests {
 
     // protects=uid re-check catches PID reuse by another user; fails_when=a reused pid owned by
     // a different uid is resolved; no_claim=same-uid reuse (start time handles that downstream)
+    // protects=same-uid PID reuse after accept; fails_when=a process that started after the
+    // connection was accepted is resolved as the peer; no_claim=reuse before accept
+    #[test]
+    fn started_after_accept_is_refused() {
+        let c = check(); // pid 11 started at 6
+        assert!(c.caller(&peer(501, Some(11)), 6).is_ok());
+        assert!(c.caller(&peer(501, Some(11)), 7).is_ok());
+        assert!(matches!(
+            c.caller(&peer(501, Some(11)), 5),
+            Err(SessionError::PidChanged { pid: 11 })
+        ));
+    }
+
     #[test]
     fn uid_changed_since_connect_is_refused() {
         let c = check();
@@ -131,7 +173,7 @@ mod tests {
             .unwrap()
             .uid = 0;
         assert!(matches!(
-            c.caller(&peer(501, Some(11))),
+            c.caller2(&peer(501, Some(11))),
             Err(SessionError::PidChanged { pid: 11 })
         ));
     }

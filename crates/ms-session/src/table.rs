@@ -1,6 +1,7 @@
 //! Reading the OS process and socket tables.
 
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// What session identity needs to know about one process.
@@ -20,30 +21,39 @@ pub struct ProcInfo {
 
 /// A source of process information. [`OsProcessTable`] reads the live system; tests use fakes.
 pub trait ProcessTable: Send + Sync {
-    /// Information about `pid`. An error means the process is gone or unreadable.
+    /// Information about `pid`. [`io::ErrorKind::NotFound`] means no such process; any other
+    /// error means it exists but could not be read.
     fn info(&self, pid: u32) -> io::Result<ProcInfo>;
 }
 
 /// A source of TCP socket ownership. [`OsProcessTable`] reads the live system.
 pub trait SocketTable: Send + Sync {
-    /// PIDs of processes holding a TCP socket whose local end is a loopback address on
-    /// `local_port` and whose remote end is on `remote_port`.
-    fn owners(&self, local_port: u16, remote_port: u16) -> io::Result<Vec<u32>>;
+    /// PIDs of processes holding a TCP socket whose local end is exactly `local` and whose
+    /// remote end is exactly `remote` (both loopback; IPv4-mapped addresses compare as IPv4).
+    fn owners(&self, local: SocketAddr, remote: SocketAddr) -> io::Result<Vec<u32>>;
 
     /// Whether `pid` holds such a socket. Used to re-check a cached answer cheaply.
-    fn holds(&self, pid: u32, local_port: u16, remote_port: u16) -> io::Result<bool>;
+    fn holds(&self, pid: u32, local: SocketAddr, remote: SocketAddr) -> io::Result<bool>;
 }
 
 /// The live process and socket tables of this machine.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OsProcessTable;
 
-pub(crate) fn matches(ends: &crate::sockparse::TcpEnds, local_port: u16, remote_port: u16) -> bool {
-    ends.local.port() == local_port
-        && ends.remote.port() == remote_port
-        // `to_canonical` so an IPv4-mapped `::ffff:127.0.0.1` on a dual-stack socket counts.
-        && ends.local.ip().to_canonical().is_loopback()
-        && ends.remote.ip().to_canonical().is_loopback()
+/// `addr` with an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) turned into IPv4.
+pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+/// The full address pair must match, not just the ports: on Linux any 127/8 address is
+/// bindable, so another process can hold the same source port on `127.0.0.2`.
+pub(crate) fn matches(
+    ends: &crate::sockparse::TcpEnds,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> bool {
+    let (l, r) = (canonical(ends.local), canonical(ends.remote));
+    l == canonical(local) && r == canonical(remote) && l.ip().is_loopback() && r.ip().is_loopback()
 }
 
 #[cfg(target_os = "macos")]
@@ -52,22 +62,25 @@ mod imp {
     use crate::sys::macos;
 
     fn proc_info(pid: u32) -> io::Result<ProcInfo> {
-        let b = macos::bsd_info(pid)?;
-        let ms = b
-            .start_sec
-            .checked_mul(1000)
-            .and_then(|s| s.checked_add(b.start_usec / 1000))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "start time overflow"))?;
+        let raw = macos::kinfo_proc(pid)?;
+        let k = crate::kinfo::parse(&raw)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad kinfo_proc"))?;
+        if k.pid != pid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "kinfo_proc pid mismatch",
+            ));
+        }
         Ok(ProcInfo {
             pid,
-            ppid: b.ppid,
-            uid: b.uid,
-            started_unix_ms: ms,
-            name: b.comm,
+            ppid: k.ppid,
+            uid: k.uid,
+            started_unix_ms: k.started_unix_ms,
+            name: k.comm,
         })
     }
 
-    fn pid_holds(pid: u32, local_port: u16, remote_port: u16) -> io::Result<bool> {
+    fn pid_holds(pid: u32, local: SocketAddr, remote: SocketAddr) -> io::Result<bool> {
         let fds = macos::list_fds(pid)?;
         let socket_type = u32::try_from(libc::PROX_FDTYPE_SOCKET).unwrap_or(u32::MAX);
         for (fd, kind) in fds {
@@ -79,7 +92,7 @@ mod imp {
                 continue;
             };
             if let Some(ends) = crate::sockparse::parse_darwin_socket_fdinfo(&raw)
-                && matches(&ends, local_port, remote_port)
+                && matches(&ends, local, remote)
             {
                 return Ok(true);
             }
@@ -94,19 +107,19 @@ mod imp {
     }
 
     impl SocketTable for OsProcessTable {
-        fn owners(&self, local_port: u16, remote_port: u16) -> io::Result<Vec<u32>> {
+        fn owners(&self, local: SocketAddr, remote: SocketAddr) -> io::Result<Vec<u32>> {
             let mut out = Vec::new();
             for pid in macos::list_all_pids()? {
                 // Other users' processes refuse PROC_PIDLISTFDS; they can't be our clients.
-                if let Ok(true) = pid_holds(pid, local_port, remote_port) {
+                if let Ok(true) = pid_holds(pid, local, remote) {
                     out.push(pid);
                 }
             }
             Ok(out)
         }
 
-        fn holds(&self, pid: u32, local_port: u16, remote_port: u16) -> io::Result<bool> {
-            pid_holds(pid, local_port, remote_port)
+        fn holds(&self, pid: u32, local: SocketAddr, remote: SocketAddr) -> io::Result<bool> {
+            pid_holds(pid, local, remote)
         }
     }
 
@@ -127,14 +140,25 @@ mod imp {
         io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
     }
 
+    /// Boot time, read once: the kernel recomputes `btime` from the wall clock on every read,
+    /// so it can move after a clock change, which would change every session's start time.
+    fn boot_time() -> io::Result<u64> {
+        static BTIME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        if let Some(b) = BTIME.get() {
+            return Ok(*b);
+        }
+        let b = procfs::parse_btime(&fs::read_to_string("/proc/stat")?)
+            .ok_or_else(|| invalid("no btime in /proc/stat"))?;
+        Ok(*BTIME.get_or_init(|| b))
+    }
+
     fn proc_info(pid: u32) -> io::Result<ProcInfo> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
         let stat = procfs::parse_stat(&stat).ok_or_else(|| invalid("bad /proc/<pid>/stat"))?;
         let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
         let uid =
             procfs::parse_status_euid(&status).ok_or_else(|| invalid("bad /proc/<pid>/status"))?;
-        let btime = procfs::parse_btime(&fs::read_to_string("/proc/stat")?)
-            .ok_or_else(|| invalid("no btime in /proc/stat"))?;
+        let btime = boot_time()?;
         let hz = rustix::param::clock_ticks_per_second();
         let started = procfs::start_unix_ms(btime, stat.start_ticks, hz)
             .ok_or_else(|| invalid("bad start time"))?;
@@ -147,14 +171,14 @@ mod imp {
         })
     }
 
-    fn inodes(local_port: u16, remote_port: u16) -> io::Result<Vec<u64>> {
+    fn inodes(local: SocketAddr, remote: SocketAddr) -> io::Result<Vec<u64>> {
         let mut out = Vec::new();
         for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
             let Ok(text) = fs::read_to_string(path) else {
                 continue;
             };
             for row in text.lines().skip(1).filter_map(parse_proc_net_tcp_row) {
-                if matches(&row.ends, local_port, remote_port) && row.inode != 0 {
+                if matches(&row.ends, local, remote) && row.inode != 0 {
                     out.push(row.inode);
                 }
             }
@@ -181,8 +205,8 @@ mod imp {
     }
 
     impl SocketTable for OsProcessTable {
-        fn owners(&self, local_port: u16, remote_port: u16) -> io::Result<Vec<u32>> {
-            let wanted = inodes(local_port, remote_port)?;
+        fn owners(&self, local: SocketAddr, remote: SocketAddr) -> io::Result<Vec<u32>> {
+            let wanted = inodes(local, remote)?;
             if wanted.is_empty() {
                 return Ok(Vec::new());
             }
@@ -197,8 +221,8 @@ mod imp {
             Ok(out)
         }
 
-        fn holds(&self, pid: u32, local_port: u16, remote_port: u16) -> io::Result<bool> {
-            let wanted = inodes(local_port, remote_port)?;
+        fn holds(&self, pid: u32, local: SocketAddr, remote: SocketAddr) -> io::Result<bool> {
+            let wanted = inodes(local, remote)?;
             Ok(!wanted.is_empty() && pid_has_inode(pid, &wanted))
         }
     }
@@ -227,10 +251,10 @@ mod imp {
     }
 
     impl SocketTable for OsProcessTable {
-        fn owners(&self, _l: u16, _r: u16) -> io::Result<Vec<u32>> {
+        fn owners(&self, _l: SocketAddr, _r: SocketAddr) -> io::Result<Vec<u32>> {
             Err(unsupported())
         }
-        fn holds(&self, _p: u32, _l: u16, _r: u16) -> io::Result<bool> {
+        fn holds(&self, _p: u32, _l: SocketAddr, _r: SocketAddr) -> io::Result<bool> {
             Err(unsupported())
         }
     }

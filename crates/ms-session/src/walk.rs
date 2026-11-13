@@ -6,7 +6,7 @@ use crate::error::SessionError;
 use crate::table::{ProcInfo, ProcessTable};
 
 /// Most parent links followed before giving up (fail closed).
-pub const MAX_DEPTH: usize = 128;
+pub const MAX_DEPTH: usize = 64;
 
 /// Who is calling.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -83,6 +83,9 @@ impl<T: ProcessTable> Resolver<T> {
     /// (or `claude`) must not start a fresh session or change agent kind; its authority comes
     /// from the real agent above it.
     ///
+    /// A parent that exists but can't be read is an error (fail closed); one that no longer
+    /// exists ends the chain.
+    ///
     /// Each step requires `parent.started <= child.started`. A parent that started later is a
     /// reused PID (the real parent exited), so the chain is broken there and the walk stops.
     pub fn resolve(&self, pid: u32) -> Result<Caller, SessionError> {
@@ -105,9 +108,18 @@ impl<T: ProcessTable> Resolver<T> {
             if cur.pid <= 1 || cur.ppid == 0 || cur.ppid == cur.pid {
                 break;
             }
-            // An unreadable parent (exited mid-walk, or not ours) ends the chain.
-            let Ok(parent) = self.table.info(cur.ppid) else {
-                break;
+            // A parent that no longer exists (exited mid-walk; the child is being reparented)
+            // ends the chain, like a detach. A parent that exists but can't be read fails
+            // closed: an agent above it could be hidden, which would break the outermost rule.
+            let parent = match self.table.info(cur.ppid) {
+                Ok(p) => p,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(source) => {
+                    return Err(SessionError::Unreadable {
+                        pid: cur.ppid,
+                        source,
+                    });
+                }
             };
             if parent.pid != cur.ppid || parent.started_unix_ms > cur.started_unix_ms {
                 break;
@@ -143,9 +155,9 @@ pub(crate) mod fake {
 
     use super::*;
 
-    /// An in-memory process table.
+    /// An in-memory process table. PIDs in `denied` exist but can't be read.
     #[derive(Debug, Default)]
-    pub struct FakeTable(pub Mutex<HashMap<u32, ProcInfo>>);
+    pub struct FakeTable(pub Mutex<HashMap<u32, ProcInfo>>, pub Mutex<Vec<u32>>);
 
     impl FakeTable {
         pub fn with(procs: &[(u32, u32, u64, &str)]) -> Self {
@@ -172,6 +184,9 @@ pub(crate) mod fake {
 
     impl ProcessTable for FakeTable {
         fn info(&self, pid: u32) -> io::Result<ProcInfo> {
+            if self.1.lock().unwrap().contains(&pid) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
             self.0
                 .lock()
                 .unwrap()
@@ -208,7 +223,7 @@ mod tests {
     }
 
     // protects=AUTH-1 session = agent root, not the caller; fails_when=the leaf or the desktop
-    // host is taken as the session; no_claim=live process reads (tests/tree.rs)
+    // host is taken as the session; no_claim=live process reads (tests/live.rs)
     #[test]
     fn desktop_chain_resolves_to_the_claude_process() {
         let r = Resolver::new(desktop());
@@ -283,6 +298,28 @@ mod tests {
                 pid: 900,
                 started_unix_ms: 300
             }
+        );
+    }
+
+    // protects=fail closed on a hidden ancestor; fails_when=an unreadable middle process lets an
+    // inner impostor agent become the session; no_claim=which errno the OS gives
+    #[test]
+    fn unreadable_parent_fails_closed_but_gone_parent_ends_chain() {
+        let t = desktop();
+        t.put(8000, 5971, 500, "codex");
+        t.put(8001, 8000, 501, "node");
+        t.1.lock().unwrap().push(5971); // zsh unreadable
+        let r = Resolver::new(t);
+        assert!(matches!(
+            r.resolve(8001),
+            Err(SessionError::Unreadable { pid: 5971, .. })
+        ));
+        // Gone (not unreadable): the chain ends at codex, like a detach.
+        r.table().1.lock().unwrap().clear();
+        r.table().0.lock().unwrap().remove(&5971);
+        assert_eq!(
+            r.resolve(8001).unwrap(),
+            session(AgentKind::Codex, 8000, 500)
         );
     }
 

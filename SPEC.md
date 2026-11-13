@@ -16,16 +16,20 @@ All in `crates/ms-session/`. No frozen interface changes.
 
 1. **Process table** (`ProcessTable` trait + `OsProcessTable`). For a PID: parent PID, uid,
    start time (Unix ms), short name (`p_comm` / `comm`), executable path when readable.
-   - macOS: `proc_pidinfo(PROC_PIDTBSDINFO)` and `proc_pidpath` from `libc`.
+   - macOS: `sysctl(KERN_PROC_PID)` (`kinfo_proc`, parsed from bytes at checked offsets; unlike
+     `proc_pidinfo` it can read root-owned processes such as `login` and `launchd`, so the walk
+     can pass them) and `proc_pidpath` for diagnostics.
    - Linux: `/proc/<pid>/stat` (ppid, start ticks), `/proc/<pid>/status` (uid), `/proc/stat`
-     (`btime`), `/proc/<pid>/exe`; tick rate from `rustix` (safe). No unsafe on Linux.
+     (`btime`, read once per daemon because the kernel recomputes it from the wall clock),
+     `/proc/<pid>/exe`; tick rate from `rustix` (safe). No unsafe on Linux.
 2. **Agent classification.** Exact, case-sensitive match on the process short name (set by the
-   kernel at exec from the file name; the executable path is diagnostics only): `claude` → `ClaudeCode`, `codex` → `Codex`, `cursor-agent` → `Cursor`,
+   kernel at exec from the file name; on Linux a process can also rename itself with
+   `prctl(PR_SET_NAME)`; the executable path is diagnostics only): `claude` → `ClaudeCode`, `codex` → `Codex`, `cursor-agent` → `Cursor`,
    `gemini` → `GeminiCli`. Desktop and IDE *hosts* (`Claude`, `Code`, `Cursor`, `Electron` …) are
    never session roots: Claude Desktop runs one `claude` process per session under the `Claude`
    app, so the app must not merge them.
 3. **Process-tree walk → `Caller`.** From the peer PID, walk parent links up to PID 1 (depth cap
-   64). The session root is the **outermost** agent process on that chain.
+   64; deeper is an error). The session root is the **outermost** agent process on that chain.
    - Outermost, not nearest: a process inside a Claude Code session that names itself `codex` (or
      `claude`) must not become a fresh session or change agent kind. Authority comes from the
      real outer agent. A Claude session that runs `codex` attributes to the Claude session.
@@ -35,20 +39,26 @@ All in `crates/ms-session/`. No frozen interface changes.
      agent ancestor, e.g. a person running `ms` in a plain terminal, or a daemonized process).
      `Unattributed` is **not** proof of a human and must never get more rights than an agent
      session; that is documented on the type.
-   - A process that cannot be read (exited, other user) is an error: fail closed.
-4. **Unix-socket peers.** `resolve_peer(&ms_ipc::PeerInfo) -> Result<Caller>` (requires a PID;
-   `None` is an error) and `SessionPeerCheck` implementing `ms_ipc::PeerCheck`: same uid as the
+   - The caller or any ancestor that exists but cannot be read is an error: fail closed (an
+     unreadable middle process could hide the real outer agent). An ancestor that no longer
+     exists ends the chain, like a detach.
+4. **Unix-socket peers.** `resolve_peer(&resolver, &ms_ipc::PeerInfo, accepted_unix_ms)`
+   (requires a PID; `None` is an error; a process whose uid differs from the kernel's peer uid,
+   or that started after the accept time, is a reused PID and is refused) and `SessionPeerCheck` implementing `ms_ipc::PeerCheck`: same uid as the
    daemon, PID present, PID's uid matches, and the walk succeeds. Drop-in for `SameUid` in L07.
-5. **TCP loopback source port → PID** (`PortResolver`). Given the proxy's local port and the
-   client's source port on loopback, find the process whose socket is
-   `local = 127.0.0.1|::1 : src_port`, `remote = proxy_port` (so `msd`'s own accepted end never
-   matches).
+5. **TCP loopback connection → PID** (`PortResolver`). Given the accepted stream's
+   `peer_addr()` (client) and `local_addr()` (proxy), find the process whose socket is exactly
+   `local = client`, `remote = proxy` (full address pair, IPv4-mapped compared as IPv4, both
+   loopback). Ports alone are not enough: on Linux any 127/8 address is bindable, so another
+   process could hold the same source port on `127.0.0.2`. The daemon's own PID is never an
+   owner.
    - macOS: `proc_listallpids` → `proc_pidinfo(PROC_PIDLISTFDS)` → `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`.
      The socket record is read into a byte buffer and parsed in safe code at offsets verified by
      a self-test against a real socket.
    - Linux: `/proc/net/tcp{,6}` row → inode → scan `/proc/<pid>/fd` links for `socket:[inode]`.
    - Cache: recent owner PIDs are probed first (agents open many connections), with a short TTL
-     on `(src_port) → owner`; every cache hit is re-verified against the live socket before use.
+     on `(client, proxy) → owner`; every cache hit is re-verified against the live socket and the
+     owner's start time before use.
    - Several processes sharing the socket (fork) must all resolve to the same `Caller` on a full
      scan, otherwise error. The cached / recent-owner paths return the first verified holder: a
      socket only reaches a second process by inheritance (same session) or by its holder
@@ -62,11 +72,23 @@ All in `crates/ms-session/`. No frozen interface changes.
 ## Unsafe
 
 One module, `src/sys/macos.rs`, with `#[allow(unsafe_code)]` scoped to it (REVIEW.md: explicit
-opt-out plus `// SAFETY:` on every block). It only calls the four libproc functions into
+opt-out plus `// SAFETY:` on every block). It only calls `sysctl(KERN_PROC_PID)` and four libproc functions into
 correctly sized, owned buffers and returns owned Rust values. All parsing is safe code.
 Rejected alternatives: the `libproc` crate (bindgen + libclang at build time, large build-time
 supply chain), `sysinfo` (no socket→PID, start time only in seconds), shelling out to `lsof`
 (slow per connection, output parsing).
+
+## Residual risks (same-user design, documented not fixed)
+
+- A process can detach from its agent (`Caller::Unattributed`, never more rights than an agent)
+  or exec / rename itself as `claude` outside any session and get a fresh `SessionId`. L07 must
+  give a never-seen session no standing grants, and must not let a fresh session escape a
+  revoked or capped one; sensitive actions still need approval (AUTH-3).
+- Unix peer PID reused by a same-uid process before accept passes the checks (needs audit
+  token / pidfd, an ms-ipc change).
+- Full scans cost ~2–5 ms and every distinct new connection can force one; an agent could load
+  the daemon this way. L07 should run lookups off the async runtime (`spawn_blocking`) and cap
+  concurrent scans. The same agent could also just `kill msd`.
 
 ## Out of scope
 

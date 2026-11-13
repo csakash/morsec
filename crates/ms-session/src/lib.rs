@@ -15,8 +15,13 @@
 //! hostile one: a process can always detach from its agent ([`Caller::Unattributed`]) or exec
 //! a binary named like an agent outside any session. Rights for sensitive actions must still
 //! come from approvals (AUTH-3), and an unattributed caller never gets more than an agent.
+//! A never-seen session gets no standing grants: a fresh `SessionId` must not be a way to
+//! escape a revoked or capped one.
+//!
+//! [`PortResolver::resolve`] may scan every process (a few ms); call it off the async runtime.
 
 pub mod error;
+pub mod kinfo;
 pub mod peer;
 pub mod port;
 pub mod procfs;

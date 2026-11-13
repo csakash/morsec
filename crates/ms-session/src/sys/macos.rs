@@ -1,9 +1,10 @@
-//! The only `unsafe` in this crate: four libproc calls on macOS.
+//! The only `unsafe` in this crate: `sysctl(KERN_PROC_PID)` and four libproc calls on macOS.
 //!
 //! Each function passes an owned, correctly sized buffer to the kernel and returns owned Rust
 //! values. Nothing here keeps a pointer past the call, and nothing parses kernel structs whose
-//! layout `libc` does not define: the socket record comes back as plain bytes and is parsed in
-//! safe code (`crate::sockparse`), at offsets that a test checks against a real socket.
+//! layout `libc` does not define: `kinfo_proc` and `socket_fdinfo` come back as plain bytes and
+//! are parsed in safe code (`crate::kinfo`, `crate::sockparse`) at offsets checked by unit tests
+//! against `clang` `offsetof` values and by `tests/live.rs` against real processes and sockets.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -19,16 +20,6 @@ const MAX_PIDS: usize = 1 << 20;
 /// Most file descriptors listed per process.
 const MAX_FDS: usize = 1 << 20;
 
-/// The fields of `proc_bsdinfo` that session identity needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BsdInfo {
-    pub ppid: u32,
-    pub uid: u32,
-    pub start_sec: u64,
-    pub start_usec: u64,
-    pub comm: String,
-}
-
 fn pid_arg(pid: u32) -> io::Result<libc::c_int> {
     libc::c_int::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
@@ -37,46 +28,46 @@ fn len_arg(len: usize) -> io::Result<libc::c_int> {
     libc::c_int::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
-/// `proc_pidinfo(PROC_PIDTBSDINFO)`.
-pub(crate) fn bsd_info(pid: u32) -> io::Result<BsdInfo> {
-    let cpid = pid_arg(pid)?;
-    let size = len_arg(size_of::<libc::proc_bsdinfo>())?;
-    // SAFETY: `proc_bsdinfo` is a plain C struct of integers and byte arrays, so the all-zero
-    // bit pattern is a valid value.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a live, writable `proc_bsdinfo` and `size` is exactly its size, so the
-    // kernel writes at most `size` bytes into memory we own. No pointer outlives the call.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            cpid,
-            libc::PROC_PIDTBSDINFO,
+/// `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)`: the raw `struct kinfo_proc`, parsed in
+/// `crate::kinfo`. Unlike `proc_pidinfo`, this works for every process (including root-owned
+/// ones such as `login` and `launchd`), which is what `ps` uses. A PID with no process gives
+/// `NotFound`.
+pub(crate) fn kinfo_proc(pid: u32) -> io::Result<Vec<u8>> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid_arg(pid)?,
+    ];
+    let mut buf = vec![0u8; crate::kinfo::SIZE];
+    let mut len: libc::size_t = buf.len();
+    // SAFETY: `mib` is a live array of 4 ints and 4 is passed as its length. `buf` is an owned,
+    // writable allocation of `len` bytes and `len` points at that size; the kernel writes at
+    // most `len` bytes and stores the written length back in `len`. No new value is set
+    // (`newp` null, `newlen` 0). No pointer outlives the call.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buf.as_mut_ptr().cast::<c_void>(),
+            &raw mut len,
+            std::ptr::null_mut(),
             0,
-            (&raw mut info).cast::<c_void>(),
-            size,
         )
     };
-    if n <= 0 {
+    if r != 0 {
         return Err(io::Error::last_os_error());
     }
-    if n != size {
+    if len == 0 {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
+    if len != crate::kinfo::SIZE {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "short proc_bsdinfo",
+            "short kinfo_proc",
         ));
     }
-    let comm: Vec<u8> = info
-        .pbi_comm
-        .iter()
-        .map(|&c| c.to_ne_bytes()[0])
-        .take_while(|&b| b != 0)
-        .collect();
-    Ok(BsdInfo {
-        ppid: info.pbi_ppid,
-        uid: info.pbi_uid,
-        start_sec: info.pbi_start_tvsec,
-        start_usec: info.pbi_start_tvusec,
-        comm: String::from_utf8_lossy(&comm).into_owned(),
-    })
+    Ok(buf)
 }
 
 /// `proc_pidpath`: the executable path, when readable.

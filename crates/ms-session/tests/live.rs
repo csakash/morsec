@@ -283,48 +283,62 @@ fn child_inherits_the_runners_caller() {
     let _ = child.wait();
 }
 
-// protects=port->pid on the real socket table, incl. the darwin struct offsets; fails_when=the
-// client end is not found, the daemon's own end matches, or a closed socket still resolves;
-// no_claim=IPv6 loopback (covered by parser unit tests)
-fn port_to_pid_live() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let proxy = listener.local_addr().unwrap().port();
-    let client = TcpStream::connect(("127.0.0.1", proxy)).unwrap();
-    let (accepted, peer) = listener.accept().unwrap();
-    let src = peer.port();
-    let me = std::process::id();
-
-    let t0 = Instant::now();
-    let owners = OsProcessTable.owners(src, proxy).unwrap();
-    let scan = t0.elapsed();
-    assert_eq!(owners, vec![me], "client end owner");
-    // Reversed orientation finds the accepted (daemon-side) socket, also ours here. The
-    // resolver always asks for (src, proxy), so a daemon's own end can't match.
-    assert_eq!(OsProcessTable.owners(proxy, src).unwrap(), vec![me]);
-    assert!(OsProcessTable.holds(me, src, proxy).unwrap());
-
-    let pr = PortResolver::new(OsProcessTable, OsProcessTable);
-    let want = Resolver::new(OsProcessTable).resolve(me).unwrap();
-    assert_eq!(pr.resolve(src, proxy).unwrap(), want);
-    let t1 = Instant::now();
-    assert_eq!(pr.resolve(src, proxy).unwrap(), want);
-    let cached = t1.elapsed();
-    println!("    full scan {scan:?}, cached+verified {cached:?}");
-
-    drop(client);
-    drop(accepted);
+// protects=macOS sysctl reads of root-owned processes (so the walk can pass login/launchd);
+// fails_when=pid 1 is unreadable or misparsed; no_claim=Linux hidepid setups
+fn reads_root_owned_processes() {
+    let init = OsProcessTable.info(1).expect("pid 1 readable");
+    assert_eq!(init.pid, 1);
+    assert_eq!(init.uid, 0);
+    assert_eq!(init.ppid, 0);
+    #[cfg(target_os = "macos")]
+    assert_eq!(init.name, "launchd");
     assert!(matches!(
-        pr.resolve(src, proxy),
-        Err(SessionError::NoSocketOwner { .. })
+        OsProcessTable.info(99_999_999).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput)
     ));
 }
 
+// protects=socket table reads incl. the darwin socket_fdinfo address and port offsets;
+// fails_when=the client end is not found by its exact address pair, a different loopback
+// address or swapped orientation matches the wrong end, or a closed socket still resolves;
+// no_claim=IPv6 loopback (parser unit tests)
+fn socket_table_live() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let client = TcpStream::connect(proxy).unwrap();
+    let (accepted, peer) = listener.accept().unwrap();
+    assert_eq!(peer, client.local_addr().unwrap());
+    let me = std::process::id();
+
+    let t0 = Instant::now();
+    let owners = OsProcessTable.owners(peer, proxy).unwrap();
+    let scan = t0.elapsed();
+    assert_eq!(owners, vec![me], "client end owner");
+    // Reversed orientation is the accepted (daemon-side) socket.
+    assert_eq!(OsProcessTable.owners(proxy, peer).unwrap(), vec![me]);
+    assert!(OsProcessTable.holds(me, peer, proxy).unwrap());
+    // Same ports, different loopback address: not this connection.
+    let other: std::net::SocketAddr = format!("127.0.0.2:{}", peer.port()).parse().unwrap();
+    assert!(OsProcessTable.owners(other, proxy).unwrap().is_empty());
+    println!("    full scan {scan:?}");
+
+    // The resolver never answers with its own process.
+    let pr = PortResolver::new(OsProcessTable, OsProcessTable);
+    assert!(matches!(
+        pr.resolve(peer, proxy),
+        Err(SessionError::NoSocketOwner { .. })
+    ));
+    drop(client);
+    drop(accepted);
+    assert!(OsProcessTable.owners(peer, proxy).unwrap().is_empty());
+}
+
 // protects=AUTH-1 proxy path end to end; fails_when=a fake claude tree's connection does not
-// resolve to that claude session or passes a codex username cross-check; no_claim=the L05
-// proxy's own Proxy-Authorization parsing
+// resolve to that claude session, passes a codex username cross-check, or still resolves
+// (from cache) after the client is gone; no_claim=the L05 proxy's Proxy-Authorization parsing
 fn proxy_client_in_fake_agent_tree() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let proxy = listener.local_addr().unwrap().port();
+    let proxy = listener.local_addr().unwrap();
     let f = Fakes::new();
     let (root, leaf) = (f.file("r"), f.file("l"));
     let argv = s(&[
@@ -333,23 +347,33 @@ fn proxy_client_in_fake_agent_tree() {
         &root,
         &f.bin("helper"),
         "connect",
-        &proxy.to_string(),
+        &proxy.port().to_string(),
         &leaf,
     ]);
     let tree = detached(&f, &argv, &root);
     let (_conn, peer) = listener.accept().unwrap();
     let leaf_pid = read_pid(&leaf);
     let pr = PortResolver::new(OsProcessTable, OsProcessTable);
-    let c = pr.resolve(peer.port(), proxy).unwrap();
+    let t0 = Instant::now();
+    let c = pr.resolve(peer, proxy).unwrap();
+    let first = t0.elapsed();
     let sid = c.session().expect("agent");
     assert_eq!(sid.agent, AgentKind::ClaudeCode);
     assert_eq!(sid.pid, tree.root);
-    assert_eq!(
-        OsProcessTable.owners(peer.port(), proxy).unwrap(),
-        vec![leaf_pid]
-    );
+    assert_eq!(OsProcessTable.owners(peer, proxy).unwrap(), vec![leaf_pid]);
     assert!(cross_check(&c, "claude-code").is_ok());
     assert!(cross_check(&c, "codex").is_err());
+    let t1 = Instant::now();
+    assert_eq!(pr.resolve(peer, proxy).unwrap(), c);
+    println!("    first {first:?}, cached+verified {:?}", t1.elapsed());
+
+    drop(tree);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while OsProcessTable.info(leaf_pid).is_ok() {
+        assert!(Instant::now() < deadline, "leaf never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(pr.resolve(peer, proxy).is_err(), "stale cache answered");
 }
 
 fn main() -> ExitCode {
@@ -382,7 +406,8 @@ fn main() -> ExitCode {
             "child_inherits_the_runners_caller",
             child_inherits_the_runners_caller,
         ),
-        ("port_to_pid_live", port_to_pid_live),
+        ("reads_root_owned_processes", reads_root_owned_processes),
+        ("socket_table_live", socket_table_live),
         (
             "proxy_client_in_fake_agent_tree",
             proxy_client_in_fake_agent_tree,

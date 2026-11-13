@@ -17,7 +17,7 @@ pub struct TcpEnds {
 }
 
 /// Offsets into `struct socket_fdinfo` (`<sys/proc_info.h>`, LP64 macOS). Checked against a
-/// real socket by `tests/port.rs` and against `clang` `offsetof` output recorded in
+/// real socket by `tests/live.rs` and against `clang` `offsetof` output recorded in
 /// `docs/evidence/session-identity.md`.
 pub(crate) mod darwin {
     /// `sizeof(struct socket_fdinfo)`.
@@ -159,7 +159,7 @@ mod tests {
     }
 
     // protects=port->pid parsing of macOS socket records; fails_when=offsets or byte order are
-    // wrong; no_claim=that the offsets match the running kernel (tests/port.rs checks that)
+    // wrong; no_claim=that the offsets match the running kernel (tests/live.rs checks that)
     #[test]
     fn darwin_v4_and_v6_round_trip() {
         let lo4: IpAddr = Ipv4Addr::LOCALHOST.into();

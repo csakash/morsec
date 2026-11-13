@@ -1,14 +1,15 @@
-//! Loopback TCP source port → owning process → [`Caller`], for proxy clients.
+//! Loopback TCP connection → owning process → [`Caller`], for proxy clients.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::error::SessionError;
-use crate::table::{ProcessTable, SocketTable};
+use crate::table::{ProcessTable, SocketTable, canonical};
 use crate::walk::{Caller, Resolver};
 
-/// How long a `(source port, proxy port) → PID` answer is kept. Every use re-checks it.
+/// How long a `(client address, proxy address) → PID` answer is kept. Every use re-checks it.
 pub const CACHE_TTL: Duration = Duration::from_secs(30);
 /// Recent owners probed before a full scan.
 pub const RECENT_OWNERS: usize = 32;
@@ -24,17 +25,23 @@ struct Entry {
 
 #[derive(Debug, Default)]
 struct State {
-    cache: HashMap<(u16, u16), Entry>,
+    cache: HashMap<(SocketAddr, SocketAddr), Entry>,
     recent: VecDeque<u32>,
 }
 
 /// Finds which process is on the client end of a proxy connection and resolves its session.
 ///
-/// Lookup order: the cached owner for this port pair, then recently seen owners (agents open
-/// many connections), then a scan of every process. Any candidate must be shown, live, to hold
-/// a socket with `local = loopback:src_port` and `remote = loopback:proxy_port`, and still have
-/// the start time it had when cached, so a stale cache entry or a reused PID can't answer.
-/// The daemon's own accepted socket has those ports the other way round, so it never matches.
+/// The connection is named by its full address pair, as `accept()` reports it: the client's
+/// address (`peer_addr`) and the proxy's own address (`local_addr`). Matching only ports would
+/// let a process that binds the same source port on another loopback address (any of 127/8 on
+/// Linux, or `::1`) borrow a live connection's identity.
+///
+/// Lookup order: the cached owner for this address pair, then recently seen owners (agents
+/// open many connections), then a scan of every process. Any candidate must be shown, live, to
+/// hold a socket with exactly `local = client` and `remote = proxy`, and still have the start
+/// time it had when cached, so a stale cache entry or a reused PID can't answer. The daemon's
+/// own process is never an owner (its accepted socket is the same pair the other way round,
+/// and a crafted `client == proxy` pair must not resolve to the daemon's own ancestry).
 ///
 /// A socket held by processes in different sessions is refused when the full scan sees it.
 /// The cached and recent-owner paths return the first verified holder: a socket only reaches a
@@ -45,6 +52,7 @@ pub struct PortResolver<S, T> {
     sockets: S,
     resolver: Resolver<T>,
     state: Mutex<State>,
+    own_pid: u32,
 }
 
 impl<S: SocketTable, T: ProcessTable> PortResolver<S, T> {
@@ -54,6 +62,7 @@ impl<S: SocketTable, T: ProcessTable> PortResolver<S, T> {
             sockets,
             resolver: Resolver::new(table),
             state: Mutex::new(State::default()),
+            own_pid: std::process::id(),
         }
     }
 
@@ -74,10 +83,13 @@ impl<S: SocketTable, T: ProcessTable> PortResolver<S, T> {
         &self,
         pid: u32,
         started: Option<u64>,
-        src: u16,
-        proxy: u16,
+        client: SocketAddr,
+        proxy: SocketAddr,
     ) -> Option<(Caller, u64)> {
-        if !matches!(self.sockets.holds(pid, src, proxy), Ok(true)) {
+        if pid == self.own_pid {
+            return None;
+        }
+        if !matches!(self.sockets.holds(pid, client, proxy), Ok(true)) {
             return None;
         }
         let info = self.resolver.info(pid).ok()?;
@@ -86,14 +98,14 @@ impl<S: SocketTable, T: ProcessTable> PortResolver<S, T> {
         }
         // Re-check after reading the process, so the socket and the start time both belong to
         // the same incarnation of `pid`.
-        if !matches!(self.sockets.holds(pid, src, proxy), Ok(true)) {
+        if !matches!(self.sockets.holds(pid, client, proxy), Ok(true)) {
             return None;
         }
         let started = info.started_unix_ms;
         Some((self.resolver.resolve_from(info).ok()?, started))
     }
 
-    fn remember(&self, src: u16, proxy: u16, pid: u32, started: u64) {
+    fn remember(&self, key: (SocketAddr, SocketAddr), pid: u32, started: u64) {
         let mut st = self.lock();
         let now = Instant::now();
         if st.cache.len() >= MAX_CACHE {
@@ -103,7 +115,7 @@ impl<S: SocketTable, T: ProcessTable> PortResolver<S, T> {
             }
         }
         st.cache.insert(
-            (src, proxy),
+            key,
             Entry {
                 pid,
                 started_unix_ms: started,
@@ -115,46 +127,52 @@ impl<S: SocketTable, T: ProcessTable> PortResolver<S, T> {
         st.recent.truncate(RECENT_OWNERS);
     }
 
-    /// The caller on the client end of the loopback connection `src_port → proxy_port`.
-    pub fn resolve(&self, src_port: u16, proxy_port: u16) -> Result<Caller, SessionError> {
+    /// The caller on the client end of the loopback connection `client → proxy`, where
+    /// `client` is the accepted stream's `peer_addr()` and `proxy` its `local_addr()`.
+    pub fn resolve(&self, client: SocketAddr, proxy: SocketAddr) -> Result<Caller, SessionError> {
+        let (client, proxy) = (canonical(client), canonical(proxy));
+        let port = client.port();
+        if !client.ip().is_loopback() || !proxy.ip().is_loopback() {
+            return Err(SessionError::NoSocketOwner { port });
+        }
+        let key = (client, proxy);
         let (cached, recent) = {
             let st = self.lock();
             let cached = st
                 .cache
-                .get(&(src_port, proxy_port))
+                .get(&key)
                 .filter(|e| e.at.elapsed() < CACHE_TTL)
                 .copied();
             (cached, st.recent.clone())
         };
         if let Some(e) = cached
-            && let Some((c, _)) =
-                self.verified(e.pid, Some(e.started_unix_ms), src_port, proxy_port)
+            && let Some((c, _)) = self.verified(e.pid, Some(e.started_unix_ms), client, proxy)
         {
             return Ok(c);
         }
         for pid in recent {
-            if let Some((c, started)) = self.verified(pid, None, src_port, proxy_port) {
-                self.remember(src_port, proxy_port, pid, started);
+            if let Some((c, started)) = self.verified(pid, None, client, proxy) {
+                self.remember(key, pid, started);
                 return Ok(c);
             }
         }
         let owners = self
             .sockets
-            .owners(src_port, proxy_port)
+            .owners(client, proxy)
             .map_err(SessionError::SocketTable)?;
         let mut found: Option<(u32, u64, Caller)> = None;
         for pid in owners {
-            let Some((c, started)) = self.verified(pid, None, src_port, proxy_port) else {
+            let Some((c, started)) = self.verified(pid, None, client, proxy) else {
                 continue;
             };
             match &found {
                 None => found = Some((pid, started, c)),
                 Some((_, _, prev)) if *prev == c => {}
-                Some(_) => return Err(SessionError::AmbiguousOwner { port: src_port }),
+                Some(_) => return Err(SessionError::AmbiguousOwner { port }),
             }
         }
-        let (pid, started, caller) = found.ok_or(SessionError::NoSocketOwner { port: src_port })?;
-        self.remember(src_port, proxy_port, pid, started);
+        let (pid, started, caller) = found.ok_or(SessionError::NoSocketOwner { port })?;
+        self.remember(key, pid, started);
         Ok(caller)
     }
 }
@@ -163,6 +181,7 @@ impl<S: SocketTable, T: ProcessTable> PortResolver<S, T> {
 mod tests {
     use std::collections::HashMap;
     use std::io;
+    use std::net::SocketAddr;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -171,24 +190,38 @@ mod tests {
     use super::*;
     use crate::walk::fake::FakeTable;
 
-    /// Socket owners keyed by (src, proxy).
+    /// Socket owners keyed by (client, proxy).
     #[derive(Debug, Default)]
     struct FakeSockets {
-        owners: Mutex<HashMap<(u16, u16), Vec<u32>>>,
+        owners: Mutex<HashMap<(SocketAddr, SocketAddr), Vec<u32>>>,
         scans: AtomicUsize,
     }
 
+    const PROXY: &str = "127.0.0.1:4600";
+
+    fn a(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Client `127.0.0.1:<port>` to the proxy.
+    fn c(port: u16) -> SocketAddr {
+        SocketAddr::new([127, 0, 0, 1].into(), port)
+    }
+
     impl FakeSockets {
-        fn set(&self, src: u16, proxy: u16, pids: &[u32]) {
+        fn set_at(&self, client: SocketAddr, pids: &[u32]) {
             self.owners
                 .lock()
                 .unwrap()
-                .insert((src, proxy), pids.to_vec());
+                .insert((client, a(PROXY)), pids.to_vec());
+        }
+        fn set(&self, src: u16, _proxy: u16, pids: &[u32]) {
+            self.set_at(c(src), pids);
         }
     }
 
     impl SocketTable for &FakeSockets {
-        fn owners(&self, l: u16, r: u16) -> io::Result<Vec<u32>> {
+        fn owners(&self, l: SocketAddr, r: SocketAddr) -> io::Result<Vec<u32>> {
             self.scans.fetch_add(1, Ordering::SeqCst);
             Ok(self
                 .owners
@@ -198,7 +231,7 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
-        fn holds(&self, pid: u32, l: u16, r: u16) -> io::Result<bool> {
+        fn holds(&self, pid: u32, l: SocketAddr, r: SocketAddr) -> io::Result<bool> {
             Ok(self
                 .owners
                 .lock()
@@ -227,19 +260,19 @@ mod tests {
     }
 
     // protects=AUTH-1 for proxy clients; fails_when=a connection is attributed to the wrong
-    // process or session; no_claim=live socket tables (tests/port.rs)
+    // process or session; no_claim=live socket tables (tests/live.rs)
     #[test]
     fn resolves_owner_and_caches_by_recent_owner() {
         let s = FakeSockets::default();
         s.set(50000, 4600, &[101]);
         let r = PortResolver::new(&s, table());
-        assert_eq!(r.resolve(50000, 4600).unwrap(), claude());
+        assert_eq!(r.resolve(c(50000), a(PROXY)).unwrap(), claude());
         assert_eq!(s.scans.load(Ordering::SeqCst), 1);
         // Same port again: served from cache, verified, no scan.
-        assert_eq!(r.resolve(50000, 4600).unwrap(), claude());
+        assert_eq!(r.resolve(c(50000), a(PROXY)).unwrap(), claude());
         // New port, same process: found via recent owners, no scan.
         s.set(50001, 4600, &[101]);
-        assert_eq!(r.resolve(50001, 4600).unwrap(), claude());
+        assert_eq!(r.resolve(c(50001), a(PROXY)).unwrap(), claude());
         assert_eq!(s.scans.load(Ordering::SeqCst), 1);
     }
 
@@ -250,13 +283,13 @@ mod tests {
         let s = FakeSockets::default();
         s.set(50000, 4600, &[101]);
         let r = PortResolver::new(&s, table());
-        assert_eq!(r.resolve(50000, 4600).unwrap(), claude());
+        assert_eq!(r.resolve(c(50000), a(PROXY)).unwrap(), claude());
         s.set(50000, 4600, &[201]);
-        let c = r.resolve(50000, 4600).unwrap();
-        assert_eq!(c.session().unwrap().agent, AgentKind::Codex);
+        let got = r.resolve(c(50000), a(PROXY)).unwrap();
+        assert_eq!(got.session().unwrap().agent, AgentKind::Codex);
         s.set(50000, 4600, &[]);
         assert!(matches!(
-            r.resolve(50000, 4600),
+            r.resolve(c(50000), a(PROXY)),
             Err(SessionError::NoSocketOwner { port: 50000 })
         ));
     }
@@ -269,17 +302,62 @@ mod tests {
         s.set(50000, 4600, &[101]);
         let t = table();
         let r = PortResolver::new(&s, t);
-        assert_eq!(r.resolve(50000, 4600).unwrap(), claude());
+        assert_eq!(r.resolve(c(50000), a(PROXY)).unwrap(), claude());
         // 101 exits; the pid is reused by a detached process that now holds the port.
         r.resolver().table().put(101, 1, 9999, "sh");
-        let c = r.resolve(50000, 4600).unwrap();
+        let got = r.resolve(c(50000), a(PROXY)).unwrap();
         assert_eq!(
-            c,
+            got,
             Caller::Unattributed {
                 pid: 101,
                 started_unix_ms: 9999
             }
         );
+        // Only a rejected cache entry is replaced: had the cached path accepted the stale
+        // entry, it would still carry the old start time.
+        let st = r.lock();
+        assert_eq!(st.cache[&(c(50000), a(PROXY))].started_unix_ms, 9999);
+    }
+
+    // protects=full address pair, not just ports; fails_when=a process holding the same source
+    // port on another loopback address borrows a live connection's session via the cache or
+    // the recent-owner path; no_claim=kernel 4-tuple uniqueness
+    #[test]
+    fn same_port_on_another_loopback_address_is_a_different_connection() {
+        let s = FakeSockets::default();
+        s.set_at(a("127.0.0.1:50000"), &[101]); // claude's real connection
+        let r = PortResolver::new(&s, table());
+        assert_eq!(r.resolve(a("127.0.0.1:50000"), a(PROXY)).unwrap(), claude());
+        // codex's process binds 127.0.0.2:50000 and connects; 101 is cached and recent.
+        s.set_at(a("127.0.0.2:50000"), &[201]);
+        let got = r.resolve(a("127.0.0.2:50000"), a(PROXY)).unwrap();
+        assert_eq!(got.session().unwrap().agent, AgentKind::Codex);
+        // Same over ::1 and IPv4-mapped forms.
+        s.set_at(a("[::1]:50000"), &[201]);
+        let got = r.resolve(a("[::1]:50000"), a(PROXY)).unwrap();
+        assert_eq!(got.session().unwrap().agent, AgentKind::Codex);
+        assert_eq!(
+            r.resolve(a("[::ffff:127.0.0.1]:50000"), a(PROXY)).unwrap(),
+            claude()
+        );
+        // Non-loopback addresses never resolve.
+        assert!(r.resolve(a("10.0.0.1:50000"), a(PROXY)).is_err());
+    }
+
+    // protects=the daemon never resolves to itself; fails_when=a crafted pair whose only holder
+    // is the daemon's own process resolves to the daemon's ancestry; no_claim=other self pids
+    #[test]
+    fn own_process_is_never_an_owner() {
+        let s = FakeSockets::default();
+        let me = std::process::id();
+        let t = table();
+        t.put(me, 100, 150, "msd");
+        s.set_at(a("127.0.0.1:4600"), &[me]);
+        let r = PortResolver::new(&s, t);
+        assert!(matches!(
+            r.resolve(a("127.0.0.1:4600"), a(PROXY)),
+            Err(SessionError::NoSocketOwner { .. })
+        ));
     }
 
     // protects=fail closed on shared sockets; fails_when=one socket held by two sessions
@@ -290,11 +368,11 @@ mod tests {
         s.set(50000, 4600, &[101, 201]);
         let r = PortResolver::new(&s, table());
         assert!(matches!(
-            r.resolve(50000, 4600),
+            r.resolve(c(50000), a(PROXY)),
             Err(SessionError::AmbiguousOwner { port: 50000 })
         ));
         // Shared within one session (fork) is fine.
         s.set(50002, 4600, &[100, 101]);
-        assert_eq!(r.resolve(50002, 4600).unwrap(), claude());
+        assert_eq!(r.resolve(c(50002), a(PROXY)).unwrap(), claude());
     }
 }
