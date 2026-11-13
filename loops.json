@@ -51,7 +51,13 @@
       "deny.toml",
       "rust-toolchain.toml",
       "scripts/check.sh",
-      "package.json"
+      "package.json",
+      "crates/**",
+      "Cargo.toml",
+      "Cargo.lock",
+      "**/build.rs",
+      ".cargo/**",
+      "scripts/**"
     ]
   },
   "hooks": {

@@ -51,7 +51,7 @@ fn fails_closed_without_cargo_deny() {
         "{stderr}"
     );
     assert!(
-        !stdout.contains("== 1/7"),
+        !stdout.contains("== 1/"),
         "a step ran before the tool check: {stdout}"
     );
 }
