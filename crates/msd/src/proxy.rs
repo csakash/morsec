@@ -253,11 +253,10 @@ pub(crate) fn ensure_ca(d: &Daemon, hosts: &BTreeSet<String>) -> Result<Ca, Stri
     Ok(ca)
 }
 
-/// Writes the CA certificate to `ca.pem` for connectors (public; never read back by msd).
+/// Writes the CA certificate to `ca.pem` for connectors (public; never read back by msd). Always
+/// a fresh atomic write: the rename replaces whatever is there, a symlink or FIFO included,
+/// without following or opening it.
 fn export_pem(d: &Daemon, pem: &str) {
-    if std::fs::read_to_string(&d.paths().ca_pem).ok().as_deref() == Some(pem) {
-        return;
-    }
     if let Err(e) = atomic_write(&d.paths().ca_pem, pem.as_bytes(), 0o644) {
         tracing::warn!(error = %e, "could not export ca.pem");
     }
