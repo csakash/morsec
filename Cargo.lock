@@ -450,7 +450,9 @@ dependencies = [
  "clap",
  "ms-core",
  "ms-ipc",
+ "ms-rules",
  "predicates",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
