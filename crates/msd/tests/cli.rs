@@ -118,8 +118,6 @@ fn stubs_exit_69_and_name_their_loop() {
     let sock = d.path().join("none.sock");
     let table = [
         ("init", "L07 daemon"),
-        ("add", "L04 import-env"),
-        ("import", "L04 import-env"),
         ("connect", "L08 connect-claude"),
         ("disconnect", "L08 connect-claude"),
         ("run", "L12 run-core"),
