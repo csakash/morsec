@@ -254,7 +254,9 @@ fn redact_assignments(s: &str) -> String {
                 while j < bytes.len() && bytes[j] == b' ' {
                     j += 1;
                 }
-                if j < bytes.len() && matches!(bytes[j], b'=' | b':') {
+                // Bare `key` only as `key=` (`key: pg/staging` names a key, it isn't one).
+                let sep_ok = |b: u8| b == b'=' || (b == b':' && *name != "key");
+                if j < bytes.len() && sep_ok(bytes[j]) {
                     j += 1;
                     while j < bytes.len() && bytes[j] == b' ' {
                         j += 1;
@@ -266,6 +268,10 @@ fn redact_assignments(s: &str) -> String {
                     }
                     let start = j;
                     let whole = WHOLE_VALUE_NAMES.contains(name);
+                    let outer_quote = i
+                        .checked_sub(1)
+                        .map(|k| bytes[k])
+                        .filter(|q| matches!(q, b'"' | b'\''));
                     while j < bytes.len() {
                         let b = bytes[j];
                         // Inside quotes, a backslash escapes the next byte (`\"`).
@@ -275,7 +281,9 @@ fn redact_assignments(s: &str) -> String {
                         }
                         let stop = match quote {
                             Some(q) => b == q,
-                            None if whole => matches!(b, b'\n' | b'\r' | b'"' | b'\''),
+                            // Runs to the end of the line, or to the quote that opened before
+                            // the name (`-H 'Authorization: ApiKey "x"'`).
+                            None if whole => matches!(b, b'\n' | b'\r') || Some(b) == outer_quote,
                             None => ends_value(b),
                         };
                         if stop {
@@ -380,48 +388,82 @@ fn hex_val(b: u8) -> Option<u8> {
 
 /// Length of the match of `value` at `text[i..]`. Each value byte may appear literally,
 /// percent-encoded (`%2D`, `%2d`), as `+` for a space (form encoding), or JSON-escaped (`\/`,
-/// `\"`, `\\`, `\n`, `\u002d`), in any mix.
+/// `\"`, `\\`, `\n`, `\b`, `\f`, `\u002d`, and `\u00e4` for a whole non-ASCII char), in any
+/// mix. A `%` or `\` in the value itself is tried both literally and as the start of an
+/// encoding, so `a%b` matches `a%25b` and `a\b` matches `a\\b`.
 fn match_at(text: &[u8], i: usize, value: &[u8]) -> Option<usize> {
-    let at = |k: usize| text.get(k).copied();
-    let mut j = i;
-    for &b in value {
-        if at(j) == Some(b) {
-            j += 1;
-        } else if at(j) == Some(b'%')
-            && at(j + 1)
-                .zip(at(j + 2))
-                .and_then(|(h, l)| Some(hex_val(h)? << 4 | hex_val(l)?))
-                == Some(b)
-        {
-            j += 3;
-        } else if b == b' ' && at(j) == Some(b'+') {
-            j += 1;
-        } else if at(j) == Some(b'\\') {
-            let short = match b {
-                b'/' | b'"' | b'\\' => Some(b),
-                b'\n' => Some(b'n'),
-                b'\r' => Some(b'r'),
-                b'\t' => Some(b't'),
-                _ => None,
-            };
-            if short.is_some() && at(j + 1) == short {
-                j += 2;
-            } else if b < 0x80
-                && at(j + 1) == Some(b'u')
-                && (2..6).all(|k| at(j + k).and_then(hex_val).is_some())
-                && (2..6).fold(0u32, |acc, k| {
-                    acc << 4 | u32::from(at(j + k).and_then(hex_val).unwrap_or(0))
-                }) == u32::from(b)
-            {
-                j += 6;
-            } else {
-                return None;
+    if value.is_empty() {
+        return None;
+    }
+    // Depth-first search over the encodings, iterative (a long value must not grow the call
+    // stack) and memoised on (text pos, value pos) so backtracking stays polynomial.
+    let mut failed = std::collections::HashSet::new();
+    let mut stack = vec![(i, 0usize, steps(text, i, value, 0), 0usize)];
+    while let Some(top) = stack.last_mut() {
+        let (j, k) = (top.0, top.1);
+        if let Some(&(dt, dv)) = top.2.get(top.3) {
+            top.3 += 1;
+            let (nj, nk) = (j + dt, k + dv);
+            if nk == value.len() {
+                return Some(nj - i);
+            }
+            if !failed.contains(&(nj, nk)) {
+                stack.push((nj, nk, steps(text, nj, value, nk), 0));
             }
         } else {
-            return None;
+            failed.insert((j, k));
+            stack.pop();
         }
     }
-    Some(j - i)
+    None
+}
+
+/// Each way value byte(s) at `k` can appear at text position `j`: (text bytes, value bytes).
+fn steps(text: &[u8], j: usize, value: &[u8], k: usize) -> Vec<(usize, usize)> {
+    let at = |n: usize| text.get(n).copied();
+    let b = value[k];
+    let mut out = Vec::with_capacity(2);
+    if at(j) == Some(b) {
+        out.push((1, 1));
+    }
+    if at(j) == Some(b'%')
+        && at(j + 1)
+            .zip(at(j + 2))
+            .and_then(|(h, l)| Some(hex_val(h)? << 4 | hex_val(l)?))
+            == Some(b)
+    {
+        out.push((3, 1));
+    }
+    if b == b' ' && at(j) == Some(b'+') {
+        out.push((1, 1));
+    }
+    if at(j) == Some(b'\\') {
+        let short = match b {
+            b'/' | b'"' | b'\\' => Some(b),
+            b'\n' => Some(b'n'),
+            b'\r' => Some(b'r'),
+            b'\t' => Some(b't'),
+            0x08 => Some(b'b'),
+            0x0c => Some(b'f'),
+            _ => None,
+        };
+        if short.is_some() && at(j + 1) == short {
+            out.push((2, 1));
+        }
+        if at(j + 1) == Some(b'u') {
+            let code = (2..6).try_fold(0u32, |acc, n| {
+                Some(acc << 4 | u32::from(hex_val(at(j + n)?)?))
+            });
+            if let Some(ch) = code.and_then(char::from_u32) {
+                let mut buf = [0u8; 4];
+                let enc = ch.encode_utf8(&mut buf).as_bytes();
+                if value[k..].starts_with(enc) {
+                    out.push((6, enc.len()));
+                }
+            }
+        }
+    }
+    out
 }
 
 const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -515,25 +557,48 @@ pub(crate) fn clean(s: &str, extra: Option<&dyn Redactor>, cap: usize) -> String
 pub(crate) fn clean_argv(argv: &[String], extra: Option<&dyn Redactor>) -> Vec<String> {
     let mut out = Vec::with_capacity(argv.len().min(MAX_ARGS + 1));
     let mut redact_next = false;
-    let tool = argv
-        .first()
-        .and_then(|a| a.rsplit('/').next())
-        .unwrap_or_default();
-    let is_mysql = matches!(
-        tool,
-        "mysql" | "mysqldump" | "mysqladmin" | "mariadb" | "mysqlimport"
-    );
+    // Tools whose glued `-pVALUE` is a password, anywhere in the argv (sudo, env and docker exec
+    // wrappers put them later).
+    let mut glued_p = false;
+    let has_sshpass = argv.iter().any(|t| t.rsplit('/').next() == Some("sshpass"));
+    let mut user_next = false;
     for a in argv.iter().take(MAX_ARGS) {
         if redact_next {
             out.push(REDACTED.to_owned());
             redact_next = false;
             continue;
         }
+        if user_next {
+            // curl -u user:password: keep the user, drop the password.
+            user_next = false;
+            out.push(match a.split_once(':') {
+                Some((user, _)) => format!("{}:{REDACTED}", clean(user, extra, MAX_ARG)),
+                None => clean(a, extra, MAX_ARG),
+            });
+            continue;
+        }
+        let base = a.rsplit('/').next().unwrap_or_default();
+        if matches!(
+            base,
+            "mysql" | "mysqldump" | "mysqladmin" | "mariadb" | "mysqlimport" | "sshpass"
+        ) {
+            glued_p = true;
+        }
         let flag = a.trim_start_matches('-').to_ascii_lowercase();
         redact_next = a.starts_with('-') && !a.contains('=') && is_secret_flag(&flag);
-        if is_mysql && a.len() > 2 && a.starts_with("-p") && !a.starts_with("--") {
-            // mysql -pVALUE: the password is glued to the flag.
+        if a == "-p" && has_sshpass {
+            // sshpass -p VALUE (mysql's bare -p prompts, so it takes no value).
+            redact_next = true;
+        }
+        if glued_p && a.len() > 2 && a.starts_with("-p") && !a.starts_with("--") {
             out.push(format!("-p{REDACTED}"));
+            continue;
+        }
+        if a == "-u" || a == "--user" {
+            user_next = true;
+        }
+        if let Some((user, _)) = a.strip_prefix("--user=").and_then(|v| v.split_once(':')) {
+            out.push(format!("--user={}:{REDACTED}", clean(user, extra, MAX_ARG)));
             continue;
         }
         out.push(clean(a, extra, MAX_ARG));
@@ -546,6 +611,13 @@ pub(crate) fn clean_argv(argv: &[String], extra: Option<&dyn Redactor>) -> Vec<S
 
 /// A flag whose name is, or ends in, a secret name: `password`, `db-password`, `api_key`.
 fn is_secret_flag(flag: &str) -> bool {
+    // Boolean switches such as --no-auth or --skip-token take no value.
+    if ["no-", "skip-", "without-", "disable-", "enable-"]
+        .iter()
+        .any(|p| flag.starts_with(p))
+    {
+        return false;
+    }
     SECRET_NAMES.iter().any(|n| {
         flag == *n
             || flag
@@ -609,6 +681,14 @@ mod tests {
             ("Authorization:Bearer\tTOKLEAK", "TOKLEAK"),
             ("{\"password\":\"ab\\\"cdLEAK\"}", "cdLEAK"),
             ("OPENAI_API_KEY=plainLEAK node", "plainLEAK"),
+            (
+                "-H 'Authorization: ApiKey \"s3cretVAL\"' https://x",
+                "s3cretVAL",
+            ),
+            (
+                "Authorization: Digest username=\"u\", response=\"6629fae4\"",
+                "6629fae4",
+            ),
             ("stripe sk_live_51HxYzAbCdEfGh", "51HxYzAbCdEfGh"),
             ("key=sk_test_CANARY_7f3a9c00", "CANARY"),
             ("ghp_0123456789abcdefABCDEF", "0123456789abcdef"),
@@ -644,6 +724,7 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
             "passport=1",
             "monkey=1 --key-file=/tmp/k my_tokenizer=x",
+            "key: pg/staging not found",
             "ünïcode ✓ text",
         ] {
             assert_eq!(r(s), s);
@@ -688,6 +769,17 @@ mod tests {
             ] {
                 assert!(!out.contains(part), "{leak} -> {out}");
             }
+        }
+        // Values containing % and \ and non-ASCII, in their encoded forms.
+        for (val, enc) in [
+            ("a%bLEAK", "x=a%25bLEAK"),
+            ("a\\bLEAK", "{\"p\":\"a\\\\bLEAK\"}"),
+            ("päss-LEAK", "{\"p\":\"p\\u00e4ss-LEAK\"}"),
+            ("%25LEAK", "x=%25LEAK"),
+        ] {
+            let vr = ValueRedactor::new(vec![(&k, val.as_bytes())]);
+            let out = vr.redact(enc);
+            assert!(!out.contains("LEAK"), "{val:?} in {enc:?} -> {out}");
         }
         let bin = [0xff_u8, 0xfe, b'A', b'B'];
         let vr3 = ValueRedactor::new(vec![(&k, bin.as_slice())]);

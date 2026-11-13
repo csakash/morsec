@@ -174,6 +174,8 @@ report commands with their observed results; a report is a claim until re-run.
 - The `hmac` crate does not zeroize its key-derived pad state; accepted and recorded. (S12)
 - The LOG-2 detector is per session and in memory: a daemon restart resets it, and attempts
   spread across sessions don't alert. L07 can rebuild it from recent receipts at open. (S11)
+- A failed rotation (for example disk full) stops the store until the daemon restarts: fail
+  closed by design. (Convergence review N5)
 - Retention/pruning of old files is out of scope (deleting the first file fails verify by design).
 
 ## Rollback Plan

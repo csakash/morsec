@@ -721,3 +721,27 @@ fn hard_link_at_next_name_refused() {
     );
     assert_eq!(fs::read_to_string(&victim).unwrap(), "");
 }
+
+// protects=convergence review: read_all and verify refuse a symlink at a receipts file name
+// (O_NOFOLLOW), and reopening refuses an existing current file with a second hard link;
+// fails_when=a symlinked file is read through or a hard-linked file is appended to;
+// no_claim=symlinks higher up the directory path
+#[test]
+fn symlink_read_and_hard_linked_reopen_refused() {
+    use std::os::unix::fs::symlink;
+    let (t, d) = seeded(3);
+    let outside = t.path().join("outside.jsonl");
+    fs::write(&outside, "").unwrap();
+    symlink(&outside, d.join(file_name(100))).unwrap();
+    assert!(read_all(&d).is_err());
+    assert!(verify(&d, None).is_err());
+
+    let (t, d) = tmp();
+    store(&d, cfg())
+        .append(event(0, 1, ReceiptResult::Allowed))
+        .unwrap();
+    let current = files(&d)[0].clone();
+    fs::hard_link(&current, t.path().join("copy")).unwrap();
+    let e = ReceiptStore::open(&d, vault_with(&KEY), cfg()).unwrap_err();
+    assert!(e.to_string().contains("hard links"), "{e}");
+}

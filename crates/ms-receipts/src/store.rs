@@ -578,3 +578,39 @@ pub fn mode_of(path: &Path) -> Result<u32> {
         .map(|m| m.permissions().mode() & 0o777)
         .map_err(|e| Error::io(format!("checking {}", path.display()), e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ms_core::AgentKind;
+
+    // protects=the LOG-2 detector's session map never exceeds MAX_TRACKED_SESSIONS, even when
+    // every session is active; fails_when=the map grows without bound; no_claim=which session
+    // is evicted beyond "least recent"
+    #[test]
+    fn detector_is_hard_capped() {
+        let mut d = Detector {
+            threshold: 5,
+            window_ms: u64::MAX,
+            action: AlertAction::None,
+            recent: HashMap::new(),
+            quiet_until: HashMap::new(),
+        };
+        for pid in 0..(MAX_TRACKED_SESSIONS as u32 + 50) {
+            let s = SessionId {
+                agent: AgentKind::Codex,
+                pid,
+                started_unix_ms: 0,
+            };
+            d.observe(&s, u64::from(pid), u64::from(pid));
+        }
+        assert!(d.recent.len() <= MAX_TRACKED_SESSIONS, "{}", d.recent.len());
+        // The newest session is kept; the oldest was evicted.
+        assert!(
+            d.recent
+                .keys()
+                .any(|s| s.pid == MAX_TRACKED_SESSIONS as u32 + 49)
+        );
+        assert!(!d.recent.keys().any(|s| s.pid == 0));
+    }
+}
