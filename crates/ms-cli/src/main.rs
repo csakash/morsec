@@ -14,6 +14,8 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use ms_core::Error;
 use ms_ipc::{Client, RequestBody, ResponseBody};
 
+mod rules;
+
 /// Exit code for "planned but not built yet" (sysexits EX_UNAVAILABLE).
 const EXIT_NOT_BUILT: u8 = 69;
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("MS_GIT_SHA"), ")");
@@ -38,6 +40,8 @@ struct Rest {
     args: Vec<OsString>,
 }
 
+// Parsed once per process; the size difference between variants doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Create the vault and start the daemon.
@@ -53,7 +57,7 @@ enum Command {
     /// Run a command with references resolved by the broker.
     Run(Rest),
     /// Show or change a key's hosts, commands, tier and session length.
-    Rules(Rest),
+    Rules(rules::RulesArgs),
     /// Show receipts; --export for a security review.
     Log(Rest),
     /// Revoke every grant now (kill switch).
@@ -82,7 +86,6 @@ impl Command {
             Command::Connect(_) => ("connect", "L08 connect-claude"),
             Command::Disconnect(_) => ("disconnect", "L08 connect-claude"),
             Command::Run(_) => ("run", "L12 run-core"),
-            Command::Rules(_) => ("rules", "L03 rules-policy"),
             Command::Log(_) => ("log", "L02 receipts"),
             Command::Stop(_) => ("stop", "L07 daemon"),
             Command::Start(_) => ("start", "L07 daemon"),
@@ -90,7 +93,7 @@ impl Command {
             Command::Mcp(_) => ("mcp", "L14 mcp-server"),
             Command::Scan(_) => ("scan", "L09 e2e-canary"),
             Command::Stats(_) => ("stats", "L02 receipts"),
-            Command::Status => return None,
+            Command::Status | Command::Rules(_) => return None,
         })
     }
 }
@@ -175,6 +178,7 @@ async fn main() -> ExitCode {
     }
     match command {
         Command::Status => status().await,
+        Command::Rules(a) => rules::run(a),
         _ => unreachable!("every other command is a stub"),
     }
 }

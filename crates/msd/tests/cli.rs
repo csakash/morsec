@@ -123,7 +123,6 @@ fn stubs_exit_69_and_name_their_loop() {
         ("connect", "L08 connect-claude"),
         ("disconnect", "L08 connect-claude"),
         ("run", "L12 run-core"),
-        ("rules", "L03 rules-policy"),
         ("log", "L02 receipts"),
         ("stop", "L07 daemon"),
         ("start", "L07 daemon"),
