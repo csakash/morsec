@@ -345,7 +345,7 @@ impl World {
         let st = Command::new("/bin/sh")
             .arg("-c")
             .arg(format!(
-                "(/bin/sh '{}' > '{}' 2>&1; echo $? > '{}.tmp'; mv '{}.tmp' '{}') </dev/null >/dev/null 2>&1 &",
+                "(sleep 0.5; /bin/sh '{}' > '{}' 2>&1; echo $? > '{}.tmp'; mv '{}.tmp' '{}') </dev/null >/dev/null 2>&1 &",
                 script.display(),
                 out.display(),
                 rc.display(),
@@ -610,6 +610,9 @@ fn ms_scan_catches_a_leaky_transcript() {
 
     let (code, out) = w.outside("ms scan");
     assert_eq!(code, 3, "{out}");
+    // msd resolves its transcript roots (/tmp is a link on macOS).
+    let leaky = std::fs::canonicalize(&leaky).unwrap();
+    let rollout = std::fs::canonicalize(&rollout).unwrap();
     let want = [
         format!("  {}:2  stripe/test  (raw)", leaky.display()),
         format!("  {}:3  stripe/test  (base64)", leaky.display()),

@@ -53,5 +53,8 @@ step "security-evals (EVAL-1): canary suite, a fake agent against a throwaway ms
 # catch a planted leak. Memory vault only; never the login keychain. The real-agent job
 # (tests/e2e/real-agent.sh) is manual or nightly and is not run here.
 cargo test --locked -p ms-e2e
+# msd's own fake-agent test (rules loosening refused, exfiltration blocked, kill switch). It also
+# runs in step 4; it is repeated here so this step holds every security eval.
+cargo test --locked -p msd --test agent_e2e
 
 printf '\ncheck.sh: all checks passed\n'

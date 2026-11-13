@@ -20,6 +20,8 @@ pub const SCAN_BUDGET: Duration = Duration::from_secs(240);
 pub const MAX_FILES: usize = 200_000;
 /// Most findings returned.
 pub const MAX_FINDINGS: usize = 1000;
+/// Most bytes of file names in one report, so it stays well under the 1 MiB frame limit.
+pub const MAX_FINDING_BYTES: usize = 512 * 1024;
 
 static SCANNING: AtomicBool = AtomicBool::new(false);
 
@@ -50,7 +52,17 @@ pub fn roots() -> Vec<PathBuf> {
     if let Some(d) = env_dir("CODEX_HOME").or_else(|| home.as_ref().map(|h| h.join(".codex"))) {
         out.push(d.join("sessions"));
     }
-    out
+    canonical(out)
+}
+
+/// These roots come from msd's own environment, not a client (SPEC D-2), so a root that is
+/// itself a link (dotfile setups, an external disk) is resolved; links under it are never
+/// followed (review R2).
+fn canonical(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots
+        .into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect()
 }
 
 /// Runs a scan over `roots` for the values of `keys`. Blocking.
@@ -75,10 +87,16 @@ pub fn scan(
     let mut notes = Vec::new();
     let mut complete = true;
     for key in keys {
+        // Built apart and merged only when the read succeeded, so a key index always names a key
+        // in `checked`.
+        let mut one = Needles::new();
         let mut added = false;
-        let read = vault.with_secret(&key, &mut |v| added = needles.add(checked.len(), v));
+        let read = vault.with_secret(&key, &mut |v| added = one.add(checked.len(), v));
         match read {
-            Ok(()) if added => checked.push(key),
+            Ok(()) if added => {
+                needles.append(one);
+                checked.push(key);
+            }
             Ok(()) => skipped_keys.push(key),
             Err(e) => {
                 tracing::warn!(key = %key, error = %e, "scan: key could not be read");
@@ -94,23 +112,29 @@ pub fn scan(
         notes.push(format!(
             "searched {}{}",
             r.display(),
-            if r.is_dir() { "" } else { " (not found)" }
+            if std::fs::symlink_metadata(r).is_ok_and(|m| m.is_dir()) {
+                ""
+            } else {
+                " (not found)"
+            }
         ));
     }
     let walk = ms_scan::transcript_files(roots, MAX_FILES);
     notes.extend(walk.notes);
-    complete &= !walk.truncated;
+    complete &= !walk.truncated && walk.unreadable == 0;
 
     let mut findings = Vec::new();
     let (mut files, mut bytes, mut unreadable) = (0u64, 0u64, 0u64);
+    let mut capped = false;
     if !needles.is_empty() {
-        for path in &walk.files {
+        let mut name_bytes = 0usize;
+        for (i, path) in walk.files.iter().enumerate() {
             if Instant::now() >= deadline {
                 complete = false;
                 notes.push(format!(
                     "stopped after {}s; {} files were not scanned",
                     budget.as_secs(),
-                    walk.files.len() as u64 - files
+                    walk.files.len() - i
                 ));
                 break;
             }
@@ -126,14 +150,30 @@ pub fn scan(
             };
             files += 1;
             bytes += s.bytes;
+            if !s.complete && Instant::now() < deadline {
+                notes.push(format!(
+                    "{} has more than {} matches; only the first are listed",
+                    path.display(),
+                    ms_scan::MAX_HITS_PER_FILE
+                ));
+            }
             complete &= s.complete;
+            let file = path.to_string_lossy().into_owned();
             for h in s.hits {
-                if findings.len() >= MAX_FINDINGS {
-                    complete = false;
+                if findings.len() >= MAX_FINDINGS || name_bytes + file.len() > MAX_FINDING_BYTES {
+                    if !capped {
+                        capped = true;
+                        complete = false;
+                        notes.push(format!(
+                            "the list stops at {} findings; fix these and scan again",
+                            findings.len()
+                        ));
+                    }
                     break;
                 }
+                name_bytes += file.len();
                 findings.push(ScanFinding {
-                    file: path.to_string_lossy().into_owned(),
+                    file: file.clone(),
                     line: h.line,
                     key: checked[h.key].clone(),
                     encoding: h.encoding.label().to_owned(),
@@ -255,6 +295,47 @@ mod tests {
         SCANNING.store(false, Ordering::Release);
         match scan(&v, keys, &[root], Duration::ZERO) {
             ResponseBody::ScanReport { complete, .. } => assert!(!complete),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // protects=review R1/R2: an unreadable directory makes the scan incomplete (ms scan exits 1,
+    // never 0), and a transcript root that is itself a symlink is resolved and searched;
+    // fails_when=either case reports a complete clean scan
+    #[test]
+    fn unreadable_dir_and_linked_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (v, keys) = vault();
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("disk/projects");
+        std::fs::create_dir_all(real.join("p")).unwrap();
+        std::fs::write(real.join("p/s.jsonl"), format!("{CANARY}\n")).unwrap();
+        let link = d.path().join("projects");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        match scan(&v, keys.clone(), &canonical(vec![link]), SCAN_BUDGET) {
+            ResponseBody::ScanReport {
+                findings, complete, ..
+            } => {
+                assert!(complete);
+                assert_eq!(findings.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        let locked = real.join("p");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = scan(&v, keys, std::slice::from_ref(&real), SCAN_BUDGET);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match r {
+            ResponseBody::ScanReport {
+                findings,
+                complete,
+                notes,
+                ..
+            } => {
+                assert!(findings.is_empty());
+                assert!(!complete, "{notes:?}");
+            }
             other => panic!("{other:?}"),
         }
     }

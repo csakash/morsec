@@ -95,9 +95,10 @@ set +e
 "$bin/ms" scan
 rc=$?
 set -e
-if [ $rc -ne 0 ]; then
-  echo "real-agent: FAIL: ms scan exited $rc" >&2
-  fail=1
-fi
+case $rc in
+  0) ;;
+  3) echo "real-agent: FAIL: ms scan found a canary in a transcript" >&2; fail=1 ;;
+  *) echo "real-agent: INCONCLUSIVE: ms scan did not finish (exit $rc); no leak was found in what it read" >&2; fail=1 ;;
+esac
 [ $fail -eq 0 ] && echo "real-agent: pass (${agents[*]})"
 exit $fail

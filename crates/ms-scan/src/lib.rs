@@ -176,6 +176,12 @@ impl Needles {
         self.list.is_empty()
     }
 
+    /// Moves every needle of `other` into this set.
+    pub fn append(&mut self, other: Needles) {
+        self.max_len = self.max_len.max(other.max_len);
+        self.list.extend(other.list);
+    }
+
     /// Number of byte strings searched.
     pub fn len(&self) -> usize {
         self.list.len()
@@ -266,6 +272,7 @@ pub fn scan_reader(
                     continue;
                 }
                 if hits.len() >= MAX_HITS_PER_FILE {
+                    out.complete = false;
                     break;
                 }
                 let line = line_base + newlines.partition_point(|&p| p < start) as u64;
@@ -320,6 +327,8 @@ pub struct Walk {
     pub notes: Vec<String>,
     /// True when `max_files` stopped the walk.
     pub truncated: bool,
+    /// Directories or entries that could not be read. Above 0 the walk is incomplete.
+    pub unreadable: usize,
 }
 
 fn is_transcript(p: &Path) -> bool {
@@ -329,8 +338,9 @@ fn is_transcript(p: &Path) -> bool {
     )
 }
 
-/// Lists transcript files under `roots`. Symlinks are never followed (a link could point the
-/// daemon anywhere); a missing root is skipped.
+/// Lists transcript files under `roots`. Symlinks under a root are never followed (a link could
+/// point the daemon anywhere); a root that is itself a symlink is skipped, so callers pass
+/// canonical roots. A missing root is skipped.
 pub fn transcript_files(roots: &[PathBuf], max_files: usize) -> Walk {
     let mut w = Walk::default();
     let mut unreadable = 0usize;
@@ -348,8 +358,15 @@ pub fn transcript_files(roots: &[PathBuf], max_files: usize) -> Walk {
                     continue;
                 }
             };
-            for e in entries.flatten() {
-                let Ok(ft) = e.file_type() else { continue };
+            for e in entries {
+                let Ok(e) = e else {
+                    unreadable += 1;
+                    continue;
+                };
+                let Ok(ft) = e.file_type() else {
+                    unreadable += 1;
+                    continue;
+                };
                 let p = e.path();
                 if ft.is_dir() {
                     if depth < MAX_DEPTH {
@@ -368,9 +385,11 @@ pub fn transcript_files(roots: &[PathBuf], max_files: usize) -> Walk {
             }
         }
     }
+    w.unreadable = unreadable;
     if unreadable > 0 {
-        w.notes
-            .push(format!("{unreadable} directories could not be read"));
+        w.notes.push(format!(
+            "{unreadable} directories or entries could not be read"
+        ));
     }
     if w.truncated {
         w.notes.push(format!(
@@ -541,8 +560,15 @@ mod tests {
             names,
             vec![PathBuf::from("p/a.jsonl"), PathBuf::from("p/sub/b.json")]
         );
-        let w = transcript_files(&[root], 1);
+        let w = transcript_files(std::slice::from_ref(&root), 1);
         assert!(w.truncated && w.files.len() == 1);
+        // An unreadable directory makes the walk incomplete (review R1).
+        use std::os::unix::fs::PermissionsExt;
+        let locked = root.join("p/sub");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let w = transcript_files(std::slice::from_ref(&root), 100);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(w.unreadable, 1, "{w:?}");
         assert!(open_regular(&d.path().join("projects/p/l.jsonl")).is_err());
     }
 }

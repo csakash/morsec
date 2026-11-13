@@ -90,11 +90,19 @@ pub(crate) fn render(resp: &ResponseBody) -> (Vec<String>, Vec<String>, u8) {
     for n in notes {
         err.push(format!("note: {}", terminal_safe(n)));
     }
+    if !complete {
+        err.push(
+            "morsec scan: the scan did not finish, so a leak may have been missed (see the notes above)"
+                .into(),
+        );
+    }
     let code = if !findings.is_empty() {
         EXIT_LEAK
     } else if !complete {
+        1
+    } else if *keys_checked == 0 {
         err.push(
-            "morsec scan: the scan did not finish, so a leak may have been missed (see the notes above)"
+            "morsec scan: there was no key to search for (the vault is empty or every value is too short), so nothing was checked"
                 .into(),
         );
         1
@@ -151,6 +159,11 @@ mod tests {
     fn exit_codes_and_terminal_safety() {
         assert_eq!(render(&report(vec![], true)).2, 0);
         assert_eq!(render(&report(vec![], false)).2, 1);
+        let mut none = report(vec![], true);
+        if let ResponseBody::ScanReport { keys_checked, .. } = &mut none {
+            *keys_checked = 0;
+        }
+        assert_eq!(render(&none).2, 1, "nothing checked must not pass");
         let f = ScanFinding {
             file: "/h/.claude/projects/p/\u{1b}]0;x\u{7}s.jsonl".into(),
             line: 7,
@@ -159,6 +172,7 @@ mod tests {
         };
         let (out, err, code) = render(&report(vec![f], false));
         assert_eq!(code, EXIT_LEAK);
+        assert!(err.iter().any(|l| l.contains("did not finish")), "{err:?}");
         let all = out.join("\n") + &err.join("\n");
         assert!(!all.chars().any(|c| c.is_control() && c != '\n'), "{all:?}");
         assert!(
