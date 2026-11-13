@@ -220,15 +220,19 @@ msd's tunnel allowlist (D2); `ms run` and `ms mcp` themselves (L12, L14); Codex/
 - **A4 (R10, R11):** a disconnect that could not finish `~/.claude.json` exits 1, says
   "partly disconnected", keeps the record, and `ms connect` (list) and `verify()` report it;
   the next disconnect finishes it without reading `settings.json`.
-- **A5 (security review S1):** the state file never stores a value from the user's files. The
-  original `settings.json` is kept as a skeleton (every string value blanked, layout, keys and
-  numbers kept) plus its SHA-256; restore fills the values back from the undone document and is
-  byte-exact when the hash matches, else structural. Wrapping is recorded as a hash plus two
-  bits. A raw `env` value that an `--env` ref replaces is not kept: disconnect removes the entry
-  and says so. Residuals: a string written with non-canonical escapes (e.g. `é`) keeps its
-  literal; the user's own `mcpServers.ms`, replaced only with `--force`, is kept so it can be put
-  back; the user's CA file paths are kept.
-- **A6 (S2, S4):** a plain re-run keeps the opt-in parts of the last connect (`--with-mcp`,
-  `--wrap`, `--statusline`); only `ms disconnect` drops them. The `ms` path written into hooks is a
-  PATH entry only in a directory outside `HOME` and the current directory that no other user can
-  write, else the canonical binary path.
+- **A5 (security review S1, S5; review R13, R14, R16):** the state file never stores a value
+  from the user's files. The original `settings.json` is kept as a skeleton (every string value
+  blanked; layout, keys and numbers kept) plus its SHA-256; restore fills the values back from
+  the undone document and is byte-exact when the hash matches, else structural. Wrapping is
+  recorded as a hash of the object's shape (never its command) plus two bits. A raw `env` value
+  that an `--env` ref replaces is not kept in any form, not even a hash: disconnect removes the
+  entry and says so, and a re-run carries the ref forward. Residuals: a string written with
+  non-canonical escapes (e.g. `é`, or `\/` as PHP's `json_encode` writes) keeps its
+  literal; the whole-file SHA-256 lets a same-user reader who knows every other byte confirm
+  guesses at one low-entropy value the user later deleted; the user's own `mcpServers.ms`,
+  replaced only with `--force`, is kept so it can be put back; the user's CA file paths are kept.
+- **A6 (S2, S4, S6):** a plain re-run keeps the opt-in parts of the last connect (`--with-mcp`,
+  `--wrap`, `--statusline`); only `ms disconnect` drops them, and a carried-over `--wrap` counts
+  as `--wrap` for the agent-session refusal. The `ms` path written into hooks is a PATH entry
+  only in a directory outside `HOME` and the current directory that no other user can write,
+  else the canonical binary path.
