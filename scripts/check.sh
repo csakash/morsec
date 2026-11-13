@@ -40,24 +40,9 @@ cargo deny --locked check
 step "6/8 cargo audit"
 cargo audit --deny warnings
 
-step "7/8 no [patch]/[replace], no path dependencies outside the workspace"
+step "7/8 no patches or overrides; path packages are workspace members"
 # cargo-deny's [sources] does not police path dependencies or patches; this does.
-# Only files that exist: grep exits 2 on a missing file even when another file matches.
-manifests=(Cargo.toml crates/*/Cargo.toml)
-for f in .cargo/config .cargo/config.toml; do [ -f "$f" ] && manifests+=("$f"); done
-if grep -nE '^[[:space:]]*\[(patch|replace)' "${manifests[@]}"; then
-  echo "check.sh: [patch]/[replace] sections are not allowed (they bypass cargo-deny)" >&2
-  exit 1
-fi
-cargo metadata --format-version 1 --locked | python3 -I -c '
-import json, os, sys
-root = os.path.realpath(".")
-bad = [p["name"] + " -> " + p["manifest_path"] for p in json.load(sys.stdin)["packages"]
-       if p["source"] is None and not os.path.realpath(p["manifest_path"]).startswith(root + os.sep)]
-if bad:
-    sys.exit("check.sh: path dependencies outside the workspace: " + ", ".join(bad))
-print("supply chain: no patches, all path packages inside the workspace")
-'
+cargo metadata --format-version 1 --locked | python3 -I scripts/supply_chain_check.py
 
 step "8/8 ARI-42 scan"
 python3 .claude/skills/ari42/scripts/ari42_scan.py check . --fail-on high
