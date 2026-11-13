@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2fe0313f5c66ef45d28d9227e17fd9ca5d15a717218ab31823ecdabba3370ce4 # shrinks to user_rule = KeyRule { mode: Run, tier: Test, hosts: [], commands: [CommandPattern { tokens: [Lit("psql"), One], rest: false }], mint_scopes: [], session_ttl_secs: 1, read_only: false }, limit = KeyLimit { mode: None, tier: None, hosts: None, commands: Some([CommandPattern { tokens: [Lit("psql"), Lit("a")], rest: false }]), mint_scopes: None, session_ttl_secs: None, read_only: false, disabled: false }, target_other = false, (req, argv) = (Run { key: KeyName("k"), argv_hash: [87, 252, 130, 194, 141, 197, 89, 196, 158, 162, 215, 207, 67, 67, 103, 97, 86, 0, 45, 125, 144, 194, 50, 88, 160, 165, 197, 46, 122, 188, 1, 6], cwd: "/r" }, ["psql", "a"])

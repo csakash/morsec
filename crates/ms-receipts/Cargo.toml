@@ -1,6 +1,6 @@
 [package]
 name = "ms-receipts"
-description = "Receipt sink trait and backends (hash-chained store built in L02)."
+description = "Receipts: hash-chained, HMAC'd JSONL store, verify, query, stats and export (L02)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,14 @@ workspace = true
 
 [dependencies]
 ms-core = { workspace = true }
+ms-vault = { workspace = true }
+serde = { workspace = true }
+# raw_value: the hash and MAC cover the exact bytes on disk, so no canonicalisation is needed.
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }

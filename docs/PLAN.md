@@ -481,7 +481,20 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
     `O_DIRECTORY|O_NOFOLLOW`, check uid and mode with `fstat` on that descriptor, bind under a
     0077 umask, and re-check with `lstat` after binding. The default paths are not affected.
   - Assemble the services and the socket server with peer checks.
-  - `ms init`: vault, HMAC keys, CA and its trust, LaunchAgent.
+  - **Wire rules (open from L03):**
+    - On start, load with `RulesStore::load(min_version)`, where `min_version` is the last
+      `rule_version` in the receipt chain (rollback guard). On any error, use `Rules::tampered()`.
+      `Rules::stopped` carries `ms stop`.
+    - For each request, merge the repo's `.morsec.toml` with `ms_rules::effective`.
+    - Run requests go through `decide_run` with the real argv. `decide` sees only the hash, so it
+      matches only literal patterns.
+    - IPC v1 can't carry rules. Add a rule payload to `RulesProposeLoosen` and a
+      `ResponseBody::Rules` reply, in this loop or a small IPC loop. Then classify each change
+      with `ms_rules::classify` and apply it with `RulesStore::save(new, approved, min_version)`.
+      `save` refuses a loosening change unless it has an approval. Then switch `ms rules` from
+      local, unverified reads to `RulesGet`.
+  - `ms init`: vault, HMAC keys (`morsec/rules-mac` for rules, `morsec/receipts-hmac` for
+    receipts, 32 bytes each), CA and its trust, LaunchAgent.
   - `ms status`: on/off and number of protected keys (the source of the mockup's pill).
   - `ms stop`: revokes every grant and puts the proxy in deny-all. It needs no approval, because
     tightening is always allowed.

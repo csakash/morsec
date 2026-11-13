@@ -8,6 +8,8 @@
 
 mod add;
 mod import;
+mod log;
+mod stats;
 mod tty;
 
 use std::ffi::OsString;
@@ -17,6 +19,8 @@ use std::process::ExitCode;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use ms_core::Error;
 use ms_ipc::{Client, RequestBody, ResponseBody};
+
+mod rules;
 
 /// Exit code for "planned but not built yet" (sysexits EX_UNAVAILABLE).
 const EXIT_NOT_BUILT: u8 = 69;
@@ -42,6 +46,8 @@ struct Rest {
     args: Vec<OsString>,
 }
 
+// Parsed once per process; the size difference between variants doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Create the vault and start the daemon.
@@ -57,9 +63,9 @@ enum Command {
     /// Run a command with references resolved by the broker.
     Run(Rest),
     /// Show or change a key's hosts, commands, tier and session length.
-    Rules(Rest),
-    /// Show receipts; --export for a security review.
-    Log(Rest),
+    Rules(rules::RulesArgs),
+    /// Show receipts; --verify checks the chain; --export for a security review.
+    Log(log::LogArgs),
     /// Revoke every grant now (kill switch).
     Stop(Rest),
     /// Resume after ms stop.
@@ -73,7 +79,7 @@ enum Command {
     /// Scan agent transcripts for leaked secret values.
     Scan(Rest),
     /// Prompts per session, blocks and approvals.
-    Stats(Rest),
+    Stats(stats::StatsArgs),
 }
 
 impl Command {
@@ -84,15 +90,17 @@ impl Command {
             Command::Connect(_) => ("connect", "L08 connect-claude"),
             Command::Disconnect(_) => ("disconnect", "L08 connect-claude"),
             Command::Run(_) => ("run", "L12 run-core"),
-            Command::Rules(_) => ("rules", "L03 rules-policy"),
-            Command::Log(_) => ("log", "L02 receipts"),
             Command::Stop(_) => ("stop", "L07 daemon"),
             Command::Start(_) => ("start", "L07 daemon"),
             Command::Doctor(_) => ("doctor", "L17 doctor"),
             Command::Mcp(_) => ("mcp", "L14 mcp-server"),
             Command::Scan(_) => ("scan", "L09 e2e-canary"),
-            Command::Stats(_) => ("stats", "L02 receipts"),
-            Command::Status | Command::Add(_) | Command::Import(_) => return None,
+            Command::Status
+            | Command::Add(_)
+            | Command::Import(_)
+            | Command::Rules(_)
+            | Command::Log(_)
+            | Command::Stats(_) => return None,
         })
     }
 }
@@ -185,6 +193,9 @@ async fn main() -> ExitCode {
         Command::Status => status().await,
         Command::Add(a) => on_own_thread(move || add::run(&a)),
         Command::Import(a) => on_own_thread(move || import::run(&a)),
+        Command::Rules(a) => rules::run(a),
+        Command::Log(args) => log::run(&args),
+        Command::Stats(args) => stats::run(&args),
         _ => unreachable!("every other command is a stub"),
     }
 }

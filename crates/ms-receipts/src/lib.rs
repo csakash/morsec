@@ -1,9 +1,35 @@
 //! Receipts: one record per use of a key.
 //!
-//! L00 freezes [`ReceiptSink`] and ships [`memory::MemorySink`] for tests. L02 builds the
-//! hash-chained, HMAC'd store, `ms log` and `ms stats`.
+//! L00 froze [`ReceiptSink`] and shipped [`memory::MemorySink`] for tests. L02 adds the real
+//! store ([`ReceiptStore`]): append-only JSONL, every record hash-chained to the one before and
+//! HMAC'd with a vault key, checkpoints, rotation, redaction before write and the LOG-2
+//! blocked-attempt detector; plus [`verify`], [`Query`], [`stats()`] and the JSON/CSV exports that
+//! back `ms log` and `ms stats`.
 
-use ms_core::{ReceiptEvent, Result};
+pub mod export;
+pub mod query;
+pub mod read;
+pub mod record;
+pub mod redact;
+pub mod stats;
+pub mod store;
+pub mod time;
+pub mod verify;
+
+use std::path::PathBuf;
+
+use ms_core::{Error, ReceiptEvent, Result};
+
+pub use export::{export_csv, export_json};
+pub use query::{Query, ResultClass};
+pub use read::{StoredRecord, read_all};
+pub use record::{
+    Alert, AlertAction, Approval, Checkpoint, Entry, HMAC_KEY_NAME, MIN_KEY_LEN, Rec, Receipt,
+};
+pub use redact::{PatternRedactor, Redactor, ValueRedactor};
+pub use stats::{SessionStats, Stats, stats};
+pub use store::{AlertHandler, ReceiptDetail, ReceiptStore, StoreConfig};
+pub use verify::{Problem, ProblemKind, VerifyReport, verify};
 
 /// Sequence number of a stored receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -13,6 +39,39 @@ pub struct ReceiptId(pub u64);
 pub trait ReceiptSink: Send + Sync {
     /// Appends one receipt and returns its id.
     fn append(&self, event: ReceiptEvent) -> Result<ReceiptId>;
+}
+
+/// Env var that overrides the receipts directory (dev loops, tests).
+pub const DIR_ENV: &str = "MORSEC_RECEIPTS_DIR";
+
+/// The receipts directory: `$MORSEC_RECEIPTS_DIR` if set, otherwise
+/// `~/Library/Application Support/morsec/receipts` on macOS and `/var/lib/morsec/receipts`
+/// elsewhere (PLAN §3.5).
+pub fn default_dir() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os(DIR_ENV).filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(p));
+    }
+    platform_dir()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| {
+            Error::io(
+                "HOME is not set, so the receipts directory can't be found",
+                std::io::Error::other("set HOME or MORSEC_RECEIPTS_DIR"),
+            )
+        })?;
+    Ok(PathBuf::from(home).join("Library/Application Support/morsec/receipts"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_dir() -> Result<PathBuf> {
+    // Keeps the signature identical across platforms.
+    let _ = Error::io;
+    Ok(PathBuf::from("/var/lib/morsec/receipts"))
 }
 
 /// In-memory sink for tests.
