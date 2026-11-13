@@ -353,13 +353,18 @@ pub(crate) fn intersect_sets<T: Ord + Clone>(
     b: &[T],
     f: impl Fn(&T, &T) -> Option<T>,
 ) -> Vec<T> {
-    let mut out: Vec<T> = a
-        .iter()
-        .flat_map(|x| b.iter().filter_map(|y| f(x, y)).collect::<Vec<_>>())
-        .collect();
-    out.sort();
-    out.dedup();
-    out
+    // Dedup the inputs and collect into a set, so repeated patterns can't multiply the work.
+    let a: std::collections::BTreeSet<&T> = a.iter().collect();
+    let b: std::collections::BTreeSet<&T> = b.iter().collect();
+    let mut out = std::collections::BTreeSet::new();
+    for x in &a {
+        for y in &b {
+            if let Some(i) = f(x, y) {
+                out.insert(i);
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 #[cfg(test)]

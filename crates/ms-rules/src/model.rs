@@ -26,7 +26,8 @@ pub struct KeyRule {
     pub mode: Mode,
     /// Production keys need an approval for every use.
     pub tier: Tier,
-    /// Hosts the key may be sent to (swap; run adapters may also bind a host).
+    /// Hosts the key may be sent to (swap; run adapters may also bind a host). Empty means no
+    /// host is allowed, never "any host": adapters that read this (L15, L16) must keep that.
     pub hosts: Vec<HostPattern>,
     /// Commands the key may be used with (run only).
     pub commands: Vec<CommandPattern>,
@@ -66,6 +67,12 @@ impl KeyRule {
     /// equal.
     pub fn normalise(mut self, file: &str, key: &KeyName) -> Result<Self> {
         let bad = |why: String| RulesError::invalid(file, format!("key {key}: {why}"));
+        if is_reserved(key) {
+            return Err(bad(
+                "names under morsec/ are morsec's own keys (rules and receipts MACs) and can't have rules"
+                    .into(),
+            ));
+        }
         if self.hosts.len() > MAX_HOSTS {
             return Err(bad(format!("more than {MAX_HOSTS} hosts")));
         }
@@ -97,6 +104,12 @@ impl KeyRule {
         self.mint_scopes.dedup();
         Ok(self)
     }
+}
+
+/// Keys under `morsec/` (the rules and receipts MAC keys) are morsec's own. No rule may name them,
+/// so no approval can ever send one to a host or a command.
+pub fn is_reserved(key: &KeyName) -> bool {
+    key.as_str() == "morsec" || key.as_str().starts_with("morsec/")
 }
 
 pub(crate) fn validate_scope(s: &str) -> std::result::Result<(), String> {
@@ -331,6 +344,8 @@ mint_scopes = ["s3:read"]
             "version = 1\n[keys.\"a\"]\nmode = \"mint\"\ntier = \"test\"\nmint_scopes = [\"a b\"]",
             "version = 1\n[keys.\"a\"]\nmode = \"swap\"\ntier = \"staging\"",
             "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\ncommands = [[]]",
+            "version = 1\n[keys.\"morsec/rules-mac\"]\nmode = \"run\"\ntier = \"production\"\ncommands = [[\"printenv\"]]",
+            "version = 1\n[keys.\"morsec\"]\nmode = \"swap\"\ntier = \"test\"",
         ];
         for c in cases {
             assert!(Rules::from_toml(c, "rules.toml").is_err(), "accepted {c:?}");

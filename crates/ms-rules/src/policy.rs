@@ -115,6 +115,10 @@ fn lookup<'r>(
     if rules.stopped {
         return Err(Reason::Stopped);
     }
+    // morsec's own keys are never usable, even if a rule for one got into memory some other way.
+    if crate::model::is_reserved(key) {
+        return Err(Reason::NoSuchKey);
+    }
     let rule = rules.keys.get(key).ok_or(Reason::NoSuchKey)?;
     if rule.mode != mode {
         return Err(wrong_mode);
@@ -300,6 +304,10 @@ mod tests {
                     deny(Reason::RulesTampered)
                 );
                 assert_eq!(decide(&Rules::default(), &s, &ok), deny(Reason::NoSuchKey));
+                // A rule for a reserved morsec/ key never applies.
+                let reserved = rules_with("morsec/rules-mac", rule(mode, tier));
+                let (req, _) = requests(mode, &k("morsec/rules-mac"));
+                assert_eq!(decide(&reserved, &s, &req), deny(Reason::NoSuchKey));
             }
         }
     }
