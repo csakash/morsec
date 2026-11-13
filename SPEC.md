@@ -19,8 +19,8 @@ All in `crates/ms-session/`. No frozen interface changes.
    - macOS: `proc_pidinfo(PROC_PIDTBSDINFO)` and `proc_pidpath` from `libc`.
    - Linux: `/proc/<pid>/stat` (ppid, start ticks), `/proc/<pid>/status` (uid), `/proc/stat`
      (`btime`), `/proc/<pid>/exe`; tick rate from `rustix` (safe). No unsafe on Linux.
-2. **Agent classification.** Exact, case-sensitive match on the process short name or the
-   executable's file name: `claude` → `ClaudeCode`, `codex` → `Codex`, `cursor-agent` → `Cursor`,
+2. **Agent classification.** Exact, case-sensitive match on the process short name (set by the
+   kernel at exec from the file name; the executable path is diagnostics only): `claude` → `ClaudeCode`, `codex` → `Codex`, `cursor-agent` → `Cursor`,
    `gemini` → `GeminiCli`. Desktop and IDE *hosts* (`Claude`, `Code`, `Cursor`, `Electron` …) are
    never session roots: Claude Desktop runs one `claude` process per session under the `Claude`
    app, so the app must not merge them.
@@ -49,8 +49,11 @@ All in `crates/ms-session/`. No frozen interface changes.
    - Linux: `/proc/net/tcp{,6}` row → inode → scan `/proc/<pid>/fd` links for `socket:[inode]`.
    - Cache: recent owner PIDs are probed first (agents open many connections), with a short TTL
      on `(src_port) → owner`; every cache hit is re-verified against the live socket before use.
-   - Several processes sharing the socket (fork) must all resolve to the same `Caller`, otherwise
-     error. Not found → error.
+   - Several processes sharing the socket (fork) must all resolve to the same `Caller` on a full
+     scan, otherwise error. The cached / recent-owner paths return the first verified holder: a
+     socket only reaches a second process by inheritance (same session) or by its holder
+     passing it on, so this cannot pull another session's identity onto a connection without
+     that session's cooperation. Not found → error.
 6. **Proxy username cross-check.** `cross_check(&Caller, username)`: the per-connector proxy
    username (`claude-code`, `codex`, `cursor`, `gemini-cli`) must name the same agent kind as the
    resolved session. Mismatch, unknown username, or an `Unattributed` caller presenting an agent
@@ -73,8 +76,11 @@ versions (needs ms-ipc change; residual risk).
 
 ## Acceptance (verify)
 
-- Tests launch **nested fake-agent process trees** (a copy of a helper binary named `claude` /
-  `codex`, with `sh` levels in between) and resolve the leaf to the right `SessionId`.
+- Tests launch **nested fake-agent process trees** and resolve the leaf to the right
+  `SessionId`. The live test binary (`tests/live.rs`, `harness = false`) copies itself as
+  `claude` / `codex` / `helper` (macOS kills renamed copies of system binaries, and a symlink
+  keeps the target's name), and starts each tree detached (reparented to PID 1) so the real
+  agent running the tests doesn't, correctly, absorb it.
 - Outermost rule: a fake `codex` inside a fake `claude` resolves to the `claude` session.
 - **PID reuse:** same PID with a different start time is a different `SessionId`; a walk that
   meets a parent started after its child stops there (fake table).
