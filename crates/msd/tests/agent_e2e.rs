@@ -280,6 +280,16 @@ fn kill_switch_and_terminal_path_end_to_end() {
     assert_ne!(code, 0, "{text}");
     assert!(text.contains("ms init --resume"), "{text}");
 
+    // S2: an agent can't run the signed msd's setup to reset keys or the stop flag. Refused before
+    // the vault is touched.
+    let (code, text) = in_agent(
+        d.path(),
+        &sock,
+        &format!("{} --init --force", msd().display()),
+    );
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("inside an agent session"), "{text}");
+
     // Fail closed: msd down, the proxy port refuses.
     drop(daemon);
     assert!(

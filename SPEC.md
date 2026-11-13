@@ -23,6 +23,9 @@ missing (`ms add`, `ms import`, `ms rules`, `ms status`, `ms stop`, `ms start`, 
   is not inside any agent's process tree (`Caller::Unattributed`). This is weaker than Touch ID
   (an agent that fully detaches from its tree and drives a pty could pass it) and is recorded
   as Partial in `ARI42.md`. It is never used for production-key use. L11 replaces it.
+  (The `/dev/tty` confirmation happens in `ms`; msd itself checks only that the caller is
+  outside every agent tree, so any detached same-user process passes the msd side. That is the
+  residual.)
 - **D-B: the rules MAC key is `morsec/rules-hmac`** (what L01's `ensure_internal_keys` creates),
   passed explicitly to `RulesStore::new`. L03's default `morsec/rules-mac` is not used by msd.
 - **D-C: daemon state that must survive a restart and resist rollback lives in the vault**, not in
@@ -146,6 +149,25 @@ missing (`ms add`, `ms import`, `ms rules`, `ms status`, `ms stop`, `ms start`, 
 - `ms rules`: reads through `RulesGet` (MAC-verified by msd); edits send `RulesProposeLoosen` with
   the proposed rule; `--at-terminal` for the D-A path. The local unverified read is kept only as a
   fallback when the daemon is down, labelled as such.
+
+## Amendments made during the build
+
+- `RulesGet` has no `cwd`: msd returns the verified user rules and `ms` merges the project
+  `.morsec.toml` itself, so msd never reads a path a client names (no file-read oracle for a
+  sandboxed agent).
+- The proposed rule travels as a one-key rules file, not a table body.
+- S3: a descriptor check plus a post-bind inode check replace the process-wide `umask` (the
+  workspace forbids `unsafe`; the verified-private directory keeps the socket unreachable until
+  the `chmod`).
+- Only `ca.pem` and `ca-hosts.json` are written; the trust bundle with system roots is L08's.
+  `Status` carries the CA certificate msd verified, and `ms init --trust` trusts that, not the file.
+- The rules rollback floor is also kept in the vault state item (`running v=<n>`), so deleting the
+  receipts can't lower it (security review S3).
+- `msd --init` refuses inside an agent tree, asks on `/dev/tty`, only uses the real state
+  directory, and never clears `ms stop` (security review S2).
+- AC4's restart persistence is proven at the daemon level over a shared vault; the dev memory vault
+  is ephemeral, so the binary-level test can't restart msd.
+- `Start` clears LOG-2 session stops as well (a person resuming morsec resets them).
 
 ## Out of scope (named follow-ups)
 

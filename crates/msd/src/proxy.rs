@@ -244,6 +244,12 @@ pub fn build(d: &Arc<Daemon>, listen: SocketAddr) -> Result<(ProxyConfig, Deps),
     }
     let hosts: BTreeSet<String> = binds.iter().flat_map(|b| b.hosts.iter().cloned()).collect();
     let ca = Arc::new(ensure_ca(d, &hosts)?);
+    d.set_ca((!hosts.is_empty()).then(|| {
+        (
+            ca.cert_pem().to_owned(),
+            ca.hosts().iter().cloned().collect(),
+        )
+    }));
     let mut cfg = ProxyConfig::new(listen);
     cfg.bindings = binds;
     let mut deps = Deps::new(
@@ -288,6 +294,7 @@ pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
         match bound {
             Ok((proxy, current)) => {
                 tracing::info!(addr = %listen, "swap proxy listening");
+                d.clear_alert("the swap proxy is not running");
                 let (mut c, mut s, dd) = (changes.clone(), shutdown.clone(), d.clone());
                 // Rebinding briefly closes the port, so only rebuild when the bindings change;
                 // policy and the stop flag are read live and need no rebuild.

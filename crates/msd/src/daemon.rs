@@ -33,8 +33,27 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Most alerts kept for `ms status`.
 const MAX_ALERTS: usize = 20;
 
-const STATE_RUNNING: &[u8] = b"running";
-const STATE_STOPPED: &[u8] = b"stopped";
+/// The daemon state item: `running v=<n>` or `stopped v=<n>`, where `n` is the highest rules
+/// version msd has saved or loaded (the rules rollback floor). Kept in the vault so an agent can
+/// neither delete it nor put an older copy back (SPEC D-C; security review S3). The bare forms
+/// `running` / `stopped` read as floor 0.
+pub fn encode_state(stopped: bool, floor: u64) -> Vec<u8> {
+    format!("{} v={floor}", if stopped { "stopped" } else { "running" }).into_bytes()
+}
+
+/// Parses [`encode_state`]'s format. `None` for anything else.
+pub fn parse_state(v: &[u8]) -> Option<(bool, u64)> {
+    let s = std::str::from_utf8(v).ok()?;
+    let (word, floor) = match s.split_once(" v=") {
+        Some((w, n)) => (w, n.parse().ok()?),
+        None => (s, 0),
+    };
+    match word {
+        "running" => Some((false, floor)),
+        "stopped" => Some((true, floor)),
+        _ => None,
+    }
+}
 
 /// The rules in force and the rollback floor.
 #[derive(Debug)]
@@ -67,13 +86,17 @@ pub type Identify = Arc<dyn Fn(&PeerInfo) -> Option<Caller> + Send + Sync>;
 /// L06 identification for a daemon running as `uid`.
 pub fn identify_by_session(uid: u32) -> Identify {
     let check = ms_session::SessionPeerCheck::new(uid);
-    Arc::new(move |peer: &PeerInfo| match check.caller(peer, now_ms()) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::warn!(error = %e, "could not identify the caller");
-            None
-        }
-    })
+    // Compared with the accept time, not now: a process that started after the connection was
+    // accepted is not the peer (PID reuse).
+    Arc::new(
+        move |peer: &PeerInfo| match check.caller(peer, peer.accepted_unix_ms) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not identify the caller");
+                None
+            }
+        },
+    )
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -96,6 +119,10 @@ pub struct Daemon {
     proxy_port: u16,
     /// Serializes rules changes (load, classify, save).
     write: Mutex<()>,
+    /// Serializes `ms stop` / `ms start` (memory flag and vault flag change together).
+    flag: Mutex<()>,
+    /// The proxy CA in use (certificate PEM, hosts), when a host is bound.
+    ca: Mutex<Option<(String, Vec<String>)>>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -189,9 +216,31 @@ impl Daemon {
         let mac_key = KeyName::new(RULES_HMAC_KEY)?;
         let mut alerts = Vec::new();
 
-        // The rollback floor comes from the chain before the store is opened for appending.
+        let state_key = KeyName::new(DAEMON_STATE_KEY)?;
+        let (stopped, vault_floor) = match vault.read_with(&state_key, <[u8]>::to_vec) {
+            Ok(v) => match parse_state(&v) {
+                Some(state) => state,
+                None => {
+                    alerts.push("the stop flag in the vault is unreadable, so morsec stays stopped. Resume with: ms init --resume".into());
+                    (true, u64::MAX)
+                }
+            },
+            Err(ms_core::Error::NoSuchKey(_)) if backend.is_memory() => {
+                backend.put_internal(&state_key, SecretBytes::new(encode_state(false, 0)))?;
+                (false, 0)
+            }
+            Err(e) => {
+                alerts.push(format!(
+                    "the stop flag could not be read from the vault ({e}), so morsec stays stopped. Resume with: ms init --resume"
+                ));
+                (true, u64::MAX)
+            }
+        };
+
+        // The rollback floor: the higher of the vault's and the receipt chain's, read before the
+        // store is opened for appending. An unreadable vault state gives u64::MAX: fail closed.
         let floor = match max_rule_version(&paths.receipts) {
-            Ok(v) => Some(v),
+            Ok(v) => Some(v.max(vault_floor)),
             Err(e) => {
                 alerts.push(format!(
                     "the receipts could not be read ({e}); every key is denied until this is fixed"
@@ -211,7 +260,7 @@ impl Daemon {
                     let v = r.version.max(floor);
                     (r, v)
                 }
-                Err(RulesError::NotInitialized { .. }) if backend.is_memory() => {
+                Err(RulesError::NotInitialized { .. }) if backend.is_memory() && floor == 0 => {
                     let r = store
                         .create(&Rules::default())
                         .map_err(|e| ms_core::Error::Socket(e.to_string()))?;
@@ -233,25 +282,6 @@ impl Daemon {
             },
         };
 
-        let state_key = KeyName::new(DAEMON_STATE_KEY)?;
-        let stopped = match vault.read_with(&state_key, <[u8]>::to_vec) {
-            Ok(v) if v == STATE_RUNNING => false,
-            Ok(v) if v == STATE_STOPPED => true,
-            Ok(_) => {
-                alerts.push("the stop flag in the vault is unreadable, so morsec stays stopped. Resume with: ms init --resume".into());
-                true
-            }
-            Err(ms_core::Error::NoSuchKey(_)) if backend.is_memory() => {
-                backend.put_internal(&state_key, SecretBytes::new(STATE_RUNNING.to_vec()))?;
-                false
-            }
-            Err(e) => {
-                alerts.push(format!(
-                    "the stop flag could not be read from the vault ({e}), so morsec stays stopped. Resume with: ms init --resume"
-                ));
-                true
-            }
-        };
         rules.stopped = stopped;
 
         let (proxy_gen, _) = watch::channel(0);
@@ -269,6 +299,8 @@ impl Daemon {
             proxy_gen,
             proxy_port,
             write: Mutex::new(()),
+            flag: Mutex::new(()),
+            ca: Mutex::new(None),
         }))
     }
 
@@ -309,6 +341,16 @@ impl Daemon {
 
     fn rebuild_proxy(&self) {
         self.proxy_gen.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// Records the CA the proxy now uses (`None` for the throwaway placeholder CA).
+    pub fn set_ca(&self, ca: Option<(String, Vec<String>)>) {
+        *lock(&self.ca) = ca;
+    }
+
+    /// Drops alerts starting with `prefix` (a condition that cleared).
+    pub fn clear_alert(&self, prefix: &str) {
+        lock(&self.alerts).retain(|a| !a.starts_with(prefix));
     }
 
     /// Adds an alert for `ms status` (deduplicated, bounded).
@@ -410,6 +452,15 @@ impl Daemon {
         value: Option<SecretBytes>,
     ) -> ResponseBody {
         let caller = self.caller(peer);
+        // A peer that can't be identified (it exited and left the connection to a child, or its
+        // PID was reused) is refused everything but status and stop: treating it as "not an
+        // agent" would fail open.
+        if caller.is_none() && !request.is_control() {
+            return reply_err(
+                ErrorCode::Denied,
+                "morsec: the process that opened this connection can't be identified any more, so the request is refused. Reconnect from a running process",
+            );
+        }
         let session = session_of(caller.as_ref(), peer);
         if self.session_stopped(&session) && !request.is_control() {
             return reply_err(
@@ -472,6 +523,7 @@ impl Daemon {
         if tampered && !alerts.iter().any(|a| a.contains("integrity")) {
             alerts.push("the rules failed their integrity check, so every key is denied".into());
         }
+        let (ca_pem, ca_hosts) = lock(&self.ca).clone().unzip();
         ResponseBody::Status {
             daemon: "msd".into(),
             version: env!("CARGO_PKG_VERSION").into(),
@@ -480,6 +532,8 @@ impl Daemon {
             keys,
             proxy_port: Some(self.proxy_port),
             alerts,
+            ca_pem,
+            ca_hosts: ca_hosts.unwrap_or_default(),
         }
     }
 
@@ -640,6 +694,16 @@ impl Daemon {
             l.min_version = l.min_version.max(saved.version);
             l.rules = saved;
         }
+        {
+            let _f = lock(&self.flag);
+            if let Err(e) = self.persist_state(self.is_stopped()) {
+                // The receipt chain still records the version, so the floor is not lost.
+                tracing::error!(error = %e, "could not save the rules floor in the vault");
+                self.alert(format!(
+                    "the rules version could not be saved in the vault ({e})"
+                ));
+            }
+        }
         self.rebuild_proxy();
         Ok((self.rules_version(), change))
     }
@@ -784,19 +848,17 @@ impl Daemon {
         }
     }
 
+    /// Writes the stop flag and the rollback floor. The caller holds `flag`.
     fn persist_state(&self, stopped: bool) -> ms_core::Result<()> {
-        let v = if stopped {
-            STATE_STOPPED
-        } else {
-            STATE_RUNNING
-        };
+        let floor = self.read_live().min_version;
         self.backend.put_internal(
             &KeyName::new(DAEMON_STATE_KEY)?,
-            SecretBytes::new(v.to_vec()),
+            SecretBytes::new(encode_state(stopped, floor)),
         )
     }
 
     fn stop(&self, session: &SessionId) -> ResponseBody {
+        let _f = lock(&self.flag);
         // In memory first: from here on every request is refused, whatever happens below.
         let version = {
             let mut l = self.write_live();
@@ -805,8 +867,7 @@ impl Daemon {
         };
         // No proxy rebuild: the proxy's session resolver returns no session while stopped, so
         // the next request is refused without the listener going away.
-        let mut message =
-            "morsec stopped: every agent request is now refused. Resume with: ms start".to_owned();
+        let mut message = "morsec stopped: every agent request is now refused. Resume from your own terminal with: ms init --resume (ms start once Touch ID arrives in L11)".to_owned();
         if let Err(e) = self.persist_state(true) {
             tracing::error!(error = %e, "could not persist the stop flag");
             self.alert(format!(
@@ -831,6 +892,8 @@ impl Daemon {
     }
 
     fn start(&self, session: &SessionId, unattributed: bool, at_terminal: bool) -> ResponseBody {
+        // Held through the approval and both writes, so a concurrent `ms stop` can't be undone.
+        let _f = lock(&self.flag);
         if !self.is_stopped() {
             return ResponseBody::Ok {
                 message: "morsec is already on".into(),
@@ -997,6 +1060,7 @@ mod tests {
             uid: 501,
             gid: 20,
             pid: Some(42),
+            accepted_unix_ms: 1,
         }
     }
 
@@ -1313,6 +1377,13 @@ mod tests {
             code(&h.req(RequestBody::RulesGet { key: None })),
             Some(ErrorCode::Denied)
         );
+        // S3: deleting the receipts does not lower the floor (it is also in the vault).
+        std::fs::remove_dir_all(h.dir.path().join("receipts")).unwrap();
+        let h = restart(h);
+        assert!(
+            h.d.rules().tampered,
+            "rollback accepted after deleting receipts"
+        );
         // A forged edit.
         std::fs::write(&rules, "version = 99\n").unwrap();
         let h = restart(h);
@@ -1362,6 +1433,76 @@ mod tests {
             ResponseBody::Status { .. }
         ));
         assert!(is_ok(&h.as_(terminal()).put("x/y", Tier::Test)));
+    }
+
+    // protects=R1: a caller that can't be identified (the connecting process exited and a child
+    // kept the fd, or its PID was reused) is refused everything but status and stop, so it can't
+    // replace a key, use the terminal path or slip out of a LOG-2 stop; fails_when=None is treated
+    // as a non-agent; no_claim=the kernel side (peer_cred of a dead PID)
+    #[test]
+    fn unidentified_caller_is_refused() {
+        let h = fresh();
+        assert!(is_ok(&h.put("stripe/test", Tier::Test)));
+        *lock(&h.who) = None;
+        assert_eq!(
+            code(&h.put("stripe/test", Tier::Test)),
+            Some(ErrorCode::Denied)
+        );
+        assert_eq!(code(&h.put("new/key", Tier::Test)), Some(ErrorCode::Denied));
+        assert_eq!(
+            code(&h.req(RequestBody::Start { at_terminal: true })),
+            Some(ErrorCode::Denied)
+        );
+        assert!(is_ok(&h.req(RequestBody::Stop)));
+        assert_eq!(
+            code(&h.req(RequestBody::Start { at_terminal: true })),
+            Some(ErrorCode::Denied)
+        );
+        assert!(h.d.is_stopped());
+        assert!(matches!(
+            h.req(RequestBody::Status),
+            ResponseBody::Status { .. }
+        ));
+    }
+
+    // protects=R2: concurrent stop and start never leave morsec on after a stop reported success;
+    // fails_when=the in-memory flag and the vault flag disagree after the race; no_claim=fairness
+    #[test]
+    fn stop_and_start_are_serialized() {
+        let h = Arc::new(fresh());
+        for _ in 0..50 {
+            let (a, b) = (h.clone(), h.clone());
+            let t1 = std::thread::spawn(move || {
+                a.as_(terminal())
+                    .req(RequestBody::Start { at_terminal: true })
+            });
+            let t2 = std::thread::spawn(move || b.d.handle(&peer(), RequestBody::Stop, None));
+            let _ = t1.join().unwrap();
+            let _ = t2.join().unwrap();
+            let mem = h.d.is_stopped();
+            let saved = h
+                .backend
+                .vault()
+                .read_with(&KeyName::new(DAEMON_STATE_KEY).unwrap(), <[u8]>::to_vec)
+                .unwrap();
+            assert_eq!(
+                Some(mem),
+                parse_state(&saved).map(|s| s.0),
+                "memory and vault disagree"
+            );
+        }
+    }
+
+    // protects=the state item format round-trips and anything else is rejected (fail closed);
+    // fails_when=garbage parses as running; no_claim=-
+    #[test]
+    fn state_format() {
+        assert_eq!(parse_state(&encode_state(true, 7)), Some((true, 7)));
+        assert_eq!(parse_state(&encode_state(false, 0)), Some((false, 0)));
+        assert_eq!(parse_state(b"running"), Some((false, 0)));
+        for bad in [&b"garbage"[..], b"running v=x", b"stopped v=", b""] {
+            assert_eq!(parse_state(bad), None);
+        }
     }
 
     // protects=an unreadable stop flag fails closed: msd starts stopped with an alert;

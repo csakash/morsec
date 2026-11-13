@@ -26,6 +26,9 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Most connections in the general pool (see [`ServerLimits::general`]).
 pub const MAX_CONNECTIONS: usize = 64;
 
+/// How long a reserved control connection may wait between frames.
+const CONTROL_FIRST_FRAME: Duration = Duration::from_secs(1);
+
 /// Connection limits. The defaults suit `msd`; tests change them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerLimits {
@@ -69,6 +72,19 @@ pub struct PeerInfo {
     pub gid: u32,
     /// Process id, when the platform reports it.
     pub pid: Option<i32>,
+    /// When the daemon accepted the connection, Unix milliseconds (L07). A process that started
+    /// after this is not the peer (PID reuse), so identity checks made later in the connection
+    /// must compare against this, not the current time.
+    pub accepted_unix_ms: u64,
+}
+
+/// Wall-clock now, Unix milliseconds.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Decides whether a peer may talk to the daemon. L06 replaces [`SameUid`] with session identity.
@@ -331,7 +347,7 @@ impl Server {
             };
             let (h, c, pc) = (handler.clone(), check.clone(), peers.clone());
             tokio::spawn(async move {
-                serve_conn(stream, h, c, pc, limits, slot).await;
+                serve_conn(stream, h, c, pc, limits, slot, now_unix_ms()).await;
             });
         }
     }
@@ -422,6 +438,7 @@ async fn serve_conn<H: Handler, P: PeerCheck>(
     peers: Arc<PeerCounts>,
     limits: ServerLimits,
     slot: Slot,
+    accepted_unix_ms: u64,
 ) {
     let lifetime = if slot.control_only() {
         limits.control_lifetime
@@ -438,6 +455,7 @@ async fn serve_conn<H: Handler, P: PeerCheck>(
             peers,
             limits,
             slot.control_only(),
+            accepted_unix_ms,
         ),
     )
     .await;
@@ -451,12 +469,14 @@ async fn conn_body<H: Handler, P: PeerCheck>(
     peers: Arc<PeerCounts>,
     limits: ServerLimits,
     control_only: bool,
+    accepted_unix_ms: u64,
 ) {
     let peer = match stream.peer_cred() {
         Ok(c) => PeerInfo {
             uid: c.uid(),
             gid: c.gid(),
             pid: c.pid(),
+            accepted_unix_ms,
         },
         // A client that connects and hangs up at once (such as `bind`'s liveness probe) has no
         // credentials left to read. That is not an attack signal, so it is not a warning.
@@ -495,7 +515,13 @@ async fn conn_body<H: Handler, P: PeerCheck>(
     };
     let mut served: u32 = 0;
     loop {
-        let frame = match tokio::time::timeout(limits.idle, read_frame(stream)).await {
+        // A reserved control slot must not be parked on: its client gets one second to send.
+        let wait = if control_only {
+            limits.idle.min(CONTROL_FIRST_FRAME)
+        } else {
+            limits.idle
+        };
+        let frame = match tokio::time::timeout(wait, read_frame(stream)).await {
             Err(_) | Ok(Ok(None)) => return,
             Ok(Ok(Some(f))) => f,
             Ok(Err(e)) => {

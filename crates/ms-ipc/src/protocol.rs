@@ -173,6 +173,14 @@ pub enum ResponseBody {
         /// Things the user should look at: tampered rules, connector settings drift (L07).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         alerts: Vec<String>,
+        /// The swap proxy's CA certificate (PEM, public), as msd loaded and checked it against
+        /// the key in the vault; absent while no host is bound (L07). `ms init --trust` trusts
+        /// this, never the file on disk, which any same-user process can replace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ca_pem: Option<String>,
+        /// The hosts that CA may sign for (its name constraints) (L07).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ca_hosts: Vec<String>,
     },
     /// Success; `message` is shown to people as is (L07).
     Ok {
@@ -220,6 +228,8 @@ impl ResponseBody {
             keys: None,
             proxy_port: None,
             alerts: Vec::new(),
+            ca_pem: None,
+            ca_hosts: Vec::new(),
         }
     }
 

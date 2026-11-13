@@ -28,6 +28,7 @@ use ms_ipc::Server;
 use ms_receipts::{ReceiptSink, ReceiptStore, StoreConfig};
 use ms_rules::{Rules, RulesStore};
 use ms_session::SessionPeerCheck;
+use ms_vault::VaultExt;
 use ms_vault::memory::MemoryVault;
 use tokio::sync::watch;
 
@@ -179,6 +180,43 @@ fn now_ms() -> u64 {
     ms_session::peer::now_unix_ms()
 }
 
+/// Refuses when this process runs inside an agent's process tree (security review S2): setting
+/// morsec up resets its keys, which only the person may do.
+fn refuse_inside_agent() -> Result<(), String> {
+    let r = ms_session::Resolver::new(ms_session::OsProcessTable);
+    match r.resolve(std::process::id()) {
+        Ok(ms_session::Caller::Unattributed { .. }) => Ok(()),
+        Ok(ms_session::Caller::Agent(_)) => Err(
+            "morsec: msd --init can't run inside an agent session. Run ms init from your own terminal".into(),
+        ),
+        Err(e) => Err(format!(
+            "morsec: can't check who is running msd --init ({e}); refusing"
+        )),
+    }
+}
+
+/// Asks the person on `/dev/tty` (never stdin, so a pipe can't answer).
+fn confirm_on_tty(question: &str) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| format!("morsec: msd --init must be confirmed at your own terminal ({e})"))?;
+    write!(tty, "{question} Type yes to confirm: ")
+        .and_then(|()| tty.flush())
+        .map_err(|e| format!("morsec: writing to the terminal: {e}"))?;
+    let mut line = String::new();
+    BufReader::new((&tty).take(64))
+        .read_line(&mut line)
+        .map_err(|e| format!("morsec: reading the terminal: {e}"))?;
+    if line.trim() == "yes" {
+        Ok(())
+    } else {
+        Err("Cancelled. Nothing was changed.".into())
+    }
+}
+
 /// `msd --init`.
 fn init(args: &Args) -> ExitCode {
     let kind = vault_kind(args);
@@ -188,14 +226,41 @@ fn init(args: &Args) -> ExitCode {
         );
         return ExitCode::from(EXIT_USAGE);
     }
+    if args.state_dir.is_some() || args.port.is_some() {
+        // The keychain items are global: initialising them for another directory would reset
+        // the real vault's keys behind the real state (security review S2).
+        eprintln!(
+            "morsec: msd --init with the keychain always uses the real state directory; drop --state-dir and --port"
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    if let Err(e) = refuse_inside_agent() {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     let result = (|| -> Result<bool, String> {
         let paths = Paths::under(state_dir(args).map_err(|e| e.to_string())?);
         prepare_private_dir(&paths.state).map_err(|e| e.to_string())?;
+        let b = backend(kind)?;
         let mac = ms_rules::store::mac_path(&paths.rules);
-        let existing = paths.rules.exists() || mac.exists() || paths.receipts.exists();
+        let receipts_key = KeyName::new(backend::RECEIPTS_HMAC_KEY).map_err(|e| e.to_string())?;
+        let keys_exist = b.vault().with_secret(&receipts_key, &mut |_| {}).is_ok();
+        let existing =
+            paths.rules.exists() || mac.exists() || paths.receipts.exists() || keys_exist;
         if existing && !args.force {
             return Ok(false);
         }
+        confirm_on_tty(if existing {
+            "Start morsec over? New internal keys, empty rules, a new receipts file; stored keys and old receipts stop verifying."
+        } else {
+            "Set morsec up (internal keys in your login keychain, empty rules, receipts)?"
+        })?;
+        // A reset never clears `ms stop`: resuming is its own, separate step.
+        let state_key = KeyName::new(DAEMON_STATE_KEY).map_err(|e| e.to_string())?;
+        let was_stopped = match b.vault().read_with(&state_key, <[u8]>::to_vec) {
+            Ok(v) => daemon::parse_state(&v).is_none_or(|(stopped, _)| stopped),
+            Err(_) => existing,
+        };
         if existing {
             // Keep the old files for inspection; they no longer verify after the reset.
             let tag = format!("old-{}", now_ms());
@@ -211,11 +276,10 @@ fn init(args: &Args) -> ExitCode {
                 let _ = std::fs::remove_file(p);
             }
         }
-        let b = backend(kind)?;
         b.reset().map_err(|e| e.to_string())?;
         b.put_internal(
-            &KeyName::new(DAEMON_STATE_KEY).map_err(|e| e.to_string())?,
-            SecretBytes::new(b"running".to_vec()),
+            &state_key,
+            SecretBytes::new(daemon::encode_state(was_stopped, 1)),
         )
         .map_err(|e| e.to_string())?;
         let vault = b.vault();
@@ -301,12 +365,7 @@ async fn serve(args: Args) -> ExitCode {
         tracing::error!("{e}");
         return ExitCode::FAILURE;
     }
-    if b.is_memory()
-        && let Err(e) = prepare_memory_state(&paths)
-    {
-        tracing::error!("{e}");
-        return ExitCode::FAILURE;
-    }
+    // Bind first: if another msd is running on this socket, its dev state must not be wiped.
     let server = match Server::bind(&socket) {
         Ok(s) => s,
         Err(e) => {
@@ -314,6 +373,12 @@ async fn serve(args: Args) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if b.is_memory()
+        && let Err(e) = prepare_memory_state(&paths)
+    {
+        tracing::error!("{e}");
+        return ExitCode::FAILURE;
+    }
     let proxy_port = args
         .proxy_port
         .or_else(|| args.port.and_then(|p| p.checked_add(1)))

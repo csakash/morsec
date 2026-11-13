@@ -1,0 +1,68 @@
+# Evidence: L07 `daemon`
+
+Commands run on the loop branch `feat/daemon`, 2026-11-13, macOS (Darwin 25.2), rustc 1.93.1.
+Full outputs are kept outside the repo in `.loops/runs/daemon/interactive/proof/`
+(`build-morsec.txt`, `qa-run.txt`, `qa-run2.txt`, `qa.md`, `PROOF.md`).
+
+## Decisions
+
+- **D-A (user):** approvals before L11 are a deny stub (`msd::approve::DenyApprover`) plus a
+  pre-L11 terminal path for loosening rules and resuming after `ms stop`: `--at-terminal`
+  (`ms rules … --at-terminal`, `ms init --resume`) asks `yes` on `/dev/tty`, and msd accepts it
+  only from a caller with no agent process above it. Production-tier keys can't be used until L11.
+- **D-B:** msd MACs the rules with `morsec/rules-hmac` (the key L01 creates), not L03's default
+  name `morsec/rules-mac`.
+- **D-C:** the stop flag and the proxy CA key are keychain items written by msd only
+  (`KeychainVault::put_internal`, two allowlisted names), so an agent can't delete or roll them
+  back the way it could a file.
+- **D-D:** the CA is issued lazily, for the exact hosts bound to swap keys; `ca.pem` and
+  `ca-hosts.json` are written to the state directory. With nothing bound, a throwaway CA for
+  `morsec.invalid` keeps the proxy listening (and refusing).
+- **D-E:** IPC stays v1 and changes additively (see `docs/PLAN.md` §4).
+
+Spec amendments made while building (the spec text is otherwise unchanged):
+- `RulesGet` has no `cwd`: the client merges the project `.morsec.toml`, so msd never reads a
+  path a client names (no file-read oracle for a sandboxed agent).
+- The proposed rule travels as a one-key rules file, not a table body.
+- The socket bind uses a descriptor check plus a post-bind inode check instead of a process-wide
+  `umask` (the workspace forbids `unsafe`; the directory is verified private, so nobody can reach
+  the socket before the `chmod`).
+- Only `ca.pem` is written; the trust bundle with system roots is L08's (connectors).
+- Restart persistence of `ms stop` is proven at the daemon level with a shared vault; the dev
+  memory vault is ephemeral, so the binary-level test can't restart.
+
+## Gate
+
+See `PROOF.md` for the final run. `npm run build` → `scripts/check.sh`, all 8 steps.
+
+## Acceptance criteria (SPEC.md)
+
+| AC | Evidence |
+|---|---|
+| 1 gate | `build-morsec.txt` |
+| 2 S3 bind | `ipc::{bind_refuses_symlinked_directory, bound_socket_is_private, bind_leaves_existing_directories_alone, bind_refuses_live_socket_and_regular_file}` |
+| 3 S6 | `ipc::{held_connections_do_not_delay_stop, reserved_slots_refuse_other_requests, per_peer_cap, request_and_lifetime_caps}`; QA: 64 sockets held by one process, `ms stop` 0.01 s, `ms status` 0.00 s (`qa-run2.txt`) |
+| 4 AUTH-4 | `daemon::tests::stop_is_immediate_and_survives_restart` (next decision `Deny(Stopped)`, still stopped after reopening over the same vault); `agent_e2e` (an agent runs `ms stop`, its next proxy request is refused, status says stopped, `ms start` from the agent refused) |
+| 5 fail closed | `agent_e2e` (msd down: proxy port refuses, `ms status` exits 1 with the `ms start` hint); `daemon::tests::{tampered_and_rolled_back_rules_fail_closed, unreadable_stop_flag_means_stopped}`; `status_with_and_without_daemon` |
+| 6 MCP-3 | `ipc::rejected_peer` (another uid), `session-identity` peer check, `agent_e2e` + `daemon::tests::{rules_changes, start_needs_approval_or_terminal}` (agent caller can't use the terminal path) |
+| 7 add/import | `cli::add_and_import_store_through_msd` (both store, `ms rules` shows them verified by msd, no value in output or receipts); `daemon::tests::put_key_and_list` |
+| 8 rules over IPC | `daemon::tests::rules_changes`; `agent_e2e` (terminal path from a detached process applies a loosening; from inside the fake agent it is refused) |
+| 9 swap through the daemon | `agent_e2e` (placeholder to an unbound host: 403 and a `host_not_allowed` receipt; after `ms stop`: refused) ; `proxy::tests::bindings_from_rules` |
+| 10 reviews, QA, proof, ARI-42 | below; `ARI42.md` AUTH-1, AUTH-3, AUTH-4, MCP-3, LOG-2 rows |
+
+## QA
+
+The dev daemon (`msd --foreground --vault memory --port 4100`) was exercised with the real `ms`;
+transcripts are in `qa-run.txt` and `qa-run2.txt`. One bug was found and fixed (f6218db): every
+rules change rebuilt the proxy, briefly closing the port, so a request right after a change was
+refused with a connection error. The proxy now rebinds only when its bindings change.
+
+## Not proven here
+
+- The keychain backend end to end (`ms init` → `msd --init` → LaunchAgent): it writes to the
+  real login keychain and `~/Library/LaunchAgents`, so it was not run on this machine during the
+  loop. The keychain primitives it uses are L01's (tested there); `put_internal` has its own
+  keychain test. `ms init --trust` (macOS trust prompt) likewise.
+- Touch ID (L11). Hardened-runtime signing with `crates/msd/msd.entitlements` (L10).
+- Uninspected allowlisted tunnels opened before `ms stop` live until idle (no allowlist source
+  exists yet; L08 adds one).

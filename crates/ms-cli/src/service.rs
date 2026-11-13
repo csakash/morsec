@@ -68,7 +68,7 @@ pub(crate) fn status_line(resp: &ResponseBody) -> Option<String> {
     let protected = keys.map(|k| format!(" · {k} {} protected", plural(k)));
     Some(match running {
         Some(false) => format!(
-            "morsec stopped{} · resume with: ms start",
+            "morsec stopped{} · resume with: ms init --resume",
             protected.unwrap_or_default()
         ),
         Some(true) => format!("morsec on{}", protected.unwrap_or_default()),
@@ -257,30 +257,67 @@ fn install_launch_agent(msd: &Path) -> Result<(), String> {
     wait_for_socket(Duration::from_secs(10))
 }
 
-fn trust() -> ExitCode {
-    let state = match home() {
-        Ok(h) => h.join("Library/Application Support/morsec"),
-        Err(e) => return fail(&e),
+/// `ms init --trust`. The certificate comes from msd, which loaded it and checked it against the
+/// CA key in the vault, never from `ca.pem` (any same-user process can replace that file). It is
+/// handed to `security` from a private temp file.
+async fn trust() -> ExitCode {
+    let (pem, hosts) = match request(RequestBody::Status).await {
+        Ok(ResponseBody::Status {
+            ca_pem: Some(pem),
+            ca_hosts,
+            ..
+        }) => (pem, ca_hosts),
+        Ok(ResponseBody::Status { .. }) => {
+            return fail(
+                "morsec: there is no morsec CA yet. It is created when a key is first allowed a host (ms rules <key> --add-host ...)",
+            );
+        }
+        Ok(ResponseBody::Error { message, .. }) => return fail(&message),
+        Ok(_) => return fail("morsec: unexpected reply from the daemon"),
+        Err(e) => return fail(&e.to_string()),
     };
-    let ca = state.join("ca.pem");
-    if !ca.is_file() {
-        return fail(
-            "morsec: there is no morsec CA yet. It is created when a key is first allowed a host (ms rules <key> --add-host ...)",
-        );
-    }
     let keychain = match home() {
         Ok(h) => h.join("Library/Keychains/login.keychain-db"),
         Err(e) => return fail(&e),
     };
-    say("macOS will ask you to allow adding the morsec CA to your trust settings.");
-    match Command::new("security")
+    let dir = std::env::temp_dir().join(format!(
+        "morsec-trust-{}-{}",
+        std::process::id(),
+        crate::import::now_unix_ms()
+    ));
+    let made = {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .and_then(|()| {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(dir.join("ca.pem"))?;
+                f.write_all(pem.as_bytes())
+            })
+    };
+    if let Err(e) = made {
+        let _ = std::fs::remove_dir_all(&dir);
+        return fail(&format!("morsec: writing a private copy of the CA: {e}"));
+    }
+    say(&format!(
+        "The morsec CA can sign only for: {}",
+        hosts.join(", ")
+    ));
+    say("macOS will ask you to allow adding it to your trust settings.");
+    let st = Command::new("security")
         .args(["add-trusted-cert", "-r", "trustRoot", "-k"])
         .arg(&keychain)
-        .arg(&ca)
-        .status()
-    {
+        .arg(dir.join("ca.pem"))
+        .status();
+    let _ = std::fs::remove_dir_all(&dir);
+    match st {
         Ok(s) if s.success() => {
-            say("The morsec CA is trusted. It can only sign for the hosts your keys are bound to.");
+            say("The morsec CA is trusted.");
             ExitCode::SUCCESS
         }
         Ok(_) => fail("morsec: the CA was not added to your trust settings"),
@@ -318,7 +355,7 @@ async fn resume() -> ExitCode {
 
 pub(crate) async fn init(a: &InitArgs) -> ExitCode {
     if a.trust {
-        return trust();
+        return trust().await;
     }
     if a.resume {
         return resume().await;
@@ -378,7 +415,7 @@ mod tests {
         }
         assert_eq!(
             status_line(&r).unwrap(),
-            "morsec stopped · 3 secrets protected · resume with: ms start"
+            "morsec stopped · 3 secrets protected · resume with: ms init --resume"
         );
     }
 

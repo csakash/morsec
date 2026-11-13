@@ -24,13 +24,30 @@ pub fn watched(home: &Path) -> Vec<PathBuf> {
     ]
 }
 
-/// A fingerprint of `p`: `None` when missing.
+/// A fingerprint of `p`: `None` when missing. The file is opened without following a symlink and
+/// without blocking, must be a regular file, and at most [`MAX_BYTES`] are read, so a planted
+/// symlink to `/dev/zero` or a FIFO can't hang or exhaust msd. Anything else is fingerprinted by
+/// its type, so a swap still counts as a change.
 pub fn fingerprint(p: &Path) -> Option<String> {
-    let m = std::fs::metadata(p).ok()?;
-    if m.len() > MAX_BYTES {
-        return Some(format!("size:{}", m.len()));
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let m = std::fs::symlink_metadata(p).ok()?;
+    if !m.file_type().is_file() {
+        return Some(format!("not-a-file:{:?}", m.file_type()));
     }
-    let bytes = std::fs::read(p).ok()?;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(p)
+        .ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return Some("not-a-file".into());
+    }
+    let mut bytes = Vec::new();
+    f.take(MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Some(format!("size>{MAX_BYTES}"));
+    }
     Some(hex::encode(Sha256::digest(&bytes)))
 }
 
@@ -61,7 +78,22 @@ pub async fn watch_loop(d: Arc<Daemon>, home: PathBuf, mut shutdown: watch::Rece
             () = tokio::time::sleep(INTERVAL) => {},
             _ = shutdown.changed() => return,
         }
-        for p in changed(&mut seen) {
+        let checked = {
+            let mut s = std::mem::take(&mut seen);
+            match tokio::task::spawn_blocking(move || {
+                let c = changed(&mut s);
+                (s, c)
+            })
+            .await
+            {
+                Ok((s, c)) => {
+                    seen = s;
+                    c
+                }
+                Err(_) => return,
+            }
+        };
+        for p in checked {
             tracing::warn!(path = %p.display(), "connector settings changed");
             d.alert(format!(
                 "{} changed while morsec was running; check that the agent still routes through morsec (ms doctor)",
@@ -93,5 +125,9 @@ mod tests {
         std::fs::write(&files[1], b"x").unwrap();
         std::fs::remove_file(&files[0]).unwrap();
         assert_eq!(changed(&mut seen).len(), 2);
+        // A symlink to a device is reported as a change, never read.
+        std::os::unix::fs::symlink("/dev/zero", &files[0]).unwrap();
+        assert_eq!(changed(&mut seen), [files[0].clone()]);
+        assert!(fingerprint(&files[0]).unwrap().starts_with("not-a-file"));
     }
 }

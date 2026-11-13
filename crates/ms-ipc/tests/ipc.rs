@@ -444,6 +444,8 @@ fn every_variant_round_trips() {
             keys: Some(3),
             proxy_port: Some(7277),
             alerts: vec!["drift".into()],
+            ca_pem: Some("-----BEGIN CERTIFICATE-----".into()),
+            ca_hosts: vec!["api.stripe.com".into()],
         },
         ResponseBody::Ok {
             message: "stored".into(),
@@ -530,10 +532,11 @@ async fn unimplemented_names_loop() {
     r.shutdown().await;
 }
 
-// protects=IPC v1 stays backwards compatible after L07's additions: messages written by a pre-L07
-// client or daemon (no new fields) still parse, with the new fields at their safe defaults;
-// fails_when=a new field is required or defaults to something permissive (at_terminal true);
-// no_claim=forward compatibility (a pre-L07 binary can't read the new reply variants)
+// protects=old-to-new compatibility of IPC v1 after L07's additions: messages written by a pre-L07
+// client or daemon (no new fields) still parse in this build, with the new fields at their safe
+// defaults; fails_when=a new field is required or defaults to something permissive (at_terminal
+// true); no_claim=new-to-old (a pre-L07 ms can't parse a new msd's extended Status or new
+// variants; ms and msd ship together)
 #[test]
 fn pre_l07_messages_still_parse() {
     let old = [
