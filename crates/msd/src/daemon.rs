@@ -121,6 +121,8 @@ pub struct Daemon {
     write: Mutex<()>,
     /// Serializes `ms stop` / `ms start` (memory flag and vault flag change together).
     flag: Mutex<()>,
+    /// Counts `ms stop`s, so a resume approved before a newer stop can't undo it.
+    stops: std::sync::atomic::AtomicU64,
     /// The proxy CA in use (certificate PEM, hosts), when a host is bound.
     ca: Mutex<Option<(String, Vec<String>)>>,
 }
@@ -304,6 +306,7 @@ impl Daemon {
             write: Mutex::new(()),
             flag: Mutex::new(()),
             ca: Mutex::new(None),
+            stops: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -864,6 +867,7 @@ impl Daemon {
 
     fn stop(&self, session: &SessionId) -> ResponseBody {
         let _f = lock(&self.flag);
+        self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // In memory first: from here on every request is refused, whatever happens below.
         let version = {
             let mut l = self.write_live();
@@ -897,6 +901,7 @@ impl Daemon {
     }
 
     fn start(&self, session: &SessionId, unattributed: bool, at_terminal: bool) -> ResponseBody {
+        let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
         if !self.is_stopped() {
             return ResponseBody::Ok {
                 message: "morsec is already on".into(),
@@ -943,6 +948,12 @@ impl Daemon {
             return ResponseBody::Ok {
                 message: "morsec is already on".into(),
             };
+        }
+        if self.stops.load(std::sync::atomic::Ordering::SeqCst) != stops_seen {
+            return reply_err(
+                ErrorCode::Denied,
+                "morsec: ms stop ran again while this resume was waiting for approval; still stopped. Resume again if you meant to",
+            );
         }
         // Persist first: if the vault write fails, stay stopped.
         if let Err(e) = self.persist_state(false) {
