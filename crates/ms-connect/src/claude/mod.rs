@@ -362,6 +362,10 @@ impl ClaudeConnector {
                     path,
                     after: Value::String(v),
                     ..
+                }
+                | Change::SetRedacted {
+                    path,
+                    after: Value::String(v),
                 } if path.len() == 2 && path[0] == "env" => check_ref_env(&path[1], v)
                     .ok()
                     .map(|()| (path[1].clone(), v.clone())),
@@ -418,6 +422,10 @@ impl ClaudeConnector {
                         path,
                         after: Value::String(x),
                         ..
+                    }
+                    | Change::SetRedacted {
+                        path,
+                        after: Value::String(x),
                     } if path.first().is_some_and(|p| p == "env")
                         && (SecretRef::parse(x).is_ok() || *x == ID) =>
                     {
@@ -584,36 +592,62 @@ impl ClaudeConnector {
         Ok((v, text, notes))
     }
 
-    /// The settings document as it would be without morsec, and its original text.
+    /// The settings document as it would be without morsec (except the references that replaced
+    /// a value of the user's, which are carried forward: that value is gone, review R13/R14),
+    /// the skeleton of the original, the text whose layout to keep, notes, and the carried
+    /// records.
+    #[allow(clippy::type_complexity)]
     fn settings_base(
         &self,
         cur: Option<&str>,
         prev: Option<&State>,
-    ) -> Result<(Value, Option<String>, Vec<String>)> {
-        match prev {
-            Some(st) if st.is_written(cur) => {
-                // A re-plan undoes in memory only; its notes would describe a disconnect.
-                let (v, text, _) = self.unwritten(st, cur.unwrap_or_default())?;
-                Ok((v, text, Vec::new()))
-            }
-            Some(st) => {
-                let mut v = parse_doc(&self.paths.settings, cur)?;
-                let was = v.clone();
-                let notes = undo(&mut v, &st.settings_edits);
-                // Keep the user's bytes when nothing of ours was there to undo (review R1).
-                let text = if v == was {
-                    cur.map(str::to_owned)
-                } else {
-                    cur.map(|c| render(&v, Some(c)))
-                };
-                Ok((v, text, notes))
-            }
-            None => Ok((
+    ) -> Result<(
+        Value,
+        Option<skel::Skeleton>,
+        Option<String>,
+        Vec<String>,
+        Vec<Change>,
+    )> {
+        let Some(st) = prev else {
+            return Ok((
                 parse_doc(&self.paths.settings, cur)?,
+                cur.map(skel::skeletonize),
                 cur.map(str::to_owned),
                 Vec::new(),
-            )),
+                Vec::new(),
+            ));
+        };
+        let mut v = parse_doc(&self.paths.settings, cur)?;
+        let (carried, rest): (Vec<Change>, Vec<Change>) =
+            st.settings_edits.changes.iter().cloned().partition(
+                |c| matches!(c, Change::SetRedacted { path, after } if v.at(path) == Some(after)),
+            );
+        let partial = Edits {
+            changes: rest,
+            created: st.settings_edits.created.clone(),
+        };
+        let was = v.clone();
+        let notes = undo(&mut v, &partial);
+        if st.is_written(cur) {
+            // The file is still what connect wrote: keep the first original's skeleton. A
+            // re-plan undoes in memory only, so its notes would describe a disconnect.
+            let style = st.original.as_ref().map(|sk| sk.text.clone());
+            return Ok((v, st.original.clone(), style, Vec::new(), carried));
         }
+        // Edited since: the current file, minus morsec's changes, is the new original. Keep the
+        // user's bytes when nothing of ours was there to undo (review R1).
+        let text = if v == was {
+            cur.map(str::to_owned)
+        } else {
+            cur.map(|c| render(&v, Some(c)))
+        };
+        Ok((
+            v,
+            text.as_deref().map(skel::skeletonize),
+            text,
+            notes,
+            carried,
+        ))
     }
 
     /// Computes a connect without writing anything.
@@ -679,12 +713,27 @@ impl ClaudeConnector {
 
         // settings.json
         let cur = fsio::read_text(&self.paths.settings).map_err(err)?;
-        let (base, original, notes) = self.settings_base(cur.as_deref(), prev.as_ref())?;
+        let (base, skeleton, style, notes, carried) =
+            self.settings_base(cur.as_deref(), prev.as_ref())?;
         warnings.extend(notes);
         let mut after = base.clone();
-        let mut sedits = Edits::default();
+        let mut sedits = Edits {
+            changes: carried,
+            created: Vec::new(),
+        };
         let extra_ca = this.plan_settings(&mut after, cfg, &mut sedits, &mut warnings)?;
-        let settings_text = render(&after, original.as_deref().or(cur.as_deref()));
+        // Keep the records of an unchanged re-run in their earlier order, so it writes nothing.
+        if let Some(p) = &prev {
+            let rank = |c: &Change| {
+                p.settings_edits
+                    .changes
+                    .iter()
+                    .position(|x| x == c)
+                    .unwrap_or(usize::MAX)
+            };
+            sedits.changes.sort_by_key(rank);
+        }
+        let settings_text = render(&after, style.as_deref().or(cur.as_deref()));
 
         // ~/.claude.json
         let ccur = fsio::read_capped(&self.paths.claude_json, MAX_CLAUDE_JSON).map_err(err)?;
@@ -713,7 +762,7 @@ impl ClaudeConnector {
         let claude_created = prev.as_ref().is_some_and(|p| p.claude_created)
             || (ccur.is_none() && claude_change.is_some());
         let state = State {
-            original: original.as_deref().map(skel::skeletonize),
+            original: skeleton,
             written: skel::sha256(&settings_text),
             settings_edits: sedits,
             claude_edits: cedits,
@@ -809,7 +858,6 @@ impl ClaudeConnector {
                     }
                     e.changes.push(Change::SetRedacted {
                         path: p,
-                        before_sha256: edit::value_sha256(&old),
                         after: new,
                     });
                     warnings.push(format!("env.{name} held a value of yours; it is replaced by the reference, and morsec doesn't keep the old value (ms disconnect removes the entry instead of putting it back)"));
@@ -913,7 +961,7 @@ impl ClaudeConnector {
         o.set("args", Value::Array(argv));
         Some(Change::Wrap {
             path: at.to_vec(),
-            sha256: edit::value_sha256(o),
+            sha256: edit::wrap_shape_sha256(o),
             shell,
             had_args,
         })
@@ -1005,7 +1053,7 @@ impl ClaudeConnector {
                 s.set("args", Value::Array(argv));
                 e.changes.push(Change::Wrap {
                     path: at.clone(),
-                    sha256: edit::value_sha256(s),
+                    sha256: edit::wrap_shape_sha256(s),
                     shell: false,
                     had_args: false,
                 });

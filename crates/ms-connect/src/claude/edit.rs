@@ -26,12 +26,11 @@ pub enum Change {
         value: Value,
     },
     /// The object member at `path` was set to `after`; it held a value of the user's that is
-    /// not kept (only its hash), so undo removes the member (security review S1).
+    /// not kept in any form (not even a hash, which a weak value could be guessed from), so undo
+    /// removes the member (security review S1, S5).
     SetRedacted {
         /// Object keys from the root.
         path: Vec<String>,
-        /// SHA-256 of the previous value, printed compactly.
-        before_sha256: String,
         /// Value written.
         after: Value,
     },
@@ -41,7 +40,9 @@ pub enum Change {
         /// For a server: the server object. For hooks: `["hooks", <event>]`, whose groups'
         /// `hooks` lists hold the wrapped hook.
         path: Vec<String>,
-        /// SHA-256 of the wrapped object, printed compactly.
+        /// SHA-256 of the wrapped object's shape: every member but `command` and `args`, plus
+        /// the length of `args`. The command itself is never hashed, so an inline secret in it
+        /// can't be guessed from the record (security review S5).
         sha256: String,
         /// It was shell form (`command` string, no `args`): unwrap from `/bin/sh -c`.
         shell: bool,
@@ -50,9 +51,13 @@ pub enum Change {
     },
 }
 
-/// SHA-256 of a value printed compactly, hex.
-pub fn value_sha256(v: &Value) -> String {
-    super::skel::sha256(&super::json::print(v, ""))
+/// The shape hash of a wrapped command object (see [`Change::Wrap`]).
+pub fn wrap_shape_sha256(v: &Value) -> String {
+    let mut shape = v.clone();
+    shape.remove("command");
+    let n = v.get("args").and_then(Value::as_array).map_or(0, Vec::len);
+    shape.set("args", Value::int(i64::try_from(n).unwrap_or(i64::MAX)));
+    super::skel::sha256(&super::json::print(&shape, ""))
 }
 
 /// Unwraps `ms run -- …` in `o` per a [`Change::Wrap`]. False when `o` isn't such a wrap.
@@ -255,7 +260,13 @@ pub fn undo(root: &mut Value, edits: &Edits) -> Vec<String> {
                 shell,
                 had_args,
             } => {
-                let hit = |o: &Value| value_sha256(o) == *sha256;
+                let hit = |o: &Value| {
+                    wrap_shape_sha256(o) == *sha256
+                        && o.get("args")
+                            .and_then(Value::as_array)
+                            .and_then(|a| a.first())
+                            == Some(&Value::str("run"))
+                };
                 let done = match root.at_mut(path) {
                     Some(Value::Array(groups)) => groups
                         .iter_mut()
@@ -339,14 +350,9 @@ pub fn edits_to_value(e: &Edits) -> Value {
                     o.set("path", path_value(path));
                     o.set("value", value.clone());
                 }
-                Change::SetRedacted {
-                    path,
-                    before_sha256,
-                    after,
-                } => {
+                Change::SetRedacted { path, after } => {
                     o.set("op", Value::str("set_redacted"));
                     o.set("path", path_value(path));
-                    o.set("before_sha256", Value::str(before_sha256.clone()));
                     o.set("after", after.clone());
                 }
                 Change::Wrap {
@@ -406,7 +412,6 @@ pub fn edits_from_value(v: &Value) -> Result<Edits, String> {
             },
             Some("set_redacted") => Change::SetRedacted {
                 path,
-                before_sha256: need_str("before_sha256")?,
                 after: need("after")?,
             },
             Some("wrap") => Change::Wrap {

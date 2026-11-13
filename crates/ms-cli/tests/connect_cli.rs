@@ -371,3 +371,31 @@ fn plain_rerun_keeps_opt_ins() {
         cj
     );
 }
+
+// protects=security review S6: a --wrap carried over from the user's last connect still counts
+// as --wrap, so an agent's plain re-run (which would wrap hooks added since) is refused;
+// fails_when=the agent's re-run is applied
+#[test]
+fn carried_wrap_refused_in_agent() {
+    let fx = Fx::new();
+    let (code, text) = fx.own_terminal(&format!(
+        "connect claude-code --yes --wrap --rules '{}'",
+        fx.dir.path().join("rules.toml").display()
+    ));
+    assert_eq!(code, 0, "{text}");
+    let before = std::fs::read_to_string(fx.settings()).unwrap();
+    let rules = fx.dir.path().join("rules.toml");
+    let (code, _, stderr) = out(fx.cmd(&fx.fake_agent()).args([
+        "connect",
+        "claude-code",
+        "--yes",
+        "--rules",
+        rules.to_str().unwrap(),
+    ]));
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("--wrap") && stderr.contains("inside an agent"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(fx.settings()).unwrap(), before);
+}

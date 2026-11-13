@@ -1094,3 +1094,50 @@ fn replaced_raw_env_value_is_not_kept() {
         "{after}"
     );
 }
+
+// protects=review R13/R14: after an --env ref replaced a raw value, a re-run keeps the ref, is a
+// no-op, and the later disconnect still says the old value wasn't kept; fails_when=the re-run
+// drops or moves the ref, rewrites the file, or the note is lost
+#[test]
+fn redacted_ref_survives_rerun() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    std::fs::write(
+        h.settings(),
+        "{\"env\": {\"STRIPE_API_KEY\": \"sk_live_CANARY_R13\", \"Z\": \"1\"}}",
+    )
+    .unwrap();
+    connect(&h, Options::default());
+    let once = h.read(&h.settings()).unwrap();
+    let c = h.connector(Options::default());
+    assert_eq!(
+        c.previous_env_refs().unwrap(),
+        vec![("STRIPE_API_KEY".to_owned(), "ms://stripe/test".to_owned())]
+    );
+    let again = c.try_plan(&h.cfg(&c)).unwrap();
+    assert!(again.diff.changes.is_empty(), "{:?}", again.diff.changes);
+    assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+    // A changed port still updates in place and keeps the record.
+    let mut cfg = h.cfg(&c);
+    cfg.proxy_port = 4555;
+    let p = c.try_plan(&cfg).unwrap();
+    c.apply(&p.diff).unwrap();
+    let t = h.read(&h.settings()).unwrap();
+    assert!(
+        t.contains("4555") && t.contains("\"STRIPE_API_KEY\": \"ms://stripe/test\""),
+        "{t}"
+    );
+    assert_eq!(t.replace("4555", "4101"), once);
+    let plan = c.plan_remove().unwrap().unwrap();
+    assert!(
+        plan.notes.iter().any(|n| n.contains("never keeps values")),
+        "{:?}",
+        plan.notes
+    );
+    c.apply_remove(&plan).unwrap();
+    let after = h.read(&h.settings()).unwrap();
+    assert!(
+        !after.contains("STRIPE") && after.contains("\"Z\": \"1\""),
+        "{after}"
+    );
+}

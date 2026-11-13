@@ -346,6 +346,9 @@ pub(crate) fn connect(a: &ConnectArgs) -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
+    if a.session_env {
+        return session_env(&c);
+    }
     // A plain re-run keeps the opt-in parts the last connect used (security review S2);
     // dropping one is a partial disconnect, which is `ms disconnect`'s job.
     match c.previous_options() {
@@ -357,21 +360,24 @@ pub(crate) fn connect(a: &ConnectArgs) -> ExitCode {
         Err(e) if !a.session_env => return fail(&e.to_string()),
         Err(_) => {}
     }
-    if a.session_env {
-        return session_env(&c);
-    }
     // Options that can loosen what the user set up are for the user, not an agent (SPEC D10).
     // --force replaces the user's own proxy or server; --wrap changes how every hook runs, and
     // while `ms run` is a stub a blocking hook would stop blocking (review R2).
-    if (a.force || a.wrap)
+    // The effective --wrap counts, carried over or not: a re-run wraps hooks added since
+    // (security review S6).
+    if (a.force || c.opts.wrap)
         && let Some(who) = inside_agent()
     {
-        let flag = if a.force { "--force" } else { "--wrap" };
+        let flag = if a.force {
+            "--force"
+        } else {
+            "--wrap (from your last ms connect)"
+        };
         return fail(&format!(
             "morsec: {flag} changes settings you made yourself, so it can't run inside an agent session ({who}). Run it from your own terminal"
         ));
     }
-    if a.wrap {
+    if c.opts.wrap {
         eprintln!(
             "warning: --wrap runs your hooks and MCP servers through `ms run`, which is not built yet (L12): until it is, they fail, and a hook that blocks a tool stops blocking. Undo with: ms disconnect claude-code"
         );
