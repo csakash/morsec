@@ -15,7 +15,7 @@ pub mod server;
 pub use client::Client;
 pub use paths::default_socket_path;
 pub use protocol::{ErrorCode, PROTOCOL_VERSION, RequestBody, ResponseBody};
-pub use server::{Handler, PeerCheck, PeerInfo, SameUid, Server};
+pub use server::{Handler, PeerCheck, PeerInfo, SameUid, Server, ServerLimits};
 
 /// Largest frame accepted, in bytes (1 MiB).
 pub const MAX_FRAME: usize = 1 << 20;

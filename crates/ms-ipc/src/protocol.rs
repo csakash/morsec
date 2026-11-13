@@ -28,8 +28,11 @@ pub struct Header {
     pub id: u64,
 }
 
-/// Requests to the daemon. In L00 only `Status` is handled; the rest answer `not_implemented`
-/// naming the loop that builds them.
+/// Requests to the daemon. A request that is planned but not built answers `not_implemented`
+/// naming the loop that builds it.
+///
+/// Fields added after v1 was frozen are optional (`#[serde(default)]`), so older clients' messages
+/// still parse (L07).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequestBody {
@@ -62,16 +65,31 @@ pub enum RequestBody {
     RulesGet {
         /// Key, or all.
         key: Option<KeyName>,
+        /// Merge this directory's project `.morsec.toml` (L07). Absent: the user rules only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
     },
-    /// Propose a looser rule; needs an approval.
+    /// Propose a change to one key's rule. The daemon classifies it: tightening is saved at
+    /// once, loosening needs an approval.
     RulesProposeLoosen {
         /// Key.
         key: KeyName,
+        /// The proposed rule for `key` as TOML (the `[keys."<key>"]` table's body). Absent:
+        /// remove the key's rule (L07).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
+        /// Pre-L11 recovery path: the user confirmed at their own terminal (L07 SPEC D-A).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        at_terminal: bool,
     },
     /// Kill switch.
     Stop,
     /// Resume after a stop; needs an approval.
-    Start,
+    Start {
+        /// Pre-L11 recovery path: the user confirmed at their own terminal (L07 SPEC D-A).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        at_terminal: bool,
+    },
     /// Query receipts.
     LogQuery {
         /// Most records to return.
@@ -82,6 +100,12 @@ pub enum RequestBody {
 }
 
 impl RequestBody {
+    /// True for the kill-switch requests that may use a reserved control slot when every
+    /// general connection slot is taken (L07, S6).
+    pub fn is_control(&self) -> bool {
+        matches!(self, RequestBody::Status | RequestBody::Stop)
+    }
+
     /// True when a raw value frame follows this request.
     pub fn carries_value(&self) -> bool {
         matches!(self, RequestBody::PutKey { .. })
@@ -94,10 +118,8 @@ impl RequestBody {
             RequestBody::PutKey { .. } | RequestBody::ListKeys => "L07 daemon",
             RequestBody::Run { .. } => "L12 run-core",
             RequestBody::Mint { .. } => "L18 mint-aws",
-            RequestBody::RulesGet { .. } | RequestBody::RulesProposeLoosen { .. } => {
-                "L03 rules-policy"
-            }
-            RequestBody::Stop | RequestBody::Start => "L07 daemon",
+            RequestBody::RulesGet { .. } | RequestBody::RulesProposeLoosen { .. } => "L07 daemon",
+            RequestBody::Stop | RequestBody::Start { .. } => "L07 daemon",
             RequestBody::LogQuery { .. } => "L02 receipts",
             RequestBody::DoctorProbe => "L17 doctor",
         }
@@ -118,6 +140,16 @@ pub enum ErrorCode {
     PeerRejected,
     /// The daemon failed.
     Internal,
+    /// The daemon is at its connection limit; only `Status` and `Stop` are served (L07).
+    Busy,
+    /// Policy or a person refused (L07).
+    Denied,
+    /// The change needs an approval that was not given (L07).
+    NeedsApproval,
+    /// morsec is not set up yet: run `ms init` (L07).
+    NotInitialized,
+    /// The request was well formed but its content is not acceptable (L07).
+    Invalid,
 }
 
 /// Responses from the daemon. No variant can hold a secret value.
@@ -130,8 +162,41 @@ pub enum ResponseBody {
         daemon: String,
         /// Daemon version.
         version: String,
-        /// `dev-stub` until L07.
+        /// `keychain`, or `dev-memory` for an ephemeral dev daemon (`dev-stub` before L07).
         mode: String,
+        /// False after `ms stop` (L07). Absent from pre-L07 daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running: Option<bool>,
+        /// Number of keys in the vault, morsec's own keys excluded (L07).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys: Option<u32>,
+        /// The swap proxy's loopback port (L07).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy_port: Option<u16>,
+        /// Things the user should look at: tampered rules, connector settings drift (L07).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        alerts: Vec<String>,
+    },
+    /// Success; `message` is shown to people as is (L07).
+    Ok {
+        /// What was done.
+        message: String,
+    },
+    /// Key metadata, never values (`ListKeys`, L07).
+    Keys {
+        /// One entry per key.
+        keys: Vec<KeyMeta>,
+    },
+    /// Effective rules (`RulesGet`, L07). ms-ipc does not depend on ms-rules, so the rules
+    /// travel as the rules file's TOML.
+    Rules {
+        /// Rules version.
+        version: u64,
+        /// The rules, in the `rules.toml` format.
+        toml: String,
+        /// Notes from the project merge and integrity state, for display.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notes: Vec<String>,
     },
     /// An error; `message` is shown to people as is.
     Error {
@@ -143,6 +208,23 @@ pub enum ResponseBody {
 }
 
 impl ResponseBody {
+    /// A status reply with only the pre-L07 fields set.
+    pub fn status(
+        daemon: impl Into<String>,
+        version: impl Into<String>,
+        mode: impl Into<String>,
+    ) -> Self {
+        ResponseBody::Status {
+            daemon: daemon.into(),
+            version: version.into(),
+            mode: mode.into(),
+            running: None,
+            keys: None,
+            proxy_port: None,
+            alerts: Vec::new(),
+        }
+    }
+
     /// An error response.
     pub fn error(code: ErrorCode, message: impl Into<String>) -> Self {
         ResponseBody::Error {
