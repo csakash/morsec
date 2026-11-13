@@ -161,7 +161,10 @@ mod tests {
         assert_eq!(code, EXIT_LEAK);
         let all = out.join("\n") + &err.join("\n");
         assert!(!all.chars().any(|c| c.is_control() && c != '\n'), "{all:?}");
-        assert!(out[1].contains("s.jsonl:7  stripe/test  (base64)"), "{out:?}");
+        assert!(
+            out[1].contains("s.jsonl:7  stripe/test  (base64)"),
+            "{out:?}"
+        );
         assert!(err.iter().any(|l| l.contains("tiny/key")));
         let (_, err, code) = render(&ResponseBody::error(ErrorCode::Denied, "no\u{1b}[2J"));
         assert_eq!(code, 1);

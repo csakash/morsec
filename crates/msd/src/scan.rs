@@ -42,7 +42,9 @@ pub fn roots() -> Vec<PathBuf> {
     };
     let home = env_dir("HOME");
     let mut out = Vec::new();
-    if let Some(d) = env_dir("CLAUDE_CONFIG_DIR").or_else(|| home.as_ref().map(|h| h.join(".claude"))) {
+    if let Some(d) =
+        env_dir("CLAUDE_CONFIG_DIR").or_else(|| home.as_ref().map(|h| h.join(".claude")))
+    {
         out.push(d.join("projects"));
     }
     if let Some(d) = env_dir("CODEX_HOME").or_else(|| home.as_ref().map(|h| h.join(".codex"))) {
@@ -52,7 +54,12 @@ pub fn roots() -> Vec<PathBuf> {
 }
 
 /// Runs a scan over `roots` for the values of `keys`. Blocking.
-pub fn scan(vault: &dyn Vault, keys: Vec<KeyName>, roots: &[PathBuf], budget: Duration) -> ResponseBody {
+pub fn scan(
+    vault: &dyn Vault,
+    keys: Vec<KeyName>,
+    roots: &[PathBuf],
+    budget: Duration,
+) -> ResponseBody {
     if SCANNING.swap(true, Ordering::AcqRel) {
         return ResponseBody::error(
             ErrorCode::Busy,
@@ -75,7 +82,9 @@ pub fn scan(vault: &dyn Vault, keys: Vec<KeyName>, roots: &[PathBuf], budget: Du
             Ok(()) => skipped_keys.push(key),
             Err(e) => {
                 tracing::warn!(key = %key, error = %e, "scan: key could not be read");
-                notes.push(format!("{key} could not be read from the vault, so it was not searched for"));
+                notes.push(format!(
+                    "{key} could not be read from the vault, so it was not searched for"
+                ));
                 complete = false;
             }
         }
@@ -105,8 +114,9 @@ pub fn scan(vault: &dyn Vault, keys: Vec<KeyName>, roots: &[PathBuf], budget: Du
                 ));
                 break;
             }
-            let result = ms_scan::open_regular(path)
-                .and_then(|f| ms_scan::scan_reader(&needles, f, &mut || Instant::now() >= deadline));
+            let result = ms_scan::open_regular(path).and_then(|f| {
+                ms_scan::scan_reader(&needles, f, &mut || Instant::now() >= deadline)
+            });
             let s = match result {
                 Ok(s) => s,
                 Err(_) => {
@@ -194,7 +204,7 @@ mod tests {
             format!("{{}}\n{{\"text\":\"key is {CANARY}\"}}\n"),
         )
         .unwrap();
-        let r = scan(&v, keys, &[root.clone()], SCAN_BUDGET);
+        let r = scan(&v, keys, std::slice::from_ref(&root), SCAN_BUDGET);
         let json = serde_json::to_string(&r).unwrap();
         let mut n = Needles::new();
         n.add(0, CANARY.as_bytes());
@@ -231,8 +241,17 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("a.jsonl"), "x\n").unwrap();
         SCANNING.store(true, Ordering::Release);
-        let r = scan(&v, keys.clone(), &[root.clone()], SCAN_BUDGET);
-        assert!(matches!(r, ResponseBody::Error { code: ErrorCode::Busy, .. }), "{r:?}");
+        let r = scan(&v, keys.clone(), std::slice::from_ref(&root), SCAN_BUDGET);
+        assert!(
+            matches!(
+                r,
+                ResponseBody::Error {
+                    code: ErrorCode::Busy,
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
         SCANNING.store(false, Ordering::Release);
         match scan(&v, keys, &[root], Duration::ZERO) {
             ResponseBody::ScanReport { complete, .. } => assert!(!complete),

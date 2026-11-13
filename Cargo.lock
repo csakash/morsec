@@ -757,6 +757,15 @@ dependencies = [
 [[package]]
 name = "ms-e2e"
 version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "ms-core",
+ "ms-ipc",
+ "ms-scan",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "ms-import"

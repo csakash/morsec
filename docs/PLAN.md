@@ -353,6 +353,10 @@ old behaviour; a default-valued field is not written, so old messages are byte-i
 - `at_terminal` is the pre-L11 recovery path (L07 SPEC D-A): msd accepts it only from a caller
   outside every agent session, after `ms` confirmed on `/dev/tty`. L11 replaces it with Touch ID.
 - Error codes `busy`, `denied`, `needs_approval`, `not_initialized`, `invalid`.
+- `Scan` (L09, no fields) answers `ScanReport { findings: [{file, line, key, encoding}],
+  files_scanned, bytes_scanned, keys_checked, skipped_keys, notes, complete }`. msd picks the
+  transcript directories itself and refuses the request inside an agent session; no field can
+  carry a value.
 - The server keeps reserved slots for `Status`/`Stop` when its 64 general slots are full, caps
   connections per peer process (8), and caps each connection's lifetime (10 min) and requests
   (1024), so a same-user process can't starve the kill switch.

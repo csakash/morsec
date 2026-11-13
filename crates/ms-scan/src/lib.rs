@@ -430,7 +430,8 @@ mod tests {
             hay.extend_from_slice(b" suffix\"}\n");
             let got = found(&n, &hay);
             // Where url-safe and standard base64 coincide the needle is kept once, as base64.
-            let ok = got.contains(&enc) || (enc == Encoding::Base64Url && got.contains(&Encoding::Base64));
+            let ok = got.contains(&enc)
+                || (enc == Encoding::Base64Url && got.contains(&Encoding::Base64));
             assert!(
                 ok,
                 "{enc:?} not found in {:?}",
