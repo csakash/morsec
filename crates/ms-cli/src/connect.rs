@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Args;
-use ms_connect::claude::diff::{Line, changed_lines};
+use ms_connect::claude::diff::{Line, changed_lines, redact, significant};
 use ms_connect::claude::{ClaudeConnector, Options, Paths, session_env_line};
 use ms_connect::{ConnectCfg, Connector};
 use ms_core::Error;
@@ -217,8 +217,11 @@ fn rule_hosts(file: Option<&Path>) -> Result<Vec<String>, String> {
     Ok(hosts)
 }
 
-/// Prints the changed lines of one file.
-fn show_file(path: &Path, before: Option<&str>, after: Option<&str>) {
+/// Prints the changed lines of one file. Lines that only gained a comma are skipped, and string
+/// values morsec didn't write are shown as "…", so a value of the user's own (a token in an env
+/// entry or hook) never reaches the terminal or an agent's transcript.
+fn show_file(path: &Path, before: Option<&str>, after: Option<&str>, safe: &[String]) {
+    let safe = |s: &str| safe.iter().any(|x| x == s);
     let verb = match (before, after) {
         (None, Some(_)) => "create",
         (Some(_), None) => "remove",
@@ -227,10 +230,10 @@ fn show_file(path: &Path, before: Option<&str>, after: Option<&str>) {
     say(&format!("{verb} {}:", path.display()));
     match changed_lines(before.unwrap_or(""), after.unwrap_or("")) {
         Some(lines) => {
-            for l in lines {
+            for l in significant(lines) {
                 match l {
-                    Line::Removed(n, t) => say(&format!("  -{n:>4} {t}")),
-                    Line::Added(n, t) => say(&format!("  +{n:>4} {t}")),
+                    Line::Removed(n, t) => say(&format!("  -{n:>4} {}", redact(t, &safe))),
+                    Line::Added(n, t) => say(&format!("  +{n:>4} {}", redact(t, &safe))),
                 }
             }
         }
@@ -381,9 +384,10 @@ pub(crate) fn connect(a: &ConnectArgs) -> ExitCode {
         say("Claude Code is already connected; nothing to change.");
         return ExitCode::SUCCESS;
     }
+    let safe = c.display_safe(Some(&cfg));
     for ch in &planned.diff.changes {
         if ch.path == c.paths.settings || ch.path == c.paths.claude_json {
-            show_file(&ch.path, ch.before.as_deref(), Some(&ch.after));
+            show_file(&ch.path, ch.before.as_deref(), Some(&ch.after), &safe);
         } else {
             say(&format!("write {}", ch.path.display()));
         }
@@ -429,8 +433,9 @@ pub(crate) fn disconnect(a: &DisconnectArgs) -> ExitCode {
         }
         Err(e) => return fail(&e.to_string()),
     };
+    let safe = c.display_safe(None);
     for f in &plan.files {
-        show_file(&f.path, f.before.as_deref(), f.after.as_deref());
+        show_file(&f.path, f.before.as_deref(), f.after.as_deref(), &safe);
     }
     say(&format!("remove {}", c.paths.state.display()));
     for n in &plan.notes {

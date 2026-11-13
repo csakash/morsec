@@ -62,9 +62,95 @@ pub fn changed_lines<'a>(old: &'a str, new: &'a str) -> Option<Vec<Line<'a>>> {
     Some(out)
 }
 
+/// Drops line pairs whose only change is a trailing comma (an entry added after them), so a
+/// line morsec didn't change is not shown.
+pub fn significant(lines: Vec<Line<'_>>) -> Vec<Line<'_>> {
+    let text = |l: &Line<'_>| match l {
+        Line::Removed(_, t) | Line::Added(_, t) => t.trim_end_matches(',').to_owned(),
+    };
+    let mut keep = vec![true; lines.len()];
+    for i in 0..lines.len() {
+        if !keep[i] || !matches!(lines[i], Line::Removed(..)) {
+            continue;
+        }
+        if let Some(j) = (0..lines.len()).find(|&j| {
+            keep[j] && matches!(lines[j], Line::Added(..)) && text(&lines[j]) == text(&lines[i])
+        }) {
+            keep[i] = false;
+            keep[j] = false;
+        }
+    }
+    lines
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(l, k)| k.then_some(l))
+        .collect()
+}
+
+/// A settings line for display: keys and non-string values as they are, and a string value only
+/// when `safe` says morsec wrote it. Anything else becomes `"…"`, so a user's own value (a token
+/// in an env entry or a hook command) never reaches the terminal, or an agent's transcript.
+pub fn redact(line: &str, safe: &dyn Fn(&str) -> bool) -> String {
+    let b = line.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut last = 0;
+    while i < b.len() {
+        if b[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < b.len() && b[i] != b'"' {
+            i += if b[i] == b'\\' { 2 } else { 1 };
+        }
+        let end = (i + 1).min(b.len());
+        i = end;
+        let lit = &line[start..end];
+        let is_key = line[end..].trim_start().starts_with(':');
+        let shown = is_key
+            || super::json::parse(lit)
+                .ok()
+                .and_then(|v| v.as_str().map(safe))
+                .unwrap_or(false);
+        out.push_str(&line[last..start]);
+        out.push_str(if shown { lit } else { "\"…\"" });
+        last = end;
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // protects=the plan preview never shows a user's own string values: comma-only changes are
+    // hidden and unknown string values are redacted, keys kept; fails_when=a value morsec didn't
+    // write is printed
+    #[test]
+    fn preview_hides_user_values() {
+        let old = "{\n  \"env\": {\n    \"OPENAI_API_KEY\": \"sk-live-SECRET\"\n  }\n}\n";
+        let new = "{\n  \"env\": {\n    \"OPENAI_API_KEY\": \"sk-live-SECRET\",\n    \"MORSEC_CONNECTED\": \"claude-code\"\n  }\n}\n";
+        let lines = significant(changed_lines(old, new).unwrap());
+        assert_eq!(
+            lines,
+            vec![Line::Added(4, "    \"MORSEC_CONNECTED\": \"claude-code\"")]
+        );
+        let safe = |s: &str| s == "claude-code";
+        assert_eq!(
+            redact("    \"MORSEC_CONNECTED\": \"claude-code\",", &safe),
+            "    \"MORSEC_CONNECTED\": \"claude-code\","
+        );
+        assert_eq!(
+            redact("    \"K\": \"sk-\\\"live\",", &safe),
+            "    \"K\": \"…\","
+        );
+        assert_eq!(redact("      \"echo tok\",", &safe), "      \"…\",");
+        assert_eq!(redact("    \"port\": 4101,", &safe), "    \"port\": 4101,");
+        assert_eq!(redact("\"unterminated", &safe), "\"…\"");
+    }
 
     #[test]
     fn only_changed_lines() {

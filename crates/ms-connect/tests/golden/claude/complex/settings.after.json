@@ -108,7 +108,7 @@
         "command": "~/.claude/statusline.sh",
         "padding": 0
     },
-    "cleanupPeriodDays": 99999999999999999999,
+    "cleanupPeriodDays": 9007199254740991,
     "ratio": 1.50e+10,
     "enabledPlugins": {
         "formatter@acme": true

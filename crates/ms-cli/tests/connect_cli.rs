@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const TYPICAL: &str = "{\n  \"model\": \"claude-opus-5-5\",\n  \"env\": {\n    \"BASH_DEFAULT_TIMEOUT_MS\": \"300000\"\n  }\n}\n";
+/// A settings file whose last env entry holds a value of the user's own (a canary): the preview
+/// must never print it.
+const TYPICAL: &str = "{\n  \"model\": \"claude-opus-5-5\",\n  \"env\": {\n    \"BASH_DEFAULT_TIMEOUT_MS\": \"300000\",\n    \"OPENAI_API_KEY\": \"sk-live-CANARY-L08\"\n  }\n}\n";
 const RULES: &str = "version = 3\n\n[keys.\"stripe/test\"]\nmode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\", \"*.stripe.com\"]\n";
 
 fn ms() -> PathBuf {
@@ -196,6 +198,10 @@ fn connect_and_disconnect_end_to_end() {
         !stdout.contains("claude-opus-5-5"),
         "unchanged lines are not shown:\n{stdout}"
     );
+    assert!(
+        !stdout.contains("CANARY"),
+        "a user value was printed:\n{stdout}"
+    );
     assert_eq!(std::fs::read_to_string(fx.settings()).unwrap(), TYPICAL);
     assert!(!fx.home().join(".morsec").exists());
 
@@ -217,6 +223,10 @@ fn connect_and_disconnect_end_to_end() {
     );
     assert!(s.contains("\"*.stripe.com\"") && s.contains(fx.socket().to_str().unwrap()));
     assert!(s.contains("\"BASH_DEFAULT_TIMEOUT_MS\": \"300000\""));
+    assert!(
+        !stdout.contains("CANARY"),
+        "a user value was printed:\n{stdout}"
+    );
 
     // A re-run without --env keeps the ref and changes nothing.
     let (code, stdout, _) = fx.connect(&["--yes"]);
@@ -245,6 +255,10 @@ fn connect_and_disconnect_end_to_end() {
 
     let (code, text) = fx.own_terminal("disconnect claude-code --yes");
     assert_eq!(code, 0, "{text}");
+    assert!(
+        !text.contains("CANARY"),
+        "a user value was printed:\n{text}"
+    );
     assert_eq!(std::fs::read_to_string(fx.settings()).unwrap(), TYPICAL);
     assert!(!fx.home().join(".morsec/connect/claude-code.json").exists());
     let (code, text) = fx.own_terminal("disconnect claude-code --yes");

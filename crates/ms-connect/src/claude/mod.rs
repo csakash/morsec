@@ -328,6 +328,66 @@ impl ClaudeConnector {
             .collect())
     }
 
+    /// The string values morsec itself writes, for the plan preview: everything else is redacted
+    /// there ([`diff::redact`]). Includes `cfg`'s refs and domains, and the previous connect's.
+    pub fn display_safe(&self, cfg: Option<&ConnectCfg>) -> Vec<String> {
+        let mut v: Vec<String> = [
+            ID,
+            MARKER,
+            "connect",
+            "--session-env",
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            "/usr/bin/env",
+            "-i",
+            "mcp",
+            "stdio",
+            "command",
+            "PATH=/usr/bin:/bin",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        v.push(self.ms.clone());
+        v.push(self.socket.clone());
+        v.push(format!("{} status", sh_quote(&self.ms)));
+        for p in [&self.paths.bundle, &self.paths.home] {
+            v.push(p.to_string_lossy().into_owned());
+        }
+        v.push(format!("HOME={}", self.paths.home.to_string_lossy()));
+        if let Some(s) = &self.socket_env {
+            v.push(s.clone());
+            v.push(format!("MORSEC_SOCKET={s}"));
+        }
+        if let Some(c) = cfg {
+            v.extend(c.env.iter().map(|(_, x)| x.clone()));
+            v.extend(c.allowed_domains.iter().cloned());
+        }
+        if let Ok(Some(st)) = self.read_state() {
+            for c in &st.settings_edits.changes {
+                match c {
+                    Change::Add {
+                        path,
+                        value: Value::String(x),
+                    } if path.first().is_some_and(|p| p == "sandbox") => v.push(x.clone()),
+                    Change::Set {
+                        path,
+                        after: Value::String(x),
+                        ..
+                    } if path.first().is_some_and(|p| p == "env")
+                        && (SecretRef::parse(x).is_ok() || *x == ID) =>
+                    {
+                        v.push(x.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        v
+    }
+
     /// True when a state file says this connector is applied.
     pub fn is_connected(&self) -> bool {
         self.paths.state.exists()
