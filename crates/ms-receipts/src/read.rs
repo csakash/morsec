@@ -1,12 +1,69 @@
 //! Reading receipts files.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use ms_core::{Error, Result};
 use serde::Serialize;
 
 use crate::record::{RawLine, Rec, hash_rec, parse_file_name};
+
+/// Largest receipts file read, in bytes. The store rotates far below this.
+pub const MAX_FILE_READ: u64 = 64 << 20;
+
+/// `O_NOFOLLOW`: a symlink at a receipts file name is refused, not followed.
+#[cfg(target_os = "macos")]
+pub(crate) const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(target_os = "linux")]
+pub(crate) const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) const O_NOFOLLOW: i32 = 0;
+
+/// `O_NONBLOCK`: opening a FIFO planted at a receipts file name must not hang.
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x0004;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const O_NONBLOCK: i32 = 0;
+
+/// Reads a receipts file: no symlinks, no FIFOs or devices, at most [`MAX_FILE_READ`] bytes.
+pub(crate) fn read_file(path: &Path) -> Result<Vec<u8>> {
+    let ctx = || format!("reading {}", path.display());
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .map_err(|e| Error::io(ctx(), e))?;
+    let m = f.metadata().map_err(|e| Error::io(ctx(), e))?;
+    if !m.is_file() {
+        return Err(Error::io(
+            ctx(),
+            std::io::Error::other("not a regular file; move it out of the receipts directory"),
+        ));
+    }
+    if m.len() > MAX_FILE_READ {
+        return Err(Error::io(
+            ctx(),
+            std::io::Error::other(format!(
+                "larger than {MAX_FILE_READ} bytes, which the store never writes; run: ms log --verify"
+            )),
+        ));
+    }
+    let mut buf = Vec::with_capacity(m.len() as usize);
+    f.take(MAX_FILE_READ + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| Error::io(ctx(), e))?;
+    if buf.len() as u64 > MAX_FILE_READ {
+        return Err(Error::io(
+            ctx(),
+            std::io::Error::other("file grew while reading"),
+        ));
+    }
+    Ok(buf)
+}
 
 /// A receipts file and the first seq its name claims.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,16 +151,16 @@ pub(crate) fn split_lines(bytes: &[u8]) -> (Vec<&[u8]>, bool) {
 pub fn read_all(dir: &Path) -> Result<Vec<StoredRecord>> {
     let mut out = Vec::new();
     for f in list_files(dir)? {
-        let bytes =
-            fs::read(&f.path).map_err(|e| Error::io(format!("reading {}", f.path.display()), e))?;
+        let bytes = read_file(&f.path)?;
         let (lines, _torn) = split_lines(&bytes);
         for (i, line) in lines.iter().enumerate() {
             let p = parse_line(line).map_err(|why| {
                 Error::io(
                     format!(
-                        "{} line {} is not a receipt ({why}); run: ms log --verify",
+                        "{} line {} is not a receipt ({}); run: ms log --verify",
                         f.path.display(),
-                        i + 1
+                        i + 1,
+                        crate::export::inert(&why)
                     ),
                     std::io::Error::from(std::io::ErrorKind::InvalidData),
                 )

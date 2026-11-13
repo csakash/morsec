@@ -268,6 +268,11 @@ fn redact_assignments(s: &str) -> String {
                     let whole = WHOLE_VALUE_NAMES.contains(name);
                     while j < bytes.len() {
                         let b = bytes[j];
+                        // Inside quotes, a backslash escapes the next byte (`\"`).
+                        if quote.is_some() && b == b'\\' {
+                            j = (j + 2).min(bytes.len());
+                            continue;
+                        }
                         let stop = match quote {
                             Some(q) => b == q,
                             None if whole => matches!(b, b'\n' | b'\r' | b'"' | b'\''),
@@ -340,8 +345,8 @@ fn redact_prefixed_tokens(s: &str) -> String {
     out
 }
 
-/// Replaces exact secret values the broker holds, literal or percent-encoded in any mix, with
-/// their `ms://` reference. Borrows the values for one append; it never stores or prints them.
+/// Replaces secret values the broker holds with their `ms://` reference: literal,
+/// percent-encoded, form-encoded, JSON-escaped (in any mix), and base64 / base64url. Borrows the values for one append; it never stores or prints them.
 pub struct ValueRedactor<'a> {
     values: Vec<(&'a KeyName, &'a [u8])>,
 }
@@ -358,7 +363,7 @@ impl std::fmt::Debug for ValueRedactor<'_> {
 }
 
 impl<'a> ValueRedactor<'a> {
-    /// Redacts each value (literal or percent-encoded) as `ms://<key>`.
+    /// Redacts each value, in the forms listed on the type, as `ms://<key>`.
     pub fn new(values: Vec<(&'a KeyName, &'a [u8])>) -> Self {
         Self { values }
     }
@@ -373,21 +378,45 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Length of the match of `value` at `text[i..]`, where each value byte may appear literally or
-/// percent-encoded (`%2D`, `%2d`), in any mix.
+/// Length of the match of `value` at `text[i..]`. Each value byte may appear literally,
+/// percent-encoded (`%2D`, `%2d`), as `+` for a space (form encoding), or JSON-escaped (`\/`,
+/// `\"`, `\\`, `\n`, `\u002d`), in any mix.
 fn match_at(text: &[u8], i: usize, value: &[u8]) -> Option<usize> {
+    let at = |k: usize| text.get(k).copied();
     let mut j = i;
     for &b in value {
-        if text.get(j) == Some(&b) {
+        if at(j) == Some(b) {
             j += 1;
-        } else if text.get(j) == Some(&b'%')
-            && text
-                .get(j + 1)
-                .zip(text.get(j + 2))
-                .and_then(|(h, l)| Some(hex_val(*h)? << 4 | hex_val(*l)?))
+        } else if at(j) == Some(b'%')
+            && at(j + 1)
+                .zip(at(j + 2))
+                .and_then(|(h, l)| Some(hex_val(h)? << 4 | hex_val(l)?))
                 == Some(b)
         {
             j += 3;
+        } else if b == b' ' && at(j) == Some(b'+') {
+            j += 1;
+        } else if at(j) == Some(b'\\') {
+            let short = match b {
+                b'/' | b'"' | b'\\' => Some(b),
+                b'\n' => Some(b'n'),
+                b'\r' => Some(b'r'),
+                b'\t' => Some(b't'),
+                _ => None,
+            };
+            if short.is_some() && at(j + 1) == short {
+                j += 2;
+            } else if b < 0x80
+                && at(j + 1) == Some(b'u')
+                && (2..6).all(|k| at(j + k).and_then(hex_val).is_some())
+                && (2..6).fold(0u32, |acc, k| {
+                    acc << 4 | u32::from(at(j + k).and_then(hex_val).unwrap_or(0))
+                }) == u32::from(b)
+            {
+                j += 6;
+            } else {
+                return None;
+            }
         } else {
             return None;
         }
@@ -395,16 +424,49 @@ fn match_at(text: &[u8], i: usize, value: &[u8]) -> Option<usize> {
     Some(j - i)
 }
 
-/// Replaces every literal or percent-encoded occurrence of `value` in `s`.
+const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Base64 of whole 3-byte groups (no padding).
+fn b64(data: &[u8], alphabet: &[u8; 64]) -> String {
+    let mut out = String::with_capacity(data.len() / 3 * 4);
+    for c in data.chunks_exact(3) {
+        let n = u32::from(c[0]) << 16 | u32::from(c[1]) << 8 | u32::from(c[2]);
+        for shift in [18, 12, 6, 0] {
+            out.push(alphabet[(n >> shift & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// The parts of `value`'s base64 (standard and URL-safe) that are the same wherever the value
+/// sits in a larger base64 blob: one per alignment. Pieces shorter than 8 chars are skipped (too
+/// likely to match ordinary text).
+fn base64_forms(value: &[u8]) -> Vec<String> {
+    let mut forms = Vec::new();
+    for offset in 0..3 {
+        let Some(rest) = value.get(offset..) else {
+            break;
+        };
+        let whole = &rest[..rest.len() / 3 * 3];
+        for alphabet in [B64_STD, B64_URL] {
+            let f = b64(whole, alphabet);
+            if f.len() >= 8 && !forms.contains(&f) {
+                forms.push(f);
+            }
+        }
+    }
+    forms
+}
+
+/// Replaces every occurrence of `value` in `s`, in any form [`match_at`] accepts.
 fn replace_value(s: &str, value: &[u8], reference: &str) -> String {
     let text = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     let mut copied = 0;
     while i < text.len() {
-        // A match starts on a value byte or '%', both of which begin a char in valid UTF-8 only
-        // when the value itself is valid UTF-8 (checked by the caller), and ends after a full
-        // value, so both cut points are char boundaries.
+        // Only cut on char boundaries; a match inside a multibyte char is skipped.
         match match_at(text, i, value) {
             Some(n) if s.is_char_boundary(i) && s.is_char_boundary(i + n) => {
                 out.push_str(&s[copied..i]);
@@ -423,11 +485,16 @@ impl Redactor for ValueRedactor<'_> {
     fn redact(&self, s: &str) -> String {
         let mut out = s.to_owned();
         for (key, value) in &self.values {
-            // A value that is not UTF-8 can't occur verbatim in a str; an empty one is everywhere.
-            if value.is_empty() || std::str::from_utf8(value).is_err() {
+            // An empty value matches everywhere. A value that is not UTF-8 can still appear
+            // percent-encoded or in base64, so it is not skipped.
+            if value.is_empty() {
                 continue;
             }
-            out = replace_value(&out, value, &format!("ms://{key}"));
+            let reference = format!("ms://{key}");
+            out = replace_value(&out, value, &reference);
+            for form in base64_forms(value) {
+                out = out.replace(&form, &reference);
+            }
         }
         out
     }
@@ -448,6 +515,14 @@ pub(crate) fn clean(s: &str, extra: Option<&dyn Redactor>, cap: usize) -> String
 pub(crate) fn clean_argv(argv: &[String], extra: Option<&dyn Redactor>) -> Vec<String> {
     let mut out = Vec::with_capacity(argv.len().min(MAX_ARGS + 1));
     let mut redact_next = false;
+    let tool = argv
+        .first()
+        .and_then(|a| a.rsplit('/').next())
+        .unwrap_or_default();
+    let is_mysql = matches!(
+        tool,
+        "mysql" | "mysqldump" | "mysqladmin" | "mariadb" | "mysqlimport"
+    );
     for a in argv.iter().take(MAX_ARGS) {
         if redact_next {
             out.push(REDACTED.to_owned());
@@ -455,13 +530,28 @@ pub(crate) fn clean_argv(argv: &[String], extra: Option<&dyn Redactor>) -> Vec<S
             continue;
         }
         let flag = a.trim_start_matches('-').to_ascii_lowercase();
-        redact_next = a.starts_with('-') && SECRET_NAMES.contains(&flag.as_str());
+        redact_next = a.starts_with('-') && !a.contains('=') && is_secret_flag(&flag);
+        if is_mysql && a.len() > 2 && a.starts_with("-p") && !a.starts_with("--") {
+            // mysql -pVALUE: the password is glued to the flag.
+            out.push(format!("-p{REDACTED}"));
+            continue;
+        }
         out.push(clean(a, extra, MAX_ARG));
     }
     if argv.len() > MAX_ARGS {
         out.push(format!("…[{} more arguments]", argv.len() - MAX_ARGS));
     }
     out
+}
+
+/// A flag whose name is, or ends in, a secret name: `password`, `db-password`, `api_key`.
+fn is_secret_flag(flag: &str) -> bool {
+    SECRET_NAMES.iter().any(|n| {
+        flag == *n
+            || flag
+                .strip_suffix(n)
+                .is_some_and(|head| head.ends_with(['-', '_', '.']))
+    })
 }
 
 /// Cuts `s` to at most `cap` bytes on a char boundary and marks the cut.
@@ -515,6 +605,10 @@ mod tests {
             ),
             ("Authorization: SSWS 00abcDEF", "00abcDEF"),
             ("Cookie: sid=s3ss10n; theme=dark", "s3ss10n"),
+            ("Authorization: Token LEAKTOK", "LEAKTOK"),
+            ("Authorization:Bearer\tTOKLEAK", "TOKLEAK"),
+            ("{\"password\":\"ab\\\"cdLEAK\"}", "cdLEAK"),
+            ("OPENAI_API_KEY=plainLEAK node", "plainLEAK"),
             ("stripe sk_live_51HxYzAbCdEfGh", "51HxYzAbCdEfGh"),
             ("key=sk_test_CANARY_7f3a9c00", "CANARY"),
             ("ghp_0123456789abcdefABCDEF", "0123456789abcdef"),
@@ -569,6 +663,35 @@ mod tests {
             "x=ms://pg/staging y=ms://pg/staging z=ms://pg/staging é"
         );
         assert!(!format!("{vr:?}").contains("word"));
+        // Form encoding, JSON escapes, base64 at every alignment, and a non-UTF-8 value.
+        let v2 = b"pa ss/w+rd";
+        let vr2 = ValueRedactor::new(vec![(&k, v2.as_slice())]);
+        for leak in [
+            "q=pa+ss%2Fw%2Brd",
+            "{\"p\":\"pa ss\\/w+rd\"}",
+            "{\"p\":\"pa\\u0020ss/w+rd\"}",
+            "auth cGEgc3MvdytyZA==",
+            "x eHBhIHNzL3crcmQ=",
+            "x eHhwYSBzcy93K3Jk",
+            "x eHhwYSBzcy93K3Jk".replace('+', "-").as_str(),
+        ] {
+            let out = vr2.redact(leak);
+            assert!(out.contains("ms://pg/staging"), "{leak} -> {out}");
+            for part in [
+                "ss/w",
+                "ss%2F",
+                "c3MvdytyZ",
+                "BzcyB3",
+                "IHNzL3cr",
+                "Bzcy93",
+                "zcy93",
+            ] {
+                assert!(!out.contains(part), "{leak} -> {out}");
+            }
+        }
+        let bin = [0xff_u8, 0xfe, b'A', b'B'];
+        let vr3 = ValueRedactor::new(vec![(&k, bin.as_slice())]);
+        assert_eq!(vr3.redact("q=%FF%FEAB"), "q=ms://pg/staging");
         let empty = ValueRedactor::new(vec![(&k, b"".as_slice())]);
         assert_eq!(empty.redact("abc"), "abc");
     }
@@ -587,6 +710,34 @@ mod tests {
             .collect();
         let out = clean_argv(&argv, None);
         assert_eq!(out, ["psql", "--password", REDACTED, "-c", "select 1"]);
+        let argv: Vec<String> = [
+            "/usr/bin/mysql",
+            "-pLEAKPW",
+            "--db-password",
+            "LEAK2",
+            "-p",
+            "3306",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = clean_argv(&argv, None);
+        assert_eq!(
+            out,
+            [
+                "/usr/bin/mysql",
+                "-p[redacted]",
+                "--db-password",
+                REDACTED,
+                "-p",
+                "3306"
+            ]
+        );
+        let bypass: Vec<String> = ["x", "--bypass", "y"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(clean_argv(&bypass, None), ["x", "--bypass", "y"]);
         let many: Vec<String> = (0..70).map(|i| i.to_string()).collect();
         let out = clean_argv(&many, None);
         assert_eq!(out.len(), MAX_ARGS + 1);

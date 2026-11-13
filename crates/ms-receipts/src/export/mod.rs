@@ -18,6 +18,20 @@ pub fn is_unsafe_char(c: char) -> bool {
         || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
+/// `s` with control and bidi characters written as `\u{XXXX}` text, for messages that quote
+/// file contents.
+pub fn inert(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if is_unsafe_char(c) {
+                format!("\\u{{{:04x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// JSON export: `{"format":"morsec-receipts","version":1,"records":[…]}`. Each record keeps its
 /// `seq` and `hash`, so a reader can line it up with `ms log --verify`. Control and bidi
 /// characters are written as `\uXXXX` escapes (the same JSON value), so the output is inert in a

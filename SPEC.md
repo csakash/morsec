@@ -160,8 +160,20 @@ report commands with their observed results; a report is a claim until re-run.
   can only check the chain until an IPC message returns a verify result or receipts. IPC v1 is
   frozen, so that addition belongs to L07 (or its own small loop). Recorded in `ARI42.md`.
 - Tail truncation (dropping the last few records) and full rollback to an older consistent copy
-  are not detectable from the files alone by a same-user verifier; the daemon's in-memory head
-  and L23's separate user close that. Recorded as residual risk.
+  are not detectable from the files alone. The store's in-memory head does **not** close this:
+  a same-user agent can restart the daemon (launchd restarts it) and roll the files back first,
+  and `open()` trusts the last record that MACs. Fix proposed for L07: anchor `(seq, head)` in
+  the vault at each checkpoint and refuse to open below it. L23's separate user closes it fully.
+  (Security review S10.)
+- **Reserve `morsec/` key names (L03, L04).** The HMAC key `morsec/receipts-hmac` lives in the
+  ordinary key namespace. Policy must always deny `morsec/*` in every mode and `ms add` / `ms
+  rules` must refuse it, or an agent could ask for `ms://morsec/receipts-hmac` and forge receipts.
+  Outside L02's owned paths. (S9)
+- `approval.token_id` is written to agent-readable receipts: L07/L11 must pass an opaque id,
+  never the approval token itself. (S13)
+- The `hmac` crate does not zeroize its key-derived pad state; accepted and recorded. (S12)
+- The LOG-2 detector is per session and in memory: a daemon restart resets it, and attempts
+  spread across sessions don't alert. L07 can rebuild it from recent receipts at open. (S11)
 - Retention/pruning of old files is out of scope (deleting the first file fails verify by design).
 
 ## Rollback Plan

@@ -1,7 +1,6 @@
 //! Chain and MAC verification (`ms log --verify`).
 
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use ms_core::{KeyName, Result};
@@ -164,15 +163,15 @@ fn verify_with_key(dir: &Path, key: Option<&[u8]>) -> Result<VerifyReport> {
     let mut prev = GENESIS_PREV;
     let n_files = files.len();
     for (fi, f) in files.iter().enumerate() {
+        // Details can quote file contents (serde errors name fields): keep them inert.
         let fail = |kind, line, expected_seq, detail: String| Problem {
             kind,
             file: f.path.clone(),
             line,
             expected_seq,
-            detail,
+            detail: crate::export::inert(&detail),
         };
-        let bytes = fs::read(&f.path)
-            .map_err(|e| ms_core::Error::io(format!("reading {}", f.path.display()), e))?;
+        let bytes = crate::read::read_file(&f.path)?;
         let (lines, torn) = split_lines(&bytes);
         if lines.is_empty() {
             if fi + 1 != n_files {
@@ -266,7 +265,7 @@ fn verify_with_key(dir: &Path, key: Option<&[u8]>) -> Result<VerifyReport> {
                 return Ok(report);
             }
             if let Entry::Checkpoint(c) = &p.rec.entry
-                && (c.through_seq + 1 != p.rec.seq || c.head != p.rec.prev)
+                && (c.through_seq.checked_add(1) != Some(p.rec.seq) || c.head != p.rec.prev)
             {
                 report.problem = Some(fail(
                     ProblemKind::BadCheckpoint,

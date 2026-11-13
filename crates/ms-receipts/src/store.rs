@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use ms_core::{Error, KeyName, ReceiptEvent, ReceiptResult, Result, SessionId};
 use ms_vault::Vault;
 
-use crate::read::{list_files, parse_line, split_lines};
+use crate::read::{MAX_FILE_READ, O_NOFOLLOW, list_files, parse_line, read_file, split_lines};
 use crate::record::{
     Alert, AlertAction, Approval, Checkpoint, Entry, FORMAT_VERSION, GENESIS_PREV, HMAC_KEY_NAME,
     MIN_KEY_LEN, Rec, Receipt, file_name, hash_rec, line, mac_ok, mac_rec,
@@ -115,6 +115,17 @@ impl Detector {
                 q.back()
                     .is_some_and(|(t, _)| time.saturating_sub(*t) <= window)
             });
+            // Hard cap: if every tracked session is still active, drop the least recent one.
+            if self.recent.len() >= MAX_TRACKED_SESSIONS {
+                let oldest = self
+                    .recent
+                    .iter()
+                    .min_by_key(|(_, q)| q.back().map_or(0, |(t, _)| *t))
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = oldest {
+                    self.recent.remove(&k);
+                }
+            }
         }
         let q = self.recent.entry(session.clone()).or_default();
         q.push_back((time, seq));
@@ -208,17 +219,31 @@ fn prepare_dir(dir: &Path) -> Result<()> {
     }
 }
 
-fn open_append(path: &Path) -> Result<File> {
-    let f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(nofollow())
+/// Opens a receipts file for appending. A new file is created exclusively (never an existing
+/// one, a symlink or a hard link planted at its name); an existing one must not be a symlink.
+/// Either way it must be a private regular file with a single link.
+fn open_append(path: &Path, new: bool) -> Result<File> {
+    let mut o = OpenOptions::new();
+    o.append(true).mode(0o600).custom_flags(O_NOFOLLOW);
+    if new {
+        o.create_new(true);
+    }
+    let f = o
         .open(path)
         .map_err(|e| Error::io(format!("opening {}", path.display()), e))?;
     let m = f
         .metadata()
         .map_err(|e| Error::io(format!("checking {}", path.display()), e))?;
+    if m.nlink() != 1 {
+        return Err(fail(
+            format!(
+                "receipts file {} has {} hard links",
+                path.display(),
+                m.nlink()
+            ),
+            "move it aside; receipts files have exactly one link",
+        ));
+    }
     if !m.is_file() || m.mode() & 0o077 != 0 {
         return Err(fail(
             format!(
@@ -232,20 +257,6 @@ fn open_append(path: &Path) -> Result<File> {
     Ok(f)
 }
 
-/// `O_NOFOLLOW`, so a symlink planted at a receipts file name is refused, not followed.
-#[cfg(target_os = "macos")]
-const fn nofollow() -> i32 {
-    0x0100
-}
-#[cfg(target_os = "linux")]
-const fn nofollow() -> i32 {
-    0o400000
-}
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-const fn nofollow() -> i32 {
-    0
-}
-
 impl ReceiptStore {
     /// Opens (or creates) the store in `dir`.
     ///
@@ -253,6 +264,15 @@ impl ReceiptStore {
     /// the last record's MAC is wrong, or the last line is incomplete.
     pub fn open(dir: impl Into<PathBuf>, vault: Arc<dyn Vault>, cfg: StoreConfig) -> Result<Self> {
         let dir = dir.into();
+        if cfg.max_file_bytes > MAX_FILE_READ / 2 {
+            return Err(fail(
+                format!(
+                    "receipts max_file_bytes must be at most {}",
+                    MAX_FILE_READ / 2
+                ),
+                "fix the store configuration",
+            ));
+        }
         if cfg.checkpoint_every < 2 {
             return Err(fail(
                 "receipts checkpoint_every must be at least 2",
@@ -268,8 +288,7 @@ impl ReceiptStore {
         // Resume from the newest file that has a record.
         let mut current: Option<PathBuf> = None;
         for f in files.iter().rev() {
-            let bytes = fs::read(&f.path)
-                .map_err(|e| Error::io(format!("reading {}", f.path.display()), e))?;
+            let bytes = read_file(&f.path)?;
             let (lines, torn) = split_lines(&bytes);
             if torn {
                 return Err(fail(
@@ -287,8 +306,9 @@ impl ReceiptStore {
             let p = parse_line(last).map_err(|why| {
                 fail(
                     format!(
-                        "the last receipt in {} is unreadable ({why})",
-                        f.path.display()
+                        "the last receipt in {} is unreadable ({})",
+                        f.path.display(),
+                        crate::export::inert(&why)
                     ),
                     "inspect it with: ms log --verify",
                 )
@@ -330,6 +350,7 @@ impl ReceiptStore {
             return Err(short_key());
         }
 
+        let new = current.is_none();
         let path = match current {
             Some(p) => {
                 let named = p
@@ -349,7 +370,7 @@ impl ReceiptStore {
             }
             None => dir.join(file_name(next_seq)),
         };
-        let file = open_append(&path)?;
+        let file = open_append(&path, new)?;
         let fmeta = file
             .metadata()
             .map_err(|e| Error::io("checking receipts file", e))?;
@@ -497,14 +518,14 @@ impl ReceiptStore {
     fn rotate(&self, st: &mut State, time: u64) -> Result<()> {
         self.checkpoint(st, time)?;
         let path = self.dir.join(file_name(st.next_seq));
-        if fs::symlink_metadata(&path).is_ok() {
-            st.broken = true;
-            return Err(fail(
-                format!("receipts file {} already exists", path.display()),
-                "inspect it with: ms log --verify",
-            ));
-        }
-        st.file = open_append(&path)?;
+        st.file = match open_append(&path, true) {
+            Ok(f) => f,
+            Err(e) => {
+                // Something already sits at the next file name: stop rather than write around it.
+                st.broken = true;
+                return Err(e);
+            }
+        };
         st.file_bytes = 0;
         Ok(())
     }

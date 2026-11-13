@@ -81,7 +81,8 @@ pub struct Receipt {
 /// An approval, as recorded.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approval {
-    /// Approval token id.
+    /// Approval token **id**: an opaque, non-secret identifier. Receipts are readable by the
+    /// agent, so callers must never pass the approval token (an HMAC) itself.
     pub token_id: Option<String>,
     /// Who approved (for example the macOS user name).
     pub by: Option<String>,

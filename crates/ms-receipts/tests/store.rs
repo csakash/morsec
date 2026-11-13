@@ -624,3 +624,100 @@ mod props {
         }
     }
 }
+
+// protects=security review S5/S6/S8: a FIFO at a receipts name fails fast (no hang) in verify,
+// read_all and open; an oversized file is refused; a checkpoint with through_seq = u64::MAX is
+// reported, not a panic; problem details quoting file contents carry no control characters;
+// fails_when=any hangs, panics or prints raw escapes; no_claim=symlinked directories higher up
+#[test]
+fn hostile_files_fail_closed() {
+    use std::process::Command;
+    // FIFO.
+    let (_t, d) = seeded(3);
+    let fifo = d.join(file_name(100));
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let d2 = d.clone();
+    std::thread::spawn(move || {
+        let v = verify(&d2, None).is_err();
+        let r = read_all(&d2).is_err();
+        let o = ReceiptStore::open(&d2, vault_with(&KEY), cfg()).is_err();
+        tx.send((v, r, o)).unwrap();
+    });
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("hung on a FIFO");
+    assert_eq!(got, (true, true, true));
+
+    // Oversized file (sparse, so the test stays cheap).
+    let (_t, d) = seeded(3);
+    let big = fs::File::create(d.join(file_name(100))).unwrap();
+    big.set_len(ms_receipts::read::MAX_FILE_READ + 1).unwrap();
+    let e = read_all(&d).unwrap_err();
+    assert!(e.to_string().contains("larger than"), "{e}");
+
+    // Checkpoint overflow, chain-only.
+    let (_t, d) = tmp();
+    fs::create_dir(&d).unwrap();
+    let rec = format!(
+        "{{\"v\":1,\"seq\":1,\"prev\":\"{}\",\"time_unix_ms\":0,\"entry\":{{\"kind\":\"checkpoint\",\"through_seq\":{},\"head\":\"x\"}}}}",
+        "0".repeat(64),
+        u64::MAX
+    );
+    fs::write(
+        d.join(file_name(1)),
+        format!("{{\"rec\":{rec},\"mac\":\"00\"}}\n"),
+    )
+    .unwrap();
+    assert_eq!(kind(&check(&d, false)), ProblemKind::BadCheckpoint);
+
+    // Inert details.
+    let (_t, d) = tmp();
+    fs::create_dir(&d).unwrap();
+    fs::write(
+        d.join(file_name(1)),
+        "{\"rec\":{\"v\":1,\"seq\":1,\"prev\":\"\",\"time_unix_ms\":0,\"entry\":{\"kind\":\"\u{1b}]0;pwn\u{7}\"}},\"mac\":\"\"}\n",
+    )
+    .unwrap();
+    let r = check(&d, false);
+    let text = format!("{r} {:?}", r.problem);
+    assert!(
+        !text.contains('\u{1b}') && !text.contains('\u{7}'),
+        "{text}"
+    );
+    let e = read_all(&d).unwrap_err().to_string();
+    assert!(!e.contains('\u{1b}'), "{e}");
+}
+
+// protects=security review S7: a hard link planted at the next file name is refused at
+// rotation (create_new) and the store stops instead of appending to the linked file;
+// fails_when=receipts land in the linked file; no_claim=a different Unix user (L23)
+#[test]
+fn hard_link_at_next_name_refused() {
+    let (t, d) = tmp();
+    let s = store(
+        &d,
+        StoreConfig {
+            max_file_bytes: 600,
+            ..cfg()
+        },
+    );
+    s.append(event(0, 1, ReceiptResult::Allowed)).unwrap();
+    s.append(event(1, 1, ReceiptResult::Allowed)).unwrap();
+    // The next rotation writes a checkpoint (seq 3), then opens the file for seq 4.
+    let victim = t.path().join("victim");
+    fs::write(&victim, "").unwrap();
+    fs::hard_link(&victim, d.join(file_name(4))).unwrap();
+    assert!(s.append(event(2, 1, ReceiptResult::Allowed)).is_err());
+    assert!(
+        s.append(event(3, 1, ReceiptResult::Allowed)).is_err(),
+        "store must stay stopped"
+    );
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "");
+}
