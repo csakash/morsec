@@ -94,7 +94,9 @@ impl Command {
             Command::Doctor(_) => ("doctor", "L17 doctor"),
             Command::Mcp(_) => ("mcp", "L14 mcp-server"),
             Command::Scan(_) => ("scan", "L09 e2e-canary"),
-            Command::Status | Command::Rules(_) | Command::Log(_) | Command::Stats(_) => return None,
+            Command::Status | Command::Rules(_) | Command::Log(_) | Command::Stats(_) => {
+                return None;
+            }
         })
     }
 }
