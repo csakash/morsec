@@ -112,10 +112,10 @@ pub fn scan(
         notes.push(format!(
             "searched {}{}",
             r.display(),
-            if std::fs::symlink_metadata(r).is_ok_and(|m| m.is_dir()) {
-                ""
-            } else {
-                " (not found)"
+            match std::fs::symlink_metadata(r) {
+                Ok(m) if m.is_dir() => "",
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => " (could not be read)",
+                _ => " (not found)",
             }
         ));
     }
@@ -126,6 +126,8 @@ pub fn scan(
     let mut findings = Vec::new();
     let (mut files, mut bytes, mut unreadable) = (0u64, 0u64, 0u64);
     let mut capped = false;
+    // Counted, not listed: one note per file could outgrow the reply frame (review N1).
+    let mut over_cap = 0u64;
     if !needles.is_empty() {
         let mut name_bytes = 0usize;
         for (i, path) in walk.files.iter().enumerate() {
@@ -151,11 +153,7 @@ pub fn scan(
             files += 1;
             bytes += s.bytes;
             if !s.complete && Instant::now() < deadline {
-                notes.push(format!(
-                    "{} has more than {} matches; only the first are listed",
-                    path.display(),
-                    ms_scan::MAX_HITS_PER_FILE
-                ));
+                over_cap += 1;
             }
             complete &= s.complete;
             let file = path.to_string_lossy().into_owned();
@@ -184,6 +182,12 @@ pub fn scan(
     if unreadable > 0 {
         complete = false;
         notes.push(format!("{unreadable} files could not be read"));
+    }
+    if over_cap > 0 {
+        notes.push(format!(
+            "{over_cap} files have more than {} matches each; only the first are listed",
+            ms_scan::MAX_HITS_PER_FILE
+        ));
     }
     drop(needles);
     tracing::info!(files, findings = findings.len(), complete, "scan finished");

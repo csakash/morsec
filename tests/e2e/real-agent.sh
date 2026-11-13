@@ -98,7 +98,7 @@ set -e
 case $rc in
   0) ;;
   3) echo "real-agent: FAIL: ms scan found a canary in a transcript" >&2; fail=1 ;;
-  *) echo "real-agent: INCONCLUSIVE: ms scan did not finish (exit $rc); no leak was found in what it read" >&2; fail=1 ;;
+  *) echo "real-agent: INCONCLUSIVE: ms scan did not complete a full scan (exit $rc); see its output above" >&2; fail=1 ;;
 esac
 [ $fail -eq 0 ] && echo "real-agent: pass (${agents[*]})"
 exit $fail

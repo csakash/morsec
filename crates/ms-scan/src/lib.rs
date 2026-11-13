@@ -347,7 +347,13 @@ pub fn transcript_files(roots: &[PathBuf], max_files: usize) -> Walk {
     for root in roots {
         match std::fs::symlink_metadata(root) {
             Ok(m) if m.is_dir() => {}
-            _ => continue,
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            // Exists but can't be looked at (a parent with mode 000): not a clean result.
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
         }
         let mut stack = vec![(root.clone(), 0usize)];
         while let Some((dir, depth)) = stack.pop() {
