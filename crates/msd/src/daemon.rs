@@ -713,6 +713,8 @@ impl Daemon {
 
     /// Pre-L11 approval for an administrative change (SPEC D-A): the stub approver first, then
     /// the terminal path for an unattributed caller that confirmed at its terminal.
+    // The error is the reply itself; it is built once per refused request, so its size is moot.
+    #[allow(clippy::result_large_err)]
     fn admin_approval(
         &self,
         session: &SessionId,

@@ -933,7 +933,7 @@ fn pin_overwrite_fails_closed() {
     }
 }
 
-// protects=put_internal writes and replaces only the two daemon items (state flag, CA PEM), which
+// protects=put_internal writes and replaces only the daemon items (state flag, CA key, CA cert), which
 // then read back through with_secret but stay out of list(); every other reserved name, and every
 // ordinary name, is refused; fails_when=put_internal can write a rules/receipts HMAC key or a
 // user key, or the items show up in list(); no_claim=ACL against other binaries (the shared
@@ -955,6 +955,11 @@ fn put_internal_only_daemon_items() {
         t.vault.read_with(&state, |v| v.to_vec()).unwrap(),
         b"running"
     );
+    let cert = KeyName::new(CA_CERT_KEY).unwrap();
+    t.vault
+        .put_internal(&cert, SecretBytes::new(b"{}".to_vec()))
+        .unwrap();
+    assert_eq!(t.vault.read_with(&cert, |v| v.to_vec()).unwrap(), b"{}");
     assert!(t.vault.list().unwrap().is_empty());
     for bad in [
         RECEIPTS_HMAC_KEY,
