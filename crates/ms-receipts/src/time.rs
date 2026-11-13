@@ -63,7 +63,8 @@ pub fn parse_time(s: &str, now_ms: u64) -> Result<u64, String> {
             s.escape_default()
         )
     };
-    if let Some((n, unit)) = s.len().checked_sub(1).map(|i| s.split_at(i)) {
+    // Split off the last char, whatever its width (a multibyte last char must not panic).
+    if let Some((n, unit)) = s.char_indices().last().map(|(i, _)| s.split_at(i)) {
         let mult = match unit {
             "s" => Some(1_000u64),
             "m" => Some(60_000),
@@ -156,6 +157,8 @@ mod tests {
             "",
             "-5m",
             "5x",
+            "5é",
+            "é",
         ] {
             assert!(parse_time(bad, 0).is_err(), "{bad}");
         }

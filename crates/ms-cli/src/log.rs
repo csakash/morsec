@@ -84,7 +84,7 @@ pub struct LogArgs {
     #[arg(short = 'n', long)]
     limit: Option<usize>,
     /// Check the hash chain of every receipts file.
-    #[arg(long, conflicts_with_all = ["export", "limit"])]
+    #[arg(long, conflicts_with_all = ["export", "limit", "since", "until", "agent", "key", "result", "pid"])]
     verify: bool,
     /// Export for a security review instead of printing a table.
     #[arg(long, value_enum, value_name = "FORMAT")]
@@ -142,8 +142,10 @@ fn verify(dir: &Path) -> ExitCode {
             println!("{}", terminal_safe(&r.to_string()));
             eprintln!(
                 "note: record MACs need the receipts key, which only the daemon can read. \
-                 This checked the hash chain: it catches removed, reordered, duplicated and \
-                 edited records, but not a rewrite that also recomputes the chain."
+                 This checked the hash chain: it catches removed, reordered or duplicated \
+                 records and edits to any record but the newest; it does not catch an edit to \
+                 the newest record, dropped trailing records, or a rewrite that recomputes the \
+                 chain."
             );
             ExitCode::SUCCESS
         }

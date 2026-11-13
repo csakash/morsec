@@ -86,6 +86,8 @@ struct Detector {
     window_ms: u64,
     action: AlertAction,
     recent: HashMap<SessionId, VecDeque<(u64, u64)>>,
+    /// After an alert, a session is not counted again until this time: one alert per window.
+    quiet_until: HashMap<SessionId, u64>,
 }
 
 /// Most sessions tracked by the detector before idle ones are dropped.
@@ -116,8 +118,10 @@ impl Detector {
             return None;
         }
         let first_seq = q.front().map_or(seq, |(_, s)| *s);
-        // One alert per burst: the counter starts again after it fires.
+        // One alert per window: the session is not counted again until the window has passed.
         q.clear();
+        self.quiet_until
+            .insert(session.clone(), time.saturating_add(self.window_ms));
         Some(Alert {
             session: session.clone(),
             blocked_count: self.threshold,
@@ -360,6 +364,7 @@ impl ReceiptStore {
                 AlertAction::None
             },
             recent: HashMap::new(),
+            quiet_until: HashMap::new(),
         };
         Ok(Self {
             dir,

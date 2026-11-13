@@ -61,6 +61,22 @@ const SECRET_NAMES: &[&str] = &[
     "sig",
     "sslpassword",
     "pgpassword",
+    "key",
+    "private-token",
+    "proxy-authorization",
+    "session",
+    "sessionid",
+    "cookie",
+    "set-cookie",
+];
+
+/// Names whose whole value (to the end of the line or closing quote) is a credential, even when
+/// it has spaces, as in `Authorization: token abc` or `Cookie: a=1; b=2`.
+const WHOLE_VALUE_NAMES: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
 ];
 
 /// Token prefixes that mark a secret by themselves (Stripe, GitHub, Slack, GitLab, npm, Google,
@@ -174,7 +190,8 @@ fn redact_url_userinfo(s: &str) -> String {
     out
 }
 
-/// `Bearer xyz`, `Basic xyz`, `token xyz` (case-insensitive) → scheme kept, credential redacted.
+/// `Bearer xyz`, `Basic xyz`, `Digest xyz` (case-insensitive) → scheme kept, credential redacted.
+/// Other schemes are covered by the whole-value rule for `Authorization`.
 fn redact_auth_schemes(s: &str) -> String {
     let lower = s.to_ascii_lowercase();
     let mut out = String::with_capacity(s.len());
@@ -212,7 +229,9 @@ fn redact_auth_schemes(s: &str) -> String {
     out
 }
 
-/// `name=value`, `name: value`, `"name":"value"` for every name in [`SECRET_NAMES`].
+/// `name=value`, `name: value`, `"name":"value"` for every name in [`SECRET_NAMES`], also as
+/// the tail of a longer identifier (`DB_PASSWORD=`, `GITHUB_TOKEN=`). A quoted value is redacted
+/// to its closing quote; a [`WHOLE_VALUE_NAMES`] value to the end of the line.
 fn redact_assignments(s: &str) -> String {
     let lower = s.to_ascii_lowercase();
     let bytes = s.as_bytes();
@@ -220,7 +239,8 @@ fn redact_assignments(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let mut matched = None;
-        let boundary = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        // `_`, `-` and `.` count as boundaries, so DB_PASSWORD and x.api_key match.
+        let boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
         if boundary {
             for name in SECRET_NAMES {
                 if !lower[i..].starts_with(name) {
@@ -228,7 +248,7 @@ fn redact_assignments(s: &str) -> String {
                 }
                 let mut j = i + name.len();
                 // Optional closing quote of a JSON key, then spaces, then '=' or ':'.
-                if j < bytes.len() && bytes[j] == b'"' {
+                if j < bytes.len() && matches!(bytes[j], b'"' | b'\'') {
                     j += 1;
                 }
                 while j < bytes.len() && bytes[j] == b' ' {
@@ -239,12 +259,23 @@ fn redact_assignments(s: &str) -> String {
                     while j < bytes.len() && bytes[j] == b' ' {
                         j += 1;
                     }
-                    let quoted = j < bytes.len() && matches!(bytes[j], b'"' | b'\'');
-                    if quoted {
+                    let quote =
+                        (j < bytes.len() && matches!(bytes[j], b'"' | b'\'')).then(|| bytes[j]);
+                    if quote.is_some() {
                         j += 1;
                     }
                     let start = j;
-                    while j < bytes.len() && !ends_value(bytes[j]) {
+                    let whole = WHOLE_VALUE_NAMES.contains(name);
+                    while j < bytes.len() {
+                        let b = bytes[j];
+                        let stop = match quote {
+                            Some(q) => b == q,
+                            None if whole => matches!(b, b'\n' | b'\r' | b'"' | b'\''),
+                            None => ends_value(b),
+                        };
+                        if stop {
+                            break;
+                        }
                         j += 1;
                     }
                     if j > start {
@@ -467,7 +498,23 @@ mod tests {
             ("PGPASSWORD=s3cr3t psql", "s3cr3t"),
             ("api_key=AAAABBBBCCCC&x=1", "AAAABBBBCCCC"),
             ("{\"token\": \"tok-123456\"}", "tok-123456"),
-            ("password: 'quoted value'", "quoted"),
+            ("password: 'correct horse battery'", "horse battery"),
+            ("{\"secret\":\"a b c\"}", "b c"),
+            ("DB_PASSWORD=hunter2 psql", "hunter2"),
+            ("GITHUB_TOKEN=abc123 gh pr list", "abc123"),
+            ("STRIPE_SECRET=xyz9 node app", "xyz9"),
+            ("MY_API_KEY=plainvalue", "plainvalue"),
+            (
+                "https://api.example.com/v1?key=abcdef0123456789",
+                "abcdef0123456789",
+            ),
+            ("key=hunter2", "hunter2"),
+            (
+                "-H 'Authorization: token 0123abcd4567' https://x",
+                "0123abcd4567",
+            ),
+            ("Authorization: SSWS 00abcDEF", "00abcDEF"),
+            ("Cookie: sid=s3ss10n; theme=dark", "s3ss10n"),
             ("stripe sk_live_51HxYzAbCdEfGh", "51HxYzAbCdEfGh"),
             ("key=sk_test_CANARY_7f3a9c00", "CANARY"),
             ("ghp_0123456789abcdefABCDEF", "0123456789abcdef"),
@@ -502,6 +549,7 @@ mod tests {
             "https://example.com/path?q=1",
             "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
             "passport=1",
+            "monkey=1 --key-file=/tmp/k my_tokenizer=x",
             "ünïcode ✓ text",
         ] {
             assert_eq!(r(s), s);

@@ -478,11 +478,21 @@ fn alert_detector() {
         .collect();
     assert_eq!(on_disk.len(), 1);
     assert!(check(&d, true).ok());
+    // Five more blocks inside the same window: still one alert (one per window per session).
+    for i in 6..11 {
+        s.append(event(i, 1, blocked())).unwrap();
+    }
+    assert_eq!(rec.0.lock().unwrap().len(), 1);
+    // After the window has passed, a new burst alerts again.
+    for i in 0..5 {
+        s.append(event(200 + i, 1, blocked())).unwrap();
+    }
+    assert_eq!(rec.0.lock().unwrap().len(), 2);
     // Attempts spread wider than the window never fire.
     for i in 0..10 {
         s.append(event(100 + i * 61, 3, blocked())).unwrap();
     }
-    assert_eq!(rec.0.lock().unwrap().len(), 1);
+    assert_eq!(rec.0.lock().unwrap().len(), 2);
 }
 
 // protects=AC7: reopening resumes seq and prev; a wrong key, a missing key, a short key and a

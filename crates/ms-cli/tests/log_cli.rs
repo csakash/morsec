@@ -173,6 +173,16 @@ fn log_table_and_filters() {
         err.starts_with("morsec: invalid time") && !err.contains("morsec: morsec"),
         "{err}"
     );
+    let (code, _, err) = ms(&d, &["log", "--since", "5é"]);
+    assert_eq!(
+        code, 1,
+        "a multibyte time must be an error, not a panic: {err}"
+    );
+    let (code, _, _) = ms(&d, &["log", "--verify", "--agent", "codex"]);
+    assert_eq!(
+        code, 2,
+        "--verify checks the whole store, so filters are a usage error"
+    );
     let (code, out, _) = ms(&t.path().join("empty"), &["log"]);
     assert_eq!(code, 0);
     assert!(out.starts_with("No receipts yet"));
