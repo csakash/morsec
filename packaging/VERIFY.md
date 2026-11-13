@@ -40,9 +40,12 @@ signature carries a timestamp, so signed bytes never match a rebuild; compare th
 which covers every byte except the signature and the two size fields signing changes:
 
 ```bash
-python3 -I packaging/lib/machocmp.py --same <release>/bin/msd /tmp/rebuild/…  # or:
-python3 -I packaging/lib/machocmp.py <release>/bin/ms <release>/bin/msd   # = code_sha256.* in BUILDINFO
+mkdir /tmp/rebuild/x && tar -xzf /tmp/rebuild/morsec-*.tar.gz -C /tmp/rebuild/x
+python3 -I packaging/lib/machocmp.py --same morsec-<version>/bin/msd /tmp/rebuild/x/morsec-<version>/bin/msd
+python3 -I packaging/lib/machocmp.py --same morsec-<version>/bin/ms  /tmp/rebuild/x/morsec-<version>/bin/ms
 ```
+
+Each prints the code digest, which is also `code_sha256.*` in `BUILDINFO`.
 
 Don't use `codesign --remove-signature` for this: it leaves a different `__LINKEDIT` size behind.
 
