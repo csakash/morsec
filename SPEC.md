@@ -227,7 +227,7 @@ msd's tunnel allowlist (D2); `ms run` and `ms mcp` themselves (L12, L14); Codex/
   recorded as a hash of the object's shape (never its command) plus two bits. A raw `env` value
   that an `--env` ref replaces is not kept in any form, not even a hash: disconnect removes the
   entry and says so, and a re-run carries the ref forward. Residuals: a string written with
-  non-canonical escapes (e.g. a non-ASCII letter written as a `\\u` escape, or `\/` as PHP's `json_encode` writes) keeps its
+  non-canonical escapes (e.g. a non-ASCII letter written as a `\u` escape, or `\/` as PHP's `json_encode` writes) keeps its
   literal; the whole-file SHA-256 lets a same-user reader who knows every other byte confirm
   guesses at one low-entropy value the user later deleted; the user's own `mcpServers.ms`,
   replaced only with `--force`, is kept so it can be put back; the user's CA file paths are kept.
