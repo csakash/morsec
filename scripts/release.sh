@@ -172,9 +172,11 @@ build_release() {
     "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "DEVELOPER_DIR=$(xcode-select -p)"
     "SOURCE_DATE_EPOCH=$epoch" CARGO_INCREMENTAL=0 ZERO_AR_DATE=1
     "MACOSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET" "CARGO_TARGET_DIR=$work/target"
-    # No host path in the binaries: rustc paths, C paths (ring), and the linker's object paths
-    # (which feed the Mach-O UUID).
-    "CARGO_ENCODED_RUSTFLAGS=--remap-path-prefix=$src=/morsec${sep}--remap-path-prefix=$cargo_home=/cargo${sep}-Clink-arg=-Wl,-oso_prefix,$work/"
+    # No host path in the binaries: rustc paths, C paths (ring), and the linker's debug-map
+    # object paths, which feed the Mach-O UUID even though `strip` removes them afterwards.
+    # -oso_prefix covers objects in the build dir; -S drops the debug map entirely, which also
+    # covers std's objects under RUSTUP_HOME.
+    "CARGO_ENCODED_RUSTFLAGS=--remap-path-prefix=$src=/morsec${sep}--remap-path-prefix=$cargo_home=/cargo${sep}-Clink-arg=-Wl,-oso_prefix,$work/${sep}-Clink-arg=-Wl,-S"
     "CFLAGS=-ffile-prefix-map=$src=/morsec -ffile-prefix-map=$cargo_home=/cargo"
   )
   (cd "$src" && "${benv[@]}" cargo build --release --locked -p ms-cli -p msd --target "$TARGET")
@@ -367,7 +369,8 @@ cmd_verify_repro() {
     say "reproducible: both builds are identical"
   else
     diff "$a/out/BUILDINFO" "$b/out/BUILDINFO" >&2 || true
-    die "NOT reproducible: the two builds differ"
+    trap - EXIT # keep both builds for diffing (no credentials are in them)
+    die "NOT reproducible: the two builds differ; both builds are kept in $work"
   fi
 }
 
