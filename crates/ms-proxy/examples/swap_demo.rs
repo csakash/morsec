@@ -31,7 +31,7 @@ impl Policy for AllowAll {
 #[derive(Debug)]
 struct OneSession;
 impl SessionResolver for OneSession {
-    fn resolve(&self, _: SocketAddr, _: Option<&str>) -> Option<SessionId> {
+    fn resolve(&self, _: SocketAddr, _: SocketAddr, _: Option<&str>) -> Option<SessionId> {
         Some(SessionId {
             agent: AgentKind::Other("demo".into()),
             pid: std::process::id(),

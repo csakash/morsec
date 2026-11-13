@@ -21,11 +21,19 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     fn version(&self) -> u64;
 }
 
-/// Maps an agent connection to its session. L06 does this by loopback source port → PID, with
-/// the per-connector proxy username as a cross-check. `None` refuses the connection.
+/// Maps an agent connection to its session. L06 does this by loopback source port → PID
+/// (`ms_session::PortResolver::resolve(peer, local)`), then `ms_session::cross_check` against the
+/// per-connector proxy username. `None` refuses the connection.
+///
+/// May block (a process-table scan): the proxy calls it on the blocking pool.
 pub trait SessionResolver: Send + Sync + std::fmt::Debug {
-    /// The session behind `peer`, if known.
-    fn resolve(&self, peer: SocketAddr, proxy_user: Option<&str>) -> Option<SessionId>;
+    /// The session behind the agent end `peer` of a connection to the proxy's `local` address.
+    fn resolve(
+        &self,
+        peer: SocketAddr,
+        local: SocketAddr,
+        proxy_user: Option<&str>,
+    ) -> Option<SessionId>;
 }
 
 /// Why a connection or request was refused without a key in sight.

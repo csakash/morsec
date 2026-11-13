@@ -283,11 +283,12 @@ impl Inner {
         permit: Arc<OwnedSemaphorePermit>,
     ) {
         let limits = &self.cfg.limits;
+        let Ok(local) = tcp.local_addr() else { return };
         let me = self.clone();
         let svc = service_fn(move |req: Request<Incoming>| {
             let me = me.clone();
             let permit = permit.clone();
-            async move { Ok::<_, Infallible>(me.front(req, peer, permit).await) }
+            async move { Ok::<_, Infallible>(me.front(req, peer, local, permit).await) }
         });
         let mut b = hyper::server::conn::http1::Builder::new();
         b.timer(TokioTimer::new())
@@ -304,11 +305,18 @@ impl Inner {
         self: Arc<Self>,
         req: Request<Incoming>,
         peer: SocketAddr,
+        local: SocketAddr,
         permit: Arc<OwnedSemaphorePermit>,
     ) -> Response<Body> {
         let (parts, body) = req.into_parts();
         let user = proxy_user(&parts);
-        let Some(session) = self.deps.sessions.resolve(peer, user.as_deref()) else {
+        let sessions = self.deps.sessions.clone();
+        let found =
+            tokio::task::spawn_blocking(move || sessions.resolve(peer, local, user.as_deref()))
+                .await
+                .ok()
+                .flatten();
+        let Some(session) = found else {
             let host = parts.uri.host().unwrap_or("").to_owned();
             self.block(None, &host, 0, BlockKind::NoSession);
             return text(

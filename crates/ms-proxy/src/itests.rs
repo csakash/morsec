@@ -65,8 +65,13 @@ impl Policy for FakePolicy {
 #[derive(Debug)]
 struct FixedSession(Option<SessionId>, Mutex<Vec<Option<String>>>);
 impl SessionResolver for FixedSession {
-    fn resolve(&self, peer: SocketAddr, user: Option<&str>) -> Option<SessionId> {
-        assert!(peer.ip().is_loopback());
+    fn resolve(
+        &self,
+        peer: SocketAddr,
+        local: SocketAddr,
+        user: Option<&str>,
+    ) -> Option<SessionId> {
+        assert!(peer.ip().is_loopback() && local.ip().is_loopback());
         self.1.lock().unwrap().push(user.map(str::to_owned));
         self.0.clone()
     }
