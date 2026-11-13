@@ -99,6 +99,16 @@ impl Detector {
         if self.threshold == 0 {
             return None;
         }
+        if self
+            .quiet_until
+            .get(session)
+            .is_some_and(|until| time < *until)
+        {
+            return None;
+        }
+        if self.quiet_until.len() >= MAX_TRACKED_SESSIONS {
+            self.quiet_until.retain(|_, until| time < *until);
+        }
         if self.recent.len() >= MAX_TRACKED_SESSIONS && !self.recent.contains_key(session) {
             let window = self.window_ms;
             self.recent.retain(|_, q| {
