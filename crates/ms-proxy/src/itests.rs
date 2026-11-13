@@ -159,6 +159,10 @@ async fn echo_handler(
         );
         return Ok(r);
     }
+    if path == "/slow" {
+        // Hold the response head until the test releases it.
+        st.gate.notified().await;
+    }
     if path == "/big" {
         let (mut tx, body) = http_body_util::channel::Channel::<Bytes, BoxError>::new(4);
         tokio::spawn(async move {
@@ -253,6 +257,7 @@ struct Opts {
     upstream_h1_only: bool,
     max_connections: usize,
     tunnel_idle: Duration,
+    budget: Option<usize>,
 }
 
 impl Default for Opts {
@@ -266,6 +271,7 @@ impl Default for Opts {
             upstream_h1_only: false,
             max_connections: 256,
             tunnel_idle: Duration::from_secs(300),
+            budget: None,
         }
     }
 }
@@ -345,6 +351,9 @@ async fn harness(o: Opts) -> H {
     cfg.limits.max_body_bytes = o.max_body;
     cfg.limits.max_connections = o.max_connections;
     cfg.limits.tunnel_idle_timeout = o.tunnel_idle;
+    if let Some(b) = o.budget {
+        cfg.limits.max_buffered_bytes = b;
+    }
     cfg.upstream_roots = UpstreamRoots::Only(vec![up.root.clone()]);
     let mut deps = Deps::new(
         vault,
@@ -911,6 +920,84 @@ async fn tunnels_are_bounded_and_idle_closed() {
     assert_eq!(c3, 200, "{msg}");
 }
 
+// protects=R1 (h2): an idle h2 tunnel with no requests closes after the idle time (no server
+// pings keep it alive); fails_when=the h2 connection stays open; no_claim=client-side pings
+#[tokio::test]
+async fn idle_h2_tunnel_closes() {
+    let h = harness(Opts {
+        tunnel_idle: Duration::from_millis(400),
+        ..Opts::default()
+    })
+    .await;
+    let (code, _, tcp) = connect(h.proxy, &format!("{STRIPE}:{}", h.up.port), "").await;
+    assert_eq!(code, 200);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(h.ca.cert_der().clone()).unwrap();
+    let mut cfg = rustls::ClientConfig::builder_with_provider(crate::tls::provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(ServerName::try_from(STRIPE.to_owned()).unwrap(), tcp)
+        .await
+        .unwrap();
+    let (mut s, c) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+        .await
+        .unwrap();
+    let conn = tokio::spawn(c);
+    let r = s
+        .send_request(get(true, STRIPE, h.up.port, "/", &[]))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    drop(r);
+    // Now idle: the proxy must end the connection on its own.
+    let ended = tokio::time::timeout(Duration::from_secs(4), conn).await;
+    assert!(ended.is_ok(), "idle h2 tunnel stayed open");
+}
+
+// protects=R6: a bodyless request reserves no body budget, so concurrent slow GETs don't
+// starve a budget of exactly one body; fails_when=the second slow GET waits for budget (503
+// after 30s); no_claim=fairness between sessions
+#[tokio::test]
+async fn bodyless_requests_hold_no_budget() {
+    let h = harness(Opts {
+        max_body: 1024,
+        budget: Some(1024),
+        ..Opts::default()
+    })
+    .await;
+    let mut tasks = Vec::new();
+    for _ in 0..3 {
+        let req = get(
+            true,
+            STRIPE,
+            h.up.port,
+            "/slow",
+            &[("authorization", "Bearer ms://stripe/test")],
+        );
+        let fut = https(&h, STRIPE, true, req);
+        tasks.push(fut);
+    }
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.up.echo.gate.notify_waiters();
+    };
+    let all = async {
+        let (a, b, c) = tokio::join!(tasks.remove(0), tasks.remove(0), tasks.remove(0));
+        [a, b, c]
+    };
+    let (got, ()) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(all, release) })
+            .await
+            .expect("bodyless requests waited on the body budget");
+    for g in got {
+        assert_eq!(g.status, 200, "{}", g.body);
+    }
+}
+
 // protects=R2: a plain-http body over the limit is never silently truncated: a ref in the
 // prefix still gets a receipt, and an allowlisted forward gets 413; fails_when=the receipt is
 // missing or the request is forwarded empty; no_claim=chunked framing edge cases
@@ -1355,8 +1442,8 @@ proptest::proptest! {
         // The one legitimate way to see the value is the echo upstream reflecting a real
         // base-URL swap; anything else carrying it is a leak.
         let text = String::from_utf8_lossy(&resp);
-        let legit = input.windows(10).any(|w| w == b"/p/stripe/")
-            && input.windows(39).any(|w| w == b"Authorization: Bearer ms://stripe/test\r\n");
+        let has = |needle: &[u8]| input.windows(needle.len()).any(|w| w == needle);
+        let legit = has(b"/p/stripe/") && has(b"Authorization: Bearer ms://stripe/test\r\n");
         proptest::prop_assert!(legit || !text.contains("CANARY"), "{}", text);
         let alive = rt().block_on(raw(h.proxy, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
         proptest::prop_assert!(alive.starts_with("HTTP/1.1 400"), "{}", alive);

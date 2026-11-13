@@ -63,7 +63,7 @@ const BUDGET_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 struct Collected {
     bytes: Bytes,
     overflow: bool,
-    _budget: OwnedSemaphorePermit,
+    _budget: Option<OwnedSemaphorePermit>,
 }
 
 /// One terminated CONNECT tunnel to a bound host.
@@ -504,9 +504,9 @@ impl Inner {
         b.http2()
             .timer(TokioTimer::new())
             .max_header_list_size(limits.max_head_bytes.try_into().unwrap_or(u32::MAX))
-            .max_concurrent_streams(32)
-            .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
-            .keep_alive_timeout(std::time::Duration::from_secs(20));
+            .max_concurrent_streams(32);
+        // No server keep-alive pings: they would count as activity and keep idle h2 tunnels
+        // open forever. The idle watchdog below also ends dead peers.
         // Boxed with an explicit output type: hyper-util's connection future otherwise trips a
         // higher-ranked `From` inference inside `tokio::spawn`.
         let conn: std::pin::Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + '_>> =
@@ -595,23 +595,20 @@ impl Inner {
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<usize>().ok());
-        let reserve = declared.unwrap_or(max).min(max);
-        let kib = u32::try_from(reserve.div_ceil(1024).max(1)).unwrap_or(u32::MAX);
-        let budget = match timeout(
-            BUDGET_WAIT,
-            self.body_budget.clone().acquire_many_owned(kib),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            _ => {
-                return Err(text(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "morsec: too many large requests in flight; nothing was sent. Retry shortly",
-                ));
-            }
+        // Reserve what the request declares (capped) up front, and grow as undeclared bodies
+        // arrive, so a bodyless h2 GET holds nothing and one client can't park the budget.
+        use hyper::body::Body as _;
+        let mut budget: Option<OwnedSemaphorePermit> = None;
+        let mut held_kib: u32 = 0;
+        let start = if body.is_end_stream() {
+            0
+        } else {
+            declared.unwrap_or(0).min(max)
         };
-        let mut buf = Vec::with_capacity(reserve.min(64 * 1024));
+        if !self.reserve(&mut budget, &mut held_kib, start).await {
+            return Err(self.busy());
+        }
+        let mut buf = Vec::with_capacity(start.min(64 * 1024));
         let mut overflow = false;
         while let Some(frame) = body.frame().await {
             let Ok(frame) = frame else {
@@ -621,13 +618,19 @@ impl Inner {
                 ));
             };
             if let Ok(data) = frame.into_data() {
-                let room = reserve.saturating_sub(buf.len());
-                if data.len() > room {
-                    buf.extend_from_slice(&data[..room]);
+                let room = max.saturating_sub(buf.len());
+                let take = data.len().min(room);
+                if !self
+                    .reserve(&mut budget, &mut held_kib, buf.len() + take)
+                    .await
+                {
+                    return Err(self.busy());
+                }
+                buf.extend_from_slice(&data[..take]);
+                if take < data.len() {
                     overflow = true;
                     break;
                 }
-                buf.extend_from_slice(&data);
             }
         }
         Ok(Collected {
@@ -635,6 +638,43 @@ impl Inner {
             overflow,
             _budget: budget,
         })
+    }
+
+    /// Grows the budget held for one body to cover `bytes`. False after waiting too long.
+    async fn reserve(
+        &self,
+        budget: &mut Option<OwnedSemaphorePermit>,
+        held_kib: &mut u32,
+        bytes: usize,
+    ) -> bool {
+        let want = u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX);
+        if want <= *held_kib {
+            return true;
+        }
+        let more = want - *held_kib;
+        match timeout(
+            BUDGET_WAIT,
+            self.body_budget.clone().acquire_many_owned(more),
+        )
+        .await
+        {
+            Ok(Ok(p)) => {
+                match budget {
+                    Some(b) => b.merge(p),
+                    None => *budget = Some(p),
+                }
+                *held_kib = want;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn busy(&self) -> Response<Body> {
+        text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "morsec: too many large requests in flight; nothing was sent. Retry shortly",
+        )
     }
 
     fn too_large(&self) -> Response<Body> {
