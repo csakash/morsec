@@ -98,6 +98,47 @@ fn url_encode(value: &[u8], upper: bool) -> Zeroizing<Vec<u8>> {
     out
 }
 
+// The encoders below write into a buffer sized up front, so it never reallocates and leaves an
+// unzeroized copy of a value behind (security review S3).
+
+/// The inside of a JSON string holding `value` (UTF-8), escaped the way serde_json does.
+fn json_escape(value: &[u8]) -> Zeroizing<Vec<u8>> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Zeroizing::new(Vec::with_capacity(value.len() * 6));
+    for &b in value {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0..=0x1f => {
+                out.extend_from_slice(b"\\u00");
+                out.push(HEX[usize::from(b >> 4)]);
+                out.push(HEX[usize::from(b & 0xf)]);
+            }
+            _ => out.push(b),
+        }
+    }
+    out
+}
+
+fn hex_encode(value: &[u8], upper: bool) -> Zeroizing<Vec<u8>> {
+    let digits: &[u8; 16] = if upper {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let mut out = Zeroizing::new(Vec::with_capacity(value.len() * 2));
+    for &b in value {
+        out.push(digits[usize::from(b >> 4)]);
+        out.push(digits[usize::from(b & 0xf)]);
+    }
+    out
+}
+
 /// The base64 characters fully determined by `value` when it starts `shift` bytes into a
 /// larger encoded blob (shift 0, 1 or 2); characters that also depend on the unknown bytes
 /// around it are dropped. Padding is never part of the result, so padded and unpadded forms
@@ -130,22 +171,13 @@ impl Needles {
         }
         let mut cands: Vec<(Encoding, Zeroizing<Vec<u8>>)> =
             vec![(Encoding::Raw, Zeroizing::new(value.to_vec()))];
-        if let Ok(s) = std::str::from_utf8(value)
-            && let Ok(j) = serde_json::to_string(s).map(Zeroizing::new)
-        {
-            let inner = &j.as_bytes()[1..j.len() - 1];
-            cands.push((Encoding::Json, Zeroizing::new(inner.to_vec())));
+        if std::str::from_utf8(value).is_ok() {
+            cands.push((Encoding::Json, json_escape(value)));
         }
         cands.push((Encoding::Url, url_encode(value, true)));
         cands.push((Encoding::Url, url_encode(value, false)));
-        cands.push((
-            Encoding::Hex,
-            Zeroizing::new(Zeroizing::new(hex::encode(value)).as_bytes().to_vec()),
-        ));
-        cands.push((
-            Encoding::Hex,
-            Zeroizing::new(Zeroizing::new(hex::encode_upper(value)).as_bytes().to_vec()),
-        ));
+        cands.push((Encoding::Hex, hex_encode(value, false)));
+        cands.push((Encoding::Hex, hex_encode(value, true)));
         for shift in 0..3 {
             cands.push((Encoding::Base64, base64_core(value, shift, false)));
         }
@@ -329,6 +361,8 @@ pub struct Walk {
     pub truncated: bool,
     /// Directories or entries that could not be read. Above 0 the walk is incomplete.
     pub unreadable: usize,
+    /// Symlinks found and not followed. Above 0 the walk is incomplete (security review S6).
+    pub links: usize,
 }
 
 fn is_transcript(p: &Path) -> bool {
@@ -374,7 +408,9 @@ pub fn transcript_files(roots: &[PathBuf], max_files: usize) -> Walk {
                     continue;
                 };
                 let p = e.path();
-                if ft.is_dir() {
+                if ft.is_symlink() {
+                    w.links += 1;
+                } else if ft.is_dir() {
                     if depth < MAX_DEPTH {
                         stack.push((p, depth + 1));
                     }
@@ -392,6 +428,12 @@ pub fn transcript_files(roots: &[PathBuf], max_files: usize) -> Walk {
         }
     }
     w.unreadable = unreadable;
+    if w.links > 0 {
+        w.notes.push(format!(
+            "{} symbolic links were not followed, so what they point to was not searched",
+            w.links
+        ));
+    }
     if unreadable > 0 {
         w.notes.push(format!(
             "{unreadable} directories or entries could not be read"
@@ -520,6 +562,28 @@ mod tests {
         assert_eq!(raw, vec![4, 6]);
     }
 
+    // protects=the zeroizing encoders produce exactly what serde_json and hex produce;
+    // fails_when=an escape differs, so a JSON-escaped value would be missed
+    #[test]
+    fn encoders_match_reference() {
+        for v in ["plain", "q\"uo\\te\n\r\t\u{8}\u{c}\u{1}\u{1f}", "ünï/cødé"] {
+            let j = serde_json::to_string(v).unwrap();
+            assert_eq!(
+                &json_escape(v.as_bytes())[..],
+                &j.as_bytes()[1..j.len() - 1],
+                "{v:?}"
+            );
+            assert_eq!(
+                &hex_encode(v.as_bytes(), false)[..],
+                hex::encode(v).as_bytes()
+            );
+            assert_eq!(
+                &hex_encode(v.as_bytes(), true)[..],
+                hex::encode_upper(v).as_bytes()
+            );
+        }
+    }
+
     // protects=values too short to scan are refused, and Debug never shows needle bytes;
     // fails_when=a short value is searched or bytes appear in Debug
     #[test]
@@ -557,6 +621,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("p/link")).unwrap();
         std::os::unix::fs::symlink(outside.join("secret.jsonl"), root.join("p/l.jsonl")).unwrap();
         let w = transcript_files(&[root.clone(), d.path().join("missing")], 100);
+        assert_eq!(w.links, 2, "{w:?}");
         let names: Vec<_> = w
             .files
             .iter()

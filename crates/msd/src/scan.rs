@@ -121,7 +121,7 @@ pub fn scan(
     }
     let walk = ms_scan::transcript_files(roots, MAX_FILES);
     notes.extend(walk.notes);
-    complete &= !walk.truncated && walk.unreadable == 0;
+    complete &= !walk.truncated && walk.unreadable == 0 && walk.links == 0;
 
     let mut findings = Vec::new();
     let (mut files, mut bytes, mut unreadable) = (0u64, 0u64, 0u64);

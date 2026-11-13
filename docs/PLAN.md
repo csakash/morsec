@@ -355,8 +355,10 @@ old behaviour; a default-valued field is not written, so old messages are byte-i
 - Error codes `busy`, `denied`, `needs_approval`, `not_initialized`, `invalid`.
 - `Scan` (L09, no fields) answers `ScanReport { findings: [{file, line, key, encoding}],
   files_scanned, bytes_scanned, keys_checked, skipped_keys, notes, complete }`. msd picks the
-  transcript directories itself and refuses the request inside an agent session; no field can
-  carry a value.
+  transcript directories itself, refuses the request inside an agent session or while stopped,
+  and writes one receipt per key per scan; no field can carry a value. Until L11 a detached
+  same-user process is not an agent session (ARI42 INJ-5 residual); L11 puts `Scan` behind the
+  approver.
 - The server keeps reserved slots for `Status`/`Stop` when its 64 general slots are full, caps
   connections per peer process (8), and caps each connection's lifetime (10 min) and requests
   (1024), so a same-user process can't starve the kill switch.

@@ -634,6 +634,25 @@ fn ms_scan_catches_a_leaky_transcript() {
         "{out}"
     );
     w.assert_clean("ms scan output", out.as_bytes());
+
+    // Every scan is on the record (security review S1): one receipt per key it read, and the
+    // receipts hold no value.
+    let state = World::files_under(&w.dir.path().join("state"));
+    let receipts: String = state
+        .iter()
+        .filter(|(p, _)| p.to_string_lossy().contains("receipts"))
+        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+        .collect();
+    for c in &w.canaries {
+        assert!(
+            receipts.contains("ms scan: agent transcripts"),
+            "no scan receipt: {receipts}"
+        );
+        assert!(receipts.contains(c.key), "{receipts}");
+    }
+    for (p, bytes) in state {
+        w.assert_clean(&p.display().to_string(), &bytes);
+    }
 }
 
 // protects=the real-agent job (claude -p / codex exec) is never part of the gate and costs
@@ -666,6 +685,24 @@ fn real_agent_job_skips_without_opt_in() {
     assert_eq!(out.status.code(), Some(0), "{text}");
     assert!(text.contains("skipped"), "{text}");
     assert!(!marker.exists(), "an agent was invoked without opt-in");
+    // When it does run, each agent starts from an empty environment (security review S2).
+    let body = std::fs::read_to_string(&script).unwrap();
+    let launches: Vec<&str> = body
+        .lines()
+        .filter(|l| l.contains("claude -p") || l.contains("codex exec --"))
+        .filter(|l| !l.trim_start().starts_with('#') && !l.contains("echo "))
+        .collect();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    for l in launches {
+        assert!(
+            l.contains("\"${agent_env[@]}\""),
+            "agent launched with the full environment: {l}"
+        );
+    }
+    assert!(
+        body.contains("agent_env=(env -i "),
+        "no empty-environment launcher"
+    );
 }
 
 // protects=EVAL-1 "the eval job exists and is required": gloop's build gate (`npm run build`)

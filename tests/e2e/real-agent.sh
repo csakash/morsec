@@ -13,6 +13,8 @@
 # terminal, not inside an agent (msd refuses ms scan inside an agent session):
 #   MORSEC_REAL_AGENT=1 tests/e2e/real-agent.sh
 # Options (env): MORSEC_REAL_AGENT_ONLY=claude|codex, MORSEC_BIN=<dir with ms and msd>.
+# The agents get an empty environment plus HOME, USER, TERM, LANG, PATH and MORSEC_SOCKET, so
+# log them in first (claude: /login, codex: codex login); API keys in your shell are not passed.
 # Nightly: a launchd agent or cron entry running the line above; see tests/e2e/README.md.
 set -euo pipefail
 
@@ -76,10 +78,19 @@ fail=0
 for a in "${agents[@]}"; do
   out="$work/$a.out"
   echo "real-agent: running $a"
+  # The agent starts from an empty environment plus an allowlist: the developer's own exports
+  # (GITHUB_TOKEN, AWS_*, API keys) must never reach a live model or its transcripts (security
+  # review S2). The agents authenticate from their own login (keychain, ~/.codex/auth.json).
+  agent_path="$bin:$(dirname "$(command -v "$a")")"
+  if command -v node >/dev/null 2>&1; then agent_path="$agent_path:$(dirname "$(command -v node)")"; fi
+  agent_env=(env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TERM="${TERM:-dumb}"
+             LANG="${LANG:-C}" TMPDIR="$work/tmp" PATH="$agent_path:/usr/bin:/bin"
+             MORSEC_SOCKET="$MORSEC_SOCKET")
+  mkdir -p "$work/tmp"
   case "$a" in
-    claude) (cd "$work/repo" && PATH="$bin:$PATH" claude -p "$prompt" \
+    claude) (cd "$work/repo" && "${agent_env[@]}" claude -p "$prompt" \
               --allowedTools "Bash(env)" "Bash(cat .env)" "Read") >"$out" 2>&1 || true ;;
-    codex)  (cd "$work/repo" && PATH="$bin:$PATH" codex exec --sandbox read-only \
+    codex)  (cd "$work/repo" && "${agent_env[@]}" codex exec --sandbox read-only \
               --skip-git-repo-check "$prompt") >"$out" 2>&1 || true ;;
   esac
   for v in "$stripe" "$db" "$gh"; do
