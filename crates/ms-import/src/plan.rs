@@ -188,6 +188,17 @@ pub fn plan(
             return Err(Error::Usage(format!("no variable named {v} in the file")));
         }
     }
+    // An override is keyed by variable name, so it would apply to every line defining that
+    // name and could give two different values one key (the second put would replace the first).
+    for v in opts.tiers.keys().chain(opts.names.keys()) {
+        let n = entries.iter().filter(|e| e.name == *v).count();
+        if n > 1 {
+            return Err(Error::Usage(format!(
+                "{v} is defined {n} times in the file, so --tier/--name for it is ambiguous. \
+                 Remove the duplicate lines first"
+            )));
+        }
+    }
     if let Some(v) = opts.include.intersection(&opts.exclude).next() {
         return Err(Error::Usage(format!("{v} is both --include and --exclude")));
     }
@@ -332,6 +343,18 @@ pub fn plan(
         row.key = Some(key);
         first_by_value.push(rows.len());
         rows.push(row);
+    }
+
+    // No two stored keys may share a name: the second put would replace the first value.
+    let mut seen = BTreeSet::new();
+    for r in rows.iter().filter(|r| r.action == Action::Import) {
+        if let Some(k) = &r.key
+            && !seen.insert(k)
+        {
+            return Err(Error::Usage(format!(
+                "two different values would be stored as {k}. Use --name to tell them apart"
+            )));
+        }
     }
 
     // An unquoted value cut at ` #` may continue into the comment for some loaders; rewriting
@@ -543,6 +566,30 @@ mod tests {
             vec![
                 row("PORT", "import (same value)", "env/db-password"),
                 row("DB_PASSWORD", "import", "env/db-password"),
+            ]
+        );
+    }
+
+    // protects=a variable defined twice can't take --name/--tier (it would map two values to one
+    // key and lose one), and without overrides the two values get two keys; fails_when=a value
+    // is lost; no_claim=which definition a loader uses
+    #[test]
+    fn repeated_variable() {
+        let src = "A_KEY=one\nA_KEY=two\n";
+        let mut o = Options::default();
+        o.names
+            .insert("A_KEY".into(), KeyName::new("custom/a").unwrap());
+        let e = plan_of(src, &[], &o).unwrap_err().to_string();
+        assert!(e.contains("defined 2 times"), "{e}");
+        let mut o = Options::default();
+        o.tiers.insert("A_KEY".into(), Tier::Test);
+        assert!(plan_of(src, &[], &o).is_err());
+        let p = plan_of(src, &[], &Options::default()).unwrap();
+        assert_eq!(
+            keys(&p),
+            vec![
+                row("A_KEY", "import", "env/a-key"),
+                row("A_KEY", "import", "env/a-key-2"),
             ]
         );
     }

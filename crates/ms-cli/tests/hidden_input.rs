@@ -125,6 +125,19 @@ fn value_is_not_echoed_and_terminal_is_restored() {
     assert!(restored, "terminal modes not restored");
 }
 
+// protects=control keys (an arrow's escape sequence) are refused, not stored; fails_when=the
+// child returns a value containing them
+#[test]
+fn control_keys_refused() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return;
+    }
+    let (out, shown, restored) = type_into_child(b"QAab\x1b[Dc\r");
+    assert!(out.contains("ERR:a control key"), "{out}");
+    assert!(!shown.contains("QAab"), "{shown:?}");
+    assert!(restored);
+}
+
 // protects=Ctrl-C cancels cleanly (no signal kills the process with echo off) and restores the
 // terminal; fails_when=the child dies, returns a value, or leaves echo off
 #[test]

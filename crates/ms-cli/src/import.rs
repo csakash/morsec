@@ -309,7 +309,7 @@ pub(crate) fn run(a: &ImportArgs) -> ExitCode {
     }
     if !a.yes {
         match confirm(&format!(
-            "Store {} key(s) and rewrite {shown}?",
+            "Import {} key(s) and rewrite {shown}?",
             plan.import_count()
         )) {
             Ok(true) => {}

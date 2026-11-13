@@ -48,7 +48,8 @@ pub(crate) fn read_hidden(prompt: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>
     let mut err = io::stderr();
     let _ = write!(err, "{prompt}");
     let _ = err.flush();
-    let mut buf = Zeroizing::new(Vec::with_capacity(128));
+    // Full capacity up front: growing the Vec would leave unwiped copies of the value behind.
+    let mut buf = Zeroizing::new(Vec::with_capacity(MAX_VALUE_BYTES));
     let mut byte = [0u8; 1];
     let result = loop {
         let n = match rustix::io::read(guard.stdin.as_fd(), &mut byte) {
@@ -68,6 +69,13 @@ pub(crate) fn read_hidden(prompt: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>
                 buf.pop();
             }
             0x15 => buf.clear(),
+            // Arrow keys, Ctrl-Z and other control bytes are not part of a value; refuse rather
+            // than store them silently.
+            c if c < 0x20 => {
+                break Err(io::Error::other(
+                    "a control key was typed (arrows, Ctrl-Z, ...). Nothing was stored; try again",
+                ));
+            }
             c => {
                 if buf.len() >= MAX_VALUE_BYTES {
                     break Err(io::Error::other("the value is longer than 64 KiB"));

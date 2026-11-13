@@ -176,3 +176,28 @@ properties run on stable as proptests inside `cargo test`, so the gate covers th
 Keychain storage (L01), persisting hosts and commands as rules (L03), daemon `PutKey`/`ListKeys`
 handlers and their reply variants (L07), 1Password/Bitwarden (L26), approval before replacing a
 key (L07/L11).
+
+## Amendments from review (2026-11-13)
+
+Fresh-context code and security review found cases where the spec as written would leave a
+secret in plaintext. Each change below makes the import stricter (fail closed); none loosens it.
+
+- A1 (security S1): names are `[A-Za-z0-9_.-]+` and `NAME: value` is an entry, matching what
+  Node's dotenv reads. Any other line that is not blank, a `#` comment or `export NAME` stops the
+  import with its line number (never its text), instead of being kept silently.
+- A2 (security S1): an imported unquoted value followed by ` #…` is refused (docker `env_file`
+  reads the comment as part of the value). Quote it, move the comment, or `--exclude` it.
+- A3 (code R3): a `\r` outside quotes that is not part of `\r\n` stops the import.
+- A4 (code R2): "public by design" values are kept: Stripe publishable keys (`pk_live_`,
+  `pk_test_`) and browser-bundled names (`NEXT_PUBLIC_`, `VITE_`, `PUBLIC_`, …) **unless the name
+  says secret** (`VITE_SECRET_TOKEN` is imported). The table labels them `keep: public`;
+  `--include` overrides.
+- A5 (code R1): `--name`/`--tier` on a variable defined more than once is refused, and no two
+  different values may be stored under one key.
+- A6 (code R5, decision D-e): a kept row whose value equals an imported secret gets that secret's
+  reference (`import (same value)`), even for ordinary config such as `POSTGRES_USER=postgres`
+  next to `POSTGRES_PASSWORD=postgres`. Leaving it would leave the secret readable under another
+  name; `--exclude` keeps it.
+- A7 (security S3): for unknown secrets only well-known URL schemes are shown in the table.
+- A8 (code R6): hidden input refuses control keys instead of storing them; the confirm prompt
+  reads `Import N key(s) and rewrite <file>? [y/N]`.

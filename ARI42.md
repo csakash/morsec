@@ -77,7 +77,7 @@ Status: **Met** (enforced + passing check) · **Partial** · **Gap** · **Risk**
 | INJ-2 | Break the lethal trifecta | Gap | Design breaks it (agent never holds values); needs a canary test |
 | INJ-3 | Contain injection in code | Gap | Approval UI and `ms log` must show agent-supplied strings as inert text (no control chars, no truncation hiding args) |
 | INJ-4 | Deny-by-default egress | Gap | Per-key host binding; block private, link-local and metadata ranges; not built |
-| INJ-5 | No secrets in prompts | Gap | Core promise: only `ms://` refs reach agents; test via transcript canary scan (PRD §12) |
+| INJ-5 | No secrets in prompts | Partial | Core promise: only `ms://` refs reach agents. L04: `ms import` leaves a `.env` holding only refs (canary absent from every file in the dir, `ms-import` `envfile::tests::import_leaves_only_refs`); its review table and errors never print a value beyond a public catalog prefix (`ms-cli` `import_add::dry_run_masks_and_changes_nothing`, `stub_daemon_fails_closed_and_is_terminal_safe`); `ms add` has no value flag and reads hidden input (`hidden_input` pty tests). Still to come: transcript canary scan (L09, PRD §12) |
 | OUT-1 | Validate model output before sinks | Gap | Run mode executes agent-supplied commands: argv only, never a shell string; per-key command allowlist |
 | OUT-2 | Disclose AI; guard user-facing output | N/A | No model output shown to end users |
 | OUT-3 | People in decisions about people | N/A | No decisions about people |
@@ -86,7 +86,7 @@ Status: **Met** (enforced + passing check) · **Partial** · **Gap** · **Risk**
 | MCP-2 | Detect tool-description changes | Partial | Skills are vendored, so changes show in diffs; no check for `ms mcp` tool manifests yet |
 | MCP-3 | Authenticate exposed MCP/agent APIs | Gap | `ms mcp`, proxy and broker socket: loopback/Unix socket only, per-session auth; not built |
 | MCP-4 | Sandbox MCP servers | Gap | `ms mcp` and other local MCP servers launched via `ms run` with explicit minimal env |
-| GW-1 | Protect provider keys | Gap | Core product function (keys never reach agent commands); test with canary key per agent |
+| GW-1 | Protect provider keys | Partial | Core product function (keys never reach agent commands); test with canary key per agent. L04: provider catalog binds each known key to its hosts and credential location; unknown keys get no hosts (unusable until `ms rules`, fails closed); an existing key is never overwritten by import or add; values held in `SecretBytes`/zeroizing buffers (`catalog::tests`, `plan::tests::naming_and_dedupe`). Still to come: Keychain storage (L01), per-agent canary tests (L09) |
 | GW-2 | Agent stack as critical supply chain | Partial | `Cargo.lock` committed; `--locked` builds; `cargo deny` (advisories, licences, crates.io-only sources) and `cargo audit` in `scripts/check.sh` (L00). Signed releases and reproducible builds still to come (L10) |
 | GW-3 | Pin models; evaluate before switching | N/A | No model in the product |
 | LOG-1 | Log every agent run | Gap | Hash-chained receipts (PRD §6); not built |
@@ -125,3 +125,4 @@ In scope: 27 (17 Gap, 9 Partial, 1 Met). Human: 5. N/A: 10.
 |---|---|---|---|
 | 2026-11-13 | Installed ARI-42 1.0.1 (Claude Code, Codex, SessionStart hook); first scoping from the PRD; added CODEOWNERS | all (initial scoping) | 0 of 27 met; 8 Partial; 19 Gap |
 | 2026-11-13 | L00 foundation: Rust workspace with lockfile, cargo-deny/cargo-audit local gate (no hosted CI, D7), deny-by-default policy stub, `SecretBytes` that can't be serialized or printed | GW-2, SDLC-6, EVAL-1 | 1 of 27 met; 9 Partial; 17 Gap |
+| 2026-11-13 | L04 import-env: `ms import` (masked review, atomic ref-only rewrite, fails closed, git-history warning), `ms add` (hidden input, no value flag), provider catalog | INJ-5, GW-1 | INJ-5 Partial, GW-1 Partial (score line to be recomputed when wave 1 merges) |

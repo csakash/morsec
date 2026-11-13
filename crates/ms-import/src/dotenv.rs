@@ -107,6 +107,13 @@ pub enum ParseError {
         /// Line of the closing quote.
         line: usize,
     },
+    /// A carriage return that does not end a line (`\r` alone, outside quotes). Loaders that
+    /// treat it as a line end would see different entries than morsec.
+    #[error("line {line} has a carriage return that is not part of a CRLF line ending")]
+    BareCarriageReturn {
+        /// The line.
+        line: usize,
+    },
     /// A line that is neither a comment, blank, nor a `NAME=value` entry.
     #[error(
         "line {line} is not a NAME=value entry or a # comment, and a loader might still read it as one"
@@ -210,7 +217,13 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
             j += 1;
         }
         let line_content_end = content_end(b, i, eol);
-        // Blank lines and comments are kept.
+        // Blank lines and comments are kept, but a comment hiding a bare CR is not: a loader
+        // that ends lines at CR would read what follows it as an entry.
+        if j < line_content_end && b[j] == b'#' && b[j..line_content_end].contains(&b'\r') {
+            return Err(ParseError::BareCarriageReturn {
+                line: line_of(b, i),
+            });
+        }
         if j >= line_content_end || b[j] == b'#' {
             i = eol + 1;
             continue;
@@ -314,6 +327,9 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
             }
             None => {
                 let end = content_end(b, i, eol);
+                if b[j.min(end)..end].contains(&b'\r') {
+                    return Err(ParseError::BareCarriageReturn { line });
+                }
                 let start = j.min(end);
                 let mut k = start;
                 // A '#' starts a comment at the value's start (after a space) or after a space.
@@ -515,6 +531,25 @@ mod tests {
         assert!(parse("\n  \n\t# c\n#\nexport NAME\r\n").unwrap().is_empty());
     }
 
+    // protects=a bare CR outside quotes (old Mac endings, stray CRs) stops the import instead of
+    // merging lines; fails_when=a following entry is swallowed into a value; no_claim=CRs inside
+    // quotes (kept literally)
+    #[test]
+    fn bare_cr_refused() {
+        for (src, line) in [
+            ("A_KEY=sk_live_xxxxxxxxxxxxxxxxxxxxxxx\rB=plain\r", 1),
+            ("X=1\nA=foo\r\r\n", 2),
+            ("# note\rB=sk_live_CANARY\n", 1),
+        ] {
+            assert_eq!(
+                parse(src).unwrap_err(),
+                ParseError::BareCarriageReturn { line },
+                "{src:?}"
+            );
+        }
+        assert_eq!(parse("A=\"x\ry\"\r\n").unwrap()[0].value(), b"x\ry");
+    }
+
     // protects=an unclosed quote or junk after a closing quote stops the import with a line
     // number; fails_when=it parses, guesses, or the error echoes file text; no_claim=recovery
     #[test]
@@ -577,18 +612,34 @@ mod tests {
             "[a-z0-9-]{1,5}: [ -~]{0,12}",
             "# [ -~]{0,20}",
             "[ -~]{0,20}",
+            "\t[A-Z]{1,3}\t=\t[ -~]{0,8}",
             "",
         ];
-        prop::collection::vec(line, 0..12).prop_map(|l| l.join("\n"))
+        let sep = prop_oneof![Just("\n"), Just("\r\n"), Just("\r")];
+        prop::collection::vec((line, sep), 0..12).prop_map(|l| {
+            l.into_iter().fold(String::new(), |mut acc, (line, sep)| {
+                acc.push_str(&line);
+                acc.push_str(sep);
+                acc
+            })
+        })
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2000))]
 
-        // protects=parse never panics on arbitrary input (stable stand-in for the fuzz target);
-        // fails_when=any input panics; no_claim=coverage-guided depth (see fuzz/)
+        // protects=parse never panics on arbitrary input, control characters and line breaks
+        // included (stable stand-in for the fuzz target); fails_when=any input panics;
+        // no_claim=coverage-guided depth (see fuzz/)
         #[test]
-        fn never_panics(s in "\\PC{0,200}") {
+        fn never_panics(s in any::<String>()) {
+            let _ = parse(&s);
+        }
+
+        // protects=as above, on ASCII-heavy input where dotenv syntax is likely; fails_when=any
+        // input panics
+        #[test]
+        fn never_panics_ascii(s in "[\\x00-\\x7f]{0,200}") {
             let _ = parse(&s);
         }
 

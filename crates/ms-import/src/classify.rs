@@ -230,11 +230,14 @@ pub fn classify(catalog: &Catalog, entry: &Entry) -> Class {
     {
         return Class::Public;
     }
+    // A browser-bundled name is public only when nothing in it says secret: `VITE_SECRET_TOKEN`
+    // is still a secret, so it is imported (fails closed).
     let upper = name.to_ascii_uppercase();
-    if catalog
-        .public_name_prefixes
-        .iter()
-        .any(|p| upper.starts_with(p.as_str()))
+    if !name_says_secret(name)
+        && catalog
+            .public_name_prefixes
+            .iter()
+            .any(|p| upper.starts_with(p.as_str()))
     {
         return Class::Public;
     }
@@ -431,6 +434,10 @@ mod tests {
             ("CLIENTSECRET=x".into(), None, None),
             ("URL=https://u:pw@internal.example.com/x".into(), None, None),
             ("BLOB=Zx81Lq0pW2nR7tY5uI3oP9aS4dF6gH1j".into(), None, None),
+            // A secret-looking name beats a public-name prefix.
+            ("VITE_SECRET_TOKEN=hunter2".into(), None, None),
+            ("PUBLIC_KEY_PASSWORD=x".into(), None, None),
+            ("NEXT_PUBLIC_API_KEY=abc".into(), None, None),
         ];
         for (line, p, t) in cases {
             assert_eq!(got(&line), sec(p, t), "{line}");
@@ -462,8 +469,8 @@ mod tests {
             ("A=${OTHER}", Class::Interpolated),
             ("SECRET=\"$OTHER\"", Class::Interpolated),
             ("SECRET=", Class::Empty),
-            ("NEXT_PUBLIC_API_KEY=abc", Class::Public),
-            ("VITE_TOKEN=abc", Class::Public),
+            ("NEXT_PUBLIC_SITE_URL=https://example.com", Class::Public),
+            ("VITE_APP_TITLE=Zx81Lq0pW2nR7tY5uI3oP9aS4dF6", Class::Public),
         ] {
             assert_eq!(class_of(line), want, "{line}");
         }

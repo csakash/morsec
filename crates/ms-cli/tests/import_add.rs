@@ -260,13 +260,11 @@ fn add_refusals() {
         assert!(err.contains("daemon not running"), "{err}");
         no_canary(&out, &err);
     }
-    // There is no way to pass the value as an argument.
+    // There is no way to pass the value as an argument: it is rejected as an unexpected
+    // argument (clap names it in the error; the caller already had it in its own argv).
     let (code, _, err) = run(&ms(), &["add", "stripe/test", CANARY], &sock, b"");
     assert_eq!(code, 2);
-    assert!(
-        !err.contains("CANARY") || err.contains("unexpected argument"),
-        "{err}"
-    );
+    assert!(err.contains("unexpected argument"), "{err}");
 }
 
 fn git(dir: &Path, args: &[&str]) {
