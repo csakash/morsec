@@ -1,5 +1,5 @@
 //! The only `unsafe` in the macOS vault: building the attribute dictionary for a non-extractable
-//! CA key.
+//! signing key (the CA key and the vault seal key).
 //!
 //! `security-framework` has no safe way to set `kSecAttrIsExtractable`, and
 //! `security-framework-sys` does not export that constant, so it is declared here. Every `unsafe`
@@ -13,9 +13,10 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use security_framework::key::SecKey;
+use security_framework::os::macos::keychain::SecKeychain;
 use security_framework_sys::item::{
     kSecAttrIsPermanent, kSecAttrKeySizeInBits, kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom,
-    kSecAttrLabel, kSecPrivateKeyAttrs, kSecPublicKeyAttrs,
+    kSecAttrLabel, kSecPrivateKeyAttrs, kSecPublicKeyAttrs, kSecUseKeychain,
 };
 
 #[link(name = "Security", kind = "framework")]
@@ -25,21 +26,27 @@ unsafe extern "C" {
 }
 
 /// Wraps an Apple-exported `CFStringRef` constant without taking ownership.
-fn constant(r: CFStringRef) -> CFString {
-    // SAFETY: `r` is one of Security.framework's exported constant CFStrings: non-null, immutable
-    // and alive for the life of the process. The get rule retains it, so dropping the wrapper
-    // releases only our retain.
+///
+/// # Safety
+/// `r` must be a valid, non-null CFString that stays alive for the call, such as one of
+/// Security.framework's exported constants (which live for the whole process).
+unsafe fn constant(r: CFStringRef) -> CFString {
+    // SAFETY: guaranteed by the caller (see above). The get rule retains the string, so dropping
+    // the wrapper releases only our own retain.
     unsafe { CFString::wrap_under_get_rule(r) }
 }
 
-/// Generates a permanent P-256 key pair in the default (login) keychain whose private key is
+/// Generates a permanent P-256 key pair in keychain `kc` (the login keychain) whose private key is
 /// non-extractable and sensitive. The creating binary is the only trusted application on the
 /// item's ACL, so only it can sign with the key.
-pub(super) fn generate_ca_key(label: &str) -> Result<SecKey, core_foundation::error::CFError> {
+pub(super) fn generate_signing_key(
+    kc: &SecKeychain,
+    label: &str,
+) -> Result<SecKey, core_foundation::error::CFError> {
     // SAFETY: each read is of an immutable `extern static` CFStringRef exported by
     // Security.framework (linked above and by security-framework-sys); reading it has no side
     // effects and the value is never written.
-    let (extractable, sensitive, permanent, key_type, ec, bits, lbl, private, public) = unsafe {
+    let (extractable, sensitive, permanent, key_type, ec, bits, lbl, private, public, use_kc) = unsafe {
         (
             kSecAttrIsExtractable,
             kSecAttrIsSensitive,
@@ -50,29 +57,59 @@ pub(super) fn generate_ca_key(label: &str) -> Result<SecKey, core_foundation::er
             kSecAttrLabel,
             kSecPrivateKeyAttrs,
             kSecPublicKeyAttrs,
+            kSecUseKeychain,
         )
+    };
+
+    // SAFETY: every argument is a Security.framework constant read just above: non-null,
+    // immutable and alive for the life of the process.
+    let [
+        extractable,
+        sensitive,
+        permanent,
+        key_type,
+        ec,
+        bits,
+        lbl,
+        private,
+        public,
+        use_kc,
+    ] = unsafe {
+        [
+            constant(extractable),
+            constant(sensitive),
+            constant(permanent),
+            constant(key_type),
+            constant(ec),
+            constant(bits),
+            constant(lbl),
+            constant(private),
+            constant(public),
+            constant(use_kc),
+        ]
     };
 
     let yes = CFBoolean::true_value().as_CFType();
     let no = CFBoolean::false_value().as_CFType();
     let private_attrs: CFDictionary<CFString, CFType> = CFDictionary::from_CFType_pairs(&[
-        (constant(permanent), yes.clone()),
-        (constant(extractable), no.clone()),
-        (constant(sensitive), yes.clone()),
+        (permanent.clone(), yes.clone()),
+        (extractable.clone(), no.clone()),
+        (sensitive.clone(), yes.clone()),
     ]);
     let public_attrs: CFDictionary<CFString, CFType> =
-        CFDictionary::from_CFType_pairs(&[(constant(permanent), yes)]);
+        CFDictionary::from_CFType_pairs(&[(permanent.clone(), yes)]);
 
     let attrs: CFDictionary<CFString, CFType> = CFDictionary::from_CFType_pairs(&[
-        (constant(key_type), constant(ec).as_CFType()),
-        (constant(bits), CFNumber::from(256i32).as_CFType()),
-        (constant(lbl), CFString::new(label).as_CFType()),
+        (key_type.clone(), ec.as_CFType()),
+        (bits.clone(), CFNumber::from(256i32).as_CFType()),
+        (lbl.clone(), CFString::new(label).as_CFType()),
         // On the file-based keychain the CSSM key-generation path reads these from the top level,
         // not from the private-key attributes (verified by the ca_key test).
-        (constant(extractable), CFBoolean::false_value().as_CFType()),
-        (constant(sensitive), CFBoolean::true_value().as_CFType()),
-        (constant(private), private_attrs.as_CFType()),
-        (constant(public), public_attrs.as_CFType()),
+        (extractable.clone(), CFBoolean::false_value().as_CFType()),
+        (sensitive.clone(), CFBoolean::true_value().as_CFType()),
+        (private.clone(), private_attrs.as_CFType()),
+        (public.clone(), public_attrs.as_CFType()),
+        (use_kc.clone(), kc.as_CFType()),
     ]);
 
     #[allow(deprecated)] // SecKey::new only takes GenerateKeyOptions, which cannot set extractable.

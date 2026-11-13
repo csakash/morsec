@@ -17,7 +17,9 @@ values that no other binary of the same user can read silently.
 | S4 | **Production-tier user presence is not enforced by the Keychain on this backend.** It is enforced by the approval path (`Approver`, L11; executor check, L07). | `SecAccessControl(.userPresence)` is data-protection-keychain only (spike: `-34018` on the legacy keychain). Recorded as an open item: when a provisioning profile exists, switch to the data-protection keychain and add `.userPresence`. |
 | S5 | Internal HMAC keys are ordinary items under reserved names `morsec/receipts-hmac` (L02's agreed name) and `morsec/rules-hmac` (L03), 32 random bytes from `SecRandomCopyBytes`, created by `ensure_internal_keys()`. They are ACL-bound to `msd` and hidden from `list()`. Users cannot `put` or `delete` names under `morsec/`. | The Keychain has no HMAC primitive on keys we can use, so "non-exportable" for HMAC keys means: readable only by the signed `msd`, never listed, never writable from outside. |
 | S6 | The CA private key is a **non-extractable** P-256 `SecKey` in the login keychain (`kSecAttrIsExtractable = false`). `msd` gets only `public_key()` and `sign()`; the private bytes never exist in process memory. | Card: "the CA private key, as non-exportable items". Spike: the default is extractable (`extr = 1`), so the attribute is set explicitly. |
-| S7 | One small `ffi` module opts out of `unsafe_code` (module-level, narrower than crate-level) to read two Apple constants (`kSecAttrIsExtractable`, `kSecAttrIsSensitive`) that `security-framework-sys` does not export. | Every `unsafe` block reads an immutable `extern static`; each has a `// SAFETY:` comment. |
+| S8 | **Every item is sealed and every call is pinned to the login keychain** (added after review). Item data = `MSV1` ‖ ECDSA P-256 signature ‖ metadata JSON ‖ value; the signature covers (service, account, metadata, value) and is made with a second non-extractable key (`<service>.seal`) that only `msd` may sign with. All searches, adds and deletes name the login keychain by path. | The security review showed (and the ACL test confirmed) that the legacy keychain lets any binary of the user `SecItemUpdate` an item's data and attributes, and that unpinned calls follow a search list or default keychain another process can change. Sealing turns overwrites and planted items into a refusal; pinning stops redirection. |
+| S9 | `ensure_internal_keys` / `ensure_ca_key` (startup) trust keys that already exist; `reset_internal_keys` / `reset_ca_key` (for `ms init`) delete whatever holds the names and create fresh keys. Signing keys are refused when more than one carries the label, or the one found is exportable or not usable by this binary. | Closes the "plant before first run" window at init; after init, items are `msd`'s. |
+| S7 | One small `ffi` module opts out of `unsafe_code` (module-level, narrower than crate-level) to read two Apple constants (`kSecAttrIsExtractable`, `kSecAttrIsSensitive`) that `security-framework-sys` does not export. | Every `unsafe` block reads an immutable `extern static` or wraps one with the get rule (`unsafe fn constant`); each has a `// SAFETY:` comment. |
 
 ## Build
 
@@ -51,10 +53,13 @@ and `Cargo.lock`. No frozen interface changes.
    `ensure_internal_keys()`, are 32 bytes, are stable across calls, and are not listed.
 5. CA key: non-extractable (no external representation of the private key), signature verifies
    with the public key, stable across `ensure_ca_key()` calls.
-6. Memory: canary value; after `with_secret` returns, no `SecretBytes` copy of it remains alive
-   in our code (structural test + `Debug` redaction). A core-dump scan is attempted where the OS
-   allows it; if it needs admin (macOS writes cores to root-owned `/cores`), that is recorded in the
-   evidence file rather than claimed.
+6. Memory: canary value never appears in `Debug`, errors or `list`. A core-dump scan with a
+   runtime canary exists (`core_dump_scan`); macOS writes cores only to root-owned `/cores`, so it
+   is `#[ignore]`d in the gate and its status is recorded in the evidence file rather than claimed.
+   (The "structural test" first planned here was dropped: safe Rust can't observe freed memory.)
+9. Tampering (added after review): another binary's direct `SecItemUpdate` of data never yields a
+   value we use; planted items (open ACL or unsealed) are replaced by `put`/`reset_*` and refused
+   by reads; a second or foreign CA key makes `ensure_ca_key` fail closed.
 7. User presence for production items: **not applicable on this backend** (S4); recorded as an
    open item, not claimed.
 8. `npm run build` (`scripts/check.sh`) passes.
