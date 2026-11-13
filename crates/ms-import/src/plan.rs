@@ -358,7 +358,7 @@ pub fn plan(
     }
 
     // A kept row holding the same value as an imported secret would leave that secret in the
-    // file under another name: it gets the same reference.
+    // file under another name: it gets the same reference, unless --exclude keeps it.
     for i in 0..rows.len() {
         if !matches!(rows[i].action, Action::KeptNotSecret | Action::KeptPublic) {
             continue;
@@ -368,6 +368,10 @@ pub fn plan(
             .iter()
             .find(|&&j| entries[rows[j].entry].value() == value)
         {
+            if opts.exclude.contains(&rows[i].var) {
+                rows[i].action = Action::KeptExcluded;
+                continue;
+            }
             let first = rows[j].clone();
             let row = &mut rows[i];
             row.action = Action::Reuse;
@@ -623,6 +627,14 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("PORT (line 1)"), "{e}");
+        // ...and the --exclude the message suggests works, for that row and a plain one.
+        let mut o = Options::default();
+        o.exclude.insert("PORT".into());
+        let p = plan_of("PORT=hunter2 #tail\nDB_PASSWORD=hunter2\n", &[], &o).unwrap();
+        assert_eq!(p.rows[0].action, Action::KeptExcluded);
+        let p = plan_of("PORT=hunter2\nDB_PASSWORD=hunter2\n", &[], &o).unwrap();
+        assert_eq!(p.rows[0].action, Action::KeptExcluded);
+        assert_eq!(p.rows[1].action, Action::Import);
     }
 
     // protects=slugs and suffixes always yield valid key names, even for long or odd variable
