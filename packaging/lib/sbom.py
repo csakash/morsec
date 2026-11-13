@@ -87,6 +87,14 @@ def reachable(metadata: dict, roots: list[str]) -> list[dict]:
     return [packages[i] for i in seen]
 
 
+def spdx_expression(cargo_license: str) -> str:
+    """Cargo's legacy "MIT/Apache-2.0" (and "MIT / Apache-2.0") means "MIT OR Apache-2.0"."""
+    parts = [p.strip() for p in cargo_license.split("/")]
+    if len(parts) > 1 and all(re.fullmatch(r"[A-Za-z0-9.+-]+", p) for p in parts):
+        return " OR ".join(parts)
+    return cargo_license
+
+
 def _ref(pkg: dict) -> str:
     return f"{pkg['name']}@{pkg['version']}"
 
@@ -119,14 +127,14 @@ def build_sbom(
     components = []
     for p in sorted(pkgs, key=lambda p: (p["name"], p["version"], p.get("source") or "")):
         c: dict = {
-            "type": "library",
+            "type": "application" if p["name"] in roots and p["id"] in members else "library",
             "bom-ref": _ref(p),
             "name": p["name"],
             "version": p["version"],
             "scope": "required",
         }
         if p.get("license"):
-            c["licenses"] = [{"expression": p["license"]}]
+            c["licenses"] = [{"expression": spdx_expression(p["license"])}]
         source = p.get("source")
         if p["id"] in members:
             c["properties"] = [{"name": "morsec:workspace-member", "value": "true"}]

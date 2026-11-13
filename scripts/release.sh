@@ -22,6 +22,9 @@ umask 022
 
 root="$(cd "$(dirname "$0")/.." && pwd -P)"
 pk="$root/packaging"
+# Packaging inputs for the build being made (scripts, sign-targets, entitlements, template).
+# build_release points it at the clone, so a dirty working tree never changes a build.
+bpk="$pk"
 TARGET="aarch64-apple-darwin"
 DEPLOYMENT_TARGET="13.0"
 URL_BASE="https://github.com/csakash/morsec/releases/download"
@@ -78,9 +81,6 @@ release_preflight() {
   [[ "$MORSEC_NOTARY_PROFILE" =~ ^[A-Za-z0-9._-]+$ ]] || die "MORSEC_NOTARY_PROFILE must be a profile name"
   [ -n "${MORSEC_MINISIGN_KEY:-}" ] || die "release needs MORSEC_MINISIGN_KEY (path to the minisign secret key)"
   [ -f "$MORSEC_MINISIGN_KEY" ] || die "MORSEC_MINISIGN_KEY is not a file: $MORSEC_MINISIGN_KEY"
-  need minisign "brew install minisign"
-  need xcrun "Install Xcode."
-  need spctl "It ships with macOS."
   local v
   v="$(workspace_version "$root")"
   [ "$v" != "0.0.0" ] || die "the workspace version is 0.0.0; bump it in Cargo.toml and tag v<version> first"
@@ -91,6 +91,9 @@ release_preflight() {
   [ "${BASH_REMATCH[1]}" = "$pinned" ] || die "MORSEC_SIGN_IDENTITY is team ${BASH_REMATCH[1]}, but releases are pinned to team $pinned (packaging/macos/team-id); the keychain trusts msd only from that team"
   [ -z "$(git -C "$root" status --porcelain)" ] || die "the working tree is not clean"
   git -C "$root" tag --points-at HEAD | grep -qx "v$v" || die "HEAD is not tagged v$v"
+  need minisign "brew install minisign"
+  need xcrun "Install Xcode."
+  need spctl "It ships with macOS."
 }
 
 # sign <file> <identifier> <identity>
@@ -98,7 +101,7 @@ sign() {
   local f="$1" ident="$2" id="$3" ts="--timestamp"
   [ "$id" = "-" ] && ts="--timestamp=none"
   codesign --force --options runtime "$ts" --identifier "$ident" \
-    --entitlements "$pk/macos/entitlements.plist" --sign "$id" "$f"
+    --entitlements "$bpk/macos/entitlements.plist" --sign "$id" "$f"
   codesign --verify --strict --verbose=2 "$f"
   local info
   info="$(codesign -d --verbose=2 "$f" 2>&1)"
@@ -115,10 +118,10 @@ sign() {
     fi
     grep -q '^Timestamp=' <<<"$info" || die "$f: no secure timestamp"
   fi
-  # No entitlements at all: hardened runtime with no exceptions.
-  if codesign -d --entitlements - --xml "$f" 2>/dev/null | grep -q '<key>'; then
-    die "$f: has entitlements; morsec ships with none"
-  fi
+  # No entitlements at all: hardened runtime with no exceptions. Fails closed if codesign fails.
+  local ents
+  ents="$(codesign -d --entitlements - --xml "$f" 2>/dev/null)" || die "$f: cannot read its entitlements"
+  case "$ents" in *'<key>'*) die "$f: has entitlements; morsec ships with none" ;; esac
 }
 
 notarize() { # notarize <dir with bin/> <work> <out dir>: the notarytool record stays in <out dir>
@@ -132,7 +135,9 @@ notarize() { # notarize <dir with bin/> <work> <out dir>: the notarytool record 
   [ "$status" = "Accepted" ] || die "notarization status is \"$status\"; run: xcrun notarytool log <id> --keychain-profile $MORSEC_NOTARY_PROFILE (id in $out)"
   local f
   for f in "$1"/bin/*; do
-    spctl --assess --type execute --verbose=4 "$f" || die "$f: spctl rejects it"
+    # `--type execute` is for app bundles and rejects a bare tool; `install` assesses its signature
+    # and notarization ("source=Notarized Developer ID").
+    spctl --assess --type install --verbose=4 "$f" || die "$f: spctl rejects it"
   done
 }
 
@@ -153,6 +158,7 @@ build_release() {
   git clone -q --no-hardlinks --no-checkout "$root" "$work/src"
   git -C "$work/src" checkout -q --detach "$commit"
   local src="$work/src" epoch version
+  bpk="$src/packaging"
   epoch="$(git -C "$src" log -1 --format=%ct)"
   version="$(workspace_version "$src")"
 
@@ -183,7 +189,7 @@ build_release() {
 
   say "SBOM (CycloneDX 1.5) and auto-update check"
   (cd "$src" && "${benv[@]}" cargo metadata --format-version 1 --locked --filter-platform "$TARGET") |
-    py "$pk/lib/sbom.py" --lock "$src/Cargo.lock" --version "$version" --commit "$commit" \
+    py "$bpk/lib/sbom.py" --lock "$src/Cargo.lock" --version "$version" --commit "$commit" \
       --epoch "$epoch" --root ms-cli --root msd --out "$stage/share/morsec/morsec.cdx.json"
 
   local signing=none
@@ -197,31 +203,42 @@ build_release() {
       [ -f "$stage/bin/$name" ] || die "sign-targets names $name, which the build did not produce"
       sign "$stage/bin/$name" "$ident" "$id"
       # Signing may change only the signature, never the code.
-      py "$pk/lib/machocmp.py" --same "$stage/bin/$name" "$unsigned/$name" >/dev/null
-    done <"$pk/macos/sign-targets"
+      py "$bpk/lib/machocmp.py" --same "$stage/bin/$name" "$unsigned/$name" >/dev/null
+    done <"$bpk/macos/sign-targets"
   fi
 
+  local rustc_v cargo_v sdk_v clang_v
+  rustc_v="$(cd "$src" && "${benv[@]}" rustc --version)"
+  cargo_v="$(cd "$src" && "${benv[@]}" cargo --version)"
+  sdk_v="$(xcrun --show-sdk-version)"
+  clang_v="$(clang --version | head -1)"
+  local -a hashes=()
+  local u c
+  for b in ms msd; do
+    u="$(sha256 "$unsigned/$b")"
+    c="$(py "$bpk/lib/machocmp.py" "$unsigned/$b")"
+    c="${c%% *}"
+    [[ "$u" =~ ^[0-9a-f]{64}$ && "$c" =~ ^[0-9a-f]{64}$ ]] || die "could not hash $b"
+    hashes+=("unsigned_sha256.$b=$u" "code_sha256.$b=$c")
+  done
   {
     echo "morsec_version=$version"
     echo "commit=$commit"
     echo "target=$TARGET"
     echo "source_date_epoch=$epoch"
     echo "macosx_deployment_target=$DEPLOYMENT_TARGET"
-    echo "rustc=$(cd "$src" && "${benv[@]}" rustc --version)"
-    echo "cargo=$(cd "$src" && "${benv[@]}" cargo --version)"
-    echo "sdk=macosx $(xcrun --show-sdk-version 2>/dev/null || echo unknown)"
-    echo "clang=$(clang --version 2>/dev/null | head -1)"
-    for b in ms msd; do
-      echo "unsigned_sha256.$b=$(sha256 "$unsigned/$b")"
-      echo "code_sha256.$b=$(py "$pk/lib/machocmp.py" "$unsigned/$b" | cut -d' ' -f1)"
-    done
+    echo "rustc=$rustc_v"
+    echo "cargo=$cargo_v"
+    echo "sdk=macosx $sdk_v"
+    echo "clang=$clang_v"
+    printf '%s\n' "${hashes[@]}"
   } >"$stage/share/morsec/BUILDINFO"
 
   if [ "$mode" = release ]; then notarize "$stage" "$work" "$out"; fi
 
   local tarball="morsec-$version-$TARGET.tar.gz"
   mkdir -p "$out"
-  py "$pk/lib/archive.py" --out "$out/$tarball" --prefix "morsec-$version" --epoch "$epoch" \
+  py "$bpk/lib/archive.py" --out "$out/$tarball" --prefix "morsec-$version" --epoch "$epoch" \
     "$stage/bin/ms=bin/ms:0755" "$stage/bin/msd=bin/msd:0755" \
     "$stage/share/morsec/BUILDINFO=share/morsec/BUILDINFO:0644" \
     "$stage/share/morsec/morsec.cdx.json=share/morsec/morsec.cdx.json:0644"
@@ -248,8 +265,8 @@ build_release() {
   local sha
   sha="$(sha256 "$out/$tarball")"
   mkdir -p "$out/homebrew-tap/Formula"
-  cp "$pk/homebrew/README.md" "$out/homebrew-tap/README.md"
-  py "$pk/lib/formula.py" --template "$pk/homebrew/morsec.rb.in" --version "$version" \
+  cp "$bpk/homebrew/README.md" "$out/homebrew-tap/README.md"
+  py "$bpk/lib/formula.py" --template "$bpk/homebrew/morsec.rb.in" --version "$version" \
     --sha256 "$sha" --url "$URL_BASE/v$version/$tarball" --out "$out/homebrew-tap/Formula/morsec.rb"
   if [ "$mode" = release ]; then
     mkdir -p "$pk/homebrew/Formula"
@@ -326,11 +343,23 @@ cmd_verify_repro() {
   check_host
   work="$(new_work morsec-repro)"
   trap cleanup EXIT
-  # Different path lengths on purpose, so a leaked path would show.
+  # Build 2 differs from build 1 in every host path a binary could pick up: the build dir (a
+  # different length on purpose), CARGO_HOME (registry sources) and RUSTUP_HOME (std's objects).
+  # The homes are APFS clones (cp -c), so they cost no space.
   local a="$work/a" b="$work/build-two-at-a-longer-path"
   mkdir -p "$a" "$b"
+  local ch="${CARGO_HOME:-$HOME/.cargo}" rh="${RUSTUP_HOME:-$HOME/.rustup}" channel
+  channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$root/rust-toolchain.toml")"
+  [ -d "$rh/toolchains/$channel-$TARGET" ] || die "toolchain $channel-$TARGET is not installed in $rh"
+  mkdir -p "$b/other-homes/rustup/toolchains" "$b/other-homes/cargo-home"
+  cp -c "$rh/settings.toml" "$b/other-homes/rustup/"
+  cp -cR "$rh/toolchains/$channel-$TARGET" "$b/other-homes/rustup/toolchains/" ||
+    die "cloning the toolchain failed (needs APFS)"
+  cp -cR "$ch/registry" "$b/other-homes/cargo-home/" || die "cloning the cargo registry failed (needs APFS)"
+  if [ -f "$ch/config.toml" ]; then cp -c "$ch/config.toml" "$b/other-homes/cargo-home/"; fi
   ( MORSEC_MINISIGN_KEY="" build_release "$a" "$a/out" "" build )
-  ( MORSEC_MINISIGN_KEY="" build_release "$b" "$b/out" "" build )
+  ( export CARGO_HOME="$b/other-homes/cargo-home" RUSTUP_HOME="$b/other-homes/rustup"
+    MORSEC_MINISIGN_KEY="" build_release "$b" "$b/out" "" build )
   say "build 1"; cat "$a/out/SHA256SUMS"; grep -E '^(unsigned|code)_sha256' "$a/out/BUILDINFO"
   say "build 2"; cat "$b/out/SHA256SUMS"; grep -E '^(unsigned|code)_sha256' "$b/out/BUILDINFO"
   if cmp -s "$a/out/SHA256SUMS" "$b/out/SHA256SUMS" && cmp -s "$a/out/BUILDINFO" "$b/out/BUILDINFO" &&

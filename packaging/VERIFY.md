@@ -21,7 +21,7 @@ codesign -d --verbose=2 morsec-<version>/bin/msd   # Identifier=cc.morsec.msd, f
                                                    # Authority=Developer ID Application: …, a Timestamp,
                                                    # TeamIdentifier = packaging/macos/team-id at the tag
 codesign -d --entitlements - morsec-<version>/bin/msd   # empty: morsec has no entitlements
-spctl --assess --type execute --verbose=4 morsec-<version>/bin/msd   # accepted, Notarized Developer ID
+spctl --assess --type install --verbose=4 morsec-<version>/bin/msd   # accepted, source=Notarized Developer ID
 ```
 
 ## 3. Rebuild and compare
@@ -52,8 +52,9 @@ Don't use `codesign --remove-signature` for this: it leaves a different `__LINKE
 
 What is and isn't reproducible:
 
-- `ms` and `msd` before signing, the SBOM and `BUILDINFO`: byte-identical across clean builds at
-  any path on the same toolchain and SDK (`scripts/release.sh verify-repro` proves it at release
+- `ms` and `msd` before signing, the SBOM and `BUILDINFO`: byte-identical across clean builds,
+  whatever the build directory, `CARGO_HOME` and `RUSTUP_HOME` paths, on the same toolchain and
+  SDK (`scripts/release.sh verify-repro` proves it at release
   time).
 - The tarball: identical when built from the same unsigned binaries with the same Python zlib.
   A released tarball holds the signed binaries, so it can't match a rebuild; check it with steps

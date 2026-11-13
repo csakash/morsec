@@ -92,6 +92,14 @@ class SbomTests(unittest.TestCase):
         self.assertEqual(comps["lib"]["hashes"], [{"alg": "SHA-256", "content": "ab" * 32}])
         self.assertNotIn("purl", comps["app"])
         self.assertEqual(comps["app"]["licenses"], [{"expression": "LicenseRef-Proprietary"}])
+        self.assertEqual(comps["app"]["type"], "application")
+        self.assertEqual(comps["lib"]["type"], "library")
+
+    def test_legacy_cargo_licenses_become_spdx(self):
+        self.assertEqual(sbom.spdx_expression("MIT/Apache-2.0"), "MIT OR Apache-2.0")
+        self.assertEqual(sbom.spdx_expression("Apache-2.0 / MIT"), "Apache-2.0 OR MIT")
+        self.assertEqual(sbom.spdx_expression("MIT OR Apache-2.0"), "MIT OR Apache-2.0")
+        self.assertEqual(sbom.spdx_expression("Apache-2.0 WITH LLVM-exception"), "Apache-2.0 WITH LLVM-exception")
 
     def test_deterministic(self):
         a, b = self.bom(), self.bom()
@@ -220,6 +228,7 @@ class FormulaTests(unittest.TestCase):
         self.assertIn('bin.install_symlink "ms" => "mors"', out)
         self.assertIn('bin.install "bin/ms", "bin/msd"', out)
         self.assertIn("depends_on arch: :arm64", out)
+        self.assertIn("depends_on macos: :ventura", out)
         self.assertIn('shell_output("#{bin}/mors --version")', out)
         # ms init owns the LaunchAgent (L07); no brew service, no updater.
         self.assertNotIn("service do", out)
@@ -291,10 +300,16 @@ class MachoTests(unittest.TestCase):
             self.assertNotEqual(a.read(), b.read())
         self.assertEqual(machocmp.code_digest(self.orig), machocmp.code_digest(signed))
 
+    def text_offset(self, path):
+        out = subprocess.run(["otool", "-l", path], check=True, capture_output=True, text=True).stdout
+        m = re.search(r"sectname __text\n\s+segname __TEXT\n(?:.*\n){2}\s+offset (\d+)", out)
+        self.assertIsNotNone(m, out)
+        return int(m.group(1))
+
     def test_code_change_changes_digest(self):
         tampered = self.copy("tampered")
         with open(tampered, "r+b") as f:
-            f.seek(0x4000 + 16)
+            f.seek(self.text_offset(tampered))  # first instruction of __text
             byte = f.read(1)
             f.seek(-1, 1)
             f.write(bytes([byte[0] ^ 0xFF]))

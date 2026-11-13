@@ -10,7 +10,7 @@ class Morsec < Formula
   # trusts only the signed msd (identifier cc.morsec.msd and the release team), so a local
   # build could not read the keys stored by the previous version.
   depends_on arch: :arm64
-  depends_on :macos
+  depends_on macos: :ventura # built with MACOSX_DEPLOYMENT_TARGET=13.0
 
   def install
     bin.install "bin/ms", "bin/msd"
