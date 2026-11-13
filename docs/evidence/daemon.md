@@ -2,7 +2,8 @@
 
 Commands run on the loop branch `feat/daemon`, 2026-11-13, macOS (Darwin 25.2), rustc 1.93.1.
 Full outputs are kept outside the repo in `.loops/runs/daemon/interactive/proof/`
-(`build-morsec.txt`, `qa-run.txt`, `qa-run2.txt`, `qa.md`, `PROOF.md`).
+(`build-morsec.txt`, `qa-run.txt`, `qa-run2.txt`, `qa.md`, `PROOF.md`). `ca-hosts.json`
+mentioned in early commits no longer exists: the CA record lives in the vault.
 
 ## Decisions
 
@@ -48,10 +49,16 @@ See `PROOF.md` for the final run. `npm run build` → `scripts/check.sh`, all 8 
 |---|---|---|
 | R1 (important) | a caller msd could no longer identify (connecting PID exited, child kept the fd) was treated as a non-agent: could replace keys and slip out of a LOG-2 stop | fixed 4625c1b: accept time carried in `PeerInfo`; unidentified callers get only status/stop (`unidentified_caller_is_refused`) |
 | R2 (important) | `ms stop` and `ms start` not serialized: a racing start could undo a stop that reported success | fixed 4625c1b: one lock across flag and vault write (`stop_and_start_are_serialized`) |
-| S1 (important) | `ms init --trust` trusted `ca.pem`, which an agent can replace with its own unconstrained CA | fixed 4625c1b: `Status` carries the CA msd loaded and key-checked; `--trust` uses that via a private temp file |
+| S1 (important) | `ms init --trust` trusted `ca.pem`, which an agent can replace with its own unconstrained CA | 4625c1b moved trust to `Status`, but round 1 showed the certificate still came from the file (`Ca::load` only byte-searches for the public key); fixed 5fc5b57: certificate and hosts live in the vault item `morsec/ca-cert`, `ca.pem` is export-only (`ca_comes_from_the_vault_not_the_file`) |
 | S2 (important) | an agent could run `msd --init` directly, resetting keys and clearing `ms stop` | fixed 4625c1b: refuses inside an agent tree, asks on `/dev/tty`, real state dir only, never clears a stop (`agent_e2e`); archiving the old receipts key on `--force` deferred to L24 |
 | S3 (important) | rules rollback by deleting the receipts (the floor lived only there) | fixed 4625c1b: floor also in the vault state item (`tampered_and_rolled_back_rules_fail_closed`) |
+| R7 (important, round 1) | an unreadable state item persisted a `u64::MAX` floor, denying every key forever | fixed 5fc5b57 (`unreadable_state_never_persists_a_sentinel_floor`) |
+| N7, N9, N10 (nits) | approval held the stop lock; `ca.pem` read unbounded; a resume approved before a newer stop | fixed 5fc5b57, 9142909, b193b26 |
+| N8 (nit) | rules file deleted with keys present needs `ms init --force` | wontfix: that state is tampering; follow-up for a rules-only recovery |
 | R-N1/S-N1..N4, R-N2..N6 (nits) | reserved-slot parking, spec drift, compat comment, wipe-before-bind, stale alerts, resume hint, drift reader, D-A wording | fixed 4625c1b, except stale skipped-binding alerts (kept; cleared on restart) |
+
+Both reviews converged within the 2-round budget: code review (round 2: no important findings)
+and security review (round 2: S1 resolved, no new issues).
 
 ## QA
 
