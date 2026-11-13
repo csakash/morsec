@@ -357,20 +357,6 @@ pub fn plan(
         }
     }
 
-    // An unquoted value cut at ` #` may continue into the comment for some loaders; rewriting
-    // only the part before it could leave the rest of a secret in the file.
-    if let Some(r) = rows
-        .iter()
-        .find(|r| r.action.rewrites() && entries[r.entry].inline_comment)
-    {
-        return Err(Error::Usage(format!(
-            "{} (line {}): the unquoted value is followed by ' #...', which some loaders read as \
-             part of the value. Quote the value or move the comment to its own line, or skip it \
-             with --exclude {}",
-            r.var, r.line, r.var
-        )));
-    }
-
     // A kept row holding the same value as an imported secret would leave that secret in the
     // file under another name: it gets the same reference.
     for i in 0..rows.len() {
@@ -393,6 +379,22 @@ pub fn plan(
             row.hosts = first.hosts;
         }
     }
+
+    // An unquoted value cut at ` #` may continue into the comment for some loaders; rewriting
+    // only the part before it could leave the rest of a secret in the file. Checked after the
+    // same-value pass so reuse rows count too.
+    if let Some(r) = rows
+        .iter()
+        .find(|r| r.action.rewrites() && entries[r.entry].inline_comment)
+    {
+        return Err(Error::Usage(format!(
+            "{} (line {}): the unquoted value is followed by ' #...', which some loaders read as \
+             part of the value. Quote the value or move the comment to its own line, or skip it \
+             with --exclude {}",
+            r.var, r.line, r.var
+        )));
+    }
+
     Ok(Plan { rows })
 }
 
@@ -612,6 +614,15 @@ mod tests {
         let mut o = Options::default();
         o.exclude.insert("A_SECRET".into());
         plan_of("A_SECRET=abc #def\n", &[], &o).unwrap();
+        // A kept row turned into a reuse row is checked too.
+        let e = plan_of(
+            "PORT=hunter2 #tail\nDB_PASSWORD=hunter2\n",
+            &[],
+            &Options::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("PORT (line 1)"), "{e}");
     }
 
     // protects=slugs and suffixes always yield valid key names, even for long or odd variable

@@ -309,6 +309,13 @@ pub fn parse(src: &str) -> Result<Vec<Entry>, ParseError> {
                 // Only spaces and an optional comment may follow on the closing line.
                 let close_eol = line_end(b, close);
                 let tail_end = content_end(b, close + 1, close_eol);
+                // A bare CR after the closing quote (even inside its comment) would start a new
+                // line for some loaders.
+                if b[close + 1..tail_end].contains(&b'\r') {
+                    return Err(ParseError::BareCarriageReturn {
+                        line: line_of(b, close),
+                    });
+                }
                 let mut t = close + 1;
                 while t < tail_end && is_hspace(b[t]) {
                     t += 1;
@@ -540,6 +547,9 @@ mod tests {
             ("A_KEY=sk_live_xxxxxxxxxxxxxxxxxxxxxxx\rB=plain\r", 1),
             ("X=1\nA=foo\r\r\n", 2),
             ("# note\rB=sk_live_CANARY\n", 1),
+            ("A=\"x\" # c\rB_SECRET=sk_live_CANARYxxxxxxxxxxxxxx\n", 1),
+            ("A='x' #c\rB=y\n", 1),
+            ("A=\"multi\nline\"\rB=y\n", 2),
         ] {
             assert_eq!(
                 parse(src).unwrap_err(),
