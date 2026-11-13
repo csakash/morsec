@@ -724,7 +724,9 @@ dependencies = [
  "clap",
  "ms-core",
  "ms-ipc",
+ "ms-receipts",
  "ms-rules",
+ "ms-vault",
  "predicates",
  "serde_json",
  "tempfile",
@@ -810,7 +812,15 @@ dependencies = [
 name = "ms-receipts"
 version = "0.0.0"
 dependencies = [
+ "hex",
+ "hmac",
  "ms-core",
+ "ms-vault",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

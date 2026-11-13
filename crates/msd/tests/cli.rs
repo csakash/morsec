@@ -123,13 +123,11 @@ fn stubs_exit_69_and_name_their_loop() {
         ("connect", "L08 connect-claude"),
         ("disconnect", "L08 connect-claude"),
         ("run", "L12 run-core"),
-        ("log", "L02 receipts"),
         ("stop", "L07 daemon"),
         ("start", "L07 daemon"),
         ("doctor", "L17 doctor"),
         ("mcp", "L14 mcp-server"),
         ("scan", "L09 e2e-canary"),
-        ("stats", "L02 receipts"),
     ];
     let alias = mors(d.path());
     for (cmd, loop_id) in table {
