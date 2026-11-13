@@ -192,8 +192,13 @@ fn is_scheme_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'+' || b == b'.' || b == b'-'
 }
 
+/// A character that, right after a candidate name, means the candidate is not a whole reference.
+/// Includes `@ : ? #` so `find_all` agrees with `parse`, which rejects userinfo, ports, queries
+/// and fragments: `ms://user@host` is no reference at all, never `ms://user` plus a tail.
 fn is_glued_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || !b.is_ascii()
+    b.is_ascii_alphanumeric()
+        || matches!(b, b'_' | b'.' | b'@' | b':' | b'?' | b'#')
+        || !b.is_ascii()
 }
 
 impl fmt::Display for SecretRef {
@@ -341,9 +346,28 @@ mod tests {
             "ms://",
             "ms://-a",
             "ms://ü",
+            // Forms parse() rejects must not be half-matched either.
+            "ms://user@stripe",
+            "ms://stripe:443",
+            "ms://stripe/test?x=1",
+            "ms://stripe/test#f",
+            "postgres://u:ms://pg/x@h/db",
         ] {
             assert!(SecretRef::find_all(none).is_empty(), "matched in {none:?}");
         }
+    }
+
+    // protects=the 255-byte limit is exact; fails_when=a 255-byte name is rejected or a 256-byte
+    // name accepted (an off-by-one in the length check); no_claim=other limits (see the tables)
+    #[test]
+    fn length_limit_is_exact() {
+        let seg = "a".repeat(63);
+        let max = [seg.as_str(); 4].join("/");
+        assert_eq!(max.len(), 255);
+        assert_eq!(KeyName::new(&max).unwrap().as_str(), max);
+        let over = format!("{seg}/{seg}/{seg}/{}/b", "a".repeat(62));
+        assert_eq!(over.len(), 256);
+        assert!(KeyName::new(&over).is_err());
     }
 
     // protects=serde never yields an invalid KeyName/SecretRef; fails_when=invalid JSON input
