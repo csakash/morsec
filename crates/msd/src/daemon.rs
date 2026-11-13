@@ -534,9 +534,14 @@ impl Daemon {
         );
         if let ResponseBody::ScanReport { findings, .. } = &report {
             let rv = self.rules_version();
+            // Every listed key, including ones too short to search or unreadable: over-recording
+            // is the safe direction for an audit trail.
             for m in &keys {
                 let n = findings.iter().filter(|f| f.key == m.name).count();
-                let target = format!("ms scan: agent transcripts, {n} findings");
+                let target = format!(
+                    "ms scan: agent transcripts, {n} finding{}",
+                    if n == 1 { "" } else { "s" }
+                );
                 if let Err(e) = self.record(
                     session,
                     &m.name,
@@ -554,6 +559,14 @@ impl Daemon {
                     );
                 }
             }
+        }
+        // `ms stop` during the scan: the report is not delivered (security re-check N-B). The
+        // receipts above still record that the values were read.
+        if self.is_stopped() {
+            return reply_err(
+                ErrorCode::Denied,
+                "morsec: morsec was stopped (ms stop) during the scan, so its result is withheld",
+            );
         }
         report
     }

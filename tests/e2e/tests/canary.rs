@@ -643,12 +643,28 @@ fn ms_scan_catches_a_leaky_transcript() {
         .filter(|(p, _)| p.to_string_lossy().contains("receipts"))
         .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
         .collect();
-    for c in &w.canaries {
+    let scan_lines: Vec<&str> = receipts
+        .lines()
+        .filter(|l| l.contains("ms scan: agent transcripts"))
+        .collect();
+    // Two scans (clean, then leaky) x three keys.
+    assert_eq!(scan_lines.len(), 6, "{scan_lines:#?}");
+    for (key, n) in [
+        ("stripe/test", "2 findings"),
+        ("postgres/canary", "1 finding"),
+        ("github/canary", "1 finding"),
+    ] {
+        let mine: Vec<&&str> = scan_lines.iter().filter(|l| l.contains(key)).collect();
+        assert_eq!(mine.len(), 2, "{key}: {mine:#?}");
         assert!(
-            receipts.contains("ms scan: agent transcripts"),
-            "no scan receipt: {receipts}"
+            mine.iter().any(|l| l.contains("0 findings")),
+            "{key} clean scan: {mine:#?}"
         );
-        assert!(receipts.contains(c.key), "{receipts}");
+        assert!(
+            mine.iter()
+                .any(|l| l.contains(&format!("agent transcripts, {n}\""))),
+            "{key} leaky scan: {mine:#?}"
+        );
     }
     for (p, bytes) in state {
         w.assert_clean(&p.display().to_string(), &bytes);

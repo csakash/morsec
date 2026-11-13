@@ -361,7 +361,8 @@ pub struct Walk {
     pub truncated: bool,
     /// Directories or entries that could not be read. Above 0 the walk is incomplete.
     pub unreadable: usize,
-    /// Symlinks found and not followed. Above 0 the walk is incomplete (security review S6).
+    /// Symlinks found and not followed. Above 0 the walk is incomplete (security review S6):
+    /// any link counts, whatever it points to, because telling which would mean following it.
     pub links: usize,
 }
 
@@ -382,7 +383,14 @@ pub fn transcript_files(roots: &[PathBuf], max_files: usize) -> Walk {
         match std::fs::symlink_metadata(root) {
             Ok(m) if m.is_dir() => {}
             Ok(_) => continue,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
             // Exists but can't be looked at (a parent with mode 000): not a clean result.
             Err(_) => {
                 unreadable += 1;
