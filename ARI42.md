@@ -125,4 +125,5 @@ In scope: 27 (17 Gap, 9 Partial, 1 Met). Human: 5. N/A: 10.
 |---|---|---|---|
 | 2026-11-13 | Installed ARI-42 1.0.1 (Claude Code, Codex, SessionStart hook); first scoping from the PRD; added CODEOWNERS | all (initial scoping) | 0 of 27 met; 8 Partial; 19 Gap |
 | 2026-11-13 | L00 foundation: Rust workspace with lockfile, cargo-deny/cargo-audit local gate (no hosted CI, D7), deny-by-default policy stub, `SecretBytes` that can't be serialized or printed | GW-2, SDLC-6, EVAL-1 | 1 of 27 met; 9 Partial; 17 Gap |
+| 2026-11-13 | L01 vault-macos: login-keychain vault bound to the signed `msd`, pinned, sealed; non-extractable CA and seal keys; reserved internal HMAC keys | GW-1, INJ-5 | 1 of 27 met; 10 Partial; 16 Gap |
 | 2026-11-13 | L03 rules-policy: rules model, MAC'd rules store, tighten-only project merge, `decide`/`decide_run`, `ms rules` (read and preview only) | AUTH-2, AUTH-3, SDLC-4 | 1 of 27 met; 10 Partial; 16 Gap AUTH-2, AUTH-3 Gap → Partial; SDLC-4 Partial (strengthened) |
