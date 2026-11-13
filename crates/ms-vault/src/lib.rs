@@ -4,6 +4,8 @@
 //! slice for the duration of `with_secret` and nothing else. Backends: [`memory`] (tests, L00),
 //! macOS Keychain (L01), Linux TPM/system user (L21).
 
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod memory;
 
 use ms_core::{KeyMeta, KeyName, Result, SecretBytes};

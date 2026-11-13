@@ -11,4 +11,24 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+ms-core = { workspace = true }
+ms-ipc = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
+# macOS: libproc calls live in one audited module, src/sys/macos.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
+# Linux: /proc is read in safe code; rustix gives the clock tick rate without unsafe.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "param"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# Live tests copy their own binary as fake `claude` / `codex` processes, so they need a custom
+# main (macOS refuses renamed copies of system binaries, and symlinks keep the target's name).
+[[test]]
+name = "live"
+harness = false
