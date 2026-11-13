@@ -38,10 +38,71 @@ Conclusions:
   the attribute is honoured only at the top level of the `SecKeyCreateRandomKey` dictionary, not
   inside `kSecPrivateKeyAttrs` (found by the `ca_key` test: `extr = 1` until moved).
 
+## Findings during the build (macOS 26.2)
+
+- On the legacy keychain, any binary of the user can `SecItemUpdate` the **attributes and the
+  data** of an item `msd` created (`acl_other_binary_is_denied`):
+  - After an attribute update, `msd` still reads the item and the other binary is still denied.
+  - After a data update, the item is denied to everyone, `msd` included. That is a denial of
+    service, never a leak or a substituted value.
+  - In response, items are sealed, and `list()` returns the sealed metadata.
+- Any binary can delete **key** items, ours included (`ca_rejects_planted_keys`). It can also plant
+  a non-extractable key under our label, made by a binary we trust, so we can sign with it.
+  - Hence signing keys are pinned by public-key hash, in an `msd`-only generic item.
+  - Other binaries are denied deleting generic items (`acl_other_binary_is_denied`, op `del`).
+- An item planted with `security add-generic-password -A` is still **denied** to our binary: the
+  partition list keeps us out. Reads refuse it, and `put` / `reset_*` replace it
+  (`planted_items_are_replaced`).
+- With `HOME` pointing elsewhere, the vault still uses the real login keychain (`home_env_is_ignored`).
+
 ## Gate
 
-<!-- filled in at the end of the build -->
+`npm run build` → `bash scripts/check.sh` exits 0. All 8 steps passed:
+
+| Step | Result |
+|---|---|
+| 1 fmt | clean |
+| 2 build | 0 warnings |
+| 3 clippy `-D warnings` | 0 warnings |
+| 4 tests | all pass; `ms-vault`: 17 passed, 3 ignored (child processes and `core_dump_scan`) |
+| 5 cargo-deny | advisories, bans, licenses and sources ok (new: `security-framework` 3.7.0, `security-framework-sys` 2.17.0, `core-foundation` 0.10, all MIT/Apache-2.0) |
+| 6 cargo-audit | 0 vulnerabilities |
+| 7 supply chain | no patches or overrides |
+| 8 ARI-42 scan | 0 findings |
+
+Separately: `MORSEC_SIGN_IDENTITY="Developer ID Application: Akash Munshi (554MCRUAKK)" cargo test
+-p ms-vault acl_developer_id` passes. After every run, `security dump-keychain | grep -c
+cc.morsec.test` returns 0. Raw outputs are kept outside the repo in
+`.loops/runs/vault-macos/interactive/proof/`.
 
 ## Acceptance criteria (SPEC.md)
 
-<!-- filled in at the end of the build -->
+| AC | Evidence |
+|---|---|
+| 1 round trip | `round_trip`, `put_replaces_value_and_meta`, `missing_key`, `meta_name_must_match` |
+| 2 ACL | `acl_other_binary_is_denied` (ad-hoc, other identifier: get, delete, put and CA sign are denied; a byte-identical copy reads); `acl_developer_id` (a Developer ID writer; a same-identifier, same-team upgrade reads; an ad-hoc binary is denied) |
+| 3 no prompts | every call holds `quiet()`; denied reads return `-25293` errors, and no test raised a dialog |
+| 4 reserved names, internal keys | `internal_keys` |
+| 5 CA key | `ca_key`, `ca_rejects_planted_keys` |
+| 6 memory | `Debug`, error and `list` canary checks in `round_trip` and `run_child` (asserts the child never prints the value). `core_dump_scan` **not run**: `/cores` is `root:wheel 0755` on this Mac. To run it: `sudo chmod 1777 /cores`, then `cargo test -p ms-vault core_dump_scan -- --ignored`. Expected residual: Security.framework's own `CFData` copies |
+| 7 user presence | not applicable on this backend (S4); open item |
+| 8 gate | above |
+| 9 tampering | `acl_other_binary_is_denied` (direct updates), `planted_items_are_replaced`, `seal_failures_fail_closed`, `ca_rejects_planted_keys`, `home_env_is_ignored` |
+
+## Review record
+
+Fresh-context reviewers, read-only, three rounds.
+
+| Round | Correctness | Security | Fixed in |
+|---|---|---|---|
+| 1 | 6 (2 medium, 4 low) | 9 (1 critical, 2 high, 2 medium, 4 low) | `f85a30c`: pin the login keychain; add-only writes; seal; planted-key checks; `reset_*`; list skips bad items; `unsafe fn constant`; unbuffered stdin; cleanup guards |
+| 2 | 4 (1 high, 1 medium, 2 low) | 6 (2 high, 2 medium, 2 low) | next commit: pin signing keys by public-key hash; create them only at init; `list()` from sealed metadata; verify before parse; keep the real add error; home directory from `getpwuid_r` with no symlinks |
+| 3 | see below | see below | |
+
+Accepted residuals, documented in the module docs, SPEC.md and ARI42 GW-1:
+- Security.framework's `CFData` copies are not wiped.
+- Denial of service by a same-user process: it can delete key items or overwrite item data.
+- "Always Allow" granted by the user to another binary.
+- Rollback or swap of the keychain file at the real path.
+- No ACL audit yet (`ms doctor`, L07).
+- Production user presence comes from the approval path (L11).

@@ -19,6 +19,7 @@ security-framework-sys = "2.17"
 core-foundation = "0.10"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

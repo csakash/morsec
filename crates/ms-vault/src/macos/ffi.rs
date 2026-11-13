@@ -1,5 +1,6 @@
 //! The only `unsafe` in the macOS vault: building the attribute dictionary for a non-extractable
-//! signing key (the CA key and the vault seal key).
+//! signing key (the CA key and the vault seal key), and finding the user's home directory from
+//! the user database rather than `$HOME` (which whoever starts `msd` controls).
 //!
 //! `security-framework` has no safe way to set `kSecAttrIsExtractable`, and
 //! `security-framework-sys` does not export that constant, so it is declared here. Every `unsafe`
@@ -114,4 +115,38 @@ pub(super) fn generate_signing_key(
 
     #[allow(deprecated)] // SecKey::new only takes GenerateKeyOptions, which cannot set extractable.
     SecKey::generate(attrs.to_untyped())
+}
+
+/// The current user's home directory from the user database (`getpwuid_r(getuid())`). Never
+/// reads `$HOME`.
+pub(super) fn home_dir_from_passwd() -> Option<std::path::PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mut size = 4096usize;
+    while size <= 1 << 20 {
+        let mut buf: Vec<libc::c_char> = vec![0; size];
+        // SAFETY: `passwd` is a plain C struct of integers and pointers, for which all-zero bytes
+        // are a valid (empty) value; getpwuid_r fills it in.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer is valid for the call: `pwd` and `result` are live locals and
+        // `buf` is a live buffer of `buf.len()` bytes. getpwuid_r writes only within them.
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+        if rc == libc::ERANGE {
+            size *= 2;
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: on success `pw_dir` points to a NUL-terminated string inside `buf`, which is
+        // still alive; the bytes are copied out before `buf` is dropped.
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+        return Some(std::path::PathBuf::from(OsStr::from_bytes(dir.to_bytes())));
+    }
+    None
 }

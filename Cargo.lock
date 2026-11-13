@@ -536,6 +536,7 @@ name = "ms-vault"
 version = "0.0.0"
 dependencies = [
  "core-foundation",
+ "libc",
  "ms-core",
  "security-framework",
  "security-framework-sys",

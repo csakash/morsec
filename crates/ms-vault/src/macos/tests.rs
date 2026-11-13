@@ -36,14 +36,22 @@ fn skip() -> bool {
     false
 }
 
-/// A vault under a unique test service; deletes its items and CA key when dropped.
+/// A vault under a unique test service; deletes its items, pins and keys when dropped.
 struct TestVault {
     vault: KeychainVault,
     service: String,
 }
 
 impl TestVault {
+    /// Initialised, as after `ms init`: seal key and internal keys exist.
     fn new() -> Self {
+        let t = Self::bare();
+        t.vault.reset_internal_keys().unwrap();
+        t
+    }
+
+    /// Not initialised.
+    fn bare() -> Self {
         static N: AtomicU32 = AtomicU32::new(0);
         let service = format!(
             "cc.morsec.test.{}.{}",
@@ -184,14 +192,18 @@ fn meta_name_must_match() {
 }
 
 // protects=names under morsec/ can't be written or deleted through the trait, and internal keys
-// are 32 random bytes, stable, readable by msd and hidden from list; fails_when=a user put
-// overwrites an HMAC key, ensure regenerates an existing key, or list shows internal keys;
-// no_claim=randomness quality (SecRandomCopyBytes)
+// are 32 random bytes, stable across ensure, rotated only by reset, readable by msd and hidden
+// from list; fails_when=a user put overwrites an HMAC key, ensure rotates an existing key, or
+// list shows internal keys or pins; no_claim=randomness quality (SecRandomCopyBytes)
 #[test]
 fn internal_keys() {
     if skip() {
         return;
     }
+    let bare = TestVault::bare();
+    let e = bare.vault.ensure_internal_keys().unwrap_err().to_string();
+    assert!(e.contains("ms init"), "needs init first: {e}");
+
     let t = TestVault::new();
     let v = &t.vault;
     let rk = key(RECEIPTS_HMAC_KEY);
@@ -203,12 +215,7 @@ fn internal_keys() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("morsec's own keys"), "{err}");
-    assert!(matches!(
-        v.read_with(&rk, |b| b.len()),
-        Err(Error::NoSuchKey(_))
-    ));
 
-    v.ensure_internal_keys().unwrap();
     let first = v.read_with(&rk, |b| b.to_vec()).unwrap();
     assert_eq!(first.len(), HMAC_KEY_LEN);
     assert_ne!(first, vec![0u8; HMAC_KEY_LEN]);
@@ -219,12 +226,23 @@ fn internal_keys() {
     assert_eq!(
         v.read_with(&rk, |b| b.to_vec()).unwrap(),
         first,
-        "must not rotate"
+        "ensure must not rotate"
     );
 
-    assert!(v.list().unwrap().is_empty(), "internal keys are hidden");
+    assert!(
+        v.list().unwrap().is_empty(),
+        "internal keys and pins are hidden"
+    );
     assert!(v.delete(&rk).is_err());
+    assert!(v.delete(&key(SEAL_PIN)).is_err());
     assert_eq!(v.read_with(&rk, |b| b.len()).unwrap(), HMAC_KEY_LEN);
+
+    v.reset_internal_keys().unwrap();
+    assert_ne!(
+        v.read_with(&rk, |b| b.to_vec()).unwrap(),
+        first,
+        "reset rotates"
+    );
 }
 
 // protects=the CA private key is non-extractable, signs verifiably, and is reused; fails_when=the
@@ -236,7 +254,9 @@ fn ca_key() {
         return;
     }
     let t = TestVault::new();
-    let ca = t.vault.ensure_ca_key().unwrap();
+    let e = t.vault.ensure_ca_key().unwrap_err().to_string();
+    assert!(e.contains("ms init"), "created only by reset: {e}");
+    let ca = t.vault.reset_ca_key().unwrap();
     assert!(
         ca.is_non_extractable(),
         "CA private key must not be exportable"
@@ -270,9 +290,10 @@ fn ca_key() {
     );
     assert_eq!(format!("{again:?}"), "CaKey(P-256, non-extractable)");
 
-    t.vault.delete_ca_key().unwrap();
-    let fresh = t.vault.ensure_ca_key().unwrap();
+    let fresh = t.vault.reset_ca_key().unwrap();
     assert_ne!(fresh.public_key_sec1().unwrap(), pubkey);
+    t.vault.delete_ca_key().unwrap();
+    assert!(t.vault.ensure_ca_key().is_err());
 }
 
 // protects=errors carry the status, the key name and a fix, and never the value;
@@ -357,7 +378,25 @@ fn acl_child() {
                 .map(|_| "PLANTED".to_owned())
                 .map_err(|e| Error::io("planting", std::io::Error::other(e.to_string())))
         }
-        "delca" => v.delete_ca_key().map(|()| "DELETED".to_owned()),
+        // Deletes every key under the CA label (ours too: key items are deletable by any binary).
+        "delca" => {
+            let _q = quiet().unwrap();
+            let kc = login_keychain().unwrap();
+            delete_keys_locked(&kc, &v.ca_label()).map(|()| "DELETED".to_owned())
+        }
+        "init" => v.reset_internal_keys().map(|()| "INIT".to_owned()),
+        // Removes everything this binary made under the service (its items and keys).
+        "wipe" => {
+            let _q = quiet().unwrap();
+            let kc = login_keychain().unwrap();
+            let _ = ItemSearchOptions::new()
+                .keychains(std::slice::from_ref(&kc))
+                .class(ItemClass::generic_password())
+                .service(&v.service)
+                .limit(Limit::All)
+                .delete();
+            delete_keys_locked(&kc, &v.seal_label()).map(|()| "WIPED".to_owned())
+        }
         other => panic!("unknown op {other}"),
     };
     match result {
@@ -432,7 +471,7 @@ fn acl_other_binary_is_denied() {
             meta(&k, Tier::Production),
         )
         .unwrap();
-    t.vault.ensure_ca_key().unwrap();
+    t.vault.reset_ca_key().unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     // Positive control: a byte-identical copy keeps our signature, so the keychain trusts it.
@@ -464,6 +503,11 @@ fn acl_other_binary_is_denied() {
         t.vault.read_with(&k, |b| b.to_vec()).unwrap(),
         CANARY.as_bytes()
     );
+    assert_eq!(
+        t.vault.list().unwrap(),
+        vec![meta(&k, Tier::Production)],
+        "list must report the sealed tier, not the rewritten comment"
+    );
     let r = run_child(&other, &t.service, k.as_str(), "get");
     assert!(r.starts_with("DENIED"), "after update-attr: {r}");
     // Data: the item becomes unusable (denied by the keychain, or refused by the seal), never a
@@ -492,7 +536,7 @@ fn acl_developer_id() {
         );
         return;
     };
-    let t = TestVault::new();
+    let t = TestVault::bare();
     let name = "stripe/live";
     let dir = tempfile::tempdir().unwrap();
     let ident = "cc.morsec.test.msd";
@@ -501,10 +545,11 @@ fn acl_developer_id() {
     struct WriterCleanup<'a>(&'a Path, &'a str, &'a str);
     impl Drop for WriterCleanup<'_> {
         fn drop(&mut self) {
-            let _ = run_child(self.0, self.1, self.2, "del");
+            let _ = run_child(self.0, self.1, self.2, "wipe");
         }
     }
     let _cleanup = WriterCleanup(&writer, &t.service, name);
+    assert_eq!(run_child(&writer, &t.service, name, "init"), "INIT");
     let upgrade = signed_copy(dir.path(), "upgrade", &identity, ident);
     let adhoc = signed_copy(dir.path(), "adhoc", "-", ident);
 
@@ -548,6 +593,7 @@ fn core_child() {
         .unwrap();
     let v = KeychainVault::with_service(service.to_string_lossy().into_owned());
     let k = key("core/canary");
+    v.reset_internal_keys().unwrap();
     v.put(&k, SecretBytes::new(buf), meta(&k, Tier::Production))
         .unwrap();
     let mut sum = 0u64;
@@ -663,18 +709,18 @@ fn add_raw(service: &str, account: &str, data: &[u8]) {
 // protects=a value never lands in an item someone else planted with an open ACL: put and
 // reset_internal_keys replace planted items with ones only this binary can read;
 // fails_when=after put/reset another binary can still read the item, or the planted value
-// survives; no_claim=ensure_internal_keys (startup) trusts keys that already exist, which is why
-// ms init must call reset_internal_keys
+// survives; no_claim=keychain-file rollback or replacement (documented residual)
 #[test]
 fn planted_items_are_replaced() {
     if skip() {
         return;
     }
-    let t = TestVault::new();
+    let t = TestVault::bare();
     let planted = "PLANTED_known_to_attacker_0123456";
     plant(&t.service, "stripe/live", planted);
     plant(&t.service, RULES_HMAC_KEY, planted);
     let k = key("stripe/live");
+    t.vault.reset_internal_keys().unwrap();
     t.vault
         .put(
             &k,
@@ -682,7 +728,6 @@ fn planted_items_are_replaced() {
             meta(&k, Tier::Production),
         )
         .unwrap();
-    t.vault.reset_internal_keys().unwrap();
     let rules = t
         .vault
         .read_with(&key(RULES_HMAC_KEY), |b| b.to_vec())
@@ -701,10 +746,10 @@ fn planted_items_are_replaced() {
     }
 }
 
-// protects=the CA key can't be swapped: a lone key this binary can't sign with, or a second key
-// planted under the CA label, makes ensure_ca_key fail closed; fails_when=ensure_ca_key returns a
-// key while a foreign one carries the label; no_claim=a planted key with an open ACL created
-// before ms init (reset_ca_key is what removes it)
+// protects=the CA key can't be swapped (round-2 review): ensure_ca_key accepts only the key whose
+// public key matches the pin written by reset_ca_key, so a key planted under the label, even one
+// this binary may sign with, is never used, and a deleted CA fails closed; fails_when=ensure
+// returns a key other than the pinned one; no_claim=keychain-file rollback or replacement
 #[test]
 fn ca_rejects_planted_keys() {
     if skip() {
@@ -713,6 +758,10 @@ fn ca_rejects_planted_keys() {
     let t = TestVault::new();
     let dir = tempfile::tempdir().unwrap();
     let other = signed_copy(dir.path(), "other", "-", "cc.morsec.test.attacker");
+    // A byte-identical copy: keys it makes are ones this binary may sign with, the strongest
+    // plant (like an attacker key with an open ACL).
+    let same = dir.path().join("same");
+    std::fs::copy(std::env::current_exe().unwrap(), &same).unwrap();
     struct Cleanup<'a>(&'a Path, &'a str);
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
@@ -721,29 +770,30 @@ fn ca_rejects_planted_keys() {
     }
     let _cleanup = Cleanup(&other, &t.service);
 
-    // A lone foreign key: not ours to sign with.
-    assert_eq!(run_child(&other, &t.service, "x", "plantca"), "PLANTED");
+    // Before init: a planted key is not adopted.
+    assert_eq!(run_child(&same, &t.service, "x", "plantca"), "PLANTED");
     let e = t.vault.ensure_ca_key().unwrap_err().to_string();
     assert!(e.contains("ms init"), "{e}");
-    // reset removes a planted key (the keychain lets any binary delete a key item) and makes our
-    // own.
-    let reset = t.vault.reset_ca_key().unwrap().public_key_sec1().unwrap();
+    // reset removes it and pins our own.
+    let ours = t.vault.reset_ca_key().unwrap().public_key_sec1().unwrap();
     assert_eq!(
         t.vault.ensure_ca_key().unwrap().public_key_sec1().unwrap(),
-        reset
+        ours
     );
-    t.vault.delete_ca_key().unwrap();
 
-    // Ours, then a second planted next to it.
-    let ours = t.vault.ensure_ca_key().unwrap().public_key_sec1().unwrap();
+    // A second key planted next to ours, by another binary or by a trusted copy: ignored.
     assert_eq!(run_child(&other, &t.service, "x", "plantca"), "PLANTED");
-    let e = t.vault.ensure_ca_key().unwrap_err().to_string();
-    assert!(e.contains("more than one"), "{e}");
-    // Any binary may delete key items, ours included: delca removes both. Denial of service (a
-    // new CA must be trusted again), recorded in the evidence file.
+    assert_eq!(run_child(&same, &t.service, "x", "plantca"), "PLANTED");
+    assert_eq!(
+        t.vault.ensure_ca_key().unwrap().public_key_sec1().unwrap(),
+        ours
+    );
+
+    // Delete ours and plant a usable replacement: refused, fail closed (denial of service).
     assert_eq!(run_child(&other, &t.service, "x", "delca"), "DELETED");
-    let fresh = t.vault.ensure_ca_key().unwrap().public_key_sec1().unwrap();
-    assert_ne!(fresh, ours);
+    assert_eq!(run_child(&same, &t.service, "x", "plantca"), "PLANTED");
+    let e = t.vault.ensure_ca_key().unwrap_err().to_string();
+    assert!(e.contains("missing or replaced"), "{e}");
 }
 
 // protects=values stored before are refused once their seal is broken: an item planted without a
@@ -768,6 +818,12 @@ fn seal_failures_fail_closed() {
     assert!(e.contains("seal check failed"), "{e}");
     // An unsealed internal key planted before morsec ran is refused, not adopted.
     let t2 = TestVault::new();
+    {
+        let _q = quiet().unwrap();
+        t2.vault
+            .delete_locked(&login_keychain().unwrap(), &key(RULES_HMAC_KEY))
+            .unwrap();
+    }
     add_raw(&t2.service, RULES_HMAC_KEY, &[b'x'; HMAC_KEY_LEN]);
     let e = t2.vault.ensure_internal_keys().unwrap_err().to_string();
     assert!(e.contains("seal check failed"), "{e}");
@@ -787,5 +843,51 @@ fn seal_failures_fail_closed() {
         delete_keys_locked(&login_keychain().unwrap(), &t.vault.seal_label()).unwrap();
     }
     let e = t.vault.read_with(&k, |b| b.len()).unwrap_err().to_string();
-    assert!(e.contains("missing"), "{e}");
+    assert!(e.contains("missing or replaced"), "{e}");
+    assert!(
+        t.vault.list().unwrap().is_empty(),
+        "unverifiable items are not listed"
+    );
+}
+
+// protects=the keychain path comes from the user database, not $HOME (round-2 review): a run
+// with HOME pointing at an attacker directory still uses the real login keychain;
+// fails_when=the child follows HOME; no_claim=a symlinked or swapped keychain file at the real
+// path beyond the symlink check
+#[test]
+fn home_env_is_ignored() {
+    if skip() {
+        return;
+    }
+    let t = TestVault::new();
+    let k = key("stripe/test");
+    t.vault
+        .put(
+            &k,
+            SecretBytes::from(CANARY.to_owned()),
+            meta(&k, Tier::Test),
+        )
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("Library/Keychains")).unwrap();
+    let same = dir.path().join("same");
+    std::fs::copy(std::env::current_exe().unwrap(), &same).unwrap();
+    let out = Command::new(&same)
+        .args([
+            "--exact",
+            "macos::tests::acl_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("HOME", dir.path())
+        .env("MORSEC_ACL_SERVICE", &t.service)
+        .env("MORSEC_ACL_KEY", k.as_str())
+        .env("MORSEC_ACL_OP", "get")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("ACL_RESULT=READ {} bytes", CANARY.len())),
+        "{stdout}"
+    );
 }

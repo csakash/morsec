@@ -4,13 +4,15 @@
 //! keychain needs a provisioning profile we don't have yet (`docs/evidence/vault-macos.md`), so
 //! this is the card's fallback:
 //!
-//! - Every operation is **pinned to the login keychain** by path, so a keychain another process
-//!   adds to the search list or makes the default is never read or written.
+//! - Every operation is **pinned to the login keychain** by path (home directory from the user
+//!   database, not `$HOME`; no symlinks), so a keychain another process adds to the search list,
+//!   makes the default, or points `$HOME` at is never read or written.
 //! - Every item is created by `msd` (add-only, after deleting whatever held the name), so the
 //!   keychain's default ACL trusts only `msd`'s **designated requirement** (for a Developer ID
 //!   build: its identifier and team). Another binary, or a replaced `msd`, can't read it.
 //! - Every item is **sealed**: its data carries an ECDSA signature over (service, account,
-//!   metadata, value) made with a non-extractable seal key only `msd` may sign with. The legacy
+//!   metadata, value) made with a non-extractable seal key, pinned by its public-key hash in an
+//!   item only `msd` can read. `list()` returns the sealed metadata, never the comment attribute. The legacy
 //!   keychain lets any binary of the user overwrite an item's data; a changed or planted item
 //!   fails the seal (or the ACL) and is refused, never used.
 //! - Every call runs with keychain **user interaction disabled**, so a denied access is an error
@@ -24,9 +26,10 @@
 //! its own `CFData` on the way in and out and frees it without wiping. Production-tier user
 //! presence is enforced by the approval path (L11), not by the Keychain. Another binary of the
 //! user can make items unusable (delete key items, overwrite data): denial of service, fail
-//! closed. `ensure_*` trust keys that already exist, so `ms init` must call the `reset_*`
-//! functions. A user who clicks "Always Allow" on a keychain dialog raised by another binary
-//! grants it access.
+//! closed. Signing keys (seal, CA) are created only by the `reset_*` functions (`ms init`)
+//! and pinned by public-key hash; `ensure_*` never create them. A user who clicks "Always Allow" on a keychain dialog raised by another binary
+//! grants it access. The keychain *file* belongs to the user: restoring an older copy (rollback)
+//! or swapping in another keychain at the same path is not detected here (`ms doctor`, L07).
 
 mod ffi;
 #[cfg(test)]
@@ -61,11 +64,18 @@ pub const RECEIPTS_HMAC_KEY: &str = "morsec/receipts-hmac";
 /// HMAC key for the rules file (L03).
 pub const RULES_HMAC_KEY: &str = "morsec/rules-hmac";
 
+/// Pins the seal key: SHA-256 of its public key, in an item only `msd` can read (not sealed).
+const SEAL_PIN: &str = "morsec/seal-id";
+
+/// Pins the CA key the same way.
+const CA_PIN: &str = "morsec/ca-id";
+
 /// Length of each internal HMAC key, in bytes.
 pub const HMAC_KEY_LEN: usize = 32;
 
 // errSec* codes we treat specially.
 const ERR_NOT_FOUND: i32 = -25300;
+const ERR_DUPLICATE: i32 = -25299;
 const ERR_AUTH_FAILED: i32 = -25293;
 const ERR_INTERACTION_NOT_ALLOWED: i32 = -25308;
 const ERR_USER_CANCELED: i32 = -128;
@@ -196,9 +206,15 @@ impl KeychainVault {
 
     // --- Inner operations. The caller holds `quiet()`. ---
 
-    /// Reads one item and checks its seal. The keychain hands back a buffer sized exactly to the
-    /// item data, which moves into a `SecretBytes` without another copy.
+    /// Reads one item and checks its seal.
     fn read_locked(&self, kc: &SecKeychain, name: &KeyName) -> Result<Opened> {
+        let blob = self.read_raw_locked(kc, name)?;
+        self.open(kc, name, blob)
+    }
+
+    /// Reads one item's data, unchecked. The keychain hands back a buffer sized exactly to the
+    /// item data, which moves into a `SecretBytes` without another copy.
+    fn read_raw_locked(&self, kc: &SecKeychain, name: &KeyName) -> Result<SecretBytes> {
         let found = self
             .item_query(kc, name)
             .load_data(true)
@@ -222,7 +238,7 @@ impl KeychainVault {
             ));
         }
         match items.pop() {
-            Some(SearchResult::Data(v)) => self.open(kc, name, SecretBytes::new(v)),
+            Some(SearchResult::Data(v)) => Ok(SecretBytes::new(v)),
             _ => Err(Error::io(
                 format!("reading {name}"),
                 std::io::Error::other("the keychain returned no data. Run: ms doctor"),
@@ -258,23 +274,94 @@ impl KeychainVault {
             return Err(tampered());
         }
         let (meta_json, value) = rest.split_at(meta_len);
-        let meta: KeyMeta = serde_json::from_slice(meta_json).map_err(|_| tampered())?;
-        if meta.name != *name {
-            return Err(tampered());
-        }
-        let seal = self.seal_key_locked(kc, false)?;
+        // Verify first; parse only bytes the seal vouches for.
+        let seal = self.seal_key_locked(kc)?;
         let digest = seal_digest(&self.service, name, meta_json, value);
         if !seal.verify_digest_locked(&digest, sig) {
             return Err(tampered());
         }
+        let meta: KeyMeta = serde_json::from_slice(meta_json).map_err(|_| tampered())?;
+        if meta.name != *name {
+            return Err(tampered());
+        }
         let start = b.len() - value.len();
-        Ok(Opened { blob, start })
+        Ok(Opened { blob, start, meta })
     }
 
-    /// The vault seal key: a non-extractable P-256 key only this binary may sign with. `create`
-    /// makes one when there is none (writing); reading never does.
-    fn seal_key_locked(&self, kc: &SecKeychain, create: bool) -> Result<CaKey> {
-        load_signing_key(kc, &self.seal_label(), create, "the vault seal key")
+    /// The vault seal key: the non-extractable P-256 key whose public key matches the pin
+    /// [`SEAL_PIN`]. Created only by [`Self::reset_internal_keys`] (`ms init`).
+    fn seal_key_locked(&self, kc: &SecKeychain) -> Result<CaKey> {
+        self.load_pinned_key(kc, &self.seal_label(), SEAL_PIN, "the vault seal key")
+    }
+
+    /// Loads the signing key under `label` whose public key hash equals the pin stored in item
+    /// `pin`. The pin item was created by this binary, so only it can read it; another binary
+    /// can neither delete it nor overwrite it into something readable (both tested). Keys planted
+    /// under the same label, even ones this binary may sign with, don't match the pin and are
+    /// ignored; if ours was deleted, nothing matches and this fails closed.
+    fn load_pinned_key(
+        &self,
+        kc: &SecKeychain,
+        label: &str,
+        pin: &str,
+        what: &str,
+    ) -> Result<CaKey> {
+        let pin_name = KeyName::new(pin)?;
+        let want = match self.read_raw_locked(kc, &pin_name) {
+            Ok(v) if v.len() == 32 => v,
+            Ok(_) => return Err(untrusted(what, "its pin is malformed")),
+            Err(Error::NoSuchKey(_)) => {
+                return Err(untrusted(
+                    what,
+                    "it has not been created yet (or its pin is missing)",
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        for key in find_private_keys(kc, label)? {
+            let k = CaKey { key };
+            if k.public_hash_locked().is_some_and(|h| h == want.expose())
+                && k.is_non_extractable_locked()
+            {
+                return Ok(k);
+            }
+        }
+        Err(untrusted(
+            what,
+            "it is missing or replaced (deleted outside morsec)",
+        ))
+    }
+
+    /// Creates a fresh signing key under `label` and pins it in item `pin`, replacing both. Keys
+    /// already under the label (ours or planted) are deleted first; a key we may not delete fails
+    /// closed.
+    fn reset_pinned_key(&self, kc: &SecKeychain, label: &str, pin: &str) -> Result<CaKey> {
+        delete_keys_locked(kc, label)?;
+        let key = generate_key(kc, label)?;
+        let hash = key.public_hash_locked().ok_or_else(|| {
+            Error::io(
+                "pinning a new signing key",
+                std::io::Error::other("the keychain returned no public key. Run: ms doctor"),
+            )
+        })?;
+        let pin_name = KeyName::new(pin)?;
+        self.delete_locked(kc, &pin_name)?;
+        self.add_raw_locked(kc, &pin_name, &hash)?;
+        Ok(key)
+    }
+
+    /// Adds an unsealed item (pins only), add-only.
+    fn add_raw_locked(&self, kc: &SecKeychain, name: &KeyName, data: &[u8]) -> Result<()> {
+        let mut add = ItemAddOptions::new(ItemAddValue::Data {
+            class: ItemClass::generic_password(),
+            data: CFData::from_buffer(data),
+        });
+        add.set_service(&self.service)
+            .set_account_name(name.as_str())
+            .set_label(format!("morsec {name}"))
+            .set_location(Location::FileKeychain(kc.clone()));
+        add.add()
+            .map_err(|e| keychain_error("storing", name.as_str(), e))
     }
 
     /// Deletes one item. `Ok(false)` when there was none.
@@ -315,7 +402,7 @@ impl KeychainVault {
         })?;
         // Seal: sign (service, account, metadata, value) with the seal key, and store the
         // signature and metadata with the value, so a change made outside morsec is detected.
-        let seal = self.seal_key_locked(kc, true)?;
+        let seal = self.seal_key_locked(kc)?;
         let digest = seal_digest(&self.service, name, comment.as_bytes(), value.expose());
         let sig = seal.sign_digest_locked(&digest)?;
         let (Ok(sig_len), Ok(meta_len)) = (u8::try_from(sig.len()), u16::try_from(comment.len()))
@@ -345,8 +432,19 @@ impl KeychainVault {
             .set_label(format!("morsec {name}"))
             .set_comment(comment)
             .set_location(Location::FileKeychain(kc.clone()));
-        add.add()
-            .map_err(|e| keychain_error("storing", name.as_str(), e))
+        add.add().map_err(|e| {
+            if e.code() == ERR_DUPLICATE {
+                Error::io(
+                    format!("storing {name} (OSStatus {ERR_DUPLICATE})"),
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "another writer stored it at the same moment. Retry",
+                    ),
+                )
+            } else {
+                keychain_error("storing", name.as_str(), e)
+            }
+        })
     }
 
     /// Replaces an item: delete, then add-only. Deleting first is deliberate: an item another
@@ -403,10 +501,8 @@ impl KeychainVault {
     /// At startup: makes sure the internal HMAC keys ([`RECEIPTS_HMAC_KEY`], [`RULES_HMAC_KEY`])
     /// exist, creating a missing one ([`HMAC_KEY_LEN`] bytes from `SecRandomCopyBytes`).
     /// Existing keys are kept, never rotated: that would break every MAC made with them. A key
-    /// of the wrong length is an error.
-    ///
-    /// This trusts keys that already exist. `ms init` must call [`Self::reset_internal_keys`]
-    /// instead, so keys another process planted before morsec was set up are replaced.
+    /// of the wrong length, or one that fails its seal, is an error. Needs the seal key, so
+    /// [`Self::reset_internal_keys`] (`ms init`) must have run.
     pub fn ensure_internal_keys(&self) -> Result<()> {
         let _q = quiet()?;
         let kc = login_keychain()?;
@@ -422,25 +518,29 @@ impl KeychainVault {
             match self.add_locked(&kc, &name, &value, &meta) {
                 Ok(()) => {}
                 // Another msd created it between our read and add: keep theirs.
-                Err(_) => match self.read_locked(&kc, &name) {
-                    Ok(v) if v.value().len() == HMAC_KEY_LEN => {}
-                    Ok(v) => return Err(bad_hmac_len(&name, v.value().len())),
-                    Err(e) => return Err(e),
-                },
+                Err(Error::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    match self.read_locked(&kc, &name) {
+                        Ok(v) if v.value().len() == HMAC_KEY_LEN => {}
+                        Ok(v) => return Err(bad_hmac_len(&name, v.value().len())),
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(())
     }
 
-    /// For `ms init` on a new vault: replaces the seal key and both internal HMAC keys with fresh
-    /// ones, removing anything already stored under their names (including keys another process
-    /// planted before morsec was set up). Fails closed if an existing item may not be deleted.
-    /// Items sealed with the old seal key can no longer be read afterwards.
+    /// For `ms init` on a new vault: creates and pins a fresh seal key and replaces both internal
+    /// HMAC keys, removing anything already stored under their names (including keys another
+    /// process planted before morsec was set up). Fails closed if an existing item may not be
+    /// deleted. Items sealed with the old seal key can no longer be read afterwards.
     pub fn reset_internal_keys(&self) -> Result<()> {
         let _q = quiet()?;
         let kc = login_keychain()?;
-        delete_keys_locked(&kc, &self.seal_label())?;
-        generate_key(&kc, &self.seal_label())?;
+        self.reset_pinned_key(&kc, &self.seal_label(), SEAL_PIN)?;
         for raw in [RECEIPTS_HMAC_KEY, RULES_HMAC_KEY] {
             let name = KeyName::new(raw)?;
             let (value, meta) = Self::new_hmac_value(&name)?;
@@ -449,35 +549,30 @@ impl KeychainVault {
         Ok(())
     }
 
-    /// At startup: returns the CA signing key, creating it if there is none. The private key is
-    /// a non-extractable P-256 key in the login keychain; its bytes never exist in this process,
-    /// and [`CaKey`] can only sign and give out the public key.
-    ///
-    /// Fails closed when more than one key carries the CA label, or when the stored key is
-    /// extractable (morsec never creates one, so another process planted it). `ms init` must call
-    /// [`Self::reset_ca_key`] instead.
+    /// At startup: returns the CA signing key that [`Self::reset_ca_key`] (`ms init`) created
+    /// and pinned. The private key is a non-extractable P-256 key in the login keychain; its bytes
+    /// never exist in this process, and [`CaKey`] can only sign and give out the public key.
+    /// Fails closed when the pinned key is gone; keys planted under the label are ignored.
     pub fn ensure_ca_key(&self) -> Result<CaKey> {
         let _q = quiet()?;
         let kc = login_keychain()?;
-        load_signing_key(&kc, &self.ca_label(), true, "the CA key")
+        self.load_pinned_key(&kc, &self.ca_label(), CA_PIN, "the CA key")
     }
 
-    /// For `ms init` and rotation: deletes every key with the CA label, then creates a new one.
-    /// Fails closed if a key may not be deleted.
+    /// For `ms init` and rotation: deletes every key with the CA label, then creates and pins a
+    /// new one. Fails closed if a key may not be deleted.
     pub fn reset_ca_key(&self) -> Result<CaKey> {
-        let label = self.ca_label();
         let _q = quiet()?;
         let kc = login_keychain()?;
-        delete_keys_locked(&kc, &label)?;
-        generate_key(&kc, &label)
+        self.reset_pinned_key(&kc, &self.ca_label(), CA_PIN)
     }
 
-    /// Deletes the CA key pair. No error when there is none.
+    /// Deletes the CA key pair and its pin. No error when there is none.
     pub fn delete_ca_key(&self) -> Result<()> {
-        let label = self.ca_label();
         let _q = quiet()?;
         let kc = login_keychain()?;
-        delete_keys_locked(&kc, &label)
+        delete_keys_locked(&kc, &self.ca_label())?;
+        self.delete_locked(&kc, &KeyName::new(CA_PIN)?).map(drop)
     }
 }
 
@@ -489,27 +584,6 @@ fn bad_hmac_len(name: &KeyName, len: usize) -> Error {
             format!("the key is {len} bytes, expected {HMAC_KEY_LEN}. Re-initialise with: ms init"),
         ),
     )
-}
-
-/// Loads the one signing key under `label`, or creates it when there is none and `create` is set.
-/// Fails closed when more than one key carries the label, or the one found is extractable or not
-/// usable by this binary: morsec never makes such a key, so another process planted it.
-fn load_signing_key(kc: &SecKeychain, label: &str, create: bool, what: &str) -> Result<CaKey> {
-    let mut keys = find_private_keys(kc, label)?;
-    match keys.len() {
-        0 if create => generate_key(kc, label),
-        0 => Err(untrusted(what, "it is missing (deleted outside morsec)")),
-        1 => match keys.pop().map(|key| CaKey { key }) {
-            // A key another binary created has that binary on its ACL, not us, so the probe
-            // signature is denied.
-            Some(k) if k.is_non_extractable_locked() && k.sign_locked(b"probe").is_ok() => Ok(k),
-            _ => Err(untrusted(
-                what,
-                "it is exportable or not usable by this msd, so morsec did not create it",
-            )),
-        },
-        _ => Err(untrusted(what, "more than one key carries its label")),
-    }
 }
 
 fn untrusted(what: &str, why: &str) -> Error {
@@ -541,6 +615,7 @@ fn seal_digest(service: &str, name: &KeyName, meta: &[u8], value: &[u8]) -> [u8;
 struct Opened {
     blob: SecretBytes,
     start: usize,
+    meta: KeyMeta,
 }
 
 impl Opened {
@@ -549,15 +624,29 @@ impl Opened {
     }
 }
 
-/// Opens the user's login keychain by path. Every operation is pinned to it.
+/// Opens the user's login keychain by path. Every operation is pinned to it. The home directory
+/// comes from the user database, never `$HOME`, and the path must contain no symlink: otherwise
+/// whoever starts `msd` could point it at a keychain whose password they know.
 fn login_keychain() -> Result<SecKeychain> {
-    let home = std::env::home_dir().ok_or_else(|| {
+    let fail = |why: &str| {
         Error::io(
             "finding the login keychain",
-            std::io::Error::other("no home directory. Run msd as a logged-in user (ms start)"),
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, why.to_owned()),
         )
+    };
+    let home = ffi::home_dir_from_passwd().ok_or_else(|| {
+        fail("no home directory in the user database. Run msd as a logged-in user")
     })?;
     let path = home.join("Library/Keychains/login.keychain-db");
+    match std::fs::canonicalize(&path) {
+        Ok(real) if real == path => {}
+        _ => {
+            return Err(fail(
+                "~/Library/Keychains/login.keychain-db is missing or reached through a symlink. \
+                 Restore the login keychain (Keychain Access), then run: ms doctor",
+            ));
+        }
+    }
     SecKeychain::open(&path).map_err(|e| keychain_error("opening the login keychain", "", e))
 }
 
@@ -648,23 +737,22 @@ impl Vault for KeychainVault {
         }
     }
 
-    /// Metadata of every key. Items whose name or metadata can't be parsed (left by another
-    /// version, or planted: attributes aren't covered by the value's ACL) are skipped, so one bad
-    /// item can't hide the rest. A planted item can add a name to this list, but its value is
-    /// never trusted: `put` replaces it, and reads only ever return it to `msd` itself.
+    /// Metadata of every key, taken from inside each item's seal. The comment attribute is only
+    /// a display copy (any binary of the user can rewrite it), so it is never trusted. Each item
+    /// is read and checked, in `msd` only, and wiped right after. Items that fail (left by
+    /// another version, planted, or changed outside morsec) are skipped, so one bad item can't
+    /// hide the rest; reading such a key reports why.
     fn list(&self) -> Result<Vec<KeyMeta>> {
-        let found = {
-            let _q = quiet()?;
-            let kc = login_keychain()?;
-            // Attributes only: no item data is requested, so no value is decrypted.
-            ItemSearchOptions::new()
-                .keychains(std::slice::from_ref(&kc))
-                .class(ItemClass::generic_password())
-                .service(&self.service)
-                .load_attributes(true)
-                .limit(Limit::All)
-                .search()
-        };
+        let _q = quiet()?;
+        let kc = login_keychain()?;
+        // Attributes only, to find the names.
+        let found = ItemSearchOptions::new()
+            .keychains(std::slice::from_ref(&kc))
+            .class(ItemClass::generic_password())
+            .service(&self.service)
+            .load_attributes(true)
+            .limit(Limit::All)
+            .search();
         let items = match found {
             Ok(items) => items,
             Err(e) if e.code() == ERR_NOT_FOUND => return Ok(Vec::new()),
@@ -679,9 +767,7 @@ impl Vault for KeychainVault {
                 if reserved(&name) {
                     return None;
                 }
-                serde_json::from_str::<KeyMeta>(attrs.get("icmt")?)
-                    .ok()
-                    .filter(|m| m.name == name)
+                self.read_locked(&kc, &name).ok().map(|o| o.meta.clone())
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -735,6 +821,13 @@ impl CaKey {
                     )),
                 )
             })
+    }
+
+    /// SHA-256 of the public key (SEC1), used to pin the key.
+    fn public_hash_locked(&self) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let pubkey = self.key.public_key()?.external_representation()?;
+        Some(Sha256::digest(pubkey.bytes()).into())
     }
 
     fn verify_digest_locked(&self, digest: &[u8; 32], sig: &[u8]) -> bool {
