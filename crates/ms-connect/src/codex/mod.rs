@@ -809,6 +809,13 @@ impl CodexConnector {
                 )));
             };
             if s.get("command").is_none() {
+                if r.carried {
+                    warnings.push(format!(
+                        "the MCP server \"{}\" is no longer a local server Codex starts, so morsec dropped its reference {}",
+                        r.server, r.name
+                    ));
+                    continue;
+                }
                 return Err(err(format!(
                     "the MCP server \"{}\" has no command (a remote server, or not set up yet); morsec can only give references to local servers Codex starts",
                     r.server

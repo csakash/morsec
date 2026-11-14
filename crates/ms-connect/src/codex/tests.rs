@@ -791,6 +791,25 @@ fn carried_ref_for_removed_server_is_dropped() {
     assert!(again.previous_mcp_refs().unwrap().is_empty());
     again.mcp_refs = vec![McpRef::parse("gh:GH_TOKEN=ms://gh/t").unwrap()];
     assert!(again.try_plan(&cfg(&[])).is_err());
+
+    // Review N1: a server that became remote (url, no command) drops a carried ref too.
+    let mut e = env();
+    write_config(&e.c, "[mcp_servers.gh]\ncommand = \"gh-mcp\"\n");
+    e.c.mcp_refs = vec![McpRef::parse("gh:GH_TOKEN=ms://gh/t").unwrap()];
+    connect(&e.c, &cfg(&[]));
+    let mut d: DocumentMut = config(&e.c).unwrap().parse().unwrap();
+    let gh = d["mcp_servers"]["gh"].as_table_like_mut().unwrap();
+    gh.remove("command");
+    gh.insert("url", toml_edit::value("https://gh"));
+    std::fs::write(&e.c.paths.config, d.to_string()).unwrap();
+    let mut again = e.c.clone();
+    again.mcp_refs = e.c.previous_mcp_refs().unwrap();
+    let p = again.try_plan(&cfg(&[])).unwrap();
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("no longer a local server"))
+    );
 }
 
 // protects=review R4: a config the user deleted after connect, re-created by a re-run, is

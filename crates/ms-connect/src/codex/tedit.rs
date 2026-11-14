@@ -609,6 +609,26 @@ mod tests {
     }
 }
 
+/// Top-level `config.toml` tables whose headers the preview may show (others print as `…`).
+const CODEX_SECTIONS: &[&str] = &[
+    "shell_environment_policy",
+    "mcp_servers",
+    "projects",
+    "profiles",
+    "features",
+    "permissions",
+    "sandbox_workspace_write",
+    "notice",
+    "tui",
+    "skills",
+    "tools",
+    "model_providers",
+    "history",
+    "otel",
+    "notify",
+    "hooks",
+];
+
 /// A changed `config.toml` line for display: table headers and keys as they are, and a value
 /// only when every string in it is one `safe` says morsec wrote. Anything else becomes `"…"`, so
 /// a user's own value (a token in an MCP server's env) never reaches the terminal or an agent's
@@ -650,7 +670,12 @@ pub fn redact_line(line: &str, safe: &dyn Fn(&str) -> bool) -> String {
                 _ => break,
             }
         }
-        if keys.is_empty() || !keys.iter().all(|(k, bare)| *bare || safe(k)) {
+        // The first key must also be a Codex section: a bare `[ghp_TOKEN]` line inside a
+        // multi-line string parses as a header too (review N2).
+        let section = keys
+            .first()
+            .is_some_and(|(k, _)| CODEX_SECTIONS.contains(&k.as_str()) || safe(k));
+        if !section || !keys.iter().all(|(k, bare)| *bare || safe(k)) {
             return "…".to_owned();
         }
         let keys: Vec<String> = keys.into_iter().map(|(k, _)| k).collect();
@@ -741,5 +766,7 @@ mod redact_tests {
         );
         assert_eq!(redact_line("[[skills.config]]", &safe), "[[skills.config]]");
         assert_eq!(redact_line("[projects.\"/Users/me\"]", &safe), "…");
+        assert_eq!(redact_line("[ghp_SECRET123]", &safe), "…");
+        assert_eq!(redact_line("[[12345]]", &safe), "…");
     }
 }
