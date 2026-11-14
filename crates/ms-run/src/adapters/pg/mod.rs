@@ -287,6 +287,14 @@ impl ContextAdapter for PrismaAdapter {
         let Some(class) = prisma::class_of(&argv) else {
             return Err(adapter_invalid("this isn't a prisma command"));
         };
+        // A read-only key would switch off the approval a writable key's URL needs (security
+        // review S1-b), so a prisma call takes read-only keys only, or writable keys only.
+        let read_only = ctx.keys.values().filter(|f| f.read_only).count();
+        if read_only > 0 && read_only < ctx.keys.len() {
+            return Err(adapter_refuse(
+                "a prisma call can't mix a read-only key with one that can write; run it with read-only keys only, or writable keys only",
+            ));
+        }
         for (key, f) in &ctx.keys {
             if !f.read_only {
                 continue;
@@ -332,7 +340,8 @@ impl ContextAdapter for PrismaAdapter {
     fn needs_approval(&self, call: &RunCall, ctx: &CallContext<'_>) -> Option<String> {
         let class = Self::class(call)?;
         // A read-only key refuses writes in `plan`, and reading commands run only after the role
-        // check proves the role can't write: no person needed (review R7).
+        // check proves the role can't write: no person needed (review R7). A call mixing
+        // read-only and writable keys is refused in `plan` (S1-b), so no person is asked for it.
         if ctx.keys.values().any(|f| f.read_only) {
             return None;
         }
@@ -455,6 +464,57 @@ mod tests {
             (self.runner.plan_in(&input, &call, &keys, &ctx), esc)
         }
 
+        /// `DATABASE_URL=ms://pg/x` (writable) and `READ_URL=ms://pg/ro` (read-only) together.
+        fn plan_mixed(
+            &self,
+            argv: &[&str],
+        ) -> std::result::Result<crate::Prepared, crate::RunError> {
+            let ro = KeyName::new("pg/ro").unwrap();
+            self.vault
+                .put(
+                    &ro,
+                    SecretBytes::from("postgres://r:pw@127.0.0.1:1/db".to_owned()),
+                    KeyMeta {
+                        name: ro.clone(),
+                        mode: Mode::Run,
+                        tier: Tier::Test,
+                        created_unix_ms: 0,
+                    },
+                )
+                .unwrap();
+            let input = RunInput::new(
+                argv.iter().map(|s| s.to_string()).collect(),
+                self.cwd.clone(),
+                vec![
+                    ("DATABASE_URL".into(), "ms://pg/x".into()),
+                    ("READ_URL".into(), "ms://pg/ro".into()),
+                ],
+            )
+            .unwrap();
+            let call = Runner::call(
+                &input,
+                self.cwd.clone(),
+                SessionId {
+                    agent: AgentKind::ClaudeCode,
+                    pid: 1,
+                    started_unix_ms: 1,
+                },
+            );
+            let x = KeyName::new("pg/x").unwrap();
+            let fact = |read_only| KeyFacts {
+                tier: Tier::Test,
+                read_only,
+            };
+            let ctx = CallContext {
+                vault: &self.vault,
+                keys: BTreeMap::from([(x.clone(), fact(false)), (ro.clone(), fact(true))]),
+                env_keys: BTreeSet::new(),
+            };
+            assert!(self.runner.needs_approval(&call, &ctx).is_none());
+            self.runner
+                .plan_in(&input, &call, &BTreeSet::from([x, ro]), &ctx)
+        }
+
         fn output(&self, p: crate::Prepared) -> String {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -495,6 +555,9 @@ mod tests {
             esc.is_some(),
             "pnpm with a valued option slipped past the prisma adapter"
         );
+        // Security review S1-b: a read-only passenger key can't switch the approval off.
+        let e = t.plan_mixed(&["prisma", "generate"]).unwrap_err().message;
+        assert!(e.contains("can't mix"), "{e}");
         // Security review S1: even `generate` runs project code with the URL, so it asks too.
         let (_, esc) = t.plan(&["prisma", "generate"], &env, false);
         assert!(esc.is_some_and(|w| w.contains("project code")));
