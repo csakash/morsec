@@ -74,6 +74,9 @@ pub(crate) fn run(a: &DoctorArgs) -> ExitCode {
     let mut report = Report::default();
     let daemon = daemon_section(&mut report);
     let port = daemon.as_ref().and_then(|d| d.proxy_port);
+    if daemon.is_some() {
+        report.section("run shims", shim_items());
+    }
     agent_section(&mut report, &claude_target(), port);
     agent_section(&mut report, &codex_target(), port);
     report.section("mcp", mcp_checks());
@@ -549,6 +552,84 @@ fn agent_items(
         (Ok(Some(_)), Some(_)) => items.push(Item::pass("proxy port matches msd")),
         (Err(e), _) => items.push(Item::fail(format!("connector state unreadable · {e}"))),
         _ => {}
+    }
+    items
+}
+
+/// Run-mode shims (L12): when a run key allows programs, `ms-shim` must sit next to `ms` and
+/// `~/.morsec/shims/<program>` must be it (a hard link, or a byte-identical copy).
+fn shim_items() -> Vec<Item> {
+    let rules = match crate::run::fetch_rules() {
+        Ok(r) => r,
+        Err(e) => return vec![Item::fail(format!("run rules not readable · {e}"))],
+    };
+    let want = crate::run::wanted(&rules);
+    if want.is_empty() {
+        return vec![Item::info(
+            "no run-mode key allows a program, so no shims are needed",
+        )];
+    }
+    let shim = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map(|p| p.with_file_name("ms-shim"));
+    let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+    else {
+        return vec![Item::fail(
+            "HOME is not set, so ~/.morsec/shims can't be checked",
+        )];
+    };
+    let dir = home.join(".morsec/shims");
+    let on_path =
+        std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == dir));
+    shim_check(shim.ok().as_deref(), &dir, &want, on_path)
+}
+
+fn shim_check(
+    shim: Option<&Path>,
+    dir: &Path,
+    want: &std::collections::BTreeSet<String>,
+    on_path: bool,
+) -> Vec<Item> {
+    use std::os::unix::fs::MetadataExt;
+    let Some((shim, meta)) = shim.and_then(|s| std::fs::metadata(s).ok().map(|m| (s, m))) else {
+        return vec![Item::fail(
+            "ms-shim is not installed next to ms · reinstall morsec (brew reinstall morsec)",
+        )];
+    };
+    let bytes = std::fs::read(shim).unwrap_or_default();
+    let is_shim = |p: &Path| {
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            (m.dev(), m.ino()) == (meta.dev(), meta.ino())
+                || (m.file_type().is_file()
+                    && m.len() == meta.len()
+                    && std::fs::read(p).is_ok_and(|b| b == bytes))
+        })
+    };
+    let bad: Vec<&str> = want
+        .iter()
+        .filter(|n| !is_shim(&dir.join(n)))
+        .map(String::as_str)
+        .collect();
+    let mut items = vec![if bad.is_empty() {
+        Item::pass(format!(
+            "{} shim{} linked in {}",
+            want.len(),
+            if want.len() == 1 { "" } else { "s" },
+            dir.display()
+        ))
+    } else {
+        Item::fail(format!(
+            "shims missing or stale: {} · run: ms run --link-shims",
+            bad.join(", ")
+        ))
+    }];
+    if !on_path {
+        items.push(Item::warn(format!(
+            "{} is not on this terminal's PATH (agents get it from their connector); add it to run these programs through morsec here too",
+            dir.display()
+        )));
     }
     items
 }
@@ -1606,6 +1687,33 @@ mod tests {
         assert_eq!(outcome, "exit 0");
         assert!(text.contains("morsec-probe-line"), "{text:?}");
         assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
+    }
+
+    // protects=L12 shims: a run program without a linked ms-shim in ~/.morsec/shims is a problem
+    // with its fix; a linked one passes; a missing ms-shim is a problem; shims not on PATH is a
+    // warning; fails_when=a missing or foreign file passes as a shim; no_claim=ms run itself
+    #[test]
+    fn shim_check_verdicts() {
+        let d = tempfile::tempdir().unwrap();
+        let shim = d.path().join("ms-shim");
+        std::fs::write(&shim, b"shim-bytes").unwrap();
+        let dir = d.path().join("shims");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::hard_link(&shim, dir.join("psql")).unwrap();
+        std::fs::write(dir.join("deploy"), b"something else").unwrap();
+        let want = |n: &[&str]| n.iter().map(|s| (*s).to_owned()).collect();
+        let items = shim_check(Some(&shim), &dir, &want(&["psql"]), true);
+        assert_eq!(
+            items.iter().map(|i| i.mark).collect::<Vec<_>>(),
+            [Mark::Pass]
+        );
+        let items = shim_check(Some(&shim), &dir, &want(&["psql", "deploy", "git"]), false);
+        assert_eq!(items[0].mark, Mark::Fail);
+        assert!(items[0].text.contains("deploy, git"), "{}", items[0].text);
+        assert!(items[0].text.contains("ms run --link-shims"));
+        assert_eq!(items[1].mark, Mark::Warn);
+        let items = shim_check(Some(&d.path().join("nope")), &dir, &want(&["psql"]), true);
+        assert_eq!(items[0].mark, Mark::Fail);
     }
 
     #[test]
