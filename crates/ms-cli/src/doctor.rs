@@ -932,11 +932,26 @@ fn direct(targets: &[String]) -> (bool, Vec<String>) {
     (false, notes)
 }
 
+/// `host:port` with a non-empty host and a port from 1 to 65535.
+fn valid_target(t: &str) -> bool {
+    t.rsplit_once(':').is_some_and(|(h, p)| {
+        !h.is_empty() && !h.contains(['/', ' ']) && p.parse::<u16>().is_ok_and(|p| p > 0)
+    })
+}
+
 fn probe(nonce: Option<&str>, targets: &[String]) -> ExitCode {
     if let Some(n) = nonce
         && !valid_nonce(n)
     {
         eprintln!("morsec: --nonce must be 32 lowercase hex characters");
+        return ExitCode::from(2);
+    }
+    // A target that can't even be parsed must not count as "blocked".
+    if let Some(bad) = targets.iter().find(|t| !valid_target(t)) {
+        eprintln!(
+            "{}",
+            terminal_safe(&format!("morsec: --direct-target {bad:?} is not host:port"))
+        );
         return ExitCode::from(2);
     }
     let canary_nonce = match nonce {
