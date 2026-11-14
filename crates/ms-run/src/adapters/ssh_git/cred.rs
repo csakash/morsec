@@ -28,6 +28,8 @@ pub const MAX_MESSAGE: usize = 8 * 1024;
 const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Most config output read.
 const MAX_CONFIG_OUTPUT: u64 = 1024 * 1024;
+/// Longest username echoed back (so the answer never outgrows its buffer, review R6).
+const MAX_USERNAME: usize = 256;
 /// The username when the request names none (GitHub's for tokens; most hosts accept any).
 pub const DEFAULT_USERNAME: &str = "x-access-token";
 
@@ -107,6 +109,9 @@ pub(crate) fn answer(ctx: &CredCtx, request: &[u8]) -> Zeroizing<Vec<u8>> {
         .filter(|u| !u.is_empty())
         .cloned()
         .unwrap_or_else(|| DEFAULT_USERNAME.to_owned());
+    if user.len() > MAX_USERNAME || user.contains(['\r', '\0']) {
+        return refuse("the username in the request is too long or holds control characters");
+    }
     let event = AuditEvent {
         key: ctx.key.clone(),
         action: Action::Credential {
@@ -159,20 +164,46 @@ fn parse(request: &[u8]) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// Config keys in the repository's own files (`local`, `worktree`) that could send the token to
-/// another program or host. The forced settings the run passes win over the plain ones, but not
-/// over URL-scoped (`http.<url>.*`, `credential.<url>.*`) or multi-valued ones, so any of these
-/// refuses the credential.
-pub(crate) fn risky_key(scope: &str, name: &str) -> bool {
+/// Config keys a repository's own files (`local`, `worktree`) may set while a credential is
+/// handed out. Everything else refuses it (review R1): the repository's config is writable by the
+/// agent, and git keys that run programs (`remote.*.receivepack`, `alias.*`, `protocol.*`,
+/// `remote.*.vcs`, filters, `core.*` commands), send traffic elsewhere (`http.*`, proxies,
+/// `url.*`), add helpers (`credential.*`) or pull in other files (`include*`, `submodule.*`) are
+/// too many to list one by one, so this is an allowlist of plain bookkeeping keys.
+pub(crate) fn allowed_repo_key(scope: &str, name: &str) -> bool {
     if scope != "local" && scope != "worktree" {
-        return false;
+        return true;
     }
     let n = name.to_ascii_lowercase();
-    n.starts_with("http.")
-        || n.starts_with("credential.")
-        || n.starts_with("include.")
-        || n.starts_with("includeif.")
-        || (n.starts_with("remote.") && (n.ends_with(".proxy") || n.ends_with(".proxyauthmethod")))
+    const PLAIN: &[&str] = &[
+        "core.repositoryformatversion",
+        "core.filemode",
+        "core.bare",
+        "core.logallrefupdates",
+        "core.ignorecase",
+        "core.precomposeunicode",
+        "core.symlinks",
+        "core.autocrlf",
+        "core.eol",
+        "user.name",
+        "user.email",
+        "pull.rebase",
+        "pull.ff",
+        "push.default",
+        "push.autosetupremote",
+        "fetch.prune",
+        "init.defaultbranch",
+        "extensions.objectformat",
+        "extensions.worktreeconfig",
+    ];
+    if PLAIN.contains(&n.as_str()) {
+        return true;
+    }
+    // remote.<name>.<key> and branch.<name>.<key>: the name may hold dots, the key is last.
+    let last = n.rsplit('.').next().unwrap_or("");
+    (n.starts_with("remote.")
+        && ["url", "pushurl", "fetch", "tagopt", "prune", "mirror"].contains(&last))
+        || (n.starts_with("branch.") && ["remote", "merge", "rebase", "pushremote"].contains(&last))
 }
 
 /// Why the repository's config makes the credential unsafe to hand out, if it does. Runs
@@ -226,7 +257,7 @@ fn config_problem(ctx: &CredCtx) -> Option<String> {
     let bad: Vec<&str> = text
         .lines()
         .filter_map(|l| l.split_once('\t'))
-        .filter(|(scope, name)| risky_key(scope, name))
+        .filter(|(scope, name)| !allowed_repo_key(scope, name))
         .map(|(_, name)| name)
         .take(3)
         .collect();
@@ -234,7 +265,7 @@ fn config_problem(ctx: &CredCtx) -> Option<String> {
         None
     } else {
         Some(format!(
-            "the repository's git config sets {} (credential helpers, proxies, TLS settings and includes could send the token elsewhere); remove them from .git/config",
+            "the repository's git config sets {} (with a git credential, a repository may set only plain keys such as remote.<name>.url and branch.<name>.merge: others can run programs or send the token elsewhere); remove them from .git/config",
             bad.iter()
                 .map(|n| n
                     .chars()
@@ -353,16 +384,41 @@ mod tests {
         assert_eq!(audit.events().len(), MAX_ANSWERS + 1);
     }
 
-    // protects=only the repository's own files are checked, by scope; fails_when=a risky local
-    // key passes or a command-line (morsec's own) key is refused; no_claim=-
+    // protects=review R1: with a credential, the repository's own config may hold only plain
+    // bookkeeping keys; keys that run programs (receivepack, uploadpack, vcs, alias, protocol,
+    // filters), route traffic (http, proxy, url) or add helpers and files are refused; morsec's
+    // own command-line keys and the default config git init writes pass; fails_when=one of
+    // those passes or a plain repository is refused; no_claim=-
     #[test]
-    fn risky_keys() {
-        assert!(risky_key("local", "http.sslVerify"));
-        assert!(risky_key("worktree", "Credential.https://x.helper"));
-        assert!(risky_key("local", "includeIf.gitdir:/x.path"));
-        assert!(risky_key("local", "remote.origin.proxy"));
-        assert!(!risky_key("local", "remote.origin.url"));
-        assert!(!risky_key("command", "credential.helper"));
-        assert!(!risky_key("local", "core.hookspath"));
+    fn repo_config_allowlist() {
+        for ok in [
+            "core.repositoryformatversion",
+            "core.bare",
+            "remote.origin.url",
+            "remote.my.fork.fetch",
+            "branch.main.merge",
+            "user.email",
+        ] {
+            assert!(allowed_repo_key("local", ok), "{ok}");
+        }
+        for bad in [
+            "http.sslVerify",
+            "Credential.https://x.helper",
+            "includeIf.gitdir:/x.path",
+            "remote.origin.proxy",
+            "remote.origin.receivepack",
+            "remote.origin.uploadpack",
+            "remote.origin.vcs",
+            "protocol.ext.allow",
+            "alias.c",
+            "url.https://x.insteadof",
+            "submodule.a.url",
+            "filter.lfs.clean",
+            "core.sshcommand",
+            "core.askpass",
+        ] {
+            assert!(!allowed_repo_key("worktree", bad), "{bad}");
+        }
+        assert!(allowed_repo_key("command", "credential.helper"));
     }
 }

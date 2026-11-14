@@ -205,12 +205,21 @@ struct Shared {
 impl Shared {
     /// A peer may talk to the run's sockets only if it is this user's and in the run's process
     /// group, and the session is still open.
-    fn peer_ok(&self, s: &tokio::net::UnixStream) -> bool {
+    async fn peer_ok(&self, s: &tokio::net::UnixStream) -> bool {
         if self.closed.load(Ordering::SeqCst) {
             return false;
         }
-        let Some(&pgid) = self.pgid.get() else {
-            return false;
+        // The child may connect before the runner reports its group (review R5): wait briefly.
+        let mut tries = 0;
+        let pgid = loop {
+            if let Some(&g) = self.pgid.get() {
+                break g;
+            }
+            tries += 1;
+            if tries > 50 {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         };
         let Ok(cred) = s.peer_cred() else {
             return false;
@@ -447,7 +456,7 @@ where
             tokio::time::sleep(Duration::from_millis(20)).await;
             continue;
         };
-        if !shared.peer_ok(&stream) {
+        if !shared.peer_ok(&stream).await {
             continue;
         }
         let Some(std) = shared.adopt(stream) else {
@@ -601,7 +610,29 @@ impl RunAdapter for SshGitAdapter<'_> {
                     ("core.hooksPath".into(), "/dev/null".into()),
                     ("core.fsmonitor".into(), "false".into()),
                     ("http.sslVerify".into(), "true".into()),
+                    // No submodule recursion: a submodule's own config is never checked.
+                    ("submodule.recurse".into(), "false".into()),
+                    ("push.recurseSubmodules".into(), "no".into()),
+                    ("fetch.recurseSubmodules".into(), "false".into()),
                 ];
+                // Only the transports this run needs (review R1): no local paths (a local
+                // push runs receive-pack and the remote's hooks inside the run), no `ext::`,
+                // no plain git or http. Per-protocol keys are forced too, since a repository's
+                // `protocol.<name>.allow` would beat the general `protocol.allow`.
+                config.push(("protocol.allow".into(), "never".into()));
+                for (proto, on) in [
+                    ("file", false),
+                    ("ext", false),
+                    ("git", false),
+                    ("http", false),
+                    ("https", setup.cred.is_some()),
+                    ("ssh", setup.ssh.is_some()),
+                ] {
+                    config.push((
+                        format!("protocol.{proto}.allow"),
+                        if on { "always" } else { "never" }.into(),
+                    ));
+                }
                 if let (Some(forced), Some(ssh)) = (self.forced_ssh(), &setup.ssh) {
                     let cmd: Vec<String> = std::iter::once(ssh.ssh.display().to_string())
                         .chain(forced)

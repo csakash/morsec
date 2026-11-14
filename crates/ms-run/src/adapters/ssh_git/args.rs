@@ -16,14 +16,10 @@ pub enum Tool {
     Git,
 }
 
-/// The tool `argv0` names: a bare `ssh`/`git`, or an absolute path whose file name is one.
+/// The tool `argv0` names: only the bare names `ssh` and `git`, resolved from the trusted path
+/// (an absolute path could be a file the agent wrote, review R3).
 pub fn tool_of(argv0: &str) -> Option<Tool> {
-    let name = if argv0.starts_with('/') {
-        Path::new(argv0).file_name()?.to_str()?
-    } else {
-        argv0
-    };
-    match name {
+    match argv0 {
         "ssh" => Some(Tool::Ssh),
         "git" => Some(Tool::Git),
         _ => None,
@@ -56,6 +52,11 @@ fn check_git(args: &[String]) -> Result<(), RunError> {
             "morsec: git options before the subcommand ({}) are refused with a morsec key: they can change which config, repository or programs git uses. Run from the repository directory instead",
             crate::printable(a)
         ))),
+        Some(_) if args.iter().any(|a| a.starts_with("--recurse-submodules")) => {
+            Err(RunError::denied(
+                "morsec: --recurse-submodules is refused with a morsec key: a submodule's own git config is not checked",
+            ))
+        }
         Some(sub) if sub == "credential" || sub.starts_with("credential-") => {
             Err(RunError::denied(
                 "morsec: git credential commands print credentials, so they don't run with a morsec key",
@@ -111,6 +112,9 @@ fn check_ssh(args: &[String], pins: &[HostPin]) -> Result<(), RunError> {
                         RunError::invalid(format!("morsec: ssh -{} needs a value", f as char))
                     })?
                 };
+                if f == b'o' {
+                    check_ssh_option(&value)?;
+                }
                 if f == b'p' {
                     port =
                         Some(value.parse().ok().filter(|p| *p != 0).ok_or_else(|| {
@@ -147,6 +151,38 @@ fn check_ssh(args: &[String], pins: &[HostPin]) -> Result<(), RunError> {
                 format!(" -p {port}")
             },
             crate::printable(&host),
+        )))
+    }
+}
+
+/// `-o` options a caller may pass to ssh with a morsec key (review R2). The rest could send ssh
+/// to another host (`HostName`, `Port`, `HostKeyAlias`), run code inside it (`PKCS11Provider`,
+/// `SecurityKeyProvider`, `KnownHostsCommand`, `Match exec`), or are morsec's own.
+const SSH_OPTIONS: &[&str] = &[
+    "serveraliveinterval",
+    "serveralivecountmax",
+    "connecttimeout",
+    "connectionattempts",
+    "loglevel",
+    "requesttty",
+    "compression",
+    "tcpkeepalive",
+    "user",
+];
+
+fn check_ssh_option(value: &str) -> Result<(), RunError> {
+    let key = value
+        .trim_start()
+        .split(|c: char| c == '=' || c.is_ascii_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if SSH_OPTIONS.contains(&key.as_str()) {
+        Ok(())
+    } else {
+        Err(RunError::denied(format!(
+            "morsec: ssh -o {} is refused with a morsec key; allowed: ServerAliveInterval, ServerAliveCountMax, ConnectTimeout, ConnectionAttempts, LogLevel, RequestTTY, Compression, TCPKeepAlive, User",
+            crate::printable(&key)
         )))
     }
 }
@@ -260,6 +296,7 @@ mod tests {
             &["-T", "git@github.com"][..],
             &["github.com", "echo", "-A"],
             &["-p", "4422", "me@127.0.0.1", "ls"],
+            &["-oConnectTimeout=5", "-o", "User git", "github.com"],
             &["-p4422", "127.0.0.1"],
             &["ssh://me@127.0.0.1:4422"],
             &["-v", "-o", "ServerAliveInterval=5", "GitHub.com"],
@@ -280,6 +317,14 @@ mod tests {
             &["-I", "/lib.so", "github.com"],
             &["-M", "github.com"],
             &["-Z", "github.com"],
+            &["-o", "HostName=evil.example", "github.com"],
+            &["-oPort=2222", "github.com"],
+            &["-o", "HostKeyAlias github.com", "evil.example"],
+            &["-o", "PKCS11Provider=/tmp/x.dylib", "github.com"],
+            &["-o", "SecurityKeyProvider=/tmp/x.dylib", "github.com"],
+            &["-o", "KnownHostsCommand=/tmp/x", "github.com"],
+            &["-o", "IdentityAgent=/tmp/s", "github.com"],
+            &["-o", "Match exec /tmp/x", "github.com"],
             &["-p"],
             &[],
             &["ssh://github.com:x"],
@@ -302,12 +347,13 @@ mod tests {
             &["--config-env=a=b", "push"],
             &["credential", "fill"],
             &["credential-store", "get"],
+            &["push", "--recurse-submodules=on-demand"],
             &[],
         ] {
             assert!(check(Tool::Git, &v(bad), &[]).is_err(), "{bad:?}");
         }
         assert_eq!(tool_of("git"), Some(Tool::Git));
-        assert_eq!(tool_of("/usr/bin/ssh"), Some(Tool::Ssh));
+        assert_eq!(tool_of("/usr/bin/ssh"), None);
         assert_eq!(tool_of("sshx"), None);
         assert_eq!(tool_of("./git"), None);
     }

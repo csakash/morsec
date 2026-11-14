@@ -302,6 +302,29 @@ hosts = ["*.com"]
 
     // protects=disabled, mode mismatch and an unparsable project file all disable keys (fail
     // closed); fails_when=such a key still allows anything; no_claim=locating the file (CLI)
+    // protects=L16 SPEC D2 (review R7): a project file can't pin SSH host keys; one that tries
+    // fails to parse, which disables every key, pins included; fails_when=a project file adds
+    // a pin or a disabled key keeps one; no_claim=-
+    #[test]
+    fn projects_cant_pin_ssh_hosts() {
+        let pin = "AAAAC3NzaC1lZDI1NTE5AAAAIPtd2fa6erUsRui9x7T64boFCGFRwuEig/mwpm4LdTO7";
+        let text = format!("[keys.\"k\"]\nssh_host_keys = [\"evil.example ssh-ed25519 {pin}\"]\n");
+        assert!(ProjectRules::from_toml(&text, ".morsec.toml").is_err());
+        let mut rule = KeyRule::new(Mode::Run, Tier::Test);
+        rule.commands = vec![CommandPattern::parse(&["git".into(), "push".into()]).unwrap()];
+        rule.ssh_host_keys = vec![
+            crate::model::SshHostKey::parse(&format!("git.example ssh-ed25519 {pin}")).unwrap(),
+        ];
+        let user = Rules {
+            version: 1,
+            keys: BTreeMap::from([(k("k"), rule)]),
+            ..Rules::default()
+        };
+        let (eff, err) = effective(&user, Some(&text), ".morsec.toml");
+        assert!(err.is_some());
+        assert!(eff.keys[&k("k")].ssh_host_keys.is_empty());
+    }
+
     #[test]
     fn disables_fail_closed() {
         let user = Rules::from_toml(USER, "rules.toml").unwrap();
