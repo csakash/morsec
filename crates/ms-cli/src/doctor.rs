@@ -639,6 +639,14 @@ fn live(report: &mut Report) {
             Err(e) => Err(e.to_string()),
         };
         let mut items = vec![Item::info(format!("{} ran: {outcome}", t.bin))];
+        if outcome != "exit 0" {
+            // Why it failed (not signed in, a bad flag...): its last lines, as inert text.
+            items.extend(
+                output_tail(&output, 3)
+                    .into_iter()
+                    .map(|l| Item::info(format!("{} said: {l}", t.bin))),
+            );
+        }
         match held {
             Err(e) => items.push(Item::fail(format!("could not ask msd what it saw · {e}"))),
             Ok((canary, rep)) => {
@@ -740,6 +748,19 @@ fn kill_group(pid: u32) {
     {
         let _ = rustix::process::kill_process_group(p, rustix::process::Signal::KILL);
     }
+}
+
+/// The last `n` non-empty lines of an agent's output, each cut to 200 characters.
+fn output_tail(output: &str, n: usize) -> Vec<String> {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(n)..]
+        .iter()
+        .map(|l| l.chars().take(200).collect())
+        .collect()
 }
 
 struct Verdict {
@@ -1316,6 +1337,16 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn output_tail_is_short() {
+        let long = "x".repeat(500);
+        let out = format!("a\n\n b \nc\n{long}\n\n");
+        let t = output_tail(&out, 3);
+        assert_eq!(t[..2], ["b".to_owned(), "c".to_owned()]);
+        assert_eq!(t[2].len(), 200);
+        assert!(output_tail("", 3).is_empty());
     }
 
     #[test]
