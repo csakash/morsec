@@ -85,6 +85,9 @@ struct Args {
     /// stop verifying.
     #[arg(long, requires = "init")]
     force: bool,
+    /// Tests only (debug builds, with --vault memory): stand in for Touch ID.
+    #[arg(long, value_enum, hide = true)]
+    test_touch_id: Option<approve::TestTouchId>,
 }
 
 fn socket_path(args: &Args) -> ms_core::Result<PathBuf> {
@@ -381,6 +384,13 @@ async fn serve(args: Args) -> ExitCode {
         .proxy_port
         .or_else(|| args.port.and_then(|p| p.checked_add(1)))
         .unwrap_or(DEFAULT_PROXY_PORT);
+    let approvals = match approve::approver(args.test_touch_id, b.is_memory()) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
     let uid = server.owner_uid();
     let opened = {
         let paths = paths.clone();
@@ -389,7 +399,7 @@ async fn serve(args: Args) -> ExitCode {
                 b,
                 paths,
                 proxy_port,
-                Arc::new(approve::DenyApprover),
+                approvals,
                 daemon::identify_by_session(uid),
             )
         })

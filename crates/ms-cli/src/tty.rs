@@ -118,18 +118,3 @@ pub(crate) fn read_stdin_value() -> io::Result<Zeroizing<Vec<u8>>> {
     out.extend_from_slice(&buf[..end]);
     Ok(out)
 }
-
-/// Asks a yes/no question on the controlling terminal (`/dev/tty`), not stdin, so a pipe can't
-/// answer it. Used for the pre-L11 terminal path (L07 SPEC D-A). True only for a typed `yes`.
-pub(crate) fn confirm_at_terminal(question: &str) -> io::Result<bool> {
-    use std::io::{BufRead, BufReader, Read};
-    let mut tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")?;
-    write!(tty, "{question} Type yes to confirm: ")?;
-    tty.flush()?;
-    let mut line = String::new();
-    BufReader::new((&tty).take(64)).read_line(&mut line)?;
-    Ok(line.trim() == "yes")
-}
