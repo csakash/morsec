@@ -59,11 +59,12 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<RunEnv>,
     },
-    /// Run a command with streamed stdin and output (L12; the shim and `ms run`). The connection
-    /// then carries [`RequestBody::RunInput`] / [`RequestBody::RunInputEnd`] from the client and
-    /// [`ResponseBody::RunOutput`] from the daemon, and ends with one [`ResponseBody::RunExit`]
-    /// or [`ResponseBody::Error`], after which the daemon closes it. Closing it early cancels the
-    /// run.
+    /// Run a command with streamed stdin and output (L12; the shim and `ms run`). The daemon
+    /// answers either one [`ResponseBody::Error`] (refused, `not_run`…), or
+    /// [`ResponseBody::RunStarted`], then [`ResponseBody::RunOutput`] frames, then one
+    /// [`ResponseBody::RunExit`] or `Error`; then it closes the connection. After `RunStarted`
+    /// the client sends [`RequestBody::RunInput`] / [`RequestBody::RunInputEnd`]. Closing the
+    /// connection early cancels the run.
     RunStream {
         /// Exact argv.
         argv: Vec<String>,
@@ -300,6 +301,10 @@ pub enum ResponseBody {
         /// False when the scan stopped early (time budget, file cap, unreadable files).
         complete: bool,
     },
+    /// The run passed every check and is starting (L12, `RunStream`): the first frame of a stream
+    /// that runs. A client sends stdin only after it, so a refusal or a `not_run` answer never
+    /// consumes the caller's input.
+    RunStarted,
     /// A chunk of a running command's output, already redacted (L12, `RunStream`).
     RunOutput {
         /// Which stream.

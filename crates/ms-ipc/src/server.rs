@@ -167,6 +167,8 @@ pub struct StreamIo {
 
 /// Frames queued in each direction of a stream.
 const STREAM_QUEUE: usize = 16;
+/// How often a stream whose stdin queue is full checks whether the client hung up.
+const STDIN_POLL: Duration = Duration::from_millis(50);
 
 /// A bound daemon socket. Removes the socket file when dropped.
 #[derive(Debug)]
@@ -675,8 +677,29 @@ async fn serve_stream<H: Handler>(
                 },
                 Err(_) => return,
             };
-            // A handler that stopped reading stdin is fine: drop the bytes.
-            let _ = in_tx.send(event).await;
+            // While the stdin queue is full (the child isn't reading), keep watching the socket:
+            // a client that hangs up must still cancel the run.
+            let mut event = Some(event);
+            while let Some(e) = event.take() {
+                tokio::select! {
+                    permit = in_tx.reserve() => {
+                        // Err: the handler stopped reading stdin; drop the bytes.
+                        if let Ok(p) = permit {
+                            p.send(e);
+                        }
+                    }
+                    ready = rd.ready(tokio::io::Interest::READABLE) => {
+                        match ready {
+                            Ok(r) if !r.is_read_closed() => {
+                                // More frames are waiting behind this one; check again shortly.
+                                tokio::time::sleep(STDIN_POLL).await;
+                                event = Some(e);
+                            }
+                            _ => return,
+                        }
+                    }
+                }
+            }
         }
     };
     let work = async move {

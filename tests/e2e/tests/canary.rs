@@ -809,6 +809,7 @@ echo '== inject'; RUN_TOKEN=ms://run/canary printf '[%s]\n' '; touch {p}' '$(tou
 echo '== exit'; RUN_TOKEN=ms://run/canary ms run -- sh -c 'exit 7'; echo "rc=$?"
 echo '== notallowed'; RUN_TOKEN=ms://run/canary ms run -- ls; echo "rc=$?"
 echo '== outside'; (cd /tmp && RUN_TOKEN=ms://run/canary env); echo "rc=$?"
+echo '== idle'; mkfifo idle.fifo; sleep 20 > idle.fifo & s=$(date +%s); RUN_TOKEN=ms://run/canary env < idle.fifo > /dev/null; echo "took=$(( $(date +%s) - s ))"; kill $! 2>/dev/null; rm -f idle.fifo
 echo '== plain'; env | grep -c AGENT_ONLY
 echo '== done'
 "#,
@@ -882,6 +883,14 @@ echo '== done'
         "1",
         "a ref-less command didn't run locally: {out}"
     );
+    // An open, idle stdin (a terminal nobody types into) must not hold the shim after the
+    // command ended.
+    let took: u64 = section("idle")
+        .trim()
+        .strip_prefix("took=")
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(99);
+    assert!(took < 10, "the shim waited on an idle stdin: {out}");
     clean("the fake agent's output", out.as_bytes());
 
     let state = World::files_under(&w.dir.path().join("state"));

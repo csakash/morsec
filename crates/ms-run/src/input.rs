@@ -24,9 +24,39 @@ pub const MAX_ENV_NAME: usize = 128;
 pub const MAX_ENV_VALUE: usize = 64 * 1024;
 
 /// Variable names a call may never set, whatever their value: the child's search path and
-/// home come from msd, and these change how a program or a shell loads code.
-const DENIED_ENV: &[&str] = &["PATH", "HOME", "SHELL", "IFS", "ENV", "BASH_ENV", "CDPATH"];
-const DENIED_ENV_PREFIXES: &[&str] = &["LD_", "DYLD_"];
+/// home come from msd, and these change how a program, a shell or an interpreter loads code
+/// (an agent could point them at files it wrote).
+const DENIED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "SHELL",
+    "IFS",
+    "ENV",
+    "BASH_ENV",
+    "CDPATH",
+    "PS4",
+    "PROMPT_COMMAND",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "RUBYOPT",
+    "RUBYLIB",
+    "CLASSPATH",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "GCONV_PATH",
+    "TMPDIR",
+];
+const DENIED_ENV_PREFIXES: &[&str] = &[
+    "LD_",
+    "DYLD_",
+    "PYTHON",
+    "PERL",
+    "GIT_",
+    "BASH_FUNC_",
+    "LUA_",
+    "MALLOC_",
+];
 
 /// A validated run request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +180,7 @@ fn check_env(env: &[(String, String)]) -> Result<(), RunError> {
     for (name, value) in env {
         if !env_name_allowed(name) {
             return Err(RunError::denied(format!(
-                "morsec: the environment variable {} can't carry a reference (allowed: letters, digits and '_'; never PATH, HOME, SHELL, IFS, ENV, BASH_ENV, CDPATH, LD_* or DYLD_*)",
+                "morsec: the environment variable {} can't carry a reference (allowed: letters, digits and '_'; never one that changes how programs load code, such as PATH, HOME, BASH_ENV, LD_*, DYLD_*, PYTHON*, PERL*, NODE_OPTIONS, GIT_*)",
                 crate::printable(name)
             )));
         }
@@ -229,6 +259,13 @@ mod tests {
             "BASH_ENV",
             "LD_PRELOAD",
             "DYLD_INSERT_LIBRARIES",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PERL5OPT",
+            "NODE_OPTIONS",
+            "RUBYOPT",
+            "GIT_SSH_COMMAND",
+            "JAVA_TOOL_OPTIONS",
             "1X",
             "A-B",
             "",

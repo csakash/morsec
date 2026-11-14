@@ -39,6 +39,8 @@ use crate::{EffectPreview, EnvValue, ExecPlan, RunAdapter, RunCall};
 
 /// Longest a run may take by default; the IPC connection lifetime (10 min) is the outer bound.
 pub const DEFAULT_MAX_RUNTIME: Duration = Duration::from_secs(590);
+/// How long output may still drain after the child exited and its group was killed.
+pub const EXIT_GRACE: Duration = Duration::from_secs(2);
 /// Bytes read from the child's output per step.
 pub const OUTPUT_CHUNK: usize = 32 * 1024;
 /// Variables copied from msd's own environment into every child, when set.
@@ -321,7 +323,28 @@ impl Runner {
             group.kill();
             status
         };
-        let all = async { tokio::join!(waited, out, err) };
+        let all = async {
+            let pumps = async { tokio::join!(out, err) };
+            tokio::pin!(pumps);
+            tokio::pin!(waited);
+            let mut status = None;
+            loop {
+                tokio::select! {
+                    s = &mut waited, if status.is_none() => status = Some(s),
+                    _ = &mut pumps => break,
+                }
+                if status.is_some() {
+                    // The child is gone and its group killed. A descendant that left the group
+                    // (setsid) may still hold the pipes: don't wait for it past a short grace.
+                    let _ = tokio::time::timeout(EXIT_GRACE, &mut pumps).await;
+                    break;
+                }
+            }
+            match status {
+                Some(s) => s,
+                None => waited.await,
+            }
+        };
         let finished = tokio::time::timeout(self.cfg.max_runtime, async {
             tokio::select! {
                 r = all => r,
@@ -330,7 +353,7 @@ impl Runner {
         })
         .await;
         match finished {
-            Ok((status, _, _)) => {
+            Ok(status) => {
                 use std::os::unix::process::ExitStatusExt;
                 let st = status.map_err(|e| {
                     RunError::internal(format!("morsec: waiting for {shown} failed: {e}"))

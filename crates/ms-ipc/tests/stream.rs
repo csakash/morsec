@@ -41,6 +41,14 @@ impl Handler for Echo {
         let RequestBody::RunStream { argv, .. } = req else {
             return ResponseBody::error(ErrorCode::Protocol, "not a stream");
         };
+        if argv.first().map(String::as_str) == Some("refuse") {
+            return ResponseBody::error(ErrorCode::Denied, "no");
+        }
+        let _ = io.output.send(ResponseBody::RunStarted).await;
+        if argv.first().map(String::as_str) == Some("deaf") {
+            // Never reads stdin.
+            std::future::pending::<()>().await;
+        }
         if argv.first().map(String::as_str) == Some("hang") {
             std::future::pending::<()>().await;
         }
@@ -138,6 +146,27 @@ async fn round_trip() {
     );
 }
 
+// protects=R1: a refusal before RunStarted leaves the caller's stdin unread, so the shim can still
+// pass it to the real tool; fails_when=any stdin byte is consumed; no_claim=-
+#[tokio::test]
+async fn refusal_leaves_stdin_unread() {
+    let (_d, path, _stop) = serve(Arc::new(Echo::default())).await;
+    let client = Client::connect(&path).await.unwrap();
+    let mut input: &[u8] = b"keep me";
+    let last = client
+        .run_stream(stream_req("refuse"), Some(&mut input), |_, _| {})
+        .await
+        .unwrap();
+    assert!(matches!(
+        last,
+        ResponseBody::Error {
+            code: ErrorCode::Denied,
+            ..
+        }
+    ));
+    assert_eq!(input, b"keep me");
+}
+
 // protects=a client that disconnects mid-stream cancels the handler (its future is dropped, which
 // is what kills the child in msd); fails_when=the handler keeps running; no_claim=-
 #[tokio::test]
@@ -172,4 +201,36 @@ async fn default_and_stray_frames() {
     );
     assert!(!RequestBody::RunInputEnd.is_stream());
     assert!(RequestBody::RunInputEnd.owner_loop().contains("L12"));
+}
+
+/// Endless stdin.
+struct Zeros;
+impl tokio::io::AsyncRead for Zeros {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let n = buf.remaining().min(8192);
+        buf.put_slice(&vec![0u8; n]);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+// protects=R4: with the stdin queue full (the handler never reads stdin) a client that hangs up
+// still cancels the run; fails_when=the handler keeps running; no_claim=-
+#[tokio::test]
+async fn disconnect_cancels_under_stdin_backpressure() {
+    let h = Arc::new(Echo::default());
+    let (_d, path, _stop) = serve(h.clone()).await;
+    let client = Client::connect(&path).await.unwrap();
+    let run = client.run_stream(stream_req("deaf"), Some(Zeros), |_, _| {});
+    let _ = tokio::time::timeout(Duration::from_millis(500), run).await;
+    for _ in 0..100 {
+        if h.dropped.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("a client that left during stdin backpressure did not cancel the run");
 }

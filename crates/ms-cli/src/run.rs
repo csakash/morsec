@@ -189,9 +189,13 @@ fn sync_shims(dir: &Path, shim: &Path, want: &BTreeSet<String>) -> Result<Vec<St
         .map_err(|e| format!("morsec: can't create {}: {e}", dir.display()))?;
     let shim_meta =
         std::fs::metadata(shim).map_err(|e| format!("morsec: {}: {e}", shim.display()))?;
-    let same = |m: &std::fs::Metadata| {
+    let shim_bytes = std::fs::read(shim).map_err(|e| format!("morsec: {}: {e}", shim.display()))?;
+    // A shim is a hard link of ms-shim, or a byte-identical copy (cross-device fallback).
+    let same_at = |p: &Path, m: &std::fs::Metadata| {
         (m.dev(), m.ino()) == (shim_meta.dev(), shim_meta.ino())
-            || (m.len() == shim_meta.len() && m.file_type().is_file())
+            || (m.file_type().is_file()
+                && m.len() == shim_meta.len()
+                && std::fs::read(p).is_ok_and(|b| b == shim_bytes))
     };
     let mut lines = Vec::new();
     for e in std::fs::read_dir(dir).map_err(|e| format!("morsec: {}: {e}", dir.display()))? {
@@ -200,7 +204,7 @@ fn sync_shims(dir: &Path, shim: &Path, want: &BTreeSet<String>) -> Result<Vec<St
         let Ok(m) = std::fs::symlink_metadata(e.path()) else {
             continue;
         };
-        if !want.contains(&name) && same(&m) {
+        if !want.contains(&name) && same_at(&e.path(), &m) {
             std::fs::remove_file(e.path()).map_err(|err| format!("morsec: {name}: {err}"))?;
             lines.push(format!("removed {name}"));
         }
@@ -208,8 +212,8 @@ fn sync_shims(dir: &Path, shim: &Path, want: &BTreeSet<String>) -> Result<Vec<St
     for name in want {
         let p = dir.join(name);
         match std::fs::symlink_metadata(&p) {
-            Ok(m) if same(&m) && (m.dev(), m.ino()) == (shim_meta.dev(), shim_meta.ino()) => {}
-            Ok(m) if same(&m) => {
+            Ok(m) if (m.dev(), m.ino()) == (shim_meta.dev(), shim_meta.ino()) => {}
+            Ok(m) if same_at(&p, &m) => {
                 std::fs::remove_file(&p).map_err(|e| format!("morsec: {name}: {e}"))?;
                 place(shim, &p)?;
                 lines.push(format!("updated {name}"));
@@ -283,6 +287,8 @@ mod tests {
         sync_shims(&dir, &shim, &want).unwrap();
         assert!(dir.join("psql").exists() && dir.join("stripe").exists());
         std::fs::write(dir.join("mine"), "user file, different size").unwrap();
+        // Same size as the shim but different bytes: not a shim, never removed.
+        std::fs::write(dir.join("lookalike"), "shim-BINARY").unwrap();
         let want2: BTreeSet<String> = ["psql".into(), "mine".into()].into();
         let lines = sync_shims(&dir, &shim, &want2).unwrap();
         assert!(!dir.join("stripe").exists());

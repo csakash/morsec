@@ -3,7 +3,6 @@
 //! with the run.
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -236,19 +235,21 @@ fn alive(pid: i32) -> bool {
     rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok()
 }
 
-/// Runs `sh -c '<bg> & echo $!; wait'`, returns the background PID once printed, and the run.
-async fn start_with_background(
+/// Starts `sh -c 'sleep 60 & echo $!; wait'`: the run (not yet polled), its output, and the
+/// stdin sender (kept open so stdin never ends).
+#[allow(clippy::type_complexity)]
+fn start_with_background(
     r: &Runner,
 ) -> (
-    i32,
     impl std::future::Future<Output = Result<Exit, ms_run::RunError>> + '_,
     mpsc::Receiver<(OutStream, Vec<u8>)>,
+    mpsc::Sender<StdinEvent>,
 ) {
     let cwd = std::fs::canonicalize(std::env::temp_dir()).unwrap();
     let inp = input(&["sh", "-c", "sleep 60 & echo $!; wait"], &[], &cwd);
     let call = Runner::call(&inp, cwd, session());
     let prepared = r.plan(&inp, &call, &BTreeSet::new(), &vault()).unwrap();
-    let (_in_tx, in_rx) = mpsc::channel(1);
+    let (in_tx, in_rx) = mpsc::channel(1);
     let (out_tx, out_rx) = mpsc::channel(8);
     let fut = r.execute(
         prepared,
@@ -257,8 +258,7 @@ async fn start_with_background(
             output: out_tx,
         },
     );
-    std::mem::forget(_in_tx);
-    (0, fut, out_rx)
+    (fut, out_rx, in_tx)
 }
 
 // protects=cancelling a run (the client went away: the future is dropped) kills the child and
@@ -267,7 +267,7 @@ async fn start_with_background(
 #[tokio::test]
 async fn cancel_kills_the_group() {
     let r = runner(Duration::from_secs(60));
-    let (_, fut, mut out_rx) = start_with_background(&r).await;
+    let (fut, mut out_rx, _stdin) = start_with_background(&r);
     let mut fut = Box::pin(fut);
     let pid = tokio::select! {
         msg = out_rx.recv() => {
@@ -292,7 +292,7 @@ async fn cancel_kills_the_group() {
 #[tokio::test]
 async fn time_limit() {
     let r = runner(Duration::from_millis(500));
-    let (_, fut, mut out_rx) = start_with_background(&r).await;
+    let (fut, mut out_rx, _stdin) = start_with_background(&r);
     let collect = async {
         let mut all = Vec::new();
         while let Some((_, b)) = out_rx.recv().await {
@@ -365,5 +365,40 @@ async fn only_allowed_keys_resolve() {
         .unwrap();
     assert!(!format!("{p:?}").contains(CANARY));
     assert_eq!(p.program(), PathBuf::from("/usr/bin/env"));
-    let _ = OsString::new();
+}
+
+// protects=R3: a descendant that leaves the process group (setsid) and keeps the output pipes
+// open doesn't hold the run past a short grace, and the command's own exit code comes back;
+// fails_when=the run waits for the time limit or reports a signal; no_claim=killing that
+// descendant (it left the group: OUT-4 residual until L23)
+#[tokio::test]
+async fn escaped_descendant_does_not_stall() {
+    if !std::path::Path::new("/usr/bin/perl").exists() {
+        return;
+    }
+    let r = runner(Duration::from_secs(60));
+    let started = std::time::Instant::now();
+    let (exit, _, _) = run(
+        &r,
+        &[
+            "perl",
+            "-e",
+            "use POSIX; if (fork()==0) { POSIX::setsid(); sleep 20; exit 0 } exit 3",
+        ],
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        exit,
+        Exit {
+            code: Some(3),
+            signal: None
+        }
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
 }

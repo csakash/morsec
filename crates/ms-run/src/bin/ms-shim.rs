@@ -46,23 +46,25 @@ fn main() {
     let code = match decide(&name, &args) {
         Ok(Some(code)) => code,
         Ok(None) => exec_real(&name, &args),
-        Err(msg) => {
+        Err((msg, code)) => {
             eprintln!("{}", client::terminal_safe(&msg));
-            client::EXIT_REFUSED
+            code
         }
     };
     std::process::exit(code);
 }
 
-/// `Ok(None)`: run the real tool. `Ok(Some(code))`: done, exit with `code`.
-fn decide(name: &OsStr, args: &[OsString]) -> Result<Option<i32>, String> {
+/// `Ok(None)`: run the real tool. `Ok(Some(code))`: done, exit with `code`. `Err`: a message
+/// and the exit code (SPEC D9).
+fn decide(name: &OsStr, args: &[OsString]) -> Result<Option<i32>, (String, i32)> {
+    let usage = |m: String| (m, EXIT_USAGE);
     let rest = args.get(1..).unwrap_or_default();
-    let env = client::ref_env(std::env::vars_os())?;
-    if !client::args_have_ref(rest)? && env.is_empty() {
+    let env = client::ref_env(std::env::vars_os()).map_err(usage)?;
+    if !client::args_have_ref(rest).map_err(usage)? && env.is_empty() {
         return Ok(None);
     }
     let Some(tool) = name.to_str() else {
-        return Err("morsec: this tool's name is not valid UTF-8".into());
+        return Err(usage("morsec: this tool's name is not valid UTF-8".into()));
     };
     let mut argv = vec![tool.to_owned()];
     for a in rest {
@@ -70,13 +72,20 @@ fn decide(name: &OsStr, args: &[OsString]) -> Result<Option<i32>, String> {
         // arguments can't travel either.
         argv.push(
             a.to_str()
-                .ok_or("morsec: an argument is not valid UTF-8, so the call can't be sent to the broker")?
+                .ok_or_else(|| {
+                    usage("morsec: an argument is not valid UTF-8, so the call can't be sent to the broker".into())
+                })?
                 .to_owned(),
         );
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("morsec: can't read the current directory: {e}"))?;
-    let socket = ms_ipc::default_socket_path().map_err(|e| e.to_string())?;
+    let cwd = std::env::current_dir().map_err(|e| {
+        (
+            format!("morsec: can't read the current directory: {e}"),
+            client::EXIT_INTERNAL,
+        )
+    })?;
+    let socket =
+        ms_ipc::default_socket_path().map_err(|e| (e.to_string(), client::EXIT_UNAVAILABLE))?;
     match client::forward(argv, cwd, env, &socket, true) {
         Outcome::Exit(code) => Ok(Some(code)),
         Outcome::NotRun => Ok(None),

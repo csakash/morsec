@@ -85,9 +85,10 @@ impl Client {
         self.receive(id, RESPONSE_TIMEOUT).await
     }
 
-    /// Runs a command as a stream (`RunStream`, L12): forwards `stdin` (or an immediate end
-    /// when `None`), hands each redacted output chunk to `on_output`, and returns the last frame
-    /// (`RunExit` or `Error`). Consumes the connection: the daemon closes it after a stream.
+    /// Runs a command as a stream (`RunStream`, L12): once the daemon answers `RunStarted`,
+    /// forwards `stdin` (or an immediate end when `None`), hands each redacted output chunk to
+    /// `on_output`, and returns the last frame (`RunExit` or `Error`). If the daemon refuses
+    /// first, `stdin` is never read. Consumes the connection: the daemon closes it after a stream.
     pub async fn run_stream<R, F>(
         mut self,
         request: RequestBody,
@@ -105,6 +106,22 @@ impl Client {
         }
         let id = self.send(&request).await?;
         let (mut rd, mut wr) = self.stream.split();
+        // Nothing of stdin is read until the daemon says the run starts.
+        let started = read_frame(&mut rd)
+            .await?
+            .ok_or_else(|| Error::Protocol("the daemon closed the run".into()))?;
+        match decode::<ResponseBody>(&started)
+            .map_err(|(_, _, m)| Error::Protocol(m))?
+            .body
+        {
+            ResponseBody::RunStarted => {}
+            ResponseBody::RunOutput { .. } => {
+                return Err(Error::Protocol(
+                    "the daemon sent output before the run started".into(),
+                ));
+            }
+            last => return Ok(last),
+        }
         let pump = async move {
             if let Some(mut input) = stdin {
                 let mut buf = vec![0u8; STDIN_CHUNK];

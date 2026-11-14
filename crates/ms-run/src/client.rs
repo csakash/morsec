@@ -118,7 +118,11 @@ pub fn forward(
             return Outcome::Exit(EXIT_INTERNAL);
         }
     };
-    rt.block_on(forward_async(argv, cwd, env, socket, stdin))
+    let out = rt.block_on(forward_async(argv, cwd, env, socket, stdin));
+    // A read of our stdin may still be blocked on a pool thread (a terminal nobody types into);
+    // waiting for it would hang after the command already finished.
+    rt.shutdown_background();
+    out
 }
 
 async fn forward_async(
@@ -200,6 +204,7 @@ fn kind(r: &ResponseBody) -> &'static str {
         ResponseBody::Keys { .. } => "keys",
         ResponseBody::Rules { .. } => "rules",
         ResponseBody::ScanReport { .. } => "scan report",
+        ResponseBody::RunStarted => "run started",
         ResponseBody::RunOutput { .. } => "run output",
         ResponseBody::RunExit { .. } => "run exit",
         ResponseBody::RunResult { .. } => "run result",

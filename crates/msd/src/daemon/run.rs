@@ -36,6 +36,8 @@ use super::{APPROVAL_TIMEOUT, Daemon, PRE_L11, now_ms, reply_err, session_of};
 pub const MAX_RUNS: usize = 8;
 /// Cap per output stream of a buffered `Run`.
 pub const BUFFERED_CAP: usize = 256 * 1024;
+/// Most output bytes in one `RunOutput` frame.
+const FRAME_DATA: usize = 32 * 1024;
 /// Longest argv shown in a receipt's target.
 const TARGET_MAX: usize = 512;
 
@@ -306,15 +308,23 @@ pub(crate) async fn run_stream(
             }
         };
     let StreamIo { input, output } = io;
+    // Only now may the client read its stdin: a refusal above leaves it untouched.
+    if output.send(ResponseBody::RunStarted).await.is_err() {
+        return reply_err(ErrorCode::Internal, "morsec: the client left");
+    }
     let (tx, mut rx) = mpsc::channel::<(ms_ipc::OutStream, Vec<u8>)>(16);
     let forward = async move {
         while let Some((stream, bytes)) = rx.recv().await {
-            let frame = ResponseBody::RunOutput {
-                stream,
-                data: ms_ipc::b64_encode(&bytes),
-            };
-            if output.send(frame).await.is_err() {
-                return;
+            // A redacted chunk can exceed the read size (held-back tail, labels); frames stay
+            // small and far under the frame limit.
+            for part in bytes.chunks(FRAME_DATA) {
+                let frame = ResponseBody::RunOutput {
+                    stream,
+                    data: ms_ipc::b64_encode(part),
+                };
+                if output.send(frame).await.is_err() {
+                    return;
+                }
             }
         }
     };
