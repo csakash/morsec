@@ -200,10 +200,114 @@ pub fn add_unique(
     Ok(())
 }
 
+/// `o` is a wrap with the shape `sha256` records, in the form a record with `shell` unwraps
+/// (shell: `ms run -- /bin/sh -c CMD`).
+fn wrap_fits(o: &Value, sha256: &str, shell: bool) -> bool {
+    let Some(a) = o.get("args").and_then(Value::as_array) else {
+        return false;
+    };
+    wrap_shape_sha256(o) == sha256
+        && a.first() == Some(&Value::str("run"))
+        && (!shell || (a.len() == 5 && a[2] == Value::str("/bin/sh") && a[3] == Value::str("-c")))
+}
+
+fn wrap_note(path: &[String]) -> String {
+    format!(
+        "a command morsec wrapped in {} was edited or moved after ms connect, so morsec can't tell it apart; it is left as it is now (still run through `ms run --`). Edit it back by hand if you need to",
+        dotted(path)
+    )
+}
+
+/// A hook wrap record: (sha256, shell, had_args, position).
+type WrapRec<'a> = (&'a str, bool, bool, Option<(usize, usize)>);
+
+/// Undoes the hook wraps of each event together (review F1, G1, G3). First every record whose
+/// hook is still at the recorded place; then the rest by shape, against the hooks still wrapped.
+/// Records with the same shape and form are interchangeable (the command comes back from the
+/// hook's own argv), so a hook is refused only when it also fits a still-open record of another
+/// form: picking there could turn a shell-form hook into exec form or back.
+fn undo_hook_wraps(root: &mut Value, changes: &[Change], notes: &mut Vec<String>) {
+    let mut events: Vec<&Vec<String>> = Vec::new();
+    for c in changes {
+        if let Change::Wrap { path, .. } = c
+            && matches!(root.at(path), Some(Value::Array(_)))
+            && !events.contains(&path)
+        {
+            events.push(path);
+        }
+    }
+    for event in events {
+        // Newest first.
+        let recs: Vec<WrapRec<'_>> = changes
+            .iter()
+            .rev()
+            .filter_map(|c| match c {
+                Change::Wrap {
+                    path,
+                    sha256,
+                    shell,
+                    had_args,
+                    at,
+                } if path == event => Some((sha256.as_str(), *shell, *had_args, *at)),
+                _ => None,
+            })
+            .collect();
+        let Some(Value::Array(groups)) = root.at_mut(event) else {
+            continue;
+        };
+        let mut hooks: Vec<(usize, usize, &mut Value)> = Vec::new();
+        for (gi, g) in groups.iter_mut().enumerate() {
+            if let Some(Value::Array(hs)) = g.get_mut("hooks") {
+                for (hi, h) in hs.iter_mut().enumerate() {
+                    hooks.push((gi, hi, h));
+                }
+            }
+        }
+        let mut used = vec![false; hooks.len()];
+        let mut open: Vec<usize> = Vec::new();
+        for (r, (sha, shell, had_args, at)) in recs.iter().enumerate() {
+            let i = at.and_then(|p| hooks.iter().position(|(g, h, _)| (*g, *h) == p));
+            match i {
+                Some(i) if !used[i] && wrap_fits(hooks[i].2, sha, *shell) => {
+                    used[i] = unwrap_command(hooks[i].2, *shell, *had_args);
+                    if !used[i] {
+                        open.push(r);
+                    }
+                }
+                _ => open.push(r),
+            }
+        }
+        let mut done = vec![false; recs.len()];
+        for &r in &open {
+            let (sha, shell, had_args, _) = recs[r];
+            let rival = |i: usize, done: &[bool]| {
+                open.iter().any(|&q| {
+                    let (qs, qsh, qha, _) = recs[q];
+                    !done[q] && (qsh, qha) != (shell, had_args) && wrap_fits(hooks[i].2, qs, qsh)
+                })
+            };
+            let cands: Vec<usize> = (0..hooks.len())
+                .filter(|&i| !used[i] && wrap_fits(hooks[i].2, sha, shell))
+                .collect();
+            let pick = cands.first().copied();
+            if let Some(i) = pick
+                && !cands.iter().any(|&j| rival(j, &done))
+                && unwrap_command(hooks[i].2, shell, had_args)
+            {
+                used[i] = true;
+                done[r] = true;
+            } else {
+                notes.push(wrap_note(event));
+            }
+        }
+    }
+}
+
 /// Undoes `edits` on `root`, newest first. A change whose current value is no longer the one
 /// written is left alone, with a note. Created containers are removed only when empty.
 pub fn undo(root: &mut Value, edits: &Edits) -> Vec<String> {
     let mut notes = Vec::new();
+    undo_hook_wraps(root, &edits.changes, &mut notes);
     for c in edits.changes.iter().rev() {
         match c {
             Change::Set {
@@ -268,65 +372,18 @@ pub fn undo(root: &mut Value, edits: &Edits) -> Vec<String> {
                 sha256,
                 shell,
                 had_args,
-                at,
+                ..
             } => {
-                let hit = |o: &Value| {
-                    wrap_shape_sha256(o) == *sha256
-                        && o.get("args")
-                            .and_then(Value::as_array)
-                            .and_then(|a| a.first())
-                            == Some(&Value::str("run"))
-                };
-                // The wrap's argv has the form this record unwraps (shell: `/bin/sh -c CMD`).
-                let fits = |o: &Value| {
-                    hit(o)
-                        && (!*shell
-                            || o.get("args").and_then(Value::as_array).is_some_and(|a| {
-                                a.len() == 5
-                                    && a[2] == Value::str("/bin/sh")
-                                    && a[3] == Value::str("-c")
-                            }))
-                };
+                // Hook wraps (a list under `path`) were undone together above.
+                if matches!(root.at(path), Some(Value::Array(_))) {
+                    continue;
+                }
                 let done = match root.at_mut(path) {
-                    Some(Value::Array(groups)) => {
-                        // The hook at the recorded place first (review F1). If the user moved it
-                        // (or the record has no place), the one wrapped hook of this shape in the
-                        // event, but only when exactly one fits: two alike could be swapped
-                        // (review G1, G2).
-                        let mut hooks: Vec<(usize, usize, &mut Value)> = Vec::new();
-                        for (gi, g) in groups.iter_mut().enumerate() {
-                            if let Some(Value::Array(hs)) = g.get_mut("hooks") {
-                                for (hi, h) in hs.iter_mut().enumerate() {
-                                    hooks.push((gi, hi, h));
-                                }
-                            }
-                        }
-                        let placed = at.and_then(|(g, h)| {
-                            hooks
-                                .iter()
-                                .position(|(gi, hi, o)| (*gi, *hi) == (g, h) && fits(o))
-                        });
-                        let pick = placed.or_else(|| {
-                            let mut alike = hooks
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, (_, _, o))| fits(o))
-                                .map(|(i, _)| i);
-                            match (alike.next(), alike.next()) {
-                                (Some(i), None) => Some(i),
-                                _ => None,
-                            }
-                        });
-                        pick.is_some_and(|i| unwrap_command(hooks[i].2, *shell, *had_args))
-                    }
-                    Some(o @ Value::Object(_)) if fits(o) => unwrap_command(o, *shell, *had_args),
+                    Some(o) if wrap_fits(o, sha256, *shell) => unwrap_command(o, *shell, *had_args),
                     _ => false,
                 };
                 if !done {
-                    notes.push(format!(
-                        "a command morsec wrapped in {} was edited or moved after ms connect, so morsec can't tell it apart; it is left as it is now (still run through `ms run --`). Edit it back by hand if you need to",
-                        dotted(path)
-                    ));
+                    notes.push(wrap_note(path));
                 }
             }
         }

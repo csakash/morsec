@@ -1335,3 +1335,50 @@ fn moved_wrapped_hook_still_unwraps() {
         "{hs:?}"
     );
 }
+
+// protects=review G3: with two plain hooks of the same shape, moving only one of them (a hook
+// put in front of it in its group) still unwraps both, on disconnect and after a re-run: the one
+// still in place doesn't count as a rival; fails_when=the moved hook stays `ms run --`
+#[test]
+fn one_of_two_alike_hooks_moved() {
+    let start = "{\"hooks\": {\"PreToolUse\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"echo a\"}]}, {\"hooks\": [{\"type\": \"command\", \"command\": \"echo b\"}]}]}}";
+    let opts = Options {
+        wrap: true,
+        ..Options::default()
+    };
+    for rerun in [false, true] {
+        let h = Home::new();
+        std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+        std::fs::write(h.settings(), start).unwrap();
+        connect(&h, opts);
+        let t = h.read(&h.settings()).unwrap();
+        let i = t.find("\"echo b\"").unwrap();
+        let g = t[..i].rfind("\"hooks\": [").unwrap() + "\"hooks\": [".len();
+        let t = format!(
+            "{}{{\"type\": \"command\", \"command\": \"echo new\"}},{}",
+            &t[..g],
+            &t[g..]
+        );
+        std::fs::write(h.settings(), t).unwrap();
+        if rerun {
+            let w = connect(&h, opts);
+            assert!(!w.iter().any(|n| n.contains("ms run --")), "{w:?}");
+        }
+        let c = h.connector(opts);
+        let plan = c.plan_remove().unwrap().unwrap();
+        assert!(
+            !plan.notes.iter().any(|n| n.contains("ms run --")),
+            "rerun={rerun}: {:?}",
+            plan.notes
+        );
+        c.apply_remove(&plan).unwrap();
+        let after = h.read(&h.settings()).unwrap();
+        assert!(!after.contains("\"run\""), "rerun={rerun}: {after}");
+        for cmd in ["echo a", "echo b", "echo new"] {
+            assert!(
+                after.contains(&format!("\"command\": \"{cmd}\"")),
+                "{after}"
+            );
+        }
+    }
+}
