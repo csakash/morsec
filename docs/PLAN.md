@@ -56,6 +56,7 @@ flowchart TB
     L16["L16 run-ssh-git"]
     L17["L17 doctor"]
     L29["L29 egress-allowlist"]
+    L30["L30 git-https-swap"]
   end
   subgraph W4["Wave 4 · v0.3"]
     L18["L18 mint-aws"]
@@ -77,6 +78,7 @@ flowchart TB
   L07 --> L08 & L09 & L10
   L07 --> L11 & L12 & L13
   L12 --> L14 & L15 & L16
+  L05 & L12 & L16 --> L30
   L11 --> L15 & L16
   L08 & L13 & L29 --> L17
   L07 & L08 --> L29
@@ -695,6 +697,20 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
 - **Verify:** a sign request for an unbound host is refused; the private key is never on disk
   outside the vault; `git push` to a bound remote works through the helper.
 - **ARI-42:** AUTH-2, GW-1, LOG-1.
+
+#### L30 `git-https-swap` · S
+Follow-up from L16, which built a git credential helper for HTTPS tokens and dropped it: a
+program git starts inside the run could ask the helper for the raw token.
+- **Depends on:** L05, L12, L16. **Owns:** `git_hosts` in `crates/ms-rules/`, the git bindings in
+  `crates/msd/src/proxy.rs`, `GIT_SSL_CAINFO` in the connectors.
+- **Build:** HTTPS git through swap mode. A swap key can name git hosts (`ms rules <key>
+  --add-git-host github.com`); on those hosts the proxy swaps the placeholder in the Basic-auth
+  password, which is where git sends a token. git only ever holds `ms://<key>`. The connectors
+  point git at the CA bundle (`GIT_SSL_CAINFO`; git ignores `SSL_CERT_FILE` on macOS).
+- **Verify:** `git push` and `git fetch` over HTTPS through the proxy to a local HTTPS git server
+  whose CA only the proxy trusts; the token is never in git's environment, files or output; a
+  placeholder sent to a host the key isn't bound to is refused with a receipt.
+- **ARI-42:** GW-1, AUTH-2, INJ-4, LOG-1.
 
 #### L17 `doctor` · M
 - **Depends on:** L08, L13, L29. **Owns:** `ms doctor` CLI module, `tests/e2e/doctor/`.
