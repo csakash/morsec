@@ -11,8 +11,9 @@ unchanged.
 
 `npm run build` (scripts/check.sh: fmt, build, clippy `-D warnings`, all tests including the
 macOS keychain tests, cargo deny, cargo audit, supply-chain check, packaging tests, ARI-42 scan,
-security-evals canary suite) passes on the final commit `40c75eb` with a clean tree: 376 tests.
-No keychain dialog blocked it.
+security-evals canary suite) passes with a clean tree on the merge of `origin/main` (0a9c68b:
+cli-scope, L11 approvals, L13 connect-codex) into this branch, and again on the final commit:
+430 tests. No keychain dialog blocked it.
 
 Card Verify list:
 
@@ -24,9 +25,14 @@ Card Verify list:
 | A non-allowlisted binary is refused | e2e "notallowed" (exit 77 and a `blocked` receipt); `resolve::tests::resolves_safely` (writable, non-executable, missing, shim-linked and relative programs refused) |
 | A cwd outside the project roots is refused | `cwd::tests::roots_are_enforced` (outside, via a symlink, via `..`, a sibling sharing a prefix, a symlinked root); e2e "outside" |
 
-Also covered: production keys ask the `Approver` with the request msd built and run only when
-approved (`daemon::run::tests::production_runs_need_the_approver`, a fake approver: deny, then
-approve); values only in rule-named variables as whole values
+Also covered: production keys go through L11's real approver (`Daemon::approve_exact`: a person
+in `ms approve`, Touch ID raised by msd, the token verified against the exact request msd built
+from the normalised argv and canonical cwd), and only an approval runs the plan
+(`daemon::run::tests::production_runs_need_the_approver`: real `HumanApprover` with the fake
+authenticator, deny → 77 and a `denied` receipt, approve → runs with redacted output and a
+`touch-id` once-token receipt; e2e `run_mode_through_shims`: the fake agent's production command
+through the shim waits while the person answers `ms approve` from a detached pty, msd running
+`--test-touch-id allow`; approve → runs redacted, deny → 77); values only in rule-named variables as whole values
 (`env_only_as_the_rule_names_it`, e2e `notwhole`/`othername`/`foreign`); `ms stop` kills a
 running command (`stop_kills_a_running_command`; QA: killed within 1 s); exit codes and signals
 pass through (`exit_codes_pass_through`); stdin forwarding (`stdin_and_stderr`; QA); a cancelled
@@ -42,7 +48,9 @@ and R4 were checked to fail on the code before the fix.
 
 QA: real `ms`, `ms-shim` and a dev msd on port 4300, driven from a Claude Code session (so msd
 attributes every call to a real agent session); the transcript and receipts are in the loop's
-`proof/qa.md`. No value appeared in any output, log or receipt. QA found two issues, both fixed
+`proof/qa.md`. A smoke after the merge repeated it with L11's approver: a production run
+approved in `ms approve` (fake Touch ID) ran with the value redacted, a denied one exited 77,
+and `ms stop` killed a running command within 1 s. No value appeared in any output, log or receipt. QA found two issues, both fixed
 in 5c255e7: base64 boundary characters left after a redaction, and a misleading `ms run`
 message.
 
@@ -57,14 +65,19 @@ agent's listener) is fixed with per-key `env` names and whole-value refs. S2 (a 
 classified as tightening) and S3 (`ms stop` didn't reach runs in progress) are fixed. The
 re-review found no issues.
 
-Not verified here: production keys with a real approver (L11 builds it; on main the deny-stub
-refuses them, QA shows the message); Linux (built and tested on macOS only; the code is
+Not verified here: the real Touch ID sheet for a run (the debug-only fake stands in; L11's own
+evidence covers the sheet); Linux (built and tested on macOS only; the code is
 portable, but there is no Linux run); real Claude Code or Codex sessions using the shims (the
 fake-agent e2e and this session's own process tree stand in); `ms-shim` in a release build
 (packaging doesn't ship it yet, see Risk).
 
 ## Risk
 
+- **Merge with main:** conflicts in ARI42.md, `ms-cli` (Cargo.toml, main.rs), `ms-ipc`
+  (lib.rs, protocol.rs) and `msd/src/daemon.rs` were resolved keeping both sides: L11's approval
+  messages and `ms approve` next to the Run* messages and `ms run`. ARI42 rows were merged row by
+  row with both loops' evidence. Run mode now calls L11's `approve_exact`; the old
+  `--at-terminal` setup in tests became inline approval.
 - **Sensitive paths (gloop risk: 35 files).** All are in the crates that handle secrets:
   - IPC protocol and server: `crates/ms-ipc/src/{protocol,server,client}.rs`. Additive to v1:
     `RunStream`, `RunInput`, `RunInputEnd`, `RunStarted`, `RunOutput`, `RunExit`, `RunResult`,
@@ -98,8 +111,9 @@ fake-agent e2e and this session's own process tree stand in); `ms-shim` in a rel
 
 ## How to revert
 
-`git revert` the loop's commits (SPEC.md commit `9f64b8d`, then `5bdf0a8`, `1866c55`,
-`a6d5001`, `5c255e7`, `40c75eb`), or revert the merge commit. Rules files written with the new
+Revert the PR's merge commit into main (`git revert -m 1 <merge>`). Within the branch, the
+L12 commits are `9f64b8d`, `5bdf0a8`, `1866c55`, `a6d5001`, `5c255e7`, `40c75eb` and `f20a98c`,
+plus the merge of main `1d8bfc1` and the receipt fix after it. Rules files written with the new
 `roots`/`env` fields would then fail to load: the old `deny_unknown_fields` parser marks the
 rules tampered and refuses everything, which fails closed. Remove those two fields (or run
 `ms init --force` on a dev setup) after reverting. Shim links in `~/.morsec/shims` can be

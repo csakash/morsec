@@ -96,9 +96,10 @@ encoding of the value redacted. Without a ref, nothing about the command changes
   `not_run` answer is an error too. Not a pty: interactive full-screen tools are out of scope.
 - **D8 — production keys go through `Approver`.** Each production key in the call raises one
   `ApprovalRequest` built by msd from the normalised argv, canonical cwd, the adapter's
-  preview and `argv_hash`; only `Approved` runs. Today msd's approver is the L11 deny-stub, so
-  production run keys are refused with the pre-L11 message. The token is recorded in the
-  receipt; checking its MAC against the exec plan is L11's (its card: "the executor refuses").
+  preview and `argv_hash`; only `Approved` runs. Since the merge of L11 this goes through
+  `Daemon::approve_exact`: a person approves in `ms approve` with Touch ID, and the token is
+  verified against that exact request before the plan (built from the same argv and cwd) runs.
+  The token id and `touch-id` are recorded in the receipt.
 - **D9 — exit codes.** The child's code passes through; a signal becomes 128+N. morsec's own
   failures: 77 refused by policy or a person, 69 daemon unavailable, 64 usage, 70 internal;
   each with a `morsec:` message on stderr.

@@ -304,7 +304,9 @@ impl Daemon {
         result: ReceiptResult,
         approval_id: Option<String>,
     ) -> ms_core::Result<()> {
-        let method = approval_id.as_ref().map(|_| "approver".to_owned());
+        let method = approval_id
+            .as_ref()
+            .map(|_| super::TOUCH_ID_METHOD.to_owned());
         self.receipts
             .append_detailed(
                 ReceiptEvent {
@@ -660,6 +662,10 @@ mod tests {
                 assert!(out.contains("TOKEN=[redacted ms://svc/test]"), "{out}");
                 assert!(!out.contains(VALUE));
                 assert!(receipts.contains("\"approved\""), "{receipts}");
+                assert!(
+                    receipts.contains("touch-id") && receipts.contains("once-"),
+                    "{receipts}"
+                );
             } else {
                 assert!(
                     matches!(
