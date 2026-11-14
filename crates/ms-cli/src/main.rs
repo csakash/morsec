@@ -8,6 +8,7 @@
 
 mod add;
 mod connect;
+mod connect_codex;
 mod import;
 mod log;
 mod service;

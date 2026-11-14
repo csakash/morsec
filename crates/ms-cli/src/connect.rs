@@ -17,60 +17,64 @@ use crate::terminal_safe;
 /// `ms connect [agent] [options]`
 #[derive(Debug, Args)]
 pub struct ConnectArgs {
-    /// claude-code (codex, cursor and gemini come later). Without it, lists the agents.
-    agent: Option<String>,
+    /// claude-code or codex (cursor and gemini come later). Without it, lists the agents.
+    pub(crate) agent: Option<String>,
     /// Show the changes and stop.
     #[arg(long)]
-    dry_run: bool,
+    pub(crate) dry_run: bool,
     /// Apply without asking.
     #[arg(long, short = 'y')]
-    yes: bool,
+    pub(crate) yes: bool,
     /// Give the agent an environment variable holding a reference, e.g.
     /// --env STRIPE_API_KEY=ms://stripe/test. Only ms:// references are accepted.
     #[arg(long = "env", value_name = "NAME=ms://REF")]
-    env: Vec<String>,
+    pub(crate) env: Vec<String>,
+    /// Codex only: give a local MCP server a reference, e.g.
+    /// --mcp-env github:GITHUB_TOKEN=ms://github/token. Only ms:// references are accepted.
+    #[arg(long = "mcp-env", value_name = "SERVER:NAME=ms://REF")]
+    pub(crate) mcp_env: Vec<String>,
     /// Also add the `ms mcp` server (off until ms mcp ships, L14).
     #[arg(long)]
-    with_mcp: bool,
+    pub(crate) with_mcp: bool,
     /// Also run your hooks and local MCP servers through `ms run --` (off until ms run ships, L12).
     #[arg(long)]
-    wrap: bool,
+    pub(crate) wrap: bool,
     /// Add a status line showing `ms status` (only when you have none).
     #[arg(long)]
-    statusline: bool,
+    pub(crate) statusline: bool,
     /// Replace a sandbox proxy port or an "ms" MCP server you set yourself.
     #[arg(long)]
-    force: bool,
+    pub(crate) force: bool,
     /// Read rules from this file instead of msd (tests; the MAC is not checked). Debug builds
     /// only: a release `ms` takes the hosts only from msd's MAC-verified rules (review R2).
     #[cfg(debug_assertions)]
     #[arg(long, hide = true)]
-    rules: Option<PathBuf>,
+    pub(crate) rules: Option<PathBuf>,
     /// Used by the Claude Code SessionStart hook: put the shims first on PATH.
     #[arg(long, hide = true)]
-    session_env: bool,
+    pub(crate) session_env: bool,
 }
 
 /// `ms disconnect <agent>`
 #[derive(Debug, Args)]
 pub struct DisconnectArgs {
-    /// claude-code.
-    agent: String,
+    /// claude-code or codex.
+    pub(crate) agent: String,
     /// Show the changes and stop.
     #[arg(long)]
-    dry_run: bool,
+    pub(crate) dry_run: bool,
     /// Remove without asking.
     #[arg(long, short = 'y')]
-    yes: bool,
+    pub(crate) yes: bool,
 }
 
-fn say(s: &str) {
+pub(crate) fn say(s: &str) {
     for line in s.lines() {
         println!("{}", terminal_safe(line));
     }
 }
 
-fn fail(s: &str) -> ExitCode {
+pub(crate) fn fail(s: &str) -> ExitCode {
     for line in s.lines() {
         eprintln!("{}", terminal_safe(line));
     }
@@ -81,7 +85,7 @@ fn fail(s: &str) -> ExitCode {
 fn agent_id(name: &str) -> Result<&'static str, ExitCode> {
     match name {
         "claude-code" | "claude" => Ok(ms_connect::claude::ID),
-        "codex" => Err(not_built("codex", "L13 connect-codex")),
+        "codex" => Ok(ms_connect::codex::ID),
         "cursor" | "gemini" => Err(not_built(name, "L22 connect-cursor-gemini")),
         other => {
             eprintln!(
@@ -109,7 +113,7 @@ fn not_built(agent: &str, loop_id: &'static str) -> ExitCode {
     ExitCode::from(crate::EXIT_NOT_BUILT)
 }
 
-fn home() -> Result<PathBuf, String> {
+pub(crate) fn home() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
@@ -121,7 +125,7 @@ fn home() -> Result<PathBuf, String> {
 /// directory outside HOME and the current directory that no other user can write (security
 /// review S4): the link is run outside the sandbox at every session start, so it must not live
 /// where a repo checkout or a temp dir could repoint it.
-fn ms_path() -> Result<String, String> {
+pub(crate) fn ms_path() -> Result<String, String> {
     let me = std::env::current_exe().map_err(|e| format!("morsec: finding ms: {e}"))?;
     let real = std::fs::canonicalize(&me).unwrap_or_else(|_| me.clone());
     let home = home().ok().and_then(|h| std::fs::canonicalize(h).ok());
@@ -176,7 +180,7 @@ fn connector(opts: Options) -> Result<ClaudeConnector, String> {
 
 /// True when this process runs inside an agent session (or that can't be told). An agent must
 /// not loosen its own sandbox (SPEC D10, SDLC-4).
-fn inside_agent() -> Option<String> {
+pub(crate) fn inside_agent() -> Option<String> {
     use ms_session::{Caller, OsProcessTable, Resolver};
     match Resolver::new(OsProcessTable).resolve(std::process::id()) {
         Ok(Caller::Agent(s)) => Some(format!("{:?} session {}", s.agent, s.pid)),
@@ -199,7 +203,7 @@ fn ask(body: RequestBody) -> ms_core::Result<ResponseBody> {
 const UNEXPECTED: &str = "morsec: unexpected reply from the daemon. Make sure ms and msd are the same version (ms --version)";
 
 /// (proxy port, CA PEM) from msd. Fails closed when msd is down.
-fn daemon_status() -> Result<(u16, Option<String>, bool), String> {
+pub(crate) fn daemon_status() -> Result<(u16, Option<String>, bool), String> {
     match ask(RequestBody::Status) {
         Ok(ResponseBody::Status {
             proxy_port,
@@ -219,7 +223,7 @@ fn daemon_status() -> Result<(u16, Option<String>, bool), String> {
 }
 
 /// Every host in the user rules, as Claude Code `allowedDomains` entries.
-fn rule_hosts(file: Option<&Path>) -> Result<Vec<String>, String> {
+pub(crate) fn rule_hosts(file: Option<&Path>) -> Result<Vec<String>, String> {
     let rules = match file {
         Some(p) => {
             let t = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -250,7 +254,7 @@ fn rule_hosts(file: Option<&Path>) -> Result<Vec<String>, String> {
 /// Prints the changed lines of one file. Lines that only gained a comma are skipped, and string
 /// values morsec didn't write are shown as "…", so a value of the user's own (a token in an env
 /// entry or hook) never reaches the terminal or an agent's transcript.
-fn show_file(path: &Path, before: Option<&str>, after: Option<&str>, safe: &[String]) {
+pub(crate) fn show_file(path: &Path, before: Option<&str>, after: Option<&str>, safe: &[String]) {
     let safe = |s: &str| safe.iter().any(|x| x == s);
     let verb = match (before, after) {
         (None, Some(_)) => "create",
@@ -272,7 +276,7 @@ fn show_file(path: &Path, before: Option<&str>, after: Option<&str>, safe: &[Str
 }
 
 /// Asks to go ahead. `--yes` skips; without a terminal nothing is changed.
-fn confirm(yes: bool, what: &str) -> Result<bool, ExitCode> {
+pub(crate) fn confirm(yes: bool, what: &str) -> Result<bool, ExitCode> {
     if yes {
         return Ok(true);
     }
@@ -322,10 +326,13 @@ fn list() -> ExitCode {
         Err(_) => "unknown (HOME is not set)",
     };
     say(&format!("claude-code  {claude}"));
-    say("codex        not built yet (L13)");
+    say(&format!(
+        "codex        {}",
+        crate::connect_codex::list_status()
+    ));
     say("cursor       not built yet (L22)");
     say("gemini       not built yet (L22)");
-    say("Connect one with: ms connect claude-code");
+    say("Connect one with: ms connect claude-code (or codex)");
     ExitCode::SUCCESS
 }
 
@@ -333,8 +340,15 @@ pub(crate) fn connect(a: &ConnectArgs) -> ExitCode {
     let Some(agent) = &a.agent else {
         return list();
     };
-    if let Err(code) = agent_id(agent) {
-        return code;
+    match agent_id(agent) {
+        Err(code) => return code,
+        Ok(ms_connect::codex::ID) => return crate::connect_codex::connect(a),
+        Ok(_) => {}
+    }
+    if !a.mcp_env.is_empty() {
+        return fail(
+            "morsec: --mcp-env is for codex; Claude Code's MCP servers get references through --wrap",
+        );
     }
     let opts = Options {
         with_mcp: a.with_mcp,
@@ -472,8 +486,10 @@ pub(crate) fn connect(a: &ConnectArgs) -> ExitCode {
 }
 
 pub(crate) fn disconnect(a: &DisconnectArgs) -> ExitCode {
-    if let Err(code) = agent_id(&a.agent) {
-        return code;
+    match agent_id(&a.agent) {
+        Err(code) => return code,
+        Ok(ms_connect::codex::ID) => return crate::connect_codex::disconnect(a),
+        Ok(_) => {}
     }
     if let Some(who) = inside_agent() {
         return fail(&format!(

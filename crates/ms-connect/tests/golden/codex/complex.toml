@@ -32,3 +32,4 @@ enabled = true
 
 [[skills.config]]
 name = "b"
+enabled = false
