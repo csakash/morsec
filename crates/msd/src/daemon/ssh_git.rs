@@ -193,6 +193,7 @@ impl Daemon {
     }
 
     /// Starts the run's session and builds its plan; the session lives as long as the run.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn plan_ssh_git(
         &self,
         runner: &Runner,
@@ -200,6 +201,7 @@ impl Daemon {
         input: &RunInput,
         call: &RunCall,
         run_keys: &std::collections::BTreeSet<KeyName>,
+        ctx: &ms_run::context::CallContext<'_>,
         run: RunContext,
     ) -> Result<Prepared, RunError> {
         let git = if sg.tool == Tool::Git {
@@ -227,7 +229,7 @@ impl Daemon {
         });
         let session = Session::start(setup, self.vault.clone(), audit)?;
         let adapter = SshGitAdapter::new(runner.resolver(), &session);
-        let mut prepared = runner.plan_with(&adapter, input, call, run_keys, &*self.vault)?;
+        let mut prepared = runner.plan_with(&adapter, input, call, run_keys, ctx)?;
         prepared.hold(Box::new(session));
         Ok(prepared)
     }

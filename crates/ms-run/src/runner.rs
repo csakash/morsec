@@ -30,6 +30,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
+use crate::context::{AdapterPlan, CallContext, ContextAdapter, RunGuard};
 use crate::error::{RunError, from_core};
 use crate::generic::GenericAdapter;
 use crate::input::RunInput;
@@ -81,20 +82,13 @@ impl RunnerConfig {
     }
 }
 
-/// Something that must live exactly as long as a run (L16: the per-run SSH agent
-/// socket). It learns the child's PID (its process-group id) once the child started,
-/// and is dropped when the run ends, however it ends.
-pub trait RunGuard: Send + Sync + std::fmt::Debug {
-    /// The child started with this PID, which is also its process-group id.
-    fn started(&self, pid: u32);
-}
-
 /// A plan ready to run, with the redaction patterns for its values. `Debug` shows no value.
 #[derive(Debug)]
 pub struct Prepared {
     plan: ExecPlan,
     arg0: OsString,
     patterns: Arc<Patterns>,
+    /// Guards kept alive for the run: a contextual adapter's (L15) and any msd added (L16).
     guards: Vec<Box<dyn RunGuard>>,
 }
 
@@ -156,14 +150,22 @@ impl Exit {
 /// See the module docs.
 pub struct Runner {
     cfg: RunnerConfig,
+    contextual: Vec<Box<dyn ContextAdapter>>,
     adapters: Vec<Box<dyn RunAdapter>>,
     generic: GenericAdapter,
+}
+
+/// The adapter chosen for a call.
+enum Chosen<'a> {
+    Contextual(&'a dyn ContextAdapter),
+    Plain(&'a dyn RunAdapter),
 }
 
 impl std::fmt::Debug for Runner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Runner")
             .field("cfg", &self.cfg)
+            .field("contextual", &self.contextual.len())
             .field("adapters", &self.adapters.len())
             .finish()
     }
@@ -175,6 +177,7 @@ impl Runner {
         let generic = GenericAdapter::new(cfg.resolver.clone());
         Self {
             cfg,
+            contextual: Vec::new(),
             adapters: Vec::new(),
             generic,
         }
@@ -184,6 +187,12 @@ impl Runner {
     /// Adapters should resolve programs with [`Runner::resolver`].
     pub fn register(&mut self, adapter: Box<dyn RunAdapter>) {
         self.adapters.push(adapter);
+    }
+
+    /// Adds a context-aware adapter (L15 SPEC D1), consulted before every frozen adapter, in
+    /// the order added.
+    pub fn register_contextual(&mut self, adapter: Box<dyn ContextAdapter>) {
+        self.contextual.push(adapter);
     }
 
     /// The program resolver.
@@ -200,21 +209,48 @@ impl Runner {
         }
     }
 
-    fn adapter(&self, argv: &[OsString]) -> &dyn RunAdapter {
-        self.adapters
-            .iter()
-            .find(|a| a.matches(argv))
-            .map(|a| &**a)
-            .unwrap_or(&self.generic)
+    fn adapter(&self, argv: &[OsString]) -> Chosen<'_> {
+        if let Some(a) = self.contextual.iter().find(|a| a.matches(argv)) {
+            return Chosen::Contextual(&**a);
+        }
+        Chosen::Plain(
+            self.adapters
+                .iter()
+                .find(|a| a.matches(argv))
+                .map(|a| &**a)
+                .unwrap_or(&self.generic),
+        )
     }
 
-    /// The adapter's effect preview, for the approval dialog.
+    /// The adapter's effect preview, for the approval dialog. A contextual adapter gets no
+    /// facts here; use [`Runner::preview_in`].
     pub fn preview(&self, call: &RunCall) -> Option<EffectPreview> {
-        self.adapter(&call.argv).preview(call)
+        match self.adapter(&call.argv) {
+            Chosen::Contextual(_) => None,
+            Chosen::Plain(a) => a.preview(call),
+        }
+    }
+
+    /// The adapter's effect preview with the call's rule facts and vault.
+    pub fn preview_in(&self, call: &RunCall, ctx: &CallContext<'_>) -> Option<EffectPreview> {
+        match self.adapter(&call.argv) {
+            Chosen::Contextual(a) => a.preview(call, ctx),
+            Chosen::Plain(a) => a.preview(call),
+        }
+    }
+
+    /// `Some(why)` when the adapter says this call needs an approval whatever the key's tier
+    /// (L15 SPEC D4). Frozen adapters never do.
+    pub fn needs_approval(&self, call: &RunCall, ctx: &CallContext<'_>) -> Option<String> {
+        match self.adapter(&call.argv) {
+            Chosen::Contextual(a) => a.needs_approval(call, ctx),
+            Chosen::Plain(_) => None,
+        }
     }
 
     /// Builds the exec plan. `run_keys` are the run-mode keys policy allowed for this call; refs
-    /// to other keys are left as they are.
+    /// to other keys are left as they are. A contextual adapter gets an empty context here (and
+    /// refuses); msd uses [`Runner::plan_in`].
     pub fn plan(
         &self,
         input: &RunInput,
@@ -222,20 +258,68 @@ impl Runner {
         run_keys: &BTreeSet<KeyName>,
         vault: &dyn Vault,
     ) -> Result<Prepared, RunError> {
-        self.plan_with(self.adapter(&call.argv), input, call, run_keys, vault)
+        self.plan_in(input, call, run_keys, &CallContext::empty(vault))
     }
 
-    /// Like [`Runner::plan`], with an adapter msd built for this one call (L16) instead of the
-    /// registered ones. The same checks apply to its plan.
+    /// [`Runner::plan`] with the call's rule facts, for contextual adapters (L15 SPEC D1).
+    pub fn plan_in(
+        &self,
+        input: &RunInput,
+        call: &RunCall,
+        run_keys: &BTreeSet<KeyName>,
+        ctx: &CallContext<'_>,
+    ) -> Result<Prepared, RunError> {
+        self.plan_chosen(self.adapter(&call.argv), input, call, run_keys, ctx)
+    }
+
+    /// Like [`Runner::plan_in`], with an adapter msd built for this one call (L16) instead of
+    /// the registered ones. The same checks apply to its plan.
     pub fn plan_with(
         &self,
         adapter: &dyn RunAdapter,
         input: &RunInput,
         call: &RunCall,
         run_keys: &BTreeSet<KeyName>,
-        vault: &dyn Vault,
+        ctx: &CallContext<'_>,
     ) -> Result<Prepared, RunError> {
-        let mut plan = adapter.plan(call, vault).map_err(|e| from_core(&e))?;
+        self.plan_chosen(Chosen::Plain(adapter), input, call, run_keys, ctx)
+    }
+
+    fn plan_chosen(
+        &self,
+        chosen: Chosen<'_>,
+        input: &RunInput,
+        call: &RunCall,
+        run_keys: &BTreeSet<KeyName>,
+        ctx: &CallContext<'_>,
+    ) -> Result<Prepared, RunError> {
+        let vault = ctx.vault;
+        // The adapter sees which keys travel in the environment from the input itself, not from
+        // whatever the caller put in the context.
+        let ctx = &CallContext {
+            vault,
+            keys: ctx.keys.clone(),
+            env_keys: input.env_keys.clone(),
+        };
+        let AdapterPlan {
+            exec: mut plan,
+            secrets,
+            guard,
+        } = match chosen {
+            Chosen::Contextual(a) => a.plan(call, ctx),
+            // Only a contextual adapter can enforce a read-only rule (L15 review R10).
+            Chosen::Plain(_) if ctx.keys.values().any(|f| f.read_only) => {
+                return Err(RunError::denied(
+                    "morsec: this key's rule is read-only, and only the psql and prisma adapters can enforce that, so this command is refused",
+                ));
+            }
+            Chosen::Plain(a) => a.plan(call, vault).map(|exec| AdapterPlan {
+                exec,
+                secrets: Vec::new(),
+                guard: None,
+            }),
+        }
+        .map_err(|e| from_core(&e))?;
         let program = plan
             .program
             .to_str()
@@ -262,6 +346,9 @@ impl Runner {
         for (k, v) in &values {
             builder.add(k, v);
         }
+        for (k, v) in &secrets {
+            builder.add(k, v);
+        }
 
         let mut names: BTreeSet<OsString> = plan.env.iter().map(|(k, _)| k.clone()).collect();
         let path = (OsString::from("PATH"), self.cfg.resolver.path_var());
@@ -283,7 +370,7 @@ impl Runner {
             plan,
             arg0: OsString::from(&input.argv[0]),
             patterns: Arc::new(builder.build()),
-            guards: Vec::new(),
+            guards: guard.into_iter().collect(),
         })
     }
 

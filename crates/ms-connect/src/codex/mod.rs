@@ -24,7 +24,7 @@ pub const MARKER: &str = "MORSEC_CONNECTED";
 /// The proxy variables pointed at msd (SPEC D1).
 pub const PROXY_VARS: [&str; 4] = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"];
 /// The CA variables pointed at the bundle.
-pub const CA_VARS: [&str; 4] = claude::CA_VARS;
+pub const CA_VARS: [&str; 5] = claude::CA_VARS;
 /// The MCP server morsec adds with `--with-mcp`.
 pub const MCP_ID: &str = "ms";
 const STATE_VERSION: i64 = 1;

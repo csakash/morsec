@@ -27,6 +27,8 @@ pub const MAX_ROOT_LEN: usize = 1024;
 pub const MAX_ENV_NAMES: usize = 32;
 /// Most pinned SSH host keys in one rule (L16).
 pub const MAX_SSH_HOST_KEYS: usize = 32;
+/// Most git hosts in one rule.
+pub const MAX_GIT_HOSTS: usize = 16;
 
 /// What one key may do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +59,10 @@ pub struct KeyRule {
     /// `HOST ssh-ed25519 BASE64` or `[HOST]:PORT ssh-ed25519 BASE64`, normalised by
     /// [`SshHostKey`]. Empty means no SSH destination: the SSH agent refuses every signature.
     pub ssh_host_keys: Vec<SshHostKey>,
+    /// Hosts where git sends the key over HTTPS (swap only, L30): there the proxy swaps the
+    /// placeholder in the Basic-auth password, which is where git puts a token. Exact DNS names,
+    /// each also in `hosts`, so the host allowlist is `hosts` alone.
+    pub git_hosts: Vec<String>,
 }
 
 impl KeyRule {
@@ -73,6 +79,7 @@ impl KeyRule {
             roots: Vec::new(),
             env: Vec::new(),
             ssh_host_keys: Vec::new(),
+            git_hosts: Vec::new(),
         }
     }
 
@@ -133,6 +140,15 @@ impl KeyRule {
                 "ssh_host_keys are only allowed on a run-mode key".into()
             ));
         }
+        if self.git_hosts.len() > MAX_GIT_HOSTS {
+            return Err(bad(format!("more than {MAX_GIT_HOSTS} git hosts")));
+        }
+        if self.mode != Mode::Swap && !self.git_hosts.is_empty() {
+            return Err(bad("git hosts are only allowed on a swap-mode key".into()));
+        }
+        for h in &self.git_hosts {
+            validate_git_host(h, &self.hosts).map_err(&bad)?;
+        }
         if self.mode != Mode::Mint && !self.mint_scopes.is_empty() {
             return Err(bad("mint_scopes are only allowed on a mint-mode key".into()));
         }
@@ -156,6 +172,8 @@ impl KeyRule {
         self.env.dedup();
         self.ssh_host_keys.sort();
         self.ssh_host_keys.dedup();
+        self.git_hosts.sort();
+        self.git_hosts.dedup();
         Ok(self)
     }
 }
@@ -313,6 +331,28 @@ fn ed25519_blob(blob: &[u8]) -> Option<[u8; 32]> {
     rest.try_into().ok()
 }
 
+/// A git host is an exact DNS name (no wildcard, no IP) that is also one of the key's `hosts`.
+pub fn validate_git_host(h: &str, hosts: &[HostPattern]) -> std::result::Result<(), String> {
+    match HostPattern::parse(h) {
+        Ok(HostPattern::Exact(e))
+            if e == h && h == h.to_ascii_lowercase() && h.parse::<std::net::IpAddr>().is_err() => {}
+        _ => {
+            return Err(format!(
+                "git host {h:?} must be an exact lowercase DNS name, not a wildcard or an IP"
+            ));
+        }
+    }
+    if !hosts
+        .iter()
+        .any(|p| matches!(p, HostPattern::Exact(e) if e == h))
+    {
+        return Err(format!(
+            "git host {h} must also be one of the key's hosts (ms rules <key> --add-git-host adds both)"
+        ));
+    }
+    Ok(())
+}
+
 /// True when `path` is `root` or inside it, comparing whole components.
 pub fn within_root(path: &Path, root: &Path) -> bool {
     path.starts_with(root)
@@ -421,6 +461,7 @@ pub(crate) struct KeyRuleFile {
     env: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ssh_host_keys: Vec<String>,
+    git_hosts: Vec<String>,
 }
 
 fn default_ttl() -> u64 {
@@ -473,6 +514,7 @@ impl KeyRuleFile {
             roots: self.roots.into_iter().map(PathBuf::from).collect(),
             env: self.env,
             ssh_host_keys: parse_ssh_host_keys(&self.ssh_host_keys, file, key)?,
+            git_hosts: self.git_hosts,
         }
         .normalise(file, key)
     }
@@ -493,6 +535,7 @@ impl KeyRuleFile {
                 .collect(),
             env: r.env.clone(),
             ssh_host_keys: r.ssh_host_keys.iter().map(ToString::to_string).collect(),
+            git_hosts: r.git_hosts.clone(),
         }
     }
 }
@@ -673,5 +716,44 @@ mint_scopes = ["s3:read"]
             .unwrap_err()
             .to_string();
         assert!(!msg.contains('\u{1b}') && !msg.contains('\n'), "{msg}");
+    }
+
+    // protects=L30 D1 git hosts parse, normalise and round-trip; fails_when=git_hosts is dropped
+    // on write or not sorted; no_claim=the proxy binding (msd proxy tests)
+    #[test]
+    fn git_hosts_roundtrip() {
+        let t = "version = 1\n[keys.\"gh/t\"]\nmode = \"swap\"\ntier = \"test\"\nhosts = [\"api.github.com\", \"github.com\", \"git.example.com\"]\ngit_hosts = [\"github.com\", \"git.example.com\", \"github.com\"]";
+        let r = Rules::from_toml(t, "rules.toml").unwrap();
+        let k = &r.keys[&KeyName::new("gh/t").unwrap()];
+        assert_eq!(k.git_hosts, ["git.example.com", "github.com"]);
+        let back = Rules::from_toml(&r.to_toml(), "rules.toml").unwrap();
+        assert_eq!(back, r);
+    }
+
+    // protects=L30 D1 a git host must be an exact lowercase DNS name that is also a host of a swap
+    // key, at most 16; fails_when=any of these is accepted; no_claim=CLI messages
+    #[test]
+    fn rejects_bad_git_hosts() {
+        let swap = |hosts: &str, git: &str| {
+            format!(
+                "version = 1\n[keys.\"a\"]\nmode = \"swap\"\ntier = \"test\"\nhosts = [{hosts}]\ngit_hosts = [{git}]"
+            )
+        };
+        let many: Vec<String> = (0..17).map(|i| format!("\"h{i}.example.com\"")).collect();
+        let many = many.join(", ");
+        let cases = [
+            swap("\"api.github.com\"", "\"github.com\""),
+            swap("\"*.github.com\"", "\"*.github.com\""),
+            swap("\"*.github.com\"", "\"x.github.com\""),
+            swap("\"10.0.0.1\"", "\"10.0.0.1\""),
+            swap("\"github.com\"", "\"GitHub.com\""),
+            swap(&many, &many),
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nhosts = [\"github.com\"]\ngit_hosts = [\"github.com\"]".into(),
+            "version = 1\n[keys.\"a\"]\nmode = \"mint\"\ntier = \"test\"\nhosts = [\"github.com\"]\ngit_hosts = [\"github.com\"]".into(),
+        ];
+        for c in &cases {
+            assert!(Rules::from_toml(c, "rules.toml").is_err(), "accepted {c:?}");
+        }
+        assert!(Rules::from_toml(&swap("\"github.com\"", "\"github.com\""), "rules.toml").is_ok());
     }
 }

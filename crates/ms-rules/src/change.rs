@@ -40,7 +40,8 @@ pub fn classify_rule(old: Option<&KeyRule>, new: Option<&KeyRule>) -> Change {
                     .iter()
                     .all(|r| o.roots.iter().any(|old| crate::model::within_root(r, old)))
                 && n.env.iter().all(|e| o.env.contains(e))
-                && n.ssh_host_keys.iter().all(|k| o.ssh_host_keys.contains(k));
+                && n.ssh_host_keys.iter().all(|k| o.ssh_host_keys.contains(k))
+                && n.git_hosts.iter().all(|g| o.git_hosts.contains(g));
             if narrower {
                 Change::Tighten
             } else {
@@ -125,6 +126,8 @@ mod tests {
                         .unwrap(),
                 )
             }),
+            // L30: a git host changes where the key goes on a host, even one already bound.
+            Box::new(|r| r.git_hosts.push("a.db.internal".into())),
         ];
         for (i, f) in loosen.iter().enumerate() {
             let mut start = o.clone();

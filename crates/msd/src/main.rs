@@ -89,6 +89,13 @@ struct Args {
     /// Tests only (debug builds, with --vault memory): stand in for Touch ID.
     #[arg(long, value_enum, hide = true)]
     test_touch_id: Option<approve::TestTouchId>,
+    /// Tests only (debug builds, with --vault memory): the proxy reaches HOST at this loopback
+    /// address (HOST=127.0.0.1:PORT, repeatable). Needs --test-upstream-ca.
+    #[arg(long, value_name = "HOST=ADDR", hide = true)]
+    test_upstream: Vec<String>,
+    /// Tests only: the CA (PEM) that verifies the test upstreams.
+    #[arg(long, value_name = "FILE", hide = true)]
+    test_upstream_ca: Option<PathBuf>,
 }
 
 fn socket_path(args: &Args) -> ms_core::Result<PathBuf> {
@@ -392,6 +399,17 @@ async fn serve(args: Args) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    let test_hook = match proxy::TestHook::new(
+        &args.test_upstream,
+        args.test_upstream_ca.as_deref(),
+        b.is_memory(),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
     let uid = server.owner_uid();
     let opened = {
         let paths = paths.clone();
@@ -422,7 +440,7 @@ async fn serve(args: Args) -> ExitCode {
         }
     };
     let (stop_tx, stop_rx) = watch::channel(false);
-    let proxy_task = tokio::spawn(proxy::supervise(d.clone(), stop_rx.clone()));
+    let proxy_task = tokio::spawn(proxy::supervise(d.clone(), stop_rx.clone(), test_hook));
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         tokio::spawn(drift::watch_loop(d.clone(), PathBuf::from(home), stop_rx));
     }

@@ -109,7 +109,13 @@ fn run_git(repo: &Path, key_text: &str, args: &[&str]) -> Result<(Option<i32>, S
         let session = Session::start(setup, v.clone(), Arc::new(NoAudit)).map_err(|e| e.message)?;
         let adapter = SshGitAdapter::new(&resolver, &session);
         let mut prepared = runner
-            .plan_with(&adapter, &input, &call, &keys, &*v)
+            .plan_with(
+                &adapter,
+                &input,
+                &call,
+                &keys,
+                &ms_run::context::CallContext::empty(&*v),
+            )
             .map_err(|e| e.message)?;
         prepared.hold(Box::new(session));
         let (exit, out, err, _) = runner.execute_buffered(prepared, 64 * 1024).await.unwrap();
