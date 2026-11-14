@@ -52,8 +52,23 @@ impl Client {
                 "PutKey must be sent with Client::put_key".into(),
             ));
         }
+        self.request_within(body, RESPONSE_TIMEOUT).await
+    }
+
+    /// Like [`Client::request`], waiting up to `timeout` for the response (`Scan`, which reads
+    /// every transcript, can take longer than the default).
+    pub async fn request_within(
+        &mut self,
+        body: RequestBody,
+        timeout: Duration,
+    ) -> Result<ResponseBody> {
+        if body.carries_value() {
+            return Err(Error::Protocol(
+                "PutKey must be sent with Client::put_key".into(),
+            ));
+        }
         let id = self.send(&body).await?;
-        self.receive(id).await
+        self.receive(id, timeout).await
     }
 
     /// Stores a key. The value goes in its own raw frame and never through serde.
@@ -66,7 +81,7 @@ impl Client {
         let id = self.send(&RequestBody::PutKey { name, meta }).await?;
         write_frame(&mut self.stream, value.expose()).await?;
         drop(value);
-        self.receive(id).await
+        self.receive(id, RESPONSE_TIMEOUT).await
     }
 
     async fn send(&mut self, body: &RequestBody) -> Result<u64> {
@@ -77,10 +92,15 @@ impl Client {
         Ok(id)
     }
 
-    async fn receive(&mut self, id: u64) -> Result<ResponseBody> {
-        let frame = tokio::time::timeout(RESPONSE_TIMEOUT, read_frame(&mut self.stream))
+    async fn receive(&mut self, id: u64, timeout: Duration) -> Result<ResponseBody> {
+        let frame = tokio::time::timeout(timeout, read_frame(&mut self.stream))
             .await
-            .map_err(|_| Error::Protocol("no response from the daemon within 30s".into()))??
+            .map_err(|_| {
+                Error::Protocol(format!(
+                    "no response from the daemon within {}s",
+                    timeout.as_secs()
+                ))
+            })??
             .ok_or_else(|| Error::Protocol("the daemon closed the connection".into()))?;
         let env = decode::<ResponseBody>(&frame).map_err(|(_, _, m)| Error::Protocol(m))?;
         // id 0 is the daemon's "this connection is being closed" error.

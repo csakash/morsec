@@ -143,7 +143,6 @@ fn stubs_exit_69_and_name_their_loop() {
         ("run", "L12 run-core"),
         ("doctor", "L17 doctor"),
         ("mcp", "L14 mcp-server"),
-        ("scan", "L09 e2e-canary"),
     ];
     let alias = mors(d.path());
     for (cmd, loop_id) in table {

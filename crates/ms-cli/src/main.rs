@@ -21,6 +21,7 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use ms_core::Error;
 
 mod rules;
+mod scan;
 
 /// Exit code for "planned but not built yet" (sysexits EX_UNAVAILABLE).
 const EXIT_NOT_BUILT: u8 = 69;
@@ -77,7 +78,7 @@ enum Command {
     /// Run the MCP server for an agent.
     Mcp(Rest),
     /// Scan agent transcripts for leaked secret values.
-    Scan(Rest),
+    Scan(scan::ScanArgs),
     /// Prompts per session, blocks and approvals.
     Stats(stats::StatsArgs),
 }
@@ -91,7 +92,6 @@ impl Command {
             Command::Run(_) => ("run", "L12 run-core"),
             Command::Doctor(_) => ("doctor", "L17 doctor"),
             Command::Mcp(_) => ("mcp", "L14 mcp-server"),
-            Command::Scan(_) => ("scan", "L09 e2e-canary"),
             Command::Status
             | Command::Init(_)
             | Command::Stop
@@ -100,7 +100,8 @@ impl Command {
             | Command::Import(_)
             | Command::Rules(_)
             | Command::Log(_)
-            | Command::Stats(_) => return None,
+            | Command::Stats(_)
+            | Command::Scan(_) => return None,
         })
     }
 }
@@ -176,6 +177,7 @@ async fn main() -> ExitCode {
         Command::Rules(a) => on_own_thread(move || rules::run(a)),
         Command::Log(args) => log::run(&args),
         Command::Stats(args) => stats::run(&args),
+        Command::Scan(a) => scan::run(&a).await,
         _ => unreachable!("every other command is a stub"),
     }
 }

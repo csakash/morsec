@@ -17,6 +17,7 @@ mod daemon;
 mod drift;
 mod paths;
 mod proxy;
+mod scan;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

@@ -494,6 +494,13 @@ impl Daemon {
             } => self.propose(&session, unattributed, &key, rule.as_deref(), at_terminal),
             RequestBody::Stop => self.stop(&session),
             RequestBody::Start { at_terminal } => self.start(&session, unattributed, at_terminal),
+            // A scan answers "is this value in a file I can write?": an oracle for short values,
+            // so only the user's own terminal may ask (L09 SPEC D-3).
+            RequestBody::Scan if in_agent => reply_err(
+                ErrorCode::Denied,
+                "morsec: ms scan can't run inside an agent session. Run it from your own terminal",
+            ),
+            RequestBody::Scan => self.scan(&session),
             other => reply_err(
                 ErrorCode::NotImplemented,
                 format!(
@@ -502,6 +509,68 @@ impl Daemon {
                 ),
             ),
         }
+    }
+
+    /// `ms scan` from outside an agent session (L09). Refused while stopped: the kill switch
+    /// means no value is read. Every scan leaves one receipt per key it read, so its use as a
+    /// guessing oracle by a detached process is at least on the record (L09 security review S1);
+    /// a reply whose receipts could not be written is withheld.
+    fn scan(&self, session: &SessionId) -> ResponseBody {
+        if self.is_stopped() {
+            return reply_err(
+                ErrorCode::Denied,
+                "morsec: morsec is stopped (ms stop), so ms scan does not read the vault. Resume first",
+            );
+        }
+        let keys = match self.list_keys() {
+            Ok(k) => k,
+            Err(e) => return reply_err(ErrorCode::Internal, e.to_string()),
+        };
+        // A stop during the scan withholds the report even if morsec was resumed since (review F2).
+        let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
+        let report = crate::scan::scan(
+            &*self.vault,
+            keys.iter().map(|m| m.name.clone()).collect(),
+            &crate::scan::roots(),
+            crate::scan::SCAN_BUDGET,
+        );
+        if let ResponseBody::ScanReport { findings, .. } = &report {
+            let rv = self.rules_version();
+            // Every listed key, including ones too short to search or unreadable: over-recording
+            // is the safe direction for an audit trail.
+            for m in &keys {
+                let n = findings.iter().filter(|f| f.key == m.name).count();
+                let target = format!(
+                    "ms scan: agent transcripts, {n} finding{}",
+                    if n == 1 { "" } else { "s" }
+                );
+                if let Err(e) = self.record(
+                    session,
+                    &m.name,
+                    m.mode,
+                    &target,
+                    rv,
+                    ReceiptResult::Allowed,
+                    None,
+                ) {
+                    return reply_err(
+                        ErrorCode::Internal,
+                        format!(
+                            "morsec: the scan's receipt could not be written ({e}), so its result is withheld"
+                        ),
+                    );
+                }
+            }
+        }
+        // `ms stop` during the scan: the report is not delivered (security re-check N-B). The
+        // receipts above still record that the values were read.
+        if self.is_stopped() || self.stops.load(std::sync::atomic::Ordering::SeqCst) != stops_seen {
+            return reply_err(
+                ErrorCode::Denied,
+                "morsec: morsec was stopped (ms stop) during the scan, so its result is withheld",
+            );
+        }
+        report
     }
 
     fn list_keys(&self) -> ms_core::Result<Vec<KeyMeta>> {
@@ -1455,6 +1524,28 @@ mod tests {
             ResponseBody::Status { .. }
         ));
         assert!(is_ok(&h.as_(terminal()).put("x/y", Tier::Test)));
+    }
+
+    // protects=L09 SPEC D-3: ms scan (a guessing oracle for short values) is refused inside an
+    // agent session and for an unidentified caller; fails_when=either gets a scan report;
+    // no_claim=the terminal path (scan.rs tests and tests/e2e run it; here it would read the
+    // real home directory)
+    #[test]
+    fn scan_refused_inside_agent() {
+        let h = fresh();
+        assert!(is_ok(&h.put("stripe/test", Tier::Test)));
+        let r = h.as_(agent()).req(RequestBody::Scan);
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        assert!(msg(&r).contains("your own terminal"), "{r:?}");
+        *lock(&h.who) = None;
+        assert_eq!(code(&h.req(RequestBody::Scan)), Some(ErrorCode::Denied));
+        // The kill switch: a stopped morsec reads no value, even for the user's terminal.
+        let h = fresh();
+        assert!(is_ok(&h.put("stripe/test", Tier::Test)));
+        assert!(is_ok(&h.req(RequestBody::Stop)));
+        let r = h.as_(terminal()).req(RequestBody::Scan);
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        assert!(msg(&r).contains("stopped"), "{r:?}");
     }
 
     // protects=R1: a caller that can't be identified (the connecting process exited and a child
