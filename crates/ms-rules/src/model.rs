@@ -23,6 +23,8 @@ pub const MAX_KEYS: usize = 4096;
 pub const MAX_ROOTS: usize = 64;
 /// Longest project root, bytes.
 pub const MAX_ROOT_LEN: usize = 1024;
+/// Most environment variable names in one rule.
+pub const MAX_ENV_NAMES: usize = 32;
 
 /// What one key may do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,9 @@ pub struct KeyRule {
     /// Project directories the key's commands may run in (run only, L12). Absolute and
     /// normalised. Empty means nowhere: a run key without roots can't run anything.
     pub roots: Vec<PathBuf>,
+    /// Environment variables the key's value may be put in for its commands (run only, L12):
+    /// a call may set one of these to exactly `ms://<this key>`. Empty means none.
+    pub env: Vec<String>,
 }
 
 impl KeyRule {
@@ -60,6 +65,7 @@ impl KeyRule {
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             read_only: false,
             roots: Vec::new(),
+            env: Vec::new(),
         }
     }
 
@@ -103,6 +109,15 @@ impl KeyRule {
         for r in &self.roots {
             validate_root(r).map_err(&bad)?;
         }
+        if self.env.len() > MAX_ENV_NAMES {
+            return Err(bad(format!("more than {MAX_ENV_NAMES} env names")));
+        }
+        if self.mode != Mode::Run && !self.env.is_empty() {
+            return Err(bad("env names are only allowed on a run-mode key".into()));
+        }
+        for n in &self.env {
+            validate_env_name(n).map_err(&bad)?;
+        }
         if self.mode != Mode::Mint && !self.mint_scopes.is_empty() {
             return Err(bad("mint_scopes are only allowed on a mint-mode key".into()));
         }
@@ -122,6 +137,8 @@ impl KeyRule {
         self.mint_scopes.dedup();
         self.roots.sort();
         self.roots.dedup();
+        self.env.sort();
+        self.env.dedup();
         Ok(self)
     }
 }
@@ -159,6 +176,23 @@ pub fn validate_root(p: &Path) -> std::result::Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// An environment variable name: `[A-Za-z_][A-Za-z0-9_]{0,127}`. (`ms-run` refuses names that
+/// change how programs load code on top of this.)
+pub fn validate_env_name(n: &str) -> std::result::Result<(), String> {
+    let b = n.as_bytes();
+    let ok = !b.is_empty()
+        && b.len() <= 128
+        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "env name {n:?} must be letters, digits and '_', not starting with a digit"
+        ))
+    }
 }
 
 /// True when `path` is `root` or inside it, comparing whole components.
@@ -265,6 +299,8 @@ pub(crate) struct KeyRuleFile {
     read_only: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    env: Vec<String>,
 }
 
 fn default_ttl() -> u64 {
@@ -315,6 +351,7 @@ impl KeyRuleFile {
             session_ttl_secs: self.session_ttl_secs,
             read_only: self.read_only,
             roots: self.roots.into_iter().map(PathBuf::from).collect(),
+            env: self.env,
         }
         .normalise(file, key)
     }
@@ -333,6 +370,7 @@ impl KeyRuleFile {
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
+            env: r.env.clone(),
         }
     }
 }
@@ -356,6 +394,7 @@ commands = [["psql", "-c", "*"], ["pg_dump", "**"]]
 session_ttl_secs = 600
 read_only = true
 roots = ["/Users/me/code/app", "/Users/me/code/api"]
+env = ["PGPASSWORD", "DATABASE_URL"]
 
 [keys."aws/dev"]
 mode = "mint"
@@ -383,6 +422,7 @@ mint_scopes = ["s3:read"]
                 PathBuf::from("/Users/me/code/app")
             ]
         );
+        assert_eq!(pg.env, ["DATABASE_URL", "PGPASSWORD"]);
         let stripe = &r.keys[&KeyName::new("stripe/test").unwrap()];
         assert_eq!(stripe.session_ttl_secs, DEFAULT_SESSION_TTL_SECS);
         let mut with_state = r.clone();
@@ -425,6 +465,11 @@ mint_scopes = ["s3:read"]
             "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/a//b\"]",
             "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/a/\"]",
             "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/a\\nb\"]",
+            // Env names: run keys only, valid names.
+            "version = 1\n[keys.\"a\"]\nmode = \"swap\"\ntier = \"test\"\nenv = [\"X\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nenv = [\"1X\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nenv = [\"A-B\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nenv = [\"\"]",
         ];
         for c in cases {
             assert!(Rules::from_toml(c, "rules.toml").is_err(), "accepted {c:?}");

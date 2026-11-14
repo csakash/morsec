@@ -782,7 +782,7 @@ fn run_mode_through_shims() {
     let repo = std::fs::canonicalize(&w.repo).unwrap();
     let setup = format!(
         r#"ms add run/canary --stdin --mode run --tier test < '{v}' && rm '{v}' &&
-(sleep 1; printf 'yes\n'; sleep 3) | script -q /dev/null ms rules run/canary --at-terminal --add-root '{repo}' \
+(sleep 1; printf 'yes\n'; sleep 3) | script -q /dev/null ms rules run/canary --at-terminal --add-root '{repo}' --add-env RUN_TOKEN \
   --add-command '["env"]' \
   --add-command '["printf", "**"]' \
   --add-command '["sh", "-c", "printf %s \"$RUN_TOKEN\" | base64"]' \
@@ -810,6 +810,9 @@ echo '== exit'; RUN_TOKEN=ms://run/canary ms run -- sh -c 'exit 7'; echo "rc=$?"
 echo '== notallowed'; RUN_TOKEN=ms://run/canary ms run -- ls; echo "rc=$?"
 echo '== outside'; (cd /tmp && RUN_TOKEN=ms://run/canary env); echo "rc=$?"
 echo '== idle'; mkfifo idle.fifo; sleep 20 > idle.fifo & s=$(date +%s); RUN_TOKEN=ms://run/canary env < idle.fifo > /dev/null; echo "took=$(( $(date +%s) - s ))"; kill $! 2>/dev/null; rm -f idle.fifo
+echo '== notwhole'; RUN_TOKEN="Bearer ms://run/canary" env; echo "rc=$?"
+echo '== othername'; OTHER=ms://run/canary env; echo "rc=$?"
+echo '== foreign'; RUN_TOKEN=ms://run/canary CURL_HOME="$PWD/ms://zz/h" env | grep -c CURL_HOME
 echo '== plain'; env | grep -c AGENT_ONLY
 echo '== done'
 "#,
@@ -877,6 +880,12 @@ echo '== done'
         "{out}"
     );
     assert!(section("outside").contains("rc=77"), "{out}");
+    // Security review S1: only the rule's variable names, only whole-value refs, and variables
+    // without a run-mode ref never reach the child.
+    assert!(section("notwhole").contains("rc=77"), "{out}");
+    assert!(section("othername").contains("rc=77"), "{out}");
+    assert!(out.contains("may not go into OTHER"), "{out}");
+    assert_eq!(section("foreign").trim(), "0", "{out}");
     assert!(out.contains("outside run/canary's project roots"), "{out}");
     assert_eq!(
         section("plain").trim(),

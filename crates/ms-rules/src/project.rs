@@ -124,6 +124,7 @@ impl ProjectRules {
 
 fn disable(rule: &mut KeyRule) {
     rule.roots.clear();
+    rule.env.clear();
     rule.hosts.clear();
     rule.commands.clear();
     rule.mint_scopes.clear();
@@ -374,6 +375,11 @@ hosts = ["*.com"]
                 read_only: ro,
                 roots: if mode == Mode::Run {
                     vec!["/r/app".into()]
+                } else {
+                    vec![]
+                },
+                env: if mode == Mode::Run {
+                    vec!["TOKEN".into()]
                 } else {
                     vec![]
                 },

@@ -221,8 +221,8 @@ impl Needles {
 
     /// Every byte string with the key index it was added under (L12's run-output redactor
     /// matches the same encodings). The bytes are value material: use them only inside msd.
-    pub fn patterns(&self) -> impl Iterator<Item = (usize, &[u8])> {
-        self.list.iter().map(|n| (n.key, &n.bytes[..]))
+    pub fn patterns(&self) -> impl Iterator<Item = (usize, Encoding, &[u8])> {
+        self.list.iter().map(|n| (n.key, n.encoding, &n.bytes[..]))
     }
 }
 

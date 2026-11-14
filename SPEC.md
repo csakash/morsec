@@ -9,9 +9,9 @@ Card: `docs/PLAN.md` § "L12 `run-core`". Depends on L07 (merged). Owns `crates/
 | `crates/ms-ipc/src/protocol.rs` | optional `env` on `Run`; new `RunStream`, `RunInput`, `RunInputEnd` requests; `RunStarted`, `RunOutput`, `RunExit`, `RunResult` replies; error code `not_run` |
 | `crates/ms-ipc/src/server.rs` | `Handler::handle_stream` (default: not implemented) and the stream pump for `RunStream` |
 | `crates/ms-ipc/src/client.rs` | `Client::run_stream` |
-| `crates/ms-rules/src/{model,change}.rs` | per-key `roots` (run keys only); adding a root is loosening |
+| `crates/ms-rules/src/{model,change,project}.rs` | per-key `roots` and `env` (run keys only); adding either is loosening |
 | `crates/ms-scan/src/lib.rs` | `Needles::patterns()` (read-only accessor) |
-| `crates/ms-cli/src/{main,rules}.rs` | wire `ms run`; `ms rules --add-root/--remove-root` |
+| `crates/ms-cli/src/{main,rules}.rs` | wire `ms run`; `ms rules --add-root/--remove-root/--add-env/--remove-env` |
 | `crates/msd/src/daemon.rs` | dispatch `Run`/`RunStream` to `daemon/run.rs` |
 | `ARI42.md` | OUT-1, OUT-4, GW-1 rows and a changelog line |
 
@@ -46,11 +46,13 @@ encoding of the value redacted. Without a ref, nothing about the command changes
   ≤ 32 KiB). A client that disconnects cancels the run: msd kills the child's process group.
   The frozen `Run` stays as the buffered form (no stdin; reply `RunResult {code, signal,
   stdout, stderr, truncated}`, each stream capped at 256 KiB) for L14's MCP tools. A run is
-  bounded by the connection lifetime (10 min). At most 8 runs at a time.
+  bounded by the connection lifetime (10 min). At most 8 runs at a time. `ms stop` and a LOG-2
+  session stop kill runs in progress (security review S3).
 - **D2 — project roots are per-key `roots` in the user rules.** "Registered" means in the
   MAC'd `rules.toml`, changed only through `ms rules <key> --add-root DIR` (loosening: needs an
   approval; `--remove-root` tightens). A run key with no roots can't run anything (fail closed;
-  the error says how to add one). Roots are absolute, normalised, not `/`. The request's cwd
+  the error says how to add one). Roots are absolute, normalised, not `/`, and match only when
+  stored canonical (a root that is a symlink matches nothing; security review S2). The request's cwd
   must be absolute and its canonical path (symlinks resolved) must lie inside a root's
   canonical path for **every** key the call uses. A project `.morsec.toml` cannot add roots
   (the merge leaves them as the user set them). Run rules also merge the project file found
@@ -65,11 +67,18 @@ encoding of the value redacted. Without a ref, nothing about the command changes
   absolute path and the argv array; no shell is ever involved.
 - **D4 — the generic adapter delivers values through environment variables only.** The client
   forwards only the environment variables whose value contains a ref (at most 64; names
-  `[A-Za-z_][A-Za-z0-9_]{0,127}`; never `PATH`, `HOME`, `SHELL`, `IFS`, `ENV`, `BASH_ENV`,
-  `LD_*`, `DYLD_*`). msd substitutes each run-mode ref in them. A ref in an argument is refused
+  `[A-Za-z_][A-Za-z0-9_]{0,127}`; never a name that changes how programs load code or run
+  commands: `PATH`, `HOME`, `SHELL`, `IFS`, `ENV`, `BASH_ENV`, `LD_*`, `DYLD_*`, `PYTHON*`,
+  `PERL*`, `NODE_OPTIONS`, `GIT_*`, pagers, editors, askpass…). A ref in an argument is refused
   by the generic adapter ("put it in an environment variable"): argv is visible to every user
   through `ps`; a same-user process can read the environment too (OUT-4 residual until L23).
   Adapters with a better channel (L15 passfile, L16 agent) take argv refs themselves.
+  **Amended in build (security review S1):** a key's value goes only into a variable its rule
+  names (new per-key `env` list, `ms rules <key> --add-env NAME`; adding one loosens), and only
+  as the whole value (`NAME=ms://key`, the same whole-value form as the DSN decision). Forwarded
+  variables that hold no run-mode ref are not given to the child at all. Without this an agent
+  could set `CURL_HOME`, `PSQLRC`, `HTTPS_PROXY`… (any name, any text around a ref) and make an
+  allowlisted tool load its config and send the value elsewhere.
 - **D5 — minimal environment.** The child gets `PATH` (the trusted search path), `HOME`,
   `USER`, `LOGNAME`, `LANG`, `TMPDIR` (from msd's own environment, when set) and the resolved
   ref variables. Nothing else from the agent or from msd.

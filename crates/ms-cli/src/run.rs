@@ -24,7 +24,8 @@ The command runs inside msd, not here: its program comes from morsec's trusted s
 environment is minimal (PATH, HOME, USER, LOGNAME, LANG, TMPDIR and the variables you pass that \
 hold ms:// references, with run-mode references replaced by the value), and it must be allowed \
 by the key's rules (ms rules <key>): an allowlisted command, run inside one of the key's project \
-roots. Put references in environment variables, not arguments: \
+roots. Put each reference, alone, in an environment variable the key's rule names \
+(ms rules <key> --add-env TOKEN), not in an argument: \
   TOKEN=ms://deploy/staging ms run -- deploy-cli push
 
 Output is redacted (the value in raw, base64, base64url, hex, URL and JSON-escaped form).
@@ -70,6 +71,23 @@ fn forward(a: &RunArgs) -> Result<i32, (String, i32)> {
         ));
     }
     let has_ref = client::args_have_ref(&a.command).map_err(|m| usage(&m))?;
+    // The shim skips these silently; an explicit `ms run` says why they were not sent.
+    let refused: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, v)| {
+            !ms_core::SecretRef::find_all(v).is_empty() && !ms_run::input::env_name_allowed(k)
+        })
+        .map(|(k, _)| k)
+        .collect();
+    if !refused.is_empty() {
+        return Err((
+            format!(
+                "morsec: {} can't carry an ms:// reference: it changes how programs load code or run commands. Use a variable the key's rule names (ms rules <key> --add-env NAME)",
+                refused.join(", ")
+            ),
+            client::EXIT_REFUSED,
+        ));
+    }
     let env = client::ref_env(std::env::vars_os()).map_err(|m| usage(&m))?;
     if !has_ref && env.is_empty() {
         return Err(usage(

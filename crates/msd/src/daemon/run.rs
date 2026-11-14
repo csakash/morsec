@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use ms_approve::ApprovalOutcome;
-use ms_core::{Decision, KeyName, Mode, Reason, ReceiptEvent, ReceiptResult, SessionId};
+use ms_core::{Decision, KeyName, Mode, Reason, ReceiptEvent, ReceiptResult, SecretRef, SessionId};
 use ms_ipc::{ErrorCode, PeerInfo, ResponseBody, RunEnv, StreamIo};
 use ms_receipts::ReceiptDetail;
 use ms_rules::project::MAX_PROJECT_FILE;
@@ -36,6 +36,11 @@ use super::{APPROVAL_TIMEOUT, Daemon, PRE_L11, now_ms, reply_err, session_of};
 pub const MAX_RUNS: usize = 8;
 /// Cap per output stream of a buffered `Run`.
 pub const BUFFERED_CAP: usize = 256 * 1024;
+/// How often a running command checks for `ms stop`.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+/// What a run killed by `ms stop` answers.
+const STOPPED_MID_RUN: &str =
+    "morsec: morsec was stopped (ms stop or a stopped session), so the command was killed";
 /// Most output bytes in one `RunOutput` frame.
 const FRAME_DATA: usize = 32 * 1024;
 /// Longest argv shown in a receipt's target.
@@ -66,7 +71,7 @@ impl Daemon {
         argv: Vec<String>,
         cwd: PathBuf,
         env: Vec<RunEnv>,
-    ) -> Result<Prepared, ResponseBody> {
+    ) -> Result<(Prepared, SessionId), ResponseBody> {
         let caller = self.caller(peer).ok_or_else(|| {
             reply_err(
                 ErrorCode::Denied,
@@ -80,7 +85,7 @@ impl Daemon {
                 "morsec: this agent session was stopped after repeated blocked attempts (LOG-2). Start a new session",
             ));
         }
-        let input = RunInput::new(
+        let mut input = RunInput::new(
             argv,
             cwd,
             env.into_iter().map(|e| (e.name, e.value)).collect(),
@@ -102,7 +107,22 @@ impl Daemon {
             )
             .reply());
         }
-        let target = target_of(&input.argv);
+        let carries_run_ref = |v: &str| {
+            SecretRef::find_all(v)
+                .iter()
+                .any(|(_, r)| run_keys.contains(r.name()))
+        };
+        let env_names: Vec<&str> = input
+            .env
+            .iter()
+            .filter(|(_, v)| carries_run_ref(v))
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let target = if env_names.is_empty() {
+            target_of(&input.argv)
+        } else {
+            format!("{} [env {}]", target_of(&input.argv), env_names.join(","))
+        };
         let hash = ms_rules::argv_hash(&input.argv);
         let refuse = |key: &KeyName, result: ReceiptResult, reply: ResponseBody| {
             if let Err(e) = self.record_run(&session, key, &target, hash, version, result, None) {
@@ -110,6 +130,50 @@ impl Daemon {
             }
             reply
         };
+
+        // Values go only into variables the key's rule names, and only as the whole value
+        // (`NAME=ms://key`): a variable the agent picks, or text around the ref, could make the
+        // tool load the agent's config or send the value somewhere else (security review S1).
+        // Variables that hold no run-mode ref are not given to the child at all.
+        let mut kept = Vec::new();
+        for (name, value) in std::mem::take(&mut input.env) {
+            if !carries_run_ref(&value) {
+                continue;
+            }
+            let whole = SecretRef::parse(&value)
+                .ok()
+                .filter(|r| run_keys.contains(r.name()));
+            let Some(r) = whole else {
+                let k = SecretRef::find_all(&value)
+                    .into_iter()
+                    .map(|(_, r)| r.name().clone())
+                    .find(|k| run_keys.contains(k))
+                    .unwrap_or_else(|| unreachable!("carries_run_ref checked it"));
+                let msg = format!(
+                    "morsec: {name} must be exactly ms://{k} (nothing before or after it, no other reference); morsec puts a value only into a whole variable"
+                );
+                let result = ReceiptResult::Blocked(Reason::CommandNotAllowed);
+                return Err(refuse(&k, result, reply_err(ErrorCode::Denied, msg)));
+            };
+            let k = r.name().clone();
+            let allowed = user
+                .keys
+                .get(&k)
+                .is_some_and(|rule| rule.env.contains(&name));
+            if !allowed || !ms_run::input::env_name_allowed(&name) {
+                let msg = format!(
+                    "morsec: {k}'s value may not go into {name}. If that variable is how the tool takes it, allow it from your own terminal: ms rules {k} --add-env {name}"
+                );
+                let result = ReceiptResult::Blocked(Reason::CommandNotAllowed);
+                return Err(refuse(&k, result, reply_err(ErrorCode::Denied, msg)));
+            }
+            kept.push((name, value));
+        }
+        input.env_keys = kept
+            .iter()
+            .filter_map(|(_, v)| SecretRef::parse(v).ok().map(|r| r.name().clone()))
+            .collect();
+        input.env = kept;
 
         // Roots: the user's rules, for every key. All keys must agree on one directory.
         let mut real_cwd = None;
@@ -216,7 +280,18 @@ impl Daemon {
                 ));
             }
         }
-        Ok(prepared)
+        Ok((prepared, session))
+    }
+
+    /// Resolves once `ms stop` is in effect or a LOG-2 alert stopped `session`, so a run in
+    /// progress can be killed (security review S3).
+    async fn stop_signal(&self, session: &SessionId) {
+        loop {
+            if self.is_stopped() || self.session_stopped(session) {
+                return;
+            }
+            tokio::time::sleep(STOP_POLL).await;
+        }
     }
 
     // Private helper; each argument is one receipt field.
@@ -265,12 +340,21 @@ pub(crate) fn run_buffered(
     let Ok(_permit) = RUNS.try_acquire() else {
         return busy();
     };
-    let prepared = match d.prepare_run(peer, argv, cwd, env) {
+    let (prepared, session) = match d.prepare_run(peer, argv, cwd, env) {
         Ok(p) => p,
         Err(r) => return r,
     };
     let handle = tokio::runtime::Handle::current();
-    match handle.block_on(runner().execute_buffered(prepared, BUFFERED_CAP)) {
+    let result = handle.block_on(async {
+        tokio::select! {
+            r = runner().execute_buffered(prepared, BUFFERED_CAP) => Some(r),
+            () = d.stop_signal(&session) => None,
+        }
+    });
+    let Some(result) = result else {
+        return reply_err(ErrorCode::Denied, STOPPED_MID_RUN);
+    };
+    match result {
         Ok((exit, out, err, truncated)) => ResponseBody::RunResult {
             code: exit.code,
             signal: exit.signal,
@@ -295,8 +379,9 @@ pub(crate) async fn run_stream(
     let Ok(_permit) = RUNS.try_acquire() else {
         return busy();
     };
-    let prepared =
-        match tokio::task::spawn_blocking(move || d.prepare_run(&peer, argv, cwd, env)).await {
+    let d2 = d.clone();
+    let (prepared, session) =
+        match tokio::task::spawn_blocking(move || d2.prepare_run(&peer, argv, cwd, env)).await {
             Ok(Ok(p)) => p,
             Ok(Err(r)) => return r,
             Err(e) => {
@@ -335,7 +420,12 @@ pub(crate) async fn run_stream(
             output: tx,
         },
     );
-    let (exit, ()) = tokio::join!(exec, forward);
+    let both = async { tokio::join!(exec, forward).0 };
+    let exit = tokio::select! {
+        e = both => e,
+        // Dropping the run kills the child's process group.
+        () = d.stop_signal(&session) => return reply_err(ErrorCode::Denied, STOPPED_MID_RUN),
+    };
     match exit {
         Ok(e) => ResponseBody::RunExit {
             code: e.code,
@@ -545,7 +635,7 @@ mod tests {
         );
         assert!(matches!(put, ResponseBody::Ok { .. }), "{put:?}");
         let rule = format!(
-            "version = 1\n[keys.\"svc/prod\"]\nmode = \"run\"\ntier = \"production\"\ncommands = [[\"env\"]]\nroots = [\"{}\"]\n",
+            "version = 1\n[keys.\"svc/prod\"]\nmode = \"run\"\ntier = \"production\"\ncommands = [[\"env\"]]\nroots = [\"{}\"]\nenv = [\"TOKEN\"]\n",
             root.display()
         );
         let saved = d.handle(
@@ -621,6 +711,174 @@ mod tests {
         assert!(receipts.contains("tok-1"), "{receipts}");
         assert!(receipts.contains("denied"), "{receipts}");
         assert!(!receipts.contains(VALUE));
+    }
+
+    /// A daemon with one test-tier run key `svc/test` (value VALUE) under `rule_body`, roots =
+    /// `<tmp>/proj`; the caller is an agent session.
+    fn test_daemon(rule_body: &str) -> (Arc<Daemon>, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let who: Arc<Mutex<Option<Caller>>> = Arc::new(Mutex::new(Some(Caller::Unattributed {
+            pid: 43,
+            started_unix_ms: 1,
+        })));
+        let w = who.clone();
+        let identify: Identify = Arc::new(move |_| w.lock().unwrap().clone());
+        let d = Daemon::open(
+            Backend::Memory(Arc::new(MemoryVault::new())),
+            Paths::under(dir.path()),
+            0,
+            Arc::new(crate::approve::DenyApprover),
+            identify,
+        )
+        .unwrap();
+        let k = KeyName::new("svc/test").unwrap();
+        let put = d.handle(
+            &peer(),
+            RequestBody::PutKey {
+                name: k.clone(),
+                meta: KeyMeta {
+                    name: k.clone(),
+                    mode: Mode::Run,
+                    tier: Tier::Test,
+                    created_unix_ms: 1,
+                },
+            },
+            Some(SecretBytes::new(VALUE.as_bytes().to_vec())),
+        );
+        assert!(matches!(put, ResponseBody::Ok { .. }), "{put:?}");
+        let rule = format!(
+            "version = 1\n[keys.\"svc/test\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"{}\"]\n{rule_body}\n",
+            root.display()
+        );
+        let saved = d.handle(
+            &peer(),
+            RequestBody::RulesProposeLoosen {
+                key: k,
+                rule: Some(rule),
+                at_terminal: true,
+            },
+            None,
+        );
+        assert!(matches!(saved, ResponseBody::Ok { .. }), "{saved:?}");
+        *who.lock().unwrap() = Some(Caller::Agent(SessionId {
+            agent: AgentKind::ClaudeCode,
+            pid: 42,
+            started_unix_ms: 1,
+        }));
+        (d, dir, root)
+    }
+
+    fn buffered(
+        rt: &tokio::runtime::Runtime,
+        d: &Arc<Daemon>,
+        root: &Path,
+        argv: &[&str],
+        env: &[(&str, &str)],
+    ) -> ResponseBody {
+        let d = d.clone();
+        let root = root.to_path_buf();
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let env: Vec<RunEnv> = env
+            .iter()
+            .map(|(n, v)| RunEnv {
+                name: n.to_string(),
+                value: v.to_string(),
+            })
+            .collect();
+        rt.block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                d.handle(
+                    &peer(),
+                    RequestBody::Run {
+                        argv,
+                        cwd: root,
+                        env,
+                    },
+                    None,
+                )
+            })
+            .await
+            .unwrap()
+        })
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    // protects=security review S1: a value goes only into a variable the key's rule names, and
+    // only as the whole value; a variable that holds no run-mode ref (CURL_HOME=…/ms://zz/h, the
+    // agent's config dir) never reaches the child; fails_when=any of those reaches the child
+    // or runs; no_claim=what the tool does with an allowed variable
+    #[test]
+    fn env_only_as_the_rule_names_it() {
+        let rt = rt();
+        let (d, _dir, root) = test_daemon("commands = [[\"env\"]]\nenv = [\"TOKEN\"]");
+        let out = |r: ResponseBody| match r {
+            ResponseBody::RunResult { stdout, .. } => {
+                String::from_utf8(ms_ipc::b64_decode(&stdout).unwrap()).unwrap()
+            }
+            other => panic!("{other:?}"),
+        };
+        let o = out(buffered(
+            &rt,
+            &d,
+            &root,
+            &["env"],
+            &[("TOKEN", "ms://svc/test"), ("CURL_HOME", "/proj/ms://zz/h")],
+        ));
+        assert!(o.contains("TOKEN=[redacted ms://svc/test]"), "{o}");
+        assert!(!o.contains("CURL_HOME") && !o.contains(VALUE), "{o}");
+        for env in [
+            [("TOKEN", "Bearer ms://svc/test")],
+            [("TOKEN", "ms://svc/test#x")],
+            [("OTHER", "ms://svc/test")],
+            [("CURL_HOME", "/x/ms://svc/test")],
+        ] {
+            let r = buffered(&rt, &d, &root, &["env"], &env);
+            assert!(
+                matches!(
+                    &r,
+                    ResponseBody::Error {
+                        code: ErrorCode::Denied | ErrorCode::Invalid,
+                        ..
+                    }
+                ),
+                "{env:?}: {r:?}"
+            );
+        }
+    }
+
+    // protects=security review S3: `ms stop` kills a run in progress (and a later run is
+    // refused); fails_when=the command runs to completion after the stop; no_claim=-
+    #[test]
+    fn stop_kills_a_running_command() {
+        let rt = rt();
+        let (d, _dir, root) = test_daemon("commands = [[\"sleep\", \"30\"]]\nenv = [\"TOKEN\"]");
+        let d2 = d.clone();
+        let started = std::time::Instant::now();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            d2.handle(&peer(), RequestBody::Stop, None)
+        });
+        let r = buffered(
+            &rt,
+            &d,
+            &root,
+            &["sleep", "30"],
+            &[("TOKEN", "ms://svc/test")],
+        );
+        assert!(matches!(stopper.join().unwrap(), ResponseBody::Ok { .. }));
+        assert!(
+            matches!(&r, ResponseBody::Error { code: ErrorCode::Denied, message } if message.contains("killed")),
+            "{r:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     // protects=receipt targets are escaped and bounded, so an agent's argv can't inject lines or

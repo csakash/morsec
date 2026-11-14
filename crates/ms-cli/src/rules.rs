@@ -58,6 +58,13 @@ pub struct RulesArgs {
     /// Propose removing a project root.
     #[arg(long, value_name = "DIR")]
     remove_root: Vec<PathBuf>,
+    /// Propose letting a run key's value go into this environment variable (the command is
+    /// then called with NAME=ms://<key>).
+    #[arg(long, value_name = "NAME")]
+    add_env: Vec<String>,
+    /// Propose removing an environment variable name.
+    #[arg(long, value_name = "NAME")]
+    remove_env: Vec<String>,
     /// Propose a tier: test or production.
     #[arg(long, value_name = "TIER")]
     tier: Option<String>,
@@ -84,6 +91,8 @@ impl RulesArgs {
             || !self.remove_command.is_empty()
             || !self.add_root.is_empty()
             || !self.remove_root.is_empty()
+            || !self.add_env.is_empty()
+            || !self.remove_env.is_empty()
             || self.tier.is_some()
             || self.ttl.is_some()
             || self.read_only
@@ -472,6 +481,7 @@ fn show(name: &KeyName, r: &KeyRule) {
                 "roots",
                 r.roots.iter().map(|p| p.display().to_string()).collect(),
             );
+            list("env", r.env.clone());
         }
         ms_core::Mode::Mint => list("scopes", r.mint_scopes.clone()),
     }
@@ -535,6 +545,13 @@ fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRu
     for d in &a.remove_root {
         let p = root_arg(d)?;
         r.roots.retain(|x| *x != p);
+    }
+    for n in &a.add_env {
+        ms_rules::validate_env_name(n).map_err(|e| format!("morsec: {e}"))?;
+        r.env.push(n.clone());
+    }
+    for n in &a.remove_env {
+        r.env.retain(|x| x != n);
     }
     if let Some(t) = &a.tier {
         r.tier = match t.as_str() {

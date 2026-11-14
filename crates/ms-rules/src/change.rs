@@ -38,7 +38,8 @@ pub fn classify_rule(old: Option<&KeyRule>, new: Option<&KeyRule>) -> Change {
                 && n.mint_scopes.iter().all(|s| o.mint_scopes.contains(s))
                 && n.roots
                     .iter()
-                    .all(|r| o.roots.iter().any(|old| crate::model::within_root(r, old)));
+                    .all(|r| o.roots.iter().any(|old| crate::model::within_root(r, old)))
+                && n.env.iter().all(|e| o.env.contains(e));
             if narrower {
                 Change::Tighten
             } else {
@@ -83,6 +84,7 @@ mod tests {
         r.hosts = vec![HostPattern::parse("*.db.internal").unwrap()];
         r.session_ttl_secs = 600;
         r.roots = vec!["/r/app".into()];
+        r.env = vec!["PGPASSWORD".into()];
         r
     }
 
@@ -109,6 +111,7 @@ mod tests {
             Box::new(|r| r.roots = vec!["/r".into()]),
             // A sibling that shares a string prefix is not inside the root.
             Box::new(|r| r.roots = vec!["/r/application".into()]),
+            Box::new(|r| r.env.push("CURL_HOME".into())),
         ];
         for (i, f) in loosen.iter().enumerate() {
             let mut start = o.clone();
@@ -132,6 +135,7 @@ mod tests {
         n.roots = vec!["/r/app/sub".into()];
         assert_eq!(classify_rule(Some(&o), Some(&n)), Change::Tighten);
         n.roots.clear();
+        n.env.clear();
         assert_eq!(classify_rule(Some(&o), Some(&n)), Change::Tighten);
         assert_eq!(classify_rule(Some(&o), None), Change::Tighten);
         assert_eq!(classify_rule(None, Some(&o)), Change::Loosen);

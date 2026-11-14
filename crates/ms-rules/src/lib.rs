@@ -18,7 +18,7 @@ pub mod store;
 
 pub use change::{Change, classify, classify_rule};
 pub use error::{Result, RulesError};
-pub use model::{KeyRule, Rules, is_reserved, validate_root, within_root};
+pub use model::{KeyRule, Rules, is_reserved, validate_env_name, validate_root, within_root};
 pub use pattern::{CommandPattern, HostPattern, NormalHost};
 pub use policy::{argv_hash, decide, decide_run, permissiveness};
 pub use project::{KeyLimit, PROJECT_FILE, ProjectRules, effective, merge};

@@ -24,12 +24,20 @@ use zeroize::Zeroizing;
 /// Most bytes held back while a redacted span may still grow. Beyond this the span is emitted
 /// as redacted and the stream moves on.
 pub const MAX_HOLD: usize = 64 * 1024;
+/// Base64 characters before a base64 match that are also redacted: they carry a few bits of
+/// the value's first byte.
+const EDGE_BACK: usize = 2;
+/// Base64 characters (then `=` padding) after a base64 match that are also redacted.
+const EDGE_FWD: usize = 2;
+const EDGE_PAD: usize = 2;
 
 /// The forms of a set of values to redact.
 pub struct Patterns {
     ac: Option<AhoCorasick>,
     /// Pattern index → index into `labels`.
     owner: Vec<usize>,
+    /// Pattern index → true for a base64 form (its boundary characters are redacted too).
+    edge: Vec<bool>,
     /// Replacement text per key.
     labels: Vec<Vec<u8>>,
     max_len: usize,
@@ -51,6 +59,7 @@ impl std::fmt::Debug for Patterns {
 pub struct PatternsBuilder {
     pats: Vec<Zeroizing<Vec<u8>>>,
     owner: Vec<usize>,
+    edge: Vec<bool>,
     labels: Vec<Vec<u8>>,
 }
 
@@ -76,25 +85,39 @@ impl PatternsBuilder {
                 self.labels.len() - 1
             }
         };
-        self.push(idx, value);
+        self.push(idx, value, false);
         let mut needles = ms_scan::Needles::new();
         if needles.add(0, value) {
-            for (_, p) in needles.patterns() {
-                self.push(idx, p);
+            for (_, enc, p) in needles.patterns() {
+                let edge = matches!(
+                    enc,
+                    ms_scan::Encoding::Base64 | ms_scan::Encoding::Base64Url
+                );
+                self.push(idx, p, edge);
             }
         }
     }
 
-    fn push(&mut self, owner: usize, p: &[u8]) {
-        if !self.pats.iter().any(|q| q[..] == *p) {
-            self.pats.push(Zeroizing::new(p.to_vec()));
-            self.owner.push(owner);
+    fn push(&mut self, owner: usize, p: &[u8], edge: bool) {
+        match self.pats.iter().position(|q| q[..] == *p) {
+            Some(i) => self.edge[i] |= edge,
+            None => {
+                self.pats.push(Zeroizing::new(p.to_vec()));
+                self.owner.push(owner);
+                self.edge.push(edge);
+            }
         }
     }
 
     /// Builds the automaton.
     pub fn build(self) -> Patterns {
-        let max_len = self.pats.iter().map(|p| p.len()).max().unwrap_or(0);
+        let longest = self.pats.iter().map(|p| p.len()).max().unwrap_or(0);
+        // A base64 match may grow by its boundary characters; hold enough to see them.
+        let max_len = if self.edge.iter().any(|e| *e) {
+            longest + EDGE_FWD + EDGE_PAD
+        } else {
+            longest
+        };
         let ac = if self.pats.is_empty() {
             None
         } else {
@@ -109,6 +132,7 @@ impl PatternsBuilder {
             failed: ac.is_none() && !self.pats.is_empty(),
             ac,
             owner: self.owner,
+            edge: self.edge,
             labels: self.labels,
             max_len,
         }
@@ -139,9 +163,31 @@ impl Patterns {
         let Some(ac) = &self.ac else {
             return Vec::new();
         };
+        let b64 = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'-' | b'_');
         let mut raw: Vec<(usize, usize, usize)> = ac
             .find_overlapping_iter(buf)
-            .map(|m| (m.start(), m.end(), self.owner[m.pattern().as_usize()]))
+            .map(|m| {
+                let i = m.pattern().as_usize();
+                let (mut s, mut e) = (m.start(), m.end());
+                if self.edge[i] {
+                    for _ in 0..EDGE_BACK {
+                        if s > 0 && b64(buf[s - 1]) {
+                            s -= 1;
+                        }
+                    }
+                    for _ in 0..EDGE_FWD {
+                        if e < buf.len() && b64(buf[e]) {
+                            e += 1;
+                        }
+                    }
+                    for _ in 0..EDGE_PAD {
+                        if e < buf.len() && buf[e] == b'=' {
+                            e += 1;
+                        }
+                    }
+                }
+                (s, e, self.owner[i])
+            })
             .collect();
         raw.sort_unstable();
         let mut merged: Vec<(usize, usize, usize)> = Vec::with_capacity(raw.len());
@@ -235,7 +281,10 @@ impl StreamRedactor {
                 s
             }
             None => {
-                let split = pos.max(cut);
+                // Keep a few bytes before the cut as context, so a base64 match starting right
+                // after them can still take in its boundary characters next time.
+                let back = if eof { 0 } else { EDGE_BACK };
+                let split = pos.max(cut.saturating_sub(back));
                 out.extend_from_slice(&buf[pos..split]);
                 split
             }
@@ -343,6 +392,27 @@ mod tests {
         assert_eq!(out, b"<[redacted ms://a]>");
         let out = feed(&p, &[b"AAAAbbbbCCCCAAAAbbbbCCCC"]);
         assert_eq!(out, b"[redacted ms://a][redacted ms://a]");
+    }
+
+    // protects=QA finding: the base64 boundary characters next to a redacted base64 form (they
+    // carry bits of the value's first and last byte) and its padding are redacted too, at every
+    // split; fails_when=`A==`-style leftovers survive; no_claim=-
+    #[test]
+    fn base64_boundaries_are_redacted() {
+        let p = pats(&[("k", SECRET.as_bytes())]);
+        for prefix in ["", "a", "ab", "abc"] {
+            let enc = STANDARD.encode(format!("{prefix}{SECRET}"));
+            let text = format!("<{enc}>");
+            for i in 0..=text.len() {
+                let out = feed(&p, &[&text.as_bytes()[..i], &text.as_bytes()[i..]]);
+                let out = String::from_utf8(out).unwrap();
+                assert!(
+                    out.ends_with("[redacted ms://k]>"),
+                    "{prefix:?} split {i}: {out}"
+                );
+                assert!(!out.contains('='), "{prefix:?} split {i}: {out}");
+            }
+        }
     }
 
     // protects=a short value (under 8 bytes) is still redacted raw; empty patterns pass output

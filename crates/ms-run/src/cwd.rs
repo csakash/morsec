@@ -32,15 +32,17 @@ pub fn check(cwd: &Path, roots: &[PathBuf], key: &str) -> Result<PathBuf, RunErr
             real.display()
         )));
     }
-    let inside = roots.iter().any(|r| {
-        // A root that doesn't exist (yet) matches nothing.
-        std::fs::canonicalize(r).is_ok_and(|root| real.starts_with(&root))
-    });
+    // A root matches only as stored: one that doesn't exist (yet), or that is a symlink or not
+    // canonical, matches nothing. Otherwise a "narrower" root inside an old one could be a link
+    // to anywhere (security review S2). `ms rules --add-root` stores canonical paths.
+    let inside = roots
+        .iter()
+        .any(|r| std::fs::canonicalize(r).is_ok_and(|root| root == *r && real.starts_with(&root)));
     if inside {
         Ok(real)
     } else {
         Err(RunError::denied(format!(
-            "morsec: {} is outside {key}'s project roots, so the command was refused. Run it from inside a project root, or add one from your own terminal: ms rules {key} --add-root <dir>",
+            "morsec: {} is outside {key}'s project roots, so the command was refused. Run it from inside a project root, or add one from your own terminal: ms rules {key} --add-root <dir> (a root that is a symlink or not a canonical path never matches)",
             real.display()
         )))
     }
@@ -84,9 +86,13 @@ mod tests {
         assert!(check(Path::new("rel"), &roots, "k").is_err());
         assert!(check(&app.join("missing"), &roots, "k").is_err());
 
-        // A root given through a symlink still matches its real directory.
-        let link = base.join("link-to-app");
-        std::os::unix::fs::symlink(&app, &link).unwrap();
-        assert_eq!(check(&sub, &[link], "k").unwrap(), sub);
+        // S2: a root that is a symlink matches nothing, even one stored inside another root
+        // (it could point anywhere, e.g. at /).
+        let link = app.join("esc");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(check(&other, &[link], "k").is_err());
+        let link2 = base.join("link-to-app");
+        std::os::unix::fs::symlink(&app, &link2).unwrap();
+        assert!(check(&sub, &[link2], "k").is_err());
     }
 }
