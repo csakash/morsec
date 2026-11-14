@@ -307,8 +307,6 @@ hosts = ["*.com"]
         );
     }
 
-    // protects=disabled, mode mismatch and an unparsable project file all disable keys (fail
-    // closed); fails_when=such a key still allows anything; no_claim=locating the file (CLI)
     // protects=L16 SPEC D2 (review R7): a project file can't pin SSH host keys; one that tries
     // fails to parse, which disables every key, pins included; fails_when=a project file adds
     // a pin or a disabled key keeps one; no_claim=-
@@ -332,6 +330,8 @@ hosts = ["*.com"]
         assert!(eff.keys[&k("k")].ssh_host_keys.is_empty());
     }
 
+    // protects=disabled, mode mismatch and an unparsable project file all disable keys (fail
+    // closed); fails_when=such a key still allows anything; no_claim=locating the file (CLI)
     #[test]
     fn disables_fail_closed() {
         let user = Rules::from_toml(USER, "rules.toml").unwrap();

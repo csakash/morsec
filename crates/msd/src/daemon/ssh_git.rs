@@ -156,6 +156,17 @@ impl Daemon {
                 printable(&input.argv[0])
             ));
         };
+        // A read-only rule can't be enforced on ssh or git (only the psql and prisma adapters
+        // can, L15): refuse now, before any approval is asked for a call that can't run.
+        if let Some(ro) = input
+            .env_keys
+            .iter()
+            .find(|e| rules.keys.get(*e).is_some_and(|r| r.read_only))
+        {
+            return refuse(format!(
+                "morsec: {ro} has a read-only rule, which morsec can't enforce for ssh or git, so this command is refused"
+            ));
+        }
         let pins: Vec<HostPin> = rules
             .keys
             .get(&k)
@@ -674,8 +685,9 @@ mod tests {
     }
 
     // protects=SPEC D1/D2: MS_SSH_KEY on a key without pinned host keys, with a tool other
-    // than ssh or git, or with a git subcommand that runs the caller's commands is refused with
-    // a receipt before anything runs; fails_when=any of these runs; no_claim=-
+    // than ssh or git, with a git subcommand that runs the caller's commands, or with a
+    // read-only rule (L15) is refused with a receipt before anything runs (and before any
+    // approval); fails_when=any of these runs; no_claim=-
     #[test]
     fn needs_pins_and_a_known_call() {
         let tmp = tempfile::tempdir().unwrap();
@@ -701,7 +713,23 @@ mod tests {
                         "\nssh_host_keys = [\"h.example ssh-ed25519 {pin}\"]"
                     )),
                 ),
+                (
+                    "gh/ro",
+                    "x",
+                    Tier::Test,
+                    body(&format!(
+                        "\nread_only = true\nssh_host_keys = [\"h.example ssh-ed25519 {pin}\"]"
+                    )),
+                ),
             ],
+        );
+        // A read-only rule is refused by msd's ssh/git check itself (before any approval), not
+        // later by the runner.
+        let r = run(&d, &proj, &["git", "push"], &[("MS_SSH_KEY", "ms://gh/ro")]);
+        assert!(
+            matches!(&r, ResponseBody::Error { code: ErrorCode::Denied, message, .. }
+                if message.contains("can't enforce for ssh or git")),
+            "{r:?}"
         );
         for (argv, key) in [
             (&["git", "push"][..], "gh/bare"),
@@ -722,6 +750,6 @@ mod tests {
             );
         }
         let rec = receipts(&t);
-        assert_eq!(rec.matches("blocked").count(), 4, "{rec}");
+        assert_eq!(rec.matches("{\"blocked\":").count(), 5, "{rec}");
     }
 }

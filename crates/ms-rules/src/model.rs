@@ -461,6 +461,7 @@ pub(crate) struct KeyRuleFile {
     env: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ssh_host_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     git_hosts: Vec<String>,
 }
 
@@ -728,6 +729,21 @@ mint_scopes = ["s3:read"]
         assert_eq!(k.git_hosts, ["git.example.com", "github.com"]);
         let back = Rules::from_toml(&r.to_toml(), "rules.toml").unwrap();
         assert_eq!(back, r);
+    }
+
+    // protects=a rules file written before L16 and L30 still parses (both fields are optional and
+    // left out when empty); fails_when=either field loses its serde default; no_claim=project files
+    #[test]
+    fn older_files_without_ssh_or_git_fields_parse() {
+        let t = "version = 1\n[keys.\"stripe/test\"]\nmode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\"]";
+        let r = Rules::from_toml(t, "rules.toml").unwrap();
+        let k = &r.keys[&KeyName::new("stripe/test").unwrap()];
+        assert!(k.git_hosts.is_empty() && k.ssh_host_keys.is_empty());
+        let out = r.to_toml();
+        assert!(
+            !out.contains("git_hosts") && !out.contains("ssh_host_keys"),
+            "{out}"
+        );
     }
 
     // protects=L30 D1 a git host must be an exact lowercase DNS name that is also a host of a swap
