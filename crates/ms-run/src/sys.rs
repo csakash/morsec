@@ -11,8 +11,9 @@
 /// id = its PID.
 pub(crate) fn new_session(cmd: &mut tokio::process::Command) {
     // SAFETY: the closure runs in the child between fork and exec, where only
-    // async-signal-safe work is allowed. It makes one raw `setsid` system call through rustix
-    // (no allocation, no locks) and builds an `io::Error` from an errno, which allocates
+    // async-signal-safe work is allowed. It makes one `setsid` call through rustix (a raw system
+    // call on Linux, libc's `setsid` on macOS; async-signal-safe under POSIX either way; no
+    // allocation, no locks) and builds an `io::Error` from an errno, which allocates
     // nothing either.
     unsafe {
         cmd.pre_exec(|| {

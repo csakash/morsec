@@ -72,9 +72,9 @@ destination check.
   `ForwardAgent=no`, `ProxyCommand=none`, `ProxyJump=none`, `ControlMaster=no`,
   `ControlPath=none`, `PermitLocalCommand=no`, `BatchMode=yes`, `PasswordAuthentication=no`,
   `KbdInteractiveAuthentication=no`, `ClearAllForwardings=yes`, `ForkAfterAuthentication=no`,
-  `EscapeChar=none`. The public key and pinned-keys files are public data in the
+  `EscapeChar=none`, `ForwardX11=no`, `ForwardX11Trusted=no`. The public key and pinned-keys files are public data in the
   run's 0700 directory.
-- Direct `ssh`: the flags `-A -F -J -S -M -I -f -L -R -D -W -w -i` are refused; `-o` takes only `ServerAliveInterval`,
+- Direct `ssh`: the flags `-A -F -J -S -M -I -f -L -R -D -W -w -i -e -X -Y` are refused; `-o` takes only `ServerAliveInterval`,
   `ServerAliveCountMax`, `ConnectTimeout`, `ConnectionAttempts`, `LogLevel`, `RequestTTY`,
   `Compression`, `TCPKeepAlive`, `User`; the destination (with `-p` or `ssh://…:PORT`) must
   match a pinned host. Otherwise refused before anything runs.

@@ -34,7 +34,9 @@ const SSH_PLAIN: &[u8] = b"1246AaCfGgKkMNnqsTtVvXxYy";
 /// socket or master, a PKCS#11 provider.
 /// Also refused (security review S2): going to the background (`-f`) and port, stdio and tunnel
 /// forwarding (`-L -R -D -W -w`), which would outlive the run; another identity file (`-i`).
-const SSH_REFUSED: &[u8] = b"AFJSMIfLRDWwi";
+/// `-e` sets the escape character over the forced `EscapeChar=none` (security review S4);
+/// `-X`/`-Y` forward the local display to the remote host.
+const SSH_REFUSED: &[u8] = b"AFJSMIfLRDWwieXY";
 
 /// Checks the caller's arguments (after `argv[0]`) for `tool`. For ssh, the destination must be
 /// one of `pins` (host and port).
@@ -291,6 +293,8 @@ pub(crate) fn forced_ssh_options(agent: &Path, public: &Path, known_hosts: &Path
         "ClearAllForwardings=yes".to_owned(),
         "ForkAfterAuthentication=no".to_owned(),
         "EscapeChar=none".to_owned(),
+        "ForwardX11=no".to_owned(),
+        "ForwardX11Trusted=no".to_owned(),
     ] {
         v.push("-o".to_owned());
         v.push(o);
@@ -373,6 +377,9 @@ mod tests {
             &["-W", "h:22", "github.com"],
             &["-w", "0", "github.com"],
             &["-i", "/Users/me/.ssh/id_ed25519", "github.com"],
+            &["-e", "~", "github.com"],
+            &["-X", "github.com"],
+            &["-Y", "github.com"],
             &["-Z", "github.com"],
             &["-o", "HostName=evil.example", "github.com"],
             &["-oPort=2222", "github.com"],

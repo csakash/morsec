@@ -846,7 +846,10 @@ mod tests {
         // Started with another group (this test runs in its own group, not that one): refused.
         session.started(1);
         assert!(ask(&sock).is_none());
-        // A session for this process's own group: answered.
+        // A session for this process's own group: answered only if this process also leads
+        // that session (the peer check wants both, security review S1). A test harness is
+        // usually not a session leader, so this is mostly the refusal; the answered path runs
+        // with real run children in the sshd test.
         let (s2, vault2) = setup(Tool::Ssh, [0x11; 32]);
         let mine = {
             let _g = rt.enter();
@@ -856,9 +859,19 @@ mod tests {
             .unwrap()
             .as_raw_nonzero()
             .get();
+        let leads = rustix::process::getsid(None)
+            .unwrap()
+            .as_raw_nonzero()
+            .get()
+            == pgid;
         mine.started(u32::try_from(pgid).unwrap());
-        let body = ask(mine.agent.as_deref().unwrap()).unwrap();
-        assert_eq!(body[0], agent::IDENTITIES_ANSWER);
+        match ask(mine.agent.as_deref().unwrap()) {
+            Some(body) => {
+                assert!(leads, "answered a peer outside the run's session");
+                assert_eq!(body[0], agent::IDENTITIES_ANSWER);
+            }
+            None => assert!(!leads, "refused a peer in the run's group and session"),
+        }
         let dir = mine.dir().to_path_buf();
         drop(mine);
         assert!(!dir.exists());
