@@ -91,7 +91,7 @@ Tests use a fake. **There is no environment variable or flag that skips Touch ID
 build.** For the end-to-end tests only, a *debug* build of msd started with the ephemeral
 `--vault memory` accepts `--test-touch-id allow|deny`, which replaces only the authenticator (the
 pending slot, caller checks, rendering and token stay real). It is refused with the keychain vault
-and absent from release builds.
+and refused at startup in release builds (`cfg!(debug_assertions)`).
 
 ## IPC v1 additions (backwards compatible)
 

@@ -174,12 +174,24 @@ pub fn run(a: &ApproveArgs) -> ExitCode {
                 if let Answer::Approve(_) = answer {
                     let _ = writeln!(tty, "Waiting for Touch ID…");
                 }
-                match decide(&rt, &p.id, answer) {
-                    Ok(m) => println!("{}", terminal_safe(&m)),
-                    Err(m) => eprintln!("{}", terminal_safe(&m)),
-                }
+                let ok = match decide(&rt, &p.id, answer) {
+                    Ok(m) => {
+                        println!("{}", terminal_safe(&m));
+                        true
+                    }
+                    Err(m) => {
+                        eprintln!("{}", terminal_safe(&m));
+                        false
+                    }
+                };
                 if !a.watch {
-                    return ExitCode::SUCCESS;
+                    // A denial you chose is success; Touch ID failing or the request having
+                    // ended is not (review R4).
+                    return if ok {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    };
                 }
                 said_waiting = false;
             }
@@ -223,9 +235,12 @@ pub(crate) fn inline_review(what: &'static str) -> InlineReview {
         let mut told = false;
         while !d.load(Ordering::SeqCst) {
             let found = pending(&rt);
-            if found.is_err() && !told {
+            if let Err(m) = &found
+                && !told
+                && m.contains("inside an agent session")
+            {
                 // Inside an agent session msd won't show approvals here; the person answers in
-                // their own terminal.
+                // their own terminal (review R5: only for that refusal, not any IPC error).
                 eprintln!(
                     "{what} may need the user's approval: they review it with ms approve in their own terminal"
                 );
@@ -266,7 +281,7 @@ pub(crate) async fn status_hint() -> Option<String> {
     let mut c = Client::connect(&path).await.ok()?;
     match c.request(RequestBody::ApprovalPending).await.ok()? {
         ResponseBody::Approval { pending: Some(_) } => {
-            Some("1 approval waiting · review it with: ms approve".into())
+            Some("1 approval waiting · run ms approve".into())
         }
         ResponseBody::Error {
             code: ErrorCode::Denied,

@@ -51,6 +51,9 @@ pub enum DecideError {
     /// The request timed out while Touch ID was up; nothing was approved.
     #[error("the request timed out before Touch ID finished; nothing was approved")]
     Expired,
+    /// `ms stop` (or another answer) ended the request while Touch ID was up.
+    #[error("the request was ended (ms stop) while Touch ID was up; nothing was approved")]
+    Ended,
     /// The token could not be made (no randomness).
     #[error("could not issue the approval: {0}")]
     Internal(String),
@@ -68,6 +71,8 @@ struct State {
     slot: Option<Slot>,
     /// Session-scope grants: reused for the identical binding until they expire or `revoke_all`.
     grants: Vec<(Binding, ApprovalToken)>,
+    /// Bumped by `revoke_all` (`ms stop`): a Touch ID that started before it approves nothing.
+    epoch: u64,
 }
 
 /// The production approver.
@@ -133,7 +138,7 @@ impl HumanApprover {
         approve: bool,
         scope: Scope,
     ) -> Result<ApprovalOutcome, DecideError> {
-        let (reason, deadline) = {
+        let (reason, deadline, epoch) = {
             let mut st = self.lock();
             let slot = match st.slot.as_mut() {
                 Some(s) if s.pending.id == id && s.answer.is_none() => s,
@@ -147,20 +152,34 @@ impl HumanApprover {
                 self.changed.notify_all();
                 return Ok(ApprovalOutcome::Denied);
             }
-            slot.deciding = true;
             let left = slot.pending.expires_unix_ms.saturating_sub(now_ms());
+            if left == 0 {
+                // Already past its deadline: don't raise a sheet at all.
+                return Err(DecideError::Expired);
+            }
+            slot.deciding = true;
+            let reason = render::touch_id_reason(&slot.pending.request, scope);
             (
-                render::touch_id_reason(&slot.pending.request, scope),
+                reason,
                 Instant::now() + Duration::from_millis(left),
+                st.epoch,
             )
         };
         // Outside the lock: the sheet can take a while, and `pending`/`busy` must stay answerable.
         let outcome = self.auth.authenticate(&reason, deadline);
         let mut st = self.lock();
+        if st.epoch != epoch {
+            return Err(DecideError::Ended);
+        }
         let slot = match st.slot.as_mut() {
             Some(s) if s.pending.id == id => s,
             _ => return Err(DecideError::Expired),
         };
+        // Answered meanwhile (ms stop denied it) or revoked since the sheet went up: the late
+        // Touch ID approves nothing, and the earlier answer stands (review R1).
+        if slot.answer.is_some() {
+            return Err(DecideError::Ended);
+        }
         let now = now_ms();
         if now >= slot.pending.expires_unix_ms || Instant::now() >= deadline {
             slot.answer = Some(ApprovalOutcome::TimedOut);
@@ -206,6 +225,7 @@ impl HumanApprover {
     /// waiting for a person is denied.
     pub fn revoke_all(&self) -> std::io::Result<()> {
         let mut st = self.lock();
+        st.epoch = st.epoch.wrapping_add(1);
         st.grants.clear();
         if let Some(s) = st.slot.as_mut()
             && s.answer.is_none()
@@ -475,6 +495,27 @@ mod tests {
         assert_eq!(
             a.ask(&req("same"), Duration::from_millis(50)),
             ApprovalOutcome::TimedOut
+        );
+    }
+
+    // protects=review R1: ms stop while Touch ID is up wins: the waiting request is denied, the
+    // late Touch ID approves nothing and leaves no session grant; fails_when=a token or grant is
+    // issued after revoke_all; no_claim=-
+    #[test]
+    fn stop_during_touch_id_approves_nothing() {
+        let (a, _) = approver(FakeAuthenticator::approve().after(Duration::from_millis(300)));
+        let (h, p) = ask_bg(&a, req("x"), Duration::from_secs(10));
+        let a2 = a.clone();
+        let id = p.id.clone();
+        let decider = std::thread::spawn(move || a2.decide(&id, true, Scope::Session));
+        std::thread::sleep(Duration::from_millis(100));
+        a.revoke_all().unwrap();
+        assert_eq!(decider.join().unwrap(), Err(DecideError::Ended));
+        assert_eq!(h.join().unwrap(), ApprovalOutcome::Denied);
+        assert_eq!(
+            a.ask(&req("x"), Duration::from_millis(50)),
+            ApprovalOutcome::TimedOut,
+            "no session grant survived"
         );
     }
 
