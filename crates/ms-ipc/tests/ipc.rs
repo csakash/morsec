@@ -433,7 +433,18 @@ fn every_variant_round_trips() {
         RequestBody::Start { at_terminal: false },
         RequestBody::Start { at_terminal: true },
         RequestBody::LogQuery { limit: 10 },
-        RequestBody::DoctorProbe,
+        RequestBody::DoctorProbe {
+            nonce: None,
+            report: None,
+        },
+        RequestBody::DoctorProbe {
+            nonce: Some("0123456789abcdef0123456789abcdef".into()),
+            report: Some(ms_ipc::ProbeReport {
+                proxy_reached: true,
+                direct_open: false,
+                detail: "x".into(),
+            }),
+        },
     ];
     let all_responses = [
         ResponseBody::status("msd", "0", "dev-stub"),
@@ -465,6 +476,33 @@ fn every_variant_round_trips() {
         ResponseBody::error(ErrorCode::NeedsApproval, "x"),
         ResponseBody::error(ErrorCode::NotInitialized, "x"),
         ResponseBody::error(ErrorCode::Invalid, "x"),
+        ResponseBody::Probe {
+            canaries: vec![],
+            reports: vec![],
+            any_open: false,
+        },
+        ResponseBody::Probe {
+            canaries: vec![ms_ipc::ProbeSighting {
+                session: None,
+                seen_unix_ms: 1,
+            }],
+            reports: vec![(
+                ms_ipc::ProbeReport {
+                    proxy_reached: false,
+                    direct_open: true,
+                    detail: String::new(),
+                },
+                ms_ipc::ProbeSighting {
+                    session: Some(ms_core::SessionId {
+                        agent: ms_core::AgentKind::Codex,
+                        pid: 9,
+                        started_unix_ms: 2,
+                    }),
+                    seen_unix_ms: 3,
+                },
+            )],
+            any_open: true,
+        },
     ];
     for (i, b) in all_requests.iter().enumerate() {
         let bytes = encode(i as u64, b).unwrap();
@@ -798,4 +836,19 @@ async fn bound_socket_is_private() {
     assert_eq!(dm.mode() & 0o777, 0o700);
     drop(s);
     assert!(!path.exists());
+}
+
+// protects=L17 additive change to the frozen v1 DoctorProbe: the pre-L17 unit form
+// {"type":"doctor_probe"} still parses (as a lookup with no nonce); fails_when=the old wire form
+// is rejected; no_claim=what msd answers
+#[test]
+fn doctor_probe_old_wire_form_parses() {
+    let env = decode::<RequestBody>(br#"{"v":1,"id":4,"body":{"type":"doctor_probe"}}"#).unwrap();
+    assert_eq!(
+        env.body,
+        RequestBody::DoctorProbe {
+            nonce: None,
+            report: None
+        }
+    );
 }

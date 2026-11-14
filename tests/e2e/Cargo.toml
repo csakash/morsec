@@ -25,3 +25,9 @@ hex = { workspace = true }
 name = "canary"
 path = "tests/canary.rs"
 harness = false
+
+# `ms doctor` end to end (L17), with this binary as fake `claude` and `codex`.
+[[test]]
+name = "doctor"
+path = "doctor/main.rs"
+harness = false

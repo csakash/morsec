@@ -11,6 +11,8 @@
 //! - [`runner`]: adapter selection, exec plans, and running the child (process group, minimal
 //!   environment, stdin forwarding, redacted output, exit status).
 //! - [`client`]: the client side shared by `ms-shim` and `ms run`.
+//! - [`context`]: context-aware adapters (rule facts, vault, cleanup; L15).
+//! - [`adapters`]: tool-specific adapters (`pg`: psql and prisma, L15).
 //!
 //! Policy (rules, approvals, receipts) lives in msd (`crates/msd/src/daemon/run.rs`), which
 //! calls [`runner::Runner::plan`] only with the keys it allowed.
@@ -25,7 +27,9 @@
 //! [`error::adapter_invalid`] so the agent gets the right code. Values an adapter reads from the
 //! vault are redacted from output only if they are among the call's keys.
 
+pub mod adapters;
 pub mod client;
+pub mod context;
 pub mod cwd;
 pub mod error;
 pub mod generic;

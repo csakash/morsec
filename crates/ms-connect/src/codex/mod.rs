@@ -328,6 +328,11 @@ impl CodexConnector {
         self.paths.state.exists()
     }
 
+    /// The msd proxy port the last connect wrote (`ms doctor` compares it with msd's, L17).
+    pub fn recorded_proxy_port(&self) -> Result<Option<u16>> {
+        Ok(self.read_state()?.map(|st| st.proxy_port))
+    }
+
     /// The opt-in parts the previous connect used (a plain re-run keeps them: SPEC D11).
     pub fn previous_options(&self) -> Result<Options> {
         Ok(self

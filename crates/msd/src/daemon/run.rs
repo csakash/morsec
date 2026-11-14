@@ -21,11 +21,16 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use ms_core::{Decision, KeyName, Mode, Reason, ReceiptEvent, ReceiptResult, SecretRef, SessionId};
+use ms_core::{
+    ApprovalRequest, Decision, KeyName, Mode, Reason, ReceiptEvent, ReceiptResult, SecretRef,
+    SessionId, Tier,
+};
 use ms_ipc::{ErrorCode, PeerInfo, ResponseBody, RunEnv, StreamIo};
 use ms_receipts::ReceiptDetail;
 use ms_rules::project::MAX_PROJECT_FILE;
 use ms_rules::{PROJECT_FILE, Rules};
+use ms_run::adapters::pg::{PrismaAdapter, PsqlAdapter};
+use ms_run::context::{CallContext, KeyFacts};
 use ms_run::{ExecIo, Prepared, RunError, RunInput, Runner, RunnerConfig};
 use tokio::sync::{Semaphore, mpsc};
 
@@ -50,7 +55,14 @@ static RUNS: Semaphore = Semaphore::const_new(MAX_RUNS);
 
 /// The runner, configured from msd's own environment on first use.
 fn runner() -> &'static Runner {
-    RUNNER.get_or_init(|| Runner::new(RunnerConfig::from_process_env()))
+    RUNNER.get_or_init(|| {
+        let mut r = Runner::new(RunnerConfig::from_process_env());
+        // L15: psql and prisma, before the generic adapter.
+        let resolver = r.resolver().clone();
+        r.register_contextual(Box::new(PsqlAdapter::new(resolver.clone())));
+        r.register_contextual(Box::new(PrismaAdapter::new(resolver)));
+        r
+    })
 }
 
 /// Per-key outcome while deciding, for receipts.
@@ -203,14 +215,58 @@ impl Daemon {
 
         let rules = effective_for(&user, &real_cwd);
         let call = Runner::call(&input, real_cwd.clone(), session.clone());
+        // L15: adapters see each key's effective rule facts (a project file's read_only applies).
+        let ctx = CallContext {
+            vault: &*self.vault,
+            keys: run_keys
+                .iter()
+                .filter_map(|k| {
+                    rules.keys.get(k).map(|r| {
+                        (
+                            k.clone(),
+                            KeyFacts {
+                                tier: r.tier,
+                                read_only: r.read_only,
+                            },
+                        )
+                    })
+                })
+                .collect(),
+            env_keys: input.env_keys.clone(),
+        };
         let mut decided = Vec::new();
         for k in &run_keys {
             match ms_rules::decide_run(&rules, &session, k, &input.argv, &real_cwd) {
-                Decision::Allow => decided.push(Decided {
-                    key: k.clone(),
-                    result: ReceiptResult::Allowed,
-                    approval_id: None,
-                }),
+                Decision::Allow => match runner().needs_approval(&call, &ctx) {
+                    None => decided.push(Decided {
+                        key: k.clone(),
+                        result: ReceiptResult::Allowed,
+                        approval_id: None,
+                    }),
+                    // L15 SPEC D4: an action of production tier (a schema migration) asks a
+                    // person whatever the key's tier, with the same binding decide_run builds.
+                    Some(why) => {
+                        let request = ApprovalRequest {
+                            session: session.clone(),
+                            key: k.clone(),
+                            tier: Tier::Production,
+                            argv_display: input.argv.clone(),
+                            argv_hash: hash,
+                            cwd: real_cwd.clone(),
+                            effect: Some(
+                                runner().preview_in(&call, &ctx).map_or(why, |p| p.summary),
+                            ),
+                        };
+                        match self.approve_exact(&request) {
+                            Ok(token) => decided.push(Decided {
+                                key: k.clone(),
+                                result: ReceiptResult::Approved,
+                                approval_id: Some(token.id),
+                            }),
+                            Err(reply) => return Err(refuse(k, ReceiptResult::Denied, reply)),
+                        }
+                    }
+                },
                 Decision::Deny { reason } => {
                     let msg = deny_message(k, &reason, &input.argv);
                     return Err(refuse(
@@ -220,7 +276,7 @@ impl Daemon {
                     ));
                 }
                 Decision::NeedsApproval { mut request } => {
-                    request.effect = runner().preview(&call).map(|p| p.summary);
+                    request.effect = runner().preview_in(&call, &ctx).map(|p| p.summary);
                     // L11: a person approves in `ms approve` with Touch ID; the token is then
                     // checked against this exact request (key, argv hash, cwd, session) before
                     // anything runs, and the plan below is built from that same argv and cwd.
@@ -243,7 +299,7 @@ impl Daemon {
             ));
         }
 
-        let prepared = match runner().plan(&input, &call, &run_keys, &*self.vault) {
+        let prepared = match runner().plan_in(&input, &call, &run_keys, &ctx) {
             Ok(p) => p,
             Err(e) => {
                 for d in &decided {
@@ -695,6 +751,16 @@ mod tests {
         rule_body: &str,
         auth: FakeAuthenticator,
     ) -> (Arc<Daemon>, tempfile::TempDir, PathBuf) {
+        test_daemon_full(tier, rule_body, auth, VALUE)
+    }
+
+    /// Like [`test_daemon_with`], with the key's value chosen (L15: a Postgres URL).
+    fn test_daemon_full(
+        tier: Tier,
+        rule_body: &str,
+        auth: FakeAuthenticator,
+        value: &str,
+    ) -> (Arc<Daemon>, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap().join("proj");
         std::fs::create_dir(&root).unwrap();
@@ -732,7 +798,7 @@ mod tests {
                     created_unix_ms: 1,
                 },
             },
-            Some(SecretBytes::new(VALUE.as_bytes().to_vec())),
+            Some(SecretBytes::new(value.as_bytes().to_vec())),
         );
         assert!(matches!(put, ResponseBody::Ok { .. }), "{put:?}");
         let tier_s = match tier {
@@ -882,5 +948,187 @@ mod tests {
         let t = target_of(&["x\n\u{1b}[2J".into(), "y".repeat(5000)]);
         assert!(!t.contains('\n') && !t.contains('\u{1b}'));
         assert!(t.chars().count() <= TARGET_MAX * 6 + 1);
+    }
+
+    /// Waits for the pending approval and answers it after `check` looked at it.
+    fn answer_after(
+        d: &Arc<Daemon>,
+        approve: bool,
+        check: impl FnOnce(&ms_ipc::PendingApproval),
+    ) -> ResponseBody {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match d.handle(&person(), RequestBody::ApprovalPending, None) {
+                ResponseBody::Approval { pending: Some(p) } => {
+                    check(&p);
+                    return d.handle(
+                        &person(),
+                        RequestBody::ApprovalDecide {
+                            id: p.id,
+                            approve,
+                            scope: Some(ApprovalScope::Once),
+                        },
+                        None,
+                    );
+                }
+                ResponseBody::Approval { pending: None } => {}
+                other => return other,
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no approval was requested"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    // protects=L15 Verify 3–4 and AUTH-3/AUTH-2 through msd with L11's real approver: a
+    // production `UPDATE` through psql waits for a person, the prompt shows the exact argv and
+    // the rolled-back preview ("1 row in orders") while the table is still unchanged, a denial
+    // changes nothing, an approval runs it exactly once; a read-only rule (effective rules) with
+    // a role that can write is refused; fails_when=the preview commits, the update runs without
+    // or more than once after an approval, or the read-only fact doesn't reach the adapter;
+    // no_claim=the real Touch ID sheet
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn production_psql_update_previews_then_runs_once() {
+        let Some(c) = ms_run::adapters::pg::test_cluster::Cluster::start() else {
+            eprintln!("NOT VERIFIED: no Postgres server binaries; msd pg test skipped");
+            return;
+        };
+        if runner().resolver().resolve("psql").is_err() {
+            eprintln!("NOT VERIFIED: no psql in the trusted search path; msd pg test skipped");
+            return;
+        }
+        let rt = rt();
+        let counter = || c.admin("shop", "SELECT counter FROM orders WHERE id = 1");
+        let sql = "UPDATE orders SET counter = counter + 1 WHERE id = 1";
+        let argv = ["psql", "ms://svc/test", "-c", sql];
+        for approve in [false, true] {
+            let (d, _dir, root) = test_daemon_full(
+                Tier::Production,
+                "commands = [[\"psql\", \"ms://svc/test\", \"-c\", \"*\"]]",
+                FakeAuthenticator::approve(),
+                &c.url("writer"),
+            );
+            let before: i64 = counter().parse().unwrap();
+            let (r, decision) = std::thread::scope(|s| {
+                let d2 = d.clone();
+                let decider = s.spawn(move || {
+                    answer_after(&d2, approve, |p| {
+                        assert_eq!(p.request.argv_display, argv);
+                        assert_eq!(p.request.effect.as_deref(), Some("1 row in orders"));
+                        assert_eq!(counter(), before.to_string(), "the preview committed");
+                    })
+                });
+                let r = buffered(&rt, &d, &root, &argv, &[]);
+                (r, decider.join().unwrap())
+            });
+            assert!(matches!(decision, ResponseBody::Ok { .. }), "{decision:?}");
+            let after: i64 = counter().parse().unwrap();
+            if approve {
+                let ResponseBody::RunResult { code, stderr, .. } = &r else {
+                    panic!("{r:?}")
+                };
+                assert_eq!(*code, Some(0), "{:?}", ms_ipc::b64_decode(stderr));
+                assert_eq!(after, before + 1, "approved update didn't run exactly once");
+            } else {
+                assert!(
+                    matches!(
+                        &r,
+                        ResponseBody::Error {
+                            code: ErrorCode::NeedsApproval,
+                            ..
+                        }
+                    ),
+                    "{r:?}"
+                );
+                assert_eq!(after, before, "a denied update changed data");
+            }
+        }
+
+        let (d, _dir, root) = test_daemon_full(
+            Tier::Test,
+            "commands = [[\"psql\", \"ms://svc/test\", \"-c\", \"*\"]]\nread_only = true",
+            FakeAuthenticator::approve(),
+            &c.url("writer"),
+        );
+        let r = buffered(&rt, &d, &root, &argv, &[]);
+        assert!(
+            matches!(&r, ResponseBody::Error { code: ErrorCode::Denied, message } if message.contains("read-only")),
+            "{r:?}"
+        );
+        assert_eq!(counter(), "1");
+    }
+
+    // protects=L15 SPEC D4 / AUTH-3: `prisma migrate deploy` asks L11's approver even on a
+    // test-tier key, the prompt shows the argv and says it changes the schema, a denial refuses
+    // it and is recorded; fails_when=a schema migration runs on a test key without a person;
+    // no_claim=Prisma itself (not installed here; the approved run fails at resolve)
+    #[test]
+    fn prisma_migrate_always_needs_approval() {
+        let rt = rt();
+        for approve in [false, true] {
+            let (d, dir, root) = test_daemon_full(
+                Tier::Test,
+                "commands = [[\"prisma\", \"migrate\", \"deploy\"]]\nenv = [\"DATABASE_URL\"]",
+                FakeAuthenticator::approve(),
+                "postgres://u:pw@127.0.0.1:1/db",
+            );
+            let (r, decision) = std::thread::scope(|s| {
+                let d2 = d.clone();
+                let decider = s.spawn(move || {
+                    answer_after(&d2, approve, |p| {
+                        assert_eq!(p.request.argv_display, ["prisma", "migrate", "deploy"]);
+                        assert_eq!(p.request.tier, Tier::Production);
+                        let e = p.request.effect.clone().unwrap_or_default();
+                        assert!(e.contains("schema"), "{e}");
+                    })
+                });
+                let r = buffered(
+                    &rt,
+                    &d,
+                    &root,
+                    &["prisma", "migrate", "deploy"],
+                    &[("DATABASE_URL", "ms://svc/test")],
+                );
+                (r, decider.join().unwrap())
+            });
+            assert!(matches!(decision, ResponseBody::Ok { .. }), "{decision:?}");
+            let receipts = std::fs::read_dir(dir.path().join("receipts"))
+                .unwrap()
+                .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+                .collect::<String>();
+            if approve {
+                // Prisma isn't in msd's trusted path here, so the approved run fails at
+                // resolve; the receipt still carries the person's Touch ID approval.
+                assert!(
+                    receipts.contains("touch-id") && receipts.contains("once-"),
+                    "{receipts}"
+                );
+                assert!(
+                    !matches!(
+                        &r,
+                        ResponseBody::Error {
+                            code: ErrorCode::NeedsApproval,
+                            ..
+                        }
+                    ),
+                    "{r:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        &r,
+                        ResponseBody::Error {
+                            code: ErrorCode::NeedsApproval,
+                            ..
+                        }
+                    ),
+                    "{r:?}"
+                );
+                assert!(receipts.contains("\"denied\""), "{receipts}");
+            }
+        }
     }
 }
