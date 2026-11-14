@@ -722,11 +722,14 @@ version = "0.0.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "libc",
+ "ms-connect",
  "ms-core",
  "ms-import",
  "ms-ipc",
  "ms-receipts",
  "ms-rules",
+ "ms-session",
  "ms-vault",
  "predicates",
  "rustix",
@@ -740,7 +743,12 @@ dependencies = [
 name = "ms-connect"
 version = "0.0.0"
 dependencies = [
+ "hex",
+ "libc",
  "ms-core",
+ "proptest",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

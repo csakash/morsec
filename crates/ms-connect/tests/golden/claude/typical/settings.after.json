@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "claude-opus-5-5",
+  "permissions": {
+    "allow": [
+      "Bash(npm run lint)",
+      "Bash(npm run test *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  },
+  "env": {
+    "BASH_DEFAULT_TIMEOUT_MS": "300000",
+    "MORSEC_CONNECTED": "claude-code",
+    "SSL_CERT_FILE": "$HOME/.morsec/ca-bundle.pem",
+    "REQUESTS_CA_BUNDLE": "$HOME/.morsec/ca-bundle.pem",
+    "CURL_CA_BUNDLE": "$HOME/.morsec/ca-bundle.pem",
+    "NODE_EXTRA_CA_CERTS": "$HOME/.morsec/ca-bundle.pem",
+    "STRIPE_API_KEY": "ms://stripe/test"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/lint-check.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/ms",
+            "args": [
+              "connect",
+              "claude-code",
+              "--session-env"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "spinnerTipsEnabled": false,
+  "sandbox": {
+    "enabled": true,
+    "network": {
+      "httpProxyPort": 4101,
+      "allowedDomains": [
+        "api.stripe.com",
+        "*.stripe.com"
+      ],
+      "allowUnixSockets": [
+        "/Users/u/Library/Application Support/morsec/msd.sock"
+      ]
+    }
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "'/opt/homebrew/bin/ms' status"
+  }
+}

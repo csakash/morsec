@@ -75,6 +75,8 @@ pub trait Connector: Send + Sync {
     fn verify(&self) -> Vec<Check>;
 }
 
+pub mod claude;
+
 /// Fake connector for tests.
 pub mod fake {
     use std::sync::Mutex;

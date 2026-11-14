@@ -7,6 +7,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod add;
+mod connect;
 mod import;
 mod log;
 mod service;
@@ -58,9 +59,9 @@ enum Command {
     /// Move a .env into the vault and rewrite it with references.
     Import(import::ImportArgs),
     /// Set up a coding agent (claude-code, codex, cursor, gemini).
-    Connect(Rest),
+    Connect(connect::ConnectArgs),
     /// Remove a coding agent's morsec settings.
-    Disconnect(Rest),
+    Disconnect(connect::DisconnectArgs),
     /// Run a command with references resolved by the broker.
     Run(Rest),
     /// Show or change a key's hosts, commands, tier and session length.
@@ -87,8 +88,6 @@ impl Command {
     /// (subcommand name, loop that builds it) for stubs; None when implemented.
     fn stub(&self) -> Option<(&'static str, &'static str)> {
         Some(match self {
-            Command::Connect(_) => ("connect", "L08 connect-claude"),
-            Command::Disconnect(_) => ("disconnect", "L08 connect-claude"),
             Command::Run(_) => ("run", "L12 run-core"),
             Command::Doctor(_) => ("doctor", "L17 doctor"),
             Command::Mcp(_) => ("mcp", "L14 mcp-server"),
@@ -101,13 +100,15 @@ impl Command {
             | Command::Rules(_)
             | Command::Log(_)
             | Command::Stats(_)
+            | Command::Connect(_)
+            | Command::Disconnect(_)
             | Command::Scan(_) => return None,
         })
     }
 }
 
 /// The name this binary was invoked as: `ms` or `mors` (or whatever the symlink is called).
-fn invoked_name() -> String {
+pub(crate) fn invoked_name() -> String {
     std::env::args_os()
         .next()
         .as_deref()
@@ -177,6 +178,8 @@ async fn main() -> ExitCode {
         Command::Rules(a) => on_own_thread(move || rules::run(a)),
         Command::Log(args) => log::run(&args),
         Command::Stats(args) => stats::run(&args),
+        Command::Connect(a) => on_own_thread(move || connect::connect(&a)),
+        Command::Disconnect(a) => on_own_thread(move || connect::disconnect(&a)),
         Command::Scan(a) => scan::run(&a).await,
         _ => unreachable!("every other command is a stub"),
     }
