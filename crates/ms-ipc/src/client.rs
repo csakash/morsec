@@ -7,7 +7,8 @@ use ms_core::{Error, KeyMeta, KeyName, Result, SecretBytes};
 use tokio::net::UnixStream;
 
 use crate::frame::{read_frame, write_frame};
-use crate::protocol::{RequestBody, ResponseBody, decode, encode};
+use crate::protocol::{OutStream, RequestBody, ResponseBody, decode, encode};
+use tokio::io::AsyncReadExt;
 
 /// How long to wait for the daemon to accept.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -84,6 +85,85 @@ impl Client {
         self.receive(id, RESPONSE_TIMEOUT).await
     }
 
+    /// Runs a command as a stream (`RunStream`, L12): once the daemon answers `RunStarted`,
+    /// forwards `stdin` (or an immediate end when `None`), hands each redacted output chunk to
+    /// `on_output`, and returns the last frame (`RunExit` or `Error`). If the daemon refuses
+    /// first, `stdin` is never read. Consumes the connection: the daemon closes it after a stream.
+    pub async fn run_stream<R, F>(
+        mut self,
+        request: RequestBody,
+        stdin: Option<R>,
+        mut on_output: F,
+    ) -> Result<ResponseBody>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        F: FnMut(OutStream, &[u8]),
+    {
+        if !request.is_stream() {
+            return Err(Error::Protocol(
+                "run_stream needs a RunStream request".into(),
+            ));
+        }
+        let id = self.send(&request).await?;
+        let (mut rd, mut wr) = self.stream.split();
+        // Nothing of stdin is read until the daemon says the run starts.
+        let started = read_frame(&mut rd)
+            .await?
+            .ok_or_else(|| Error::Protocol("the daemon closed the run".into()))?;
+        match decode::<ResponseBody>(&started)
+            .map_err(|(_, _, m)| Error::Protocol(m))?
+            .body
+        {
+            ResponseBody::RunStarted => {}
+            ResponseBody::RunOutput { .. } => {
+                return Err(Error::Protocol(
+                    "the daemon sent output before the run started".into(),
+                ));
+            }
+            last => return Ok(last),
+        }
+        let pump = async move {
+            if let Some(mut input) = stdin {
+                let mut buf = vec![0u8; STDIN_CHUNK];
+                loop {
+                    let n = match input.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let frame = RequestBody::RunInput {
+                        data: crate::b64_encode(&buf[..n]),
+                    };
+                    if !send_on(&mut wr, id, &frame).await {
+                        return std::future::pending().await;
+                    }
+                }
+            }
+            let _ = send_on(&mut wr, id, &RequestBody::RunInputEnd).await;
+            std::future::pending::<()>().await
+        };
+        let reader = async move {
+            loop {
+                let frame = read_frame(&mut rd)
+                    .await?
+                    .ok_or_else(|| Error::Protocol("the daemon closed the run".into()))?;
+                let env = decode::<ResponseBody>(&frame).map_err(|(_, _, m)| Error::Protocol(m))?;
+                match env.body {
+                    ResponseBody::RunOutput { stream, data } => {
+                        let bytes = crate::b64_decode(&data).ok_or_else(|| {
+                            Error::Protocol("the daemon sent malformed output".into())
+                        })?;
+                        on_output(stream, &bytes);
+                    }
+                    last => return Ok(last),
+                }
+            }
+        };
+        tokio::select! {
+            r = reader => r,
+            () = pump => unreachable!("the stdin pump never finishes"),
+        }
+    }
+
     async fn send(&mut self, body: &RequestBody) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
@@ -111,6 +191,16 @@ impl Client {
             )));
         }
         Ok(env.body)
+    }
+}
+
+/// Stdin bytes per `RunInput` frame.
+const STDIN_CHUNK: usize = 32 * 1024;
+
+async fn send_on<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, id: u64, body: &RequestBody) -> bool {
+    match encode(id, body) {
+        Ok(bytes) => write_frame(w, &bytes).await.is_ok(),
+        Err(_) => false,
     }
 }
 

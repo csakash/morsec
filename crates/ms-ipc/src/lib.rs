@@ -15,10 +15,24 @@ pub mod server;
 pub use client::Client;
 pub use paths::default_socket_path;
 pub use protocol::{
-    ApprovalScope, ErrorCode, PROTOCOL_VERSION, PendingApproval, RequestBody, ResponseBody,
-    ScanFinding,
+    ApprovalScope, ErrorCode, OutStream, PROTOCOL_VERSION, PendingApproval, RequestBody,
+    ResponseBody, RunEnv, ScanFinding,
 };
-pub use server::{Handler, PeerCheck, PeerInfo, SameUid, Server, ServerLimits, now_unix_ms};
+pub use server::{
+    Handler, PeerCheck, PeerInfo, SameUid, Server, ServerLimits, StdinEvent, StreamIo, now_unix_ms,
+};
 
 /// Largest frame accepted, in bytes (1 MiB).
 pub const MAX_FRAME: usize = 1 << 20;
+
+/// Encodes stream bytes for `RunInput` / `RunOutput` / `RunResult` (standard base64).
+pub fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decodes [`b64_encode`]'s output. `None` for anything else.
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}

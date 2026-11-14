@@ -1,7 +1,51 @@
 //! Run mode: the broker runs a command with a secret and returns redacted output.
 //!
-//! L00 freezes [`RunAdapter`] and the plan types. L12 builds the runner, shim and redactor;
-//! L15 and L16 add the Postgres and SSH/git adapters.
+//! L00 froze [`RunAdapter`] and the plan types. L12 (this crate) builds on them:
+//!
+//! - [`input`]: checks a request (argv shape, the forwarded ref-bearing environment).
+//! - [`cwd`]: the working directory must be inside the key's project roots.
+//! - [`resolve`]: programs come from a trusted search path, never the agent's `PATH`.
+//! - [`redact`]: Aho–Corasick redaction of every encoding of a value, across chunk boundaries.
+//! - [`generic`]: the fallback adapter for allowlisted CLIs (values through the environment
+//!   only).
+//! - [`runner`]: adapter selection, exec plans, and running the child (process group, minimal
+//!   environment, stdin forwarding, redacted output, exit status).
+//! - [`client`]: the client side shared by `ms-shim` and `ms run`.
+//!
+//! Policy (rules, approvals, receipts) lives in msd (`crates/msd/src/daemon/run.rs`), which
+//! calls [`runner::Runner::plan`] only with the keys it allowed.
+//!
+//! # Writing an adapter (L15, L16)
+//!
+//! Implement [`RunAdapter`] and register it with [`runner::Runner::register`]; adapters are
+//! tried in order before the generic one. `plan` must return an absolute `program` (resolve
+//! names with [`runner::Runner::resolver`]; the runner re-checks it), an argv array, the call's
+//! `cwd` unchanged, and any variables of its own in `env` (the runner adds `PATH`, the base set
+//! and the forwarded ref variables). Refuse with [`error::adapter_refuse`] /
+//! [`error::adapter_invalid`] so the agent gets the right code. Values an adapter reads from the
+//! vault are redacted from output only if they are among the call's keys.
+
+pub mod client;
+pub mod cwd;
+pub mod error;
+pub mod generic;
+pub mod input;
+pub mod redact;
+pub mod resolve;
+pub mod runner;
+
+pub use error::{RunError, RunErrorKind};
+pub use input::RunInput;
+pub use runner::{ExecIo, Exit, Prepared, Runner, RunnerConfig};
+
+/// Truncates and escapes agent-supplied text before it goes into a message.
+pub(crate) fn printable(s: &str) -> String {
+    let mut out: String = s.chars().take(80).flat_map(char::escape_default).collect();
+    if s.chars().count() > 80 {
+        out.push('…');
+    }
+    out
+}
 
 use std::ffi::OsString;
 use std::path::PathBuf;

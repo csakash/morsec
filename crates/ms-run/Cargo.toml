@@ -1,6 +1,6 @@
 [package]
 name = "ms-run"
-description = "Run mode: adapter trait, exec plans (runner in L12)."
+description = "Run mode: the runner, the ms-shim binary, the streaming redactor and the generic adapter (L12)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,23 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "ms-shim"
+path = "src/bin/ms-shim.rs"
+
 [dependencies]
 ms-core = { workspace = true }
 ms-vault = { workspace = true }
+ms-ipc = { workspace = true }
+ms-scan = { workspace = true }
+aho-corasick = "1"
+tokio = { workspace = true, features = ["process", "io-std"] }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }

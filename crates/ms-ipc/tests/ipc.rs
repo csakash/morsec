@@ -409,6 +409,7 @@ fn every_variant_round_trips() {
         RequestBody::Run {
             argv: vec!["psql".into(), "ms://pg/staging".into()],
             cwd: "/tmp".into(),
+            env: Vec::new(),
         },
         RequestBody::Mint {
             key: name.clone(),

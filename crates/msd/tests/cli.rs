@@ -137,11 +137,7 @@ fn version_under_both_names() {
 fn stubs_exit_69_and_name_their_loop() {
     let d = tmpdir();
     let sock = d.path().join("none.sock");
-    let table = [
-        ("run", "L12 run-core"),
-        ("doctor", "L17 doctor"),
-        ("mcp", "L14 mcp-server"),
-    ];
+    let table = [("doctor", "L17 doctor"), ("mcp", "L14 mcp-server")];
     let alias = mors(d.path());
     for (cmd, loop_id) in table {
         for (bin, name) in [(ms(), "ms"), (alias.clone(), "mors")] {
