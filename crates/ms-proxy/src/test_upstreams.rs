@@ -60,9 +60,9 @@ impl TestUpstreams {
         deps.resolver = Arc::new(MapResolver(self.map.clone()));
     }
 
-    /// Lets `proxy` connect to the mapped loopback addresses.
+    /// Lets `proxy` connect to the mapped loopback addresses, and to no other loopback address.
     pub fn allow(&self, proxy: &mut Proxy) {
-        proxy.allow_loopback_upstreams_for_tests();
+        proxy.allow_loopback_upstreams_only(self.map.values().copied().collect());
     }
 }
 
@@ -80,7 +80,10 @@ impl Resolve for MapResolver {
                 return Ok(vec![*a]);
             }
             let all = SystemResolver.resolve(host, port).await?;
-            Ok(all.into_iter().filter(|a| !a.ip().is_loopback()).collect())
+            Ok(all
+                .into_iter()
+                .filter(|a| !a.ip().to_canonical().is_loopback())
+                .collect())
         })
     }
 }

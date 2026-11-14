@@ -4,7 +4,7 @@
 //! the rules change. Stopping (`ms stop`) needs no rebuild to take effect: the session resolver
 //! returns no session while stopped, so every new request is refused at once.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -206,6 +206,23 @@ pub fn bindings(rules: &Rules) -> (Vec<Binding>, Vec<String>) {
             shaped_placeholder: None,
         });
     }
+    // Provider names come from key names (`/` → `-`, git bindings add `-git`), so two keys can
+    // land on one name (`a/b` and `a-b`, or `x/y` with git hosts and `x/y/git`). The proxy refuses
+    // a config with a duplicate, which would stop every swap; drop just the colliding bindings.
+    let mut count: BTreeMap<String, usize> = BTreeMap::new();
+    for b in &out {
+        *count.entry(b.provider.clone()).or_default() += 1;
+    }
+    out.retain(|b| {
+        let dup = count[&b.provider] > 1;
+        if dup {
+            skipped.push(format!(
+                "{}: its proxy name {} is also another key's (key names that differ only in '/' and '-'), so neither is swapped; rename one",
+                b.key, b.provider
+            ));
+        }
+        !dup
+    });
     (out, skipped)
 }
 
@@ -543,5 +560,35 @@ git_hosts = ["git.example.com"]
         assert!(TestHook::new(&spec, None, true).is_err());
         assert!(TestHook::new(&["git.test=10.1.1.1:443".into()], Some(&ca), true).is_err());
         assert!(TestHook::new(&spec, Some(&ca), true).is_ok());
+    }
+
+    // protects=review finding 2: two keys whose proxy names collide are both skipped with a note
+    // instead of failing the whole proxy config; fails_when=a duplicate provider reaches the
+    // config; no_claim=ProxyConfig::validate itself (ms-proxy)
+    #[test]
+    fn colliding_provider_names_are_skipped() {
+        let r = rules(
+            r#"
+version = 1
+[keys."stripe/x"]
+mode = "swap"
+tier = "test"
+hosts = ["git.example.com"]
+git_hosts = ["git.example.com"]
+[keys."stripe/x/git"]
+mode = "swap"
+tier = "test"
+hosts = ["api.stripe.com"]
+[keys."stripe/test"]
+mode = "swap"
+tier = "test"
+hosts = ["api.stripe.com"]
+"#,
+        );
+        let (b, skipped) = bindings(&r);
+        let names: Vec<_> = b.iter().map(|b| b.provider.as_str()).collect();
+        assert_eq!(names, ["stripe-test"]);
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(skipped.iter().all(|s| s.contains("stripe-x-git")));
     }
 }
