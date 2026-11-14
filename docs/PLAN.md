@@ -608,7 +608,10 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
     on: `localizedReason` names the key, its tier and a short request code (6 characters of the
     token HMAC over session, argv hash, cwd and expiry), and the terminal prints the same code
     and tells the user to approve only if the two match. Production requests also show the
-    command's binary name in the sheet.
+    command's binary name and a short digest of the full argv and cwd in the sheet, which the
+    terminal repeats next to the arguments. Residual, recorded in `ARI42.md` (AUTH-3): an agent
+    that redraws only the argument lines can still mislead a user who doesn't compare the digest;
+    the token still binds the real argv, so what runs is exactly what the sheet's digest names.
   - An agent can't approve its own request: the approving `ms` must be outside every agent
     session (the check today's `at_terminal` path uses, L06 process tree) and attached to a
     terminal, and msd shows the prompt for its own pending request, never for text a caller sent.
@@ -722,7 +725,9 @@ Follow-up D2 from L08, written up by `cli-scope` (too big for that loop).
   - The allowlist lives in the MAC'd `rules.toml`: `[egress] allow = ["registry.npmjs.org",
     "*.github.com"]` (exact names or `*.suffix`, validated like `ProxyConfig.allow`). Empty by
     default. A wildcard over a public suffix or a single label (`*.com`, `*.github.io`, where
-    anyone can host) is rejected, with a test (security review of `cli-scope`, S2). msd never reads it from an agent-writable file: not Claude Code's `settings.json`,
+    anyone can host) is rejected, with a test (security review of `cli-scope`, S2). The check uses
+    a pinned, embedded snapshot of the Public Suffix List (private section included), updated by
+    a reviewed change only. msd never reads it from an agent-writable file: not Claude Code's `settings.json`,
     not the connector state, not `.morsec.toml`.
   - Adding a host loosens the rules, so it needs an approval (`RulesProposeLoosen`, Touch ID once
     L11 lands); removing one tightens and is saved. A project `.morsec.toml` may only narrow it
