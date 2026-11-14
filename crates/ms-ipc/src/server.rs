@@ -122,7 +122,51 @@ pub trait Handler: Send + Sync + 'static {
         request: RequestBody,
         value: Option<SecretBytes>,
     ) -> impl Future<Output = ResponseBody> + Send;
+
+    /// Serves a streaming request (`RunStream`, L12). Chunks sent on `io.output` reach the
+    /// client as they come; the returned body is the stream's last frame, after which the
+    /// connection closes. The future is dropped (cancelled) when the client goes away or the
+    /// connection's lifetime runs out, so anything it started must stop on drop.
+    ///
+    /// The default answers `not_implemented`.
+    fn handle_stream(
+        &self,
+        peer: &PeerInfo,
+        request: RequestBody,
+        io: StreamIo,
+    ) -> impl Future<Output = ResponseBody> + Send {
+        let _ = (peer, io);
+        let owner = request.owner_loop();
+        async move {
+            ResponseBody::error(
+                ErrorCode::NotImplemented,
+                format!("morsec: this request is not built yet (planned in loop {owner})"),
+            )
+        }
+    }
 }
+
+/// Stdin from a streaming client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdinEvent {
+    /// Bytes.
+    Data(Vec<u8>),
+    /// The client's stdin ended.
+    End,
+}
+
+/// The two directions of a stream (L12). `input` closes without [`StdinEvent::End`] only when
+/// the client is gone.
+#[derive(Debug)]
+pub struct StreamIo {
+    /// Stdin from the client.
+    pub input: tokio::sync::mpsc::Receiver<StdinEvent>,
+    /// Frames to the client (`RunOutput`). Bounded: a slow client slows the producer.
+    pub output: tokio::sync::mpsc::Sender<ResponseBody>,
+}
+
+/// Frames queued in each direction of a stream.
+const STREAM_QUEUE: usize = 16;
 
 /// A bound daemon socket. Removes the socket file when dropped.
 #[derive(Debug)]
@@ -580,9 +624,96 @@ async fn conn_body<H: Handler, P: PeerCheck>(
             None
         };
         served += 1;
+        if env.body.is_stream() {
+            serve_stream(stream, &*handler, &peer, env.id, env.body).await;
+            return;
+        }
         let response = handler.handle(&peer, env.body, value).await;
         if !send(stream, env.id, &response).await {
             return;
         }
+    }
+}
+
+/// Runs one stream: client frames feed `StreamIo::input`, `StreamIo::output` is written as it
+/// comes, and the handler's result is the last frame. Ends the connection afterwards. If the
+/// client disconnects, sends a bad frame or stops reading, the handler future is dropped, which
+/// cancels the run.
+async fn serve_stream<H: Handler>(
+    stream: &mut UnixStream,
+    handler: &H,
+    peer: &PeerInfo,
+    id: u64,
+    body: RequestBody,
+) {
+    let (mut rd, mut wr) = stream.split();
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel(STREAM_QUEUE);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(STREAM_QUEUE);
+    let io = StreamIo {
+        input: in_rx,
+        output: out_tx,
+    };
+    // Reads client frames until the client goes away. Only stdin frames are valid here.
+    let reader = async move {
+        let mut ended = false;
+        loop {
+            let frame = match read_frame(&mut rd).await {
+                Ok(Some(f)) => f,
+                Ok(None) | Err(_) => return,
+            };
+            let event = match decode::<RequestBody>(&frame) {
+                Ok(e) => match e.body {
+                    RequestBody::RunInput { data } if !ended => match crate::b64_decode(&data) {
+                        Some(bytes) => StdinEvent::Data(bytes),
+                        None => return,
+                    },
+                    RequestBody::RunInputEnd if !ended => {
+                        ended = true;
+                        StdinEvent::End
+                    }
+                    _ => return,
+                },
+                Err(_) => return,
+            };
+            // A handler that stopped reading stdin is fine: drop the bytes.
+            let _ = in_tx.send(event).await;
+        }
+    };
+    let work = async move {
+        let run = handler.handle_stream(peer, body, io);
+        tokio::pin!(run);
+        let last = loop {
+            tokio::select! {
+                biased;
+                Some(frame) = out_rx.recv() => {
+                    if !send_half(&mut wr, id, &frame).await {
+                        return;
+                    }
+                }
+                last = &mut run => break last,
+            }
+        };
+        // Output the handler queued before finishing comes first.
+        while let Ok(frame) = out_rx.try_recv() {
+            if !send_half(&mut wr, id, &frame).await {
+                return;
+            }
+        }
+        let _ = send_half(&mut wr, id, &last).await;
+    };
+    tokio::select! {
+        () = work => {}
+        () = reader => {}
+    }
+}
+
+async fn send_half<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    id: u64,
+    body: &ResponseBody,
+) -> bool {
+    match encode(id, body) {
+        Ok(bytes) => write_frame(w, &bytes).await.is_ok(),
+        Err(_) => false,
     }
 }

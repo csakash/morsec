@@ -52,6 +52,12 @@ pub struct RulesArgs {
     /// Propose removing a command, as a JSON array.
     #[arg(long, value_name = "JSON")]
     remove_command: Vec<String>,
+    /// Propose adding a project root a run key's commands may run in (an absolute directory).
+    #[arg(long, value_name = "DIR")]
+    add_root: Vec<PathBuf>,
+    /// Propose removing a project root.
+    #[arg(long, value_name = "DIR")]
+    remove_root: Vec<PathBuf>,
     /// Propose a tier: test or production.
     #[arg(long, value_name = "TIER")]
     tier: Option<String>,
@@ -76,6 +82,8 @@ impl RulesArgs {
             || !self.remove_host.is_empty()
             || !self.add_command.is_empty()
             || !self.remove_command.is_empty()
+            || !self.add_root.is_empty()
+            || !self.remove_root.is_empty()
             || self.tier.is_some()
             || self.ttl.is_some()
             || self.read_only
@@ -455,10 +463,16 @@ fn show(name: &KeyName, r: &KeyRule) {
     };
     match r.mode {
         ms_core::Mode::Swap => {}
-        ms_core::Mode::Run => list(
-            "commands",
-            r.commands.iter().map(ToString::to_string).collect(),
-        ),
+        ms_core::Mode::Run => {
+            list(
+                "commands",
+                r.commands.iter().map(ToString::to_string).collect(),
+            );
+            list(
+                "roots",
+                r.roots.iter().map(|p| p.display().to_string()).collect(),
+            );
+        }
         ms_core::Mode::Mint => list("scopes", r.mint_scopes.clone()),
     }
     if r.mode == ms_core::Mode::Swap || !r.hosts.is_empty() {
@@ -483,6 +497,21 @@ fn parse_command(json: &str) -> Result<CommandPattern, String> {
     CommandPattern::parse(&argv).map_err(|e| format!("morsec: {e}"))
 }
 
+/// A root as given on the command line: made absolute against the current directory and
+/// resolved (symlinks, `..`) when it exists, so the rule names the real directory.
+fn root_arg(d: &Path) -> Result<PathBuf, String> {
+    let abs = if d.is_absolute() {
+        d.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("morsec: can't read the current directory: {e}"))?
+            .join(d)
+    };
+    let p = std::fs::canonicalize(&abs).unwrap_or(abs);
+    ms_rules::validate_root(&p).map_err(|e| format!("morsec: {e}"))?;
+    Ok(p)
+}
+
 fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRule, String> {
     let mut r = current.clone();
     for h in &a.add_host {
@@ -499,6 +528,13 @@ fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRu
     for c in &a.remove_command {
         let p = parse_command(c)?;
         r.commands.retain(|x| *x != p);
+    }
+    for d in &a.add_root {
+        r.roots.push(root_arg(d)?);
+    }
+    for d in &a.remove_root {
+        let p = root_arg(d)?;
+        r.roots.retain(|x| *x != p);
     }
     if let Some(t) = &a.tier {
         r.tier = match t.as_str() {

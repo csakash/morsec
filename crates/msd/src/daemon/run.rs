@@ -1,0 +1,624 @@
+//! Run mode in msd (L12): policy, approvals and receipts around `ms-run`'s runner.
+//!
+//! For each `Run` / `RunStream`:
+//!
+//! 1. The caller is identified from the kernel peer (never from the request); an unidentified
+//!    or LOG-2-stopped session is refused.
+//! 2. The request is checked (`ms_run::RunInput`). The run-mode keys among its refs are the
+//!    keys the call needs; none at all answers `not_run`, so the shim runs the tool unchanged.
+//! 3. For every such key: the working directory must lie inside the key's project roots (user
+//!    rules; resolved through symlinks), and `ms_rules::decide_run` on the user rules merged with
+//!    the project's `.morsec.toml` must allow the exact argv. A production key asks the
+//!    [`Approver`](ms_approve::Approver) with an `ApprovalRequest` built here from the
+//!    normalised argv, the canonical cwd and the adapter's preview.
+//! 4. The receipts (one per key, with the argv hash) are written before anything runs; if they
+//!    can't be, nothing runs.
+//! 5. The runner builds the plan and runs it; output is redacted on the way out.
+
+use std::collections::BTreeSet;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+use ms_approve::ApprovalOutcome;
+use ms_core::{Decision, KeyName, Mode, Reason, ReceiptEvent, ReceiptResult, SessionId};
+use ms_ipc::{ErrorCode, PeerInfo, ResponseBody, RunEnv, StreamIo};
+use ms_receipts::ReceiptDetail;
+use ms_rules::project::MAX_PROJECT_FILE;
+use ms_rules::{PROJECT_FILE, Rules};
+use ms_run::{ExecIo, Prepared, RunError, RunInput, Runner, RunnerConfig};
+use tokio::sync::{Semaphore, mpsc};
+
+use super::{APPROVAL_TIMEOUT, Daemon, PRE_L11, now_ms, reply_err, session_of};
+
+/// Most runs at once.
+pub const MAX_RUNS: usize = 8;
+/// Cap per output stream of a buffered `Run`.
+pub const BUFFERED_CAP: usize = 256 * 1024;
+/// Longest argv shown in a receipt's target.
+const TARGET_MAX: usize = 512;
+
+static RUNNER: OnceLock<Runner> = OnceLock::new();
+static RUNS: Semaphore = Semaphore::const_new(MAX_RUNS);
+
+/// The runner, configured from msd's own environment on first use.
+fn runner() -> &'static Runner {
+    RUNNER.get_or_init(|| Runner::new(RunnerConfig::from_process_env()))
+}
+
+/// Per-key outcome while deciding, for receipts.
+struct Decided {
+    key: KeyName,
+    result: ReceiptResult,
+    approval_id: Option<String>,
+}
+
+impl Daemon {
+    /// Steps 1–4: everything up to an exec plan. Blocking (vault, approvals, receipts).
+    // The error is the reply itself.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn prepare_run(
+        &self,
+        peer: &PeerInfo,
+        argv: Vec<String>,
+        cwd: PathBuf,
+        env: Vec<RunEnv>,
+    ) -> Result<Prepared, ResponseBody> {
+        let caller = self.caller(peer).ok_or_else(|| {
+            reply_err(
+                ErrorCode::Denied,
+                "morsec: the process that opened this connection can't be identified any more, so the run is refused. Reconnect from a running process",
+            )
+        })?;
+        let session = session_of(Some(&caller), peer);
+        if self.session_stopped(&session) {
+            return Err(reply_err(
+                ErrorCode::Denied,
+                "morsec: this agent session was stopped after repeated blocked attempts (LOG-2). Start a new session",
+            ));
+        }
+        let input = RunInput::new(
+            argv,
+            cwd,
+            env.into_iter().map(|e| (e.name, e.value)).collect(),
+        )
+        .map_err(|e| e.reply())?;
+
+        let (user, version) = {
+            let l = self.read_live();
+            (l.rules.clone(), l.rules.version)
+        };
+        let run_keys: BTreeSet<KeyName> = input
+            .keys()
+            .into_iter()
+            .filter(|k| user.keys.get(k).is_some_and(|r| r.mode == Mode::Run))
+            .collect();
+        if run_keys.is_empty() {
+            return Err(RunError::not_run(
+                "morsec: no run-mode key is referenced, so morsec has nothing to run",
+            )
+            .reply());
+        }
+        let target = target_of(&input.argv);
+        let hash = ms_rules::argv_hash(&input.argv);
+        let refuse = |key: &KeyName, result: ReceiptResult, reply: ResponseBody| {
+            if let Err(e) = self.record_run(&session, key, &target, hash, version, result, None) {
+                tracing::error!(error = %e, "could not record a refused run");
+            }
+            reply
+        };
+
+        // Roots: the user's rules, for every key. All keys must agree on one directory.
+        let mut real_cwd = None;
+        for k in &run_keys {
+            let roots = user
+                .keys
+                .get(k)
+                .map(|r| r.roots.clone())
+                .unwrap_or_default();
+            match ms_run::cwd::check(&input.cwd, &roots, k.as_str()) {
+                Ok(c) => real_cwd = Some(c),
+                Err(e) => {
+                    let result = ReceiptResult::Blocked(Reason::CommandNotAllowed);
+                    return Err(refuse(k, result, e.reply()));
+                }
+            }
+        }
+        let Some(real_cwd) = real_cwd else {
+            unreachable!("run_keys is not empty")
+        };
+
+        let rules = effective_for(&user, &real_cwd);
+        let call = Runner::call(&input, real_cwd.clone(), session.clone());
+        let mut decided = Vec::new();
+        for k in &run_keys {
+            match ms_rules::decide_run(&rules, &session, k, &input.argv, &real_cwd) {
+                Decision::Allow => decided.push(Decided {
+                    key: k.clone(),
+                    result: ReceiptResult::Allowed,
+                    approval_id: None,
+                }),
+                Decision::Deny { reason } => {
+                    let msg = deny_message(k, &reason, &input.argv);
+                    return Err(refuse(
+                        k,
+                        ReceiptResult::Blocked(reason),
+                        reply_err(ErrorCode::Denied, msg),
+                    ));
+                }
+                Decision::NeedsApproval { mut request } => {
+                    request.effect = runner().preview(&call).map(|p| p.summary);
+                    match self.approver.ask(&request, APPROVAL_TIMEOUT) {
+                        ApprovalOutcome::Approved(token) => decided.push(Decided {
+                            key: k.clone(),
+                            result: ReceiptResult::Approved,
+                            approval_id: Some(token.id),
+                        }),
+                        ApprovalOutcome::Denied | ApprovalOutcome::TimedOut => {
+                            return Err(refuse(
+                                k,
+                                ReceiptResult::Denied,
+                                reply_err(
+                                    ErrorCode::NeedsApproval,
+                                    format!(
+                                        "morsec: {k} is a production key, so this command needs an approval, which was not given. ({PRE_L11})"
+                                    ),
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // An approval can take minutes; `ms stop` or a LOG-2 stop may have come meanwhile.
+        if self.is_stopped() || self.session_stopped(&session) {
+            return Err(reply_err(
+                ErrorCode::Denied,
+                "morsec: morsec was stopped while this command waited, so it did not run",
+            ));
+        }
+
+        let prepared = match runner().plan(&input, &call, &run_keys, &*self.vault) {
+            Ok(p) => p,
+            Err(e) => {
+                for d in &decided {
+                    let _ = self.record_run(
+                        &session,
+                        &d.key,
+                        &target,
+                        hash,
+                        version,
+                        ReceiptResult::Failed(e.message.clone()),
+                        d.approval_id.clone(),
+                    );
+                }
+                return Err(e.reply());
+            }
+        };
+        for d in decided {
+            if let Err(e) = self.record_run(
+                &session,
+                &d.key,
+                &target,
+                hash,
+                version,
+                d.result,
+                d.approval_id,
+            ) {
+                return Err(reply_err(
+                    ErrorCode::Internal,
+                    format!(
+                        "morsec: the receipt for this run could not be written ({e}), so it did not run"
+                    ),
+                ));
+            }
+        }
+        Ok(prepared)
+    }
+
+    // Private helper; each argument is one receipt field.
+    #[allow(clippy::too_many_arguments)]
+    fn record_run(
+        &self,
+        session: &SessionId,
+        key: &KeyName,
+        target: &str,
+        argv_hash: [u8; 32],
+        rule_version: u64,
+        result: ReceiptResult,
+        approval_id: Option<String>,
+    ) -> ms_core::Result<()> {
+        let method = approval_id.as_ref().map(|_| "approver".to_owned());
+        self.receipts
+            .append_detailed(
+                ReceiptEvent {
+                    time_unix_ms: now_ms(),
+                    session: session.clone(),
+                    key: key.clone(),
+                    mode: Mode::Run,
+                    target: target.to_owned(),
+                    argv_hash: Some(argv_hash),
+                    rule_version,
+                    approval_id,
+                    result,
+                },
+                ReceiptDetail {
+                    approval_method: method,
+                    ..ReceiptDetail::default()
+                },
+            )
+            .map(drop)
+    }
+}
+
+/// `Run`: the buffered form. Runs on the blocking pool, like every other request.
+pub(crate) fn run_buffered(
+    d: &Daemon,
+    peer: &PeerInfo,
+    argv: Vec<String>,
+    cwd: PathBuf,
+    env: Vec<RunEnv>,
+) -> ResponseBody {
+    let Ok(_permit) = RUNS.try_acquire() else {
+        return busy();
+    };
+    let prepared = match d.prepare_run(peer, argv, cwd, env) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let handle = tokio::runtime::Handle::current();
+    match handle.block_on(runner().execute_buffered(prepared, BUFFERED_CAP)) {
+        Ok((exit, out, err, truncated)) => ResponseBody::RunResult {
+            code: exit.code,
+            signal: exit.signal,
+            stdout: ms_ipc::b64_encode(&out),
+            stderr: ms_ipc::b64_encode(&err),
+            truncated,
+        },
+        Err(e) => e.reply(),
+    }
+}
+
+/// `RunStream`: decide on the blocking pool, then stream. Dropping the future (the client left)
+/// kills the child's process group.
+pub(crate) async fn run_stream(
+    d: Arc<Daemon>,
+    peer: PeerInfo,
+    argv: Vec<String>,
+    cwd: PathBuf,
+    env: Vec<RunEnv>,
+    io: StreamIo,
+) -> ResponseBody {
+    let Ok(_permit) = RUNS.try_acquire() else {
+        return busy();
+    };
+    let prepared =
+        match tokio::task::spawn_blocking(move || d.prepare_run(&peer, argv, cwd, env)).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(r)) => return r,
+            Err(e) => {
+                tracing::error!(error = %e, "run handler failed");
+                return reply_err(
+                    ErrorCode::Internal,
+                    "morsec: the daemon failed handling this run",
+                );
+            }
+        };
+    let StreamIo { input, output } = io;
+    let (tx, mut rx) = mpsc::channel::<(ms_ipc::OutStream, Vec<u8>)>(16);
+    let forward = async move {
+        while let Some((stream, bytes)) = rx.recv().await {
+            let frame = ResponseBody::RunOutput {
+                stream,
+                data: ms_ipc::b64_encode(&bytes),
+            };
+            if output.send(frame).await.is_err() {
+                return;
+            }
+        }
+    };
+    let exec = runner().execute(
+        prepared,
+        ExecIo {
+            stdin: input,
+            output: tx,
+        },
+    );
+    let (exit, ()) = tokio::join!(exec, forward);
+    match exit {
+        Ok(e) => ResponseBody::RunExit {
+            code: e.code,
+            signal: e.signal,
+        },
+        Err(e) => e.reply(),
+    }
+}
+
+fn busy() -> ResponseBody {
+    reply_err(
+        ErrorCode::Busy,
+        format!(
+            "morsec: {MAX_RUNS} commands are already running through morsec; try again when one finishes"
+        ),
+    )
+}
+
+/// The argv as recorded: arguments joined by spaces, escaped and bounded.
+fn target_of(argv: &[String]) -> String {
+    let joined = argv.join(" ");
+    let mut out: String = joined
+        .chars()
+        .take(TARGET_MAX)
+        .flat_map(char::escape_default)
+        .collect();
+    if joined.chars().count() > TARGET_MAX {
+        out.push('…');
+    }
+    out
+}
+
+fn deny_message(key: &KeyName, reason: &Reason, argv: &[String]) -> String {
+    let shown = target_of(argv);
+    match reason {
+        Reason::CommandNotAllowed => format!(
+            "morsec: {key} is not allowed to run `{shown}`. If it should be, allow it from your own terminal: ms rules {key} --add-command '<json argv pattern>'"
+        ),
+        Reason::Stopped => "morsec: morsec is stopped (ms stop); nothing runs until it is resumed".into(),
+        Reason::RulesTampered => {
+            "morsec: the rules file failed its integrity check, so every key is refused. Check ms status".into()
+        }
+        Reason::NoSuchKey => format!("morsec: there is no rule for {key}"),
+        other => format!("morsec: {key} was refused ({other:?})"),
+    }
+}
+
+/// The user rules merged with the project file above `cwd` (up to the git root). A project file
+/// that can't be read or parsed disables every key (fail closed).
+fn effective_for(user: &Rules, cwd: &Path) -> Rules {
+    let Some(file) = find_project_file(cwd) else {
+        return user.clone();
+    };
+    let shown = file.display().to_string();
+    match read_project(&file) {
+        Ok(text) => ms_rules::effective(user, Some(&text), &shown).0,
+        Err(_) => ms_rules::project::disable_all(user, &shown),
+    }
+}
+
+/// `.morsec.toml` in `start` or a parent, up to and including the directory holding `.git`
+/// (the same walk as `ms rules`). Outside a git repository nothing is found.
+fn find_project_file(start: &Path) -> Option<PathBuf> {
+    let mut found = None;
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        let candidate = d.join(PROJECT_FILE);
+        if found.is_none() && std::fs::symlink_metadata(&candidate).is_ok() {
+            found = Some(candidate);
+        }
+        if d.join(".git").exists() {
+            return found;
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Reads a project file: a regular file (not a link), at most `MAX_PROJECT_FILE` bytes, UTF-8.
+fn read_project(p: &Path) -> std::io::Result<String> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut text = String::new();
+    f.take(MAX_PROJECT_FILE as u64 + 1)
+        .read_to_string(&mut text)?;
+    if text.len() > MAX_PROJECT_FILE {
+        return Err(std::io::Error::other("too large"));
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // protects=a project file can't widen and an unreadable one fails closed; the walk stops at
+    // the git root; fails_when=a link or oversized file is read, or a file above .git applies;
+    // no_claim=the merge semantics (ms-rules project tests)
+    #[test]
+    fn project_file_lookup() {
+        let d = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(d.path()).unwrap();
+        let repo = top.join("repo");
+        let sub = repo.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        std::fs::write(top.join(PROJECT_FILE), "junk").unwrap();
+        assert_eq!(find_project_file(&sub), None);
+        std::fs::write(repo.join(PROJECT_FILE), "").unwrap();
+        assert_eq!(find_project_file(&sub), Some(repo.join(PROJECT_FILE)));
+        assert_eq!(read_project(&repo.join(PROJECT_FILE)).unwrap(), "");
+
+        std::fs::remove_file(repo.join(PROJECT_FILE)).unwrap();
+        std::os::unix::fs::symlink(top.join(PROJECT_FILE), repo.join(PROJECT_FILE)).unwrap();
+        assert!(read_project(&repo.join(PROJECT_FILE)).is_err());
+        let user = Rules::from_toml(
+            "version = 1\n[keys.\"k\"]\nmode = \"run\"\ntier = \"test\"\ncommands = [[\"env\"]]\nroots = [\"/r\"]",
+            "rules.toml",
+        )
+        .unwrap();
+        let eff = effective_for(&user, &sub);
+        assert!(eff.keys[&KeyName::new("k").unwrap()].commands.is_empty());
+
+        std::fs::remove_file(repo.join(PROJECT_FILE)).unwrap();
+        std::fs::write(repo.join(PROJECT_FILE), "x".repeat(MAX_PROJECT_FILE + 1)).unwrap();
+        assert!(read_project(&repo.join(PROJECT_FILE)).is_err());
+    }
+
+    use crate::backend::Backend;
+    use crate::daemon::Identify;
+    use crate::paths::Paths;
+    use ms_approve::ApprovalToken;
+    use ms_approve::fake::FakeApprover;
+    use ms_core::{AgentKind, KeyMeta, SecretBytes, Tier};
+    use ms_ipc::RequestBody;
+    use ms_session::Caller;
+    use ms_vault::memory::MemoryVault;
+    use std::sync::Mutex;
+
+    const VALUE: &str = "pk_live_RUNMSD_canary_93a1";
+
+    fn peer() -> PeerInfo {
+        PeerInfo {
+            uid: 501,
+            gid: 20,
+            pid: Some(42),
+            accepted_unix_ms: 1,
+        }
+    }
+
+    // protects=AUTH-3 / D8: a production run key goes through the Approver with a request built
+    // by msd (normalised argv, canonical cwd, argv hash); a denial refuses the run (and the
+    // pre-L11 deny-stub behaves like that denial); an approval runs exactly the approved argv and
+    // output comes back redacted; both are recorded; fails_when=a production run runs without an
+    // approval, the request shows something other than what runs, or the value is returned;
+    // no_claim=the L11 token MAC check (L11)
+    #[test]
+    fn production_runs_need_the_approver() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let tok = ApprovalToken {
+            id: "tok-1".into(),
+            mac: [7; 32],
+            expires_unix_ms: u64::MAX,
+        };
+        let approver = Arc::new(FakeApprover::new([
+            ApprovalOutcome::Denied,
+            ApprovalOutcome::Approved(tok),
+        ]));
+        let who: Arc<Mutex<Option<Caller>>> = Arc::new(Mutex::new(Some(Caller::Unattributed {
+            pid: 43,
+            started_unix_ms: 1,
+        })));
+        let w = who.clone();
+        let identify: Identify = Arc::new(move |_| w.lock().unwrap().clone());
+        let d = Daemon::open(
+            Backend::Memory(Arc::new(MemoryVault::new())),
+            Paths::under(dir.path()),
+            0,
+            approver.clone(),
+            identify,
+        )
+        .unwrap();
+        let k = KeyName::new("svc/prod").unwrap();
+        let put = d.handle(
+            &peer(),
+            RequestBody::PutKey {
+                name: k.clone(),
+                meta: KeyMeta {
+                    name: k.clone(),
+                    mode: Mode::Run,
+                    tier: Tier::Production,
+                    created_unix_ms: 1,
+                },
+            },
+            Some(SecretBytes::new(VALUE.as_bytes().to_vec())),
+        );
+        assert!(matches!(put, ResponseBody::Ok { .. }), "{put:?}");
+        let rule = format!(
+            "version = 1\n[keys.\"svc/prod\"]\nmode = \"run\"\ntier = \"production\"\ncommands = [[\"env\"]]\nroots = [\"{}\"]\n",
+            root.display()
+        );
+        let saved = d.handle(
+            &peer(),
+            RequestBody::RulesProposeLoosen {
+                key: k.clone(),
+                rule: Some(rule),
+                at_terminal: true,
+            },
+            None,
+        );
+        assert!(matches!(saved, ResponseBody::Ok { .. }), "{saved:?}");
+        *who.lock().unwrap() = Some(Caller::Agent(SessionId {
+            agent: AgentKind::ClaudeCode,
+            pid: 42,
+            started_unix_ms: 1,
+        }));
+
+        let run = |d: Arc<Daemon>| {
+            let root = root.clone();
+            rt.block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    d.handle(
+                        &peer(),
+                        RequestBody::Run {
+                            argv: vec!["env".into()],
+                            cwd: root.join("."),
+                            env: vec![RunEnv {
+                                name: "TOKEN".into(),
+                                value: "ms://svc/prod".into(),
+                            }],
+                        },
+                        None,
+                    )
+                })
+                .await
+                .unwrap()
+            })
+        };
+
+        let denied = run(d.clone());
+        assert!(
+            matches!(
+                &denied,
+                ResponseBody::Error {
+                    code: ErrorCode::NeedsApproval,
+                    ..
+                }
+            ),
+            "{denied:?}"
+        );
+        let approved = run(d.clone());
+        let ResponseBody::RunResult { code, stdout, .. } = approved else {
+            panic!("{approved:?}")
+        };
+        assert_eq!(code, Some(0));
+        let out = String::from_utf8(ms_ipc::b64_decode(&stdout).unwrap()).unwrap();
+        assert!(out.contains("TOKEN=[redacted ms://svc/prod]"), "{out}");
+        assert!(!out.contains(VALUE));
+
+        let asked = approver.asked();
+        assert_eq!(asked.len(), 2);
+        for a in &asked {
+            assert_eq!(a.key, k);
+            assert_eq!(a.argv_display, ["env"]);
+            assert_eq!(a.argv_hash, ms_rules::argv_hash(&["env"]));
+            assert_eq!(a.cwd, root);
+        }
+        let receipts = std::fs::read_dir(dir.path().join("receipts"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(receipts.contains("tok-1"), "{receipts}");
+        assert!(receipts.contains("denied"), "{receipts}");
+        assert!(!receipts.contains(VALUE));
+    }
+
+    // protects=receipt targets are escaped and bounded, so an agent's argv can't inject lines or
+    // flood the log; fails_when=a newline/ESC survives or the length is unbounded; no_claim=-
+    #[test]
+    fn target_is_bounded() {
+        let t = target_of(&["x\n\u{1b}[2J".into(), "y".repeat(5000)]);
+        assert!(!t.contains('\n') && !t.contains('\u{1b}'));
+        assert!(t.chars().count() <= TARGET_MAX * 6 + 1);
+    }
+}

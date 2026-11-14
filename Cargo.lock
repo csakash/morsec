@@ -729,6 +729,7 @@ dependencies = [
  "ms-ipc",
  "ms-receipts",
  "ms-rules",
+ "ms-run",
  "ms-session",
  "ms-vault",
  "predicates",
@@ -794,6 +795,7 @@ dependencies = [
 name = "ms-ipc"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "libc",
  "ms-core",
  "serde",
@@ -881,8 +883,19 @@ dependencies = [
 name = "ms-run"
 version = "0.0.0"
 dependencies = [
+ "aho-corasick",
+ "base64 0.22.1",
+ "hex",
  "ms-core",
+ "ms-ipc",
+ "ms-scan",
  "ms-vault",
+ "proptest",
+ "rustix",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -940,6 +953,7 @@ dependencies = [
  "ms-proxy",
  "ms-receipts",
  "ms-rules",
+ "ms-run",
  "ms-scan",
  "ms-session",
  "ms-vault",

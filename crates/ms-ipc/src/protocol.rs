@@ -47,13 +47,39 @@ pub enum RequestBody {
     },
     /// List key metadata.
     ListKeys,
-    /// Run a command (from the shim or `ms run`). Non-UTF-8 arguments are refused by the client.
+    /// Run a command and answer once with its (capped, redacted) output: [`ResponseBody::RunResult`].
+    /// No stdin. Non-UTF-8 arguments are refused by the client.
     Run {
         /// Exact argv.
         argv: Vec<String>,
         /// Working directory.
         cwd: PathBuf,
+        /// The caller's environment variables whose value holds an `ms://` ref, and only those
+        /// (L12). Refs only: a client never has a value to send.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<RunEnv>,
     },
+    /// Run a command with streamed stdin and output (L12; the shim and `ms run`). The connection
+    /// then carries [`RequestBody::RunInput`] / [`RequestBody::RunInputEnd`] from the client and
+    /// [`ResponseBody::RunOutput`] from the daemon, and ends with one [`ResponseBody::RunExit`]
+    /// or [`ResponseBody::Error`], after which the daemon closes it. Closing it early cancels the
+    /// run.
+    RunStream {
+        /// Exact argv.
+        argv: Vec<String>,
+        /// Working directory.
+        cwd: PathBuf,
+        /// As in `Run`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<RunEnv>,
+    },
+    /// Stdin bytes for the running `RunStream` (base64). Only valid inside a stream.
+    RunInput {
+        /// Standard base64.
+        data: String,
+    },
+    /// Stdin is at its end. Only valid inside a stream.
+    RunInputEnd,
     /// Mint a short-lived credential.
     Mint {
         /// Key.
@@ -106,6 +132,11 @@ impl RequestBody {
         matches!(self, RequestBody::Status | RequestBody::Stop)
     }
 
+    /// True for `RunStream`, which turns the connection into a stream (L12).
+    pub fn is_stream(&self) -> bool {
+        matches!(self, RequestBody::RunStream { .. })
+    }
+
     /// True when a raw value frame follows this request.
     pub fn carries_value(&self) -> bool {
         matches!(self, RequestBody::PutKey { .. })
@@ -116,7 +147,10 @@ impl RequestBody {
         match self {
             RequestBody::Status => "L00 foundation",
             RequestBody::PutKey { .. } | RequestBody::ListKeys => "L07 daemon",
-            RequestBody::Run { .. } => "L12 run-core",
+            RequestBody::Run { .. }
+            | RequestBody::RunStream { .. }
+            | RequestBody::RunInput { .. }
+            | RequestBody::RunInputEnd => "L12 run-core",
             RequestBody::Mint { .. } => "L18 mint-aws",
             RequestBody::RulesGet { .. } | RequestBody::RulesProposeLoosen { .. } => "L07 daemon",
             RequestBody::Stop | RequestBody::Start { .. } => "L07 daemon",
@@ -151,6 +185,30 @@ pub enum ErrorCode {
     NotInitialized,
     /// The request was well formed but its content is not acceptable (L07).
     Invalid,
+    /// A run request referenced no run-mode key, so the broker has nothing to do: the shim runs
+    /// the real tool unchanged (L12).
+    NotRun,
+}
+
+/// One environment variable a client forwards with a run request: its value holds an `ms://`
+/// ref (L12). The daemon resolves run-mode refs in it for the child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEnv {
+    /// Variable name.
+    pub name: String,
+    /// Its value as the caller has it, refs and all.
+    pub value: String,
+}
+
+/// Which output stream a [`ResponseBody::RunOutput`] chunk belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutStream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
 }
 
 /// Where a vault value was found (`ScanReport`, L09). Location and key name only: there is no
@@ -241,6 +299,38 @@ pub enum ResponseBody {
         notes: Vec<String>,
         /// False when the scan stopped early (time budget, file cap, unreadable files).
         complete: bool,
+    },
+    /// A chunk of a running command's output, already redacted (L12, `RunStream`).
+    RunOutput {
+        /// Which stream.
+        stream: OutStream,
+        /// The bytes, standard base64.
+        data: String,
+    },
+    /// How a streamed run ended (L12). The last frame of a `RunStream`.
+    RunExit {
+        /// Exit code, when the command exited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+        /// Signal number, when a signal ended it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
+    },
+    /// A buffered run's result (L12, `Run`). Output is redacted and capped.
+    RunResult {
+        /// Exit code, when the command exited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+        /// Signal number, when a signal ended it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
+        /// Standard output, standard base64.
+        stdout: String,
+        /// Standard error, standard base64.
+        stderr: String,
+        /// True when either stream was cut at the cap.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     /// An error; `message` is shown to people as is.
     Error {

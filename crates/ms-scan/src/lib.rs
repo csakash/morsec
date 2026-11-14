@@ -218,6 +218,12 @@ impl Needles {
     pub fn len(&self) -> usize {
         self.list.len()
     }
+
+    /// Every byte string with the key index it was added under (L12's run-output redactor
+    /// matches the same encodings). The bytes are value material: use them only inside msd.
+    pub fn patterns(&self) -> impl Iterator<Item = (usize, &[u8])> {
+        self.list.iter().map(|n| (n.key, &n.bytes[..]))
+    }
 }
 
 /// One match: where, which key, which form. Never the matched bytes.

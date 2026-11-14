@@ -1,6 +1,7 @@
 //! The rules model and its TOML file format.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use ms_core::{KeyName, Mode, Tier};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,10 @@ pub const MAX_MINT_SCOPES: usize = 64;
 pub const MAX_SCOPE_LEN: usize = 128;
 /// Most keys in one rules file.
 pub const MAX_KEYS: usize = 4096;
+/// Most project roots in one rule.
+pub const MAX_ROOTS: usize = 64;
+/// Longest project root, bytes.
+pub const MAX_ROOT_LEN: usize = 1024;
 
 /// What one key may do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +43,9 @@ pub struct KeyRule {
     pub session_ttl_secs: u64,
     /// Run adapters must use read-only access (for example `default_transaction_read_only`).
     pub read_only: bool,
+    /// Project directories the key's commands may run in (run only, L12). Absolute and
+    /// normalised. Empty means nowhere: a run key without roots can't run anything.
+    pub roots: Vec<PathBuf>,
 }
 
 impl KeyRule {
@@ -51,6 +59,7 @@ impl KeyRule {
             mint_scopes: Vec::new(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             read_only: false,
+            roots: Vec::new(),
         }
     }
 
@@ -85,6 +94,15 @@ impl KeyRule {
         if self.mode != Mode::Run && !self.commands.is_empty() {
             return Err(bad("commands are only allowed on a run-mode key".into()));
         }
+        if self.roots.len() > MAX_ROOTS {
+            return Err(bad(format!("more than {MAX_ROOTS} roots")));
+        }
+        if self.mode != Mode::Run && !self.roots.is_empty() {
+            return Err(bad("roots are only allowed on a run-mode key".into()));
+        }
+        for r in &self.roots {
+            validate_root(r).map_err(&bad)?;
+        }
         if self.mode != Mode::Mint && !self.mint_scopes.is_empty() {
             return Err(bad("mint_scopes are only allowed on a mint-mode key".into()));
         }
@@ -102,6 +120,8 @@ impl KeyRule {
         self.commands.dedup();
         self.mint_scopes.sort();
         self.mint_scopes.dedup();
+        self.roots.sort();
+        self.roots.dedup();
         Ok(self)
     }
 }
@@ -110,6 +130,40 @@ impl KeyRule {
 /// so no approval can ever send one to a host or a command.
 pub fn is_reserved(key: &KeyName) -> bool {
     key.as_str() == "morsec" || key.as_str().starts_with("morsec/")
+}
+
+/// A project root must be an absolute, normalised UTF-8 path (no `.`, `..`, `//` or trailing
+/// `/`), not `/` itself, without control characters.
+pub fn validate_root(p: &Path) -> std::result::Result<(), String> {
+    let Some(s) = p.to_str() else {
+        return Err("a root must be valid UTF-8".into());
+    };
+    if s.is_empty() || s.len() > MAX_ROOT_LEN || s.chars().any(char::is_control) {
+        return Err(format!(
+            "root {s:?} must be 1 to {MAX_ROOT_LEN} bytes without control characters"
+        ));
+    }
+    if !s.starts_with('/') {
+        return Err(format!("root {s:?} must be an absolute path"));
+    }
+    if s == "/" {
+        return Err("root \"/\" would allow every directory; name a project directory".into());
+    }
+    if s.ends_with('/')
+        || s[1..]
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Err(format!(
+            "root {s:?} must be normalised (no '.', '..', '//' or trailing '/')"
+        ));
+    }
+    Ok(())
+}
+
+/// True when `path` is `root` or inside it, comparing whole components.
+pub fn within_root(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
 }
 
 pub(crate) fn validate_scope(s: &str) -> std::result::Result<(), String> {
@@ -209,6 +263,8 @@ pub(crate) struct KeyRuleFile {
     session_ttl_secs: u64,
     #[serde(default)]
     read_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    roots: Vec<String>,
 }
 
 fn default_ttl() -> u64 {
@@ -258,6 +314,7 @@ impl KeyRuleFile {
             mint_scopes: self.mint_scopes,
             session_ttl_secs: self.session_ttl_secs,
             read_only: self.read_only,
+            roots: self.roots.into_iter().map(PathBuf::from).collect(),
         }
         .normalise(file, key)
     }
@@ -271,6 +328,11 @@ impl KeyRuleFile {
             mint_scopes: r.mint_scopes.clone(),
             session_ttl_secs: r.session_ttl_secs,
             read_only: r.read_only,
+            roots: r
+                .roots
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
         }
     }
 }
@@ -293,6 +355,7 @@ tier = "production"
 commands = [["psql", "-c", "*"], ["pg_dump", "**"]]
 session_ttl_secs = 600
 read_only = true
+roots = ["/Users/me/code/app", "/Users/me/code/api"]
 
 [keys."aws/dev"]
 mode = "mint"
@@ -313,6 +376,13 @@ mint_scopes = ["s3:read"]
         assert_eq!(pg.session_ttl_secs, 600);
         assert!(pg.read_only);
         assert_eq!(pg.commands.len(), 2);
+        assert_eq!(
+            pg.roots,
+            [
+                PathBuf::from("/Users/me/code/api"),
+                PathBuf::from("/Users/me/code/app")
+            ]
+        );
         let stripe = &r.keys[&KeyName::new("stripe/test").unwrap()];
         assert_eq!(stripe.session_ttl_secs, DEFAULT_SESSION_TTL_SECS);
         let mut with_state = r.clone();
@@ -346,6 +416,15 @@ mint_scopes = ["s3:read"]
             "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\ncommands = [[]]",
             "version = 1\n[keys.\"morsec/rules-mac\"]\nmode = \"run\"\ntier = \"production\"\ncommands = [[\"printenv\"]]",
             "version = 1\n[keys.\"morsec\"]\nmode = \"swap\"\ntier = \"test\"",
+            // Roots: run keys only, absolute, normalised, never "/".
+            "version = 1\n[keys.\"a\"]\nmode = \"swap\"\ntier = \"test\"\nroots = [\"/x\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"rel/dir\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/a/../b\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/a/./b\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/a//b\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/a/\"]",
+            "version = 1\n[keys.\"a\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/a\\nb\"]",
         ];
         for c in cases {
             assert!(Rules::from_toml(c, "rules.toml").is_err(), "accepted {c:?}");

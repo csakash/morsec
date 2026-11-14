@@ -123,6 +123,7 @@ impl ProjectRules {
 }
 
 fn disable(rule: &mut KeyRule) {
+    rule.roots.clear();
     rule.hosts.clear();
     rule.commands.clear();
     rule.mint_scopes.clear();
@@ -371,6 +372,11 @@ hosts = ["*.com"]
                 mint_scopes: if mode == Mode::Mint { scopes } else { vec![] },
                 session_ttl_secs: ttl,
                 read_only: ro,
+                roots: if mode == Mode::Run {
+                    vec!["/r/app".into()]
+                } else {
+                    vec![]
+                },
             })
     }
 

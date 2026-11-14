@@ -35,7 +35,10 @@ pub fn classify_rule(old: Option<&KeyRule>, new: Option<&KeyRule>) -> Change {
                 && (n.read_only || !o.read_only)
                 && hosts_within(&n.hosts, &o.hosts)
                 && commands_within(&n.commands, &o.commands)
-                && n.mint_scopes.iter().all(|s| o.mint_scopes.contains(s));
+                && n.mint_scopes.iter().all(|s| o.mint_scopes.contains(s))
+                && n.roots
+                    .iter()
+                    .all(|r| o.roots.iter().any(|old| crate::model::within_root(r, old)));
             if narrower {
                 Change::Tighten
             } else {
@@ -79,6 +82,7 @@ mod tests {
         r.commands = vec![CommandPattern::parse(&["psql".into(), "**".into()]).unwrap()];
         r.hosts = vec![HostPattern::parse("*.db.internal").unwrap()];
         r.session_ttl_secs = 600;
+        r.roots = vec!["/r/app".into()];
         r
     }
 
@@ -101,6 +105,10 @@ mod tests {
                 r.commands
                     .push(CommandPattern::parse(&["sh".into(), "**".into()]).unwrap())
             }),
+            Box::new(|r| r.roots.push("/r/other".into())),
+            Box::new(|r| r.roots = vec!["/r".into()]),
+            // A sibling that shares a string prefix is not inside the root.
+            Box::new(|r| r.roots = vec!["/r/application".into()]),
         ];
         for (i, f) in loosen.iter().enumerate() {
             let mut start = o.clone();
@@ -121,6 +129,9 @@ mod tests {
         n.hosts = vec![HostPattern::parse("a.db.internal").unwrap()];
         n.commands =
             vec![CommandPattern::parse(&["psql".into(), "-c".into(), "*".into()]).unwrap()];
+        n.roots = vec!["/r/app/sub".into()];
+        assert_eq!(classify_rule(Some(&o), Some(&n)), Change::Tighten);
+        n.roots.clear();
         assert_eq!(classify_rule(Some(&o), Some(&n)), Change::Tighten);
         assert_eq!(classify_rule(Some(&o), None), Change::Tighten);
         assert_eq!(classify_rule(None, Some(&o)), Change::Loosen);

@@ -20,6 +20,8 @@ use ms_session::Caller;
 use ms_vault::{Vault, VaultExt};
 use tokio::sync::watch;
 
+mod run;
+
 use crate::approve::PRE_L11;
 use crate::backend::{Backend, DAEMON_STATE_KEY, RULES_HMAC_KEY};
 use crate::paths::Paths;
@@ -501,6 +503,13 @@ impl Daemon {
                 "morsec: ms scan can't run inside an agent session. Run it from your own terminal",
             ),
             RequestBody::Scan => self.scan(&session),
+            RequestBody::Run { argv, cwd, env } => run::run_buffered(self, peer, argv, cwd, env),
+            RequestBody::RunStream { .. }
+            | RequestBody::RunInput { .. }
+            | RequestBody::RunInputEnd => reply_err(
+                ErrorCode::Protocol,
+                "morsec: run input is only valid inside a run stream",
+            ),
             other => reply_err(
                 ErrorCode::NotImplemented,
                 format!(
@@ -1112,6 +1121,20 @@ impl ms_ipc::Handler for IpcHandler {
                     "morsec: the daemon failed handling this request",
                 )
             })
+    }
+
+    async fn handle_stream(
+        &self,
+        peer: &PeerInfo,
+        request: RequestBody,
+        io: ms_ipc::StreamIo,
+    ) -> ResponseBody {
+        match request {
+            RequestBody::RunStream { argv, cwd, env } => {
+                run::run_stream(self.0.clone(), *peer, argv, cwd, env, io).await
+            }
+            _ => reply_err(ErrorCode::Protocol, "morsec: not a streaming request"),
+        }
     }
 }
 

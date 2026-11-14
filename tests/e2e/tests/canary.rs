@@ -41,6 +41,7 @@ const TESTS: &[Test] = &[
         real_agent_job_skips_without_opt_in,
     ),
     ("gate_requires_security_evals", gate_requires_security_evals),
+    ("run_mode_through_shims", run_mode_through_shims),
 ];
 
 fn main() -> ExitCode {
@@ -756,4 +757,152 @@ fn gate_requires_security_evals() {
             "the gate runs a real agent: {l}"
         );
     }
+}
+
+// protects=L12 run mode end to end (OUT-1, OUT-4, GW-1): with a run key allowlisted for a few
+// commands and one project root, a fake agent's commands that carry the ref go through the
+// shims to msd: `env` shows only the minimal environment with the value redacted (nothing from
+// the agent's own environment); a base64 copy of the value is redacted; shell metacharacters in
+// arguments stay literal; the child's exit code comes back; a non-allowlisted command and a cwd
+// outside the root are refused (77) and recorded as blocked; a command with no ref runs
+// locally through the shim unchanged; receipts and msd's log hold no value. fails_when=any of
+// those breaks; no_claim=production keys with a real approver (L11), Postgres/SSH adapters
+// (L15/L16)
+fn run_mode_through_shims() {
+    let w = World::new();
+    let value = format!("rk_{}", random_hex(20));
+    let mut needles = Needles::new();
+    assert!(needles.add(0, value.as_bytes()));
+    let clean = |what: &str, blob: &[u8]| {
+        let hits = ms_scan::find_in(&needles, blob);
+        assert!(hits.is_empty(), "run value leaked into {what}: {hits:?}");
+        w.assert_clean(what, blob);
+    };
+    std::fs::write(w.dir.path().join("value"), &value).unwrap();
+    let repo = std::fs::canonicalize(&w.repo).unwrap();
+    let setup = format!(
+        r#"ms add run/canary --stdin --mode run --tier test < '{v}' && rm '{v}' &&
+(sleep 1; printf 'yes\n'; sleep 3) | script -q /dev/null ms rules run/canary --at-terminal --add-root '{repo}' \
+  --add-command '["env"]' \
+  --add-command '["printf", "**"]' \
+  --add-command '["sh", "-c", "printf %s \"$RUN_TOKEN\" | base64"]' \
+  --add-command '["sh", "-c", "exit 7"]' &&
+ms run --link-shims"#,
+        v = w.dir.path().join("value").display(),
+        repo = repo.display()
+    );
+    let (code, out) = w.outside(&setup);
+    assert_eq!(code, 0, "setup failed: {out}");
+    assert!(
+        out.contains("linked env") && out.contains("linked printf"),
+        "{out}"
+    );
+    clean("setup output", out.as_bytes());
+
+    let shims = w.home.join(".morsec/shims");
+    let pwned = w.dir.path().join("pwned");
+    let script = format!(
+        r#"export PATH='{shims}':"$PATH" AGENT_ONLY=agent-secret-env
+echo '== env'; RUN_TOKEN=ms://run/canary env; echo "rc=$?"
+echo '== b64'; RUN_TOKEN=ms://run/canary ms run -- sh -c 'printf %s "$RUN_TOKEN" | base64'
+echo '== inject'; RUN_TOKEN=ms://run/canary printf '[%s]\n' '; touch {p}' '$(touch {p})' '`touch {p}`'
+echo '== exit'; RUN_TOKEN=ms://run/canary ms run -- sh -c 'exit 7'; echo "rc=$?"
+echo '== notallowed'; RUN_TOKEN=ms://run/canary ms run -- ls; echo "rc=$?"
+echo '== outside'; (cd /tmp && RUN_TOKEN=ms://run/canary env); echo "rc=$?"
+echo '== plain'; env | grep -c AGENT_ONLY
+echo '== done'
+"#,
+        shims = shims.display(),
+        p = pwned.display()
+    );
+    let (code, out) = w.in_agent(&script);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("== done"), "{out}");
+    let section = |name: &str| {
+        out.split(&format!("== {name}\n"))
+            .nth(1)
+            .and_then(|s| s.split("\n== ").next())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let env = section("env");
+    assert!(
+        env.contains("RUN_TOKEN=[redacted ms://run/canary]"),
+        "{env}"
+    );
+    assert!(env.contains("rc=0"), "{env}");
+    for absent in ["AGENT_ONLY", "MORSEC_SOCKET", "STRIPE_SECRET_KEY"] {
+        assert!(!env.contains(absent), "{absent} reached the child: {env}");
+    }
+    let names: Vec<&str> = env
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+        .filter(|k| *k != "rc")
+        .collect();
+    for n in &names {
+        assert!(
+            [
+                "PATH",
+                "HOME",
+                "LANG",
+                "TMPDIR",
+                "USER",
+                "LOGNAME",
+                "RUN_TOKEN"
+            ]
+            .contains(n),
+            "unexpected variable {n} in the child: {env}"
+        );
+    }
+    assert!(
+        section("b64").contains("[redacted ms://run/canary]"),
+        "{out}"
+    );
+    let inject = section("inject");
+    assert!(
+        inject.contains(&format!("[; touch {}]", pwned.display())),
+        "{inject}"
+    );
+    assert!(
+        inject.contains(&format!("[$(touch {})]", pwned.display())),
+        "{inject}"
+    );
+    assert!(!pwned.exists(), "an argument reached a shell");
+    assert!(section("exit").contains("rc=7"), "{out}");
+    // Messages go to stderr, which in_agent appends after stdout.
+    assert!(section("notallowed").contains("rc=77"), "{out}");
+    assert!(
+        out.contains("run/canary is not allowed to run `ls`"),
+        "{out}"
+    );
+    assert!(section("outside").contains("rc=77"), "{out}");
+    assert!(out.contains("outside run/canary's project roots"), "{out}");
+    assert_eq!(
+        section("plain").trim(),
+        "1",
+        "a ref-less command didn't run locally: {out}"
+    );
+    clean("the fake agent's output", out.as_bytes());
+
+    let state = World::files_under(&w.dir.path().join("state"));
+    let receipts: String = state
+        .iter()
+        .filter(|(p, _)| p.to_string_lossy().contains("receipts"))
+        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+        .collect();
+    assert!(
+        receipts.contains("run/canary"),
+        "no run receipts: {receipts}"
+    );
+    assert!(
+        receipts.contains("blocked"),
+        "refusals not recorded: {receipts}"
+    );
+    for (p, bytes) in state {
+        clean(&p.display().to_string(), &bytes);
+    }
+    clean(
+        "msd's log",
+        &std::fs::read(w.dir.path().join("msd.log")).unwrap(),
+    );
 }
