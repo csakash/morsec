@@ -10,6 +10,8 @@
 //! - `open`: the same, but direct egress is open;
 //! - `liar`: prints a passing probe line without running anything;
 //! - `says-open`: prints a probe line saying direct egress is open, without running anything.
+//! - `forge`: a detached process also called `claude` sends a passing canary and report first
+//!   (security review S1); the agent itself runs nothing.
 //!
 //! Commands that must come from the user's own terminal (`ms connect`, `ms doctor --live`) run
 //! detached (reparented to PID 1), so they are outside any agent session even when an agent runs
@@ -98,15 +100,27 @@ fn fake_agent(name: &str, args: &[String]) -> ExitCode {
     let proxy = std::env::var("FAKE_PROXY").unwrap_or_default();
     let target = |which: &str| std::env::var(which).unwrap_or_default();
     match mode.as_str() {
-        // The sandbox's proxy variable, as the connector or the sandbox sets it.
+        // The sandbox's proxy variable, as the connector or the sandbox sets it. A real agent
+        // keeps running a while after the command (it writes its reply): so does this one.
         "blocked" => sh(&format!(
-            "HTTPS_PROXY='{proxy}' {cmd} --direct-target {}",
+            "HTTPS_PROXY='{proxy}' {cmd} --direct-target {}; s=$?; sleep 1; exit $s",
             target("FAKE_CLOSED")
         )),
         "open" => sh(&format!(
-            "HTTPS_PROXY='{proxy}' {cmd} --direct-target {}",
+            "HTTPS_PROXY='{proxy}' {cmd} --direct-target {}; s=$?; sleep 1; exit $s",
             target("FAKE_OPEN")
         )),
+        // Security review S1: another process, detached (reparented to launchd) and also called
+        // `claude`, sends a passing canary and report for this nonce first; the agent itself
+        // never runs the probe.
+        "forge" => {
+            let me = std::env::current_exe().unwrap();
+            sh(&format!(
+                "( '{}' -c \"HTTPS_PROXY='{proxy}' {cmd} --direct-target {}; sleep 2\" >/dev/null 2>&1 & ) ; sleep 3",
+                me.display(),
+                target("FAKE_CLOSED")
+            ))
+        }
         "liar" => {
             println!("morsec-probe nonce={nonce} proxy=reached direct=blocked");
             ExitCode::SUCCESS
@@ -486,12 +500,15 @@ fn probe_open_egress_fails_loudly() {
             report: None,
         },
     ) {
-        ResponseBody::Probe {
-            canary: Some(c),
-            report: Some((r, by)),
-        } => {
+        ResponseBody::Probe { canaries, reports } => {
+            assert_eq!(
+                (canaries.len(), reports.len()),
+                (1, 1),
+                "{canaries:?} {reports:?}"
+            );
+            let (r, by) = &reports[0];
             assert!(r.direct_open && r.proxy_reached, "{r:?}");
-            let s = c.session.expect("canary from a session");
+            let s = canaries[0].session.clone().expect("canary from a session");
             assert_eq!(s.agent, ms_core::AgentKind::ClaudeCode);
             assert_eq!(by.session, Some(s));
         }
@@ -578,6 +595,22 @@ fn live_with_fake_agents() {
     let (code, out) = live("blocked", "blocked");
     assert_eq!(code, 0, "{out}");
     assert!(!out.contains('✗'), "{out}");
+
+    // Security review S1: a detached process called `claude` forges a passing canary and report
+    // for the nonce; it is not the agent doctor started, so nothing passes.
+    let (code, out) = live("forge", "blocked");
+    assert_eq!(code, 1, "{out}");
+    let claude = out.split("live: claude-code").nth(1).unwrap();
+    let claude = claude.split("live: codex").next().unwrap();
+    assert!(
+        claude.contains("✗ a canary reached morsec's proxy, but not from the agent doctor started"),
+        "{out}"
+    );
+    assert!(
+        claude.contains("✗ a probe report arrived, but not from the agent doctor started"),
+        "{out}"
+    );
+    assert!(!claude.contains('✓'), "{out}");
     drop(open);
 }
 

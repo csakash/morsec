@@ -14,16 +14,23 @@ use ms_core::SessionId;
 use ms_ipc::{ErrorCode, ProbeReport, ProbeSighting, ResponseBody};
 use ms_proxy::{BlockEvent, EgressObserver, LogObserver};
 
-/// Nonces remembered; the oldest is dropped first.
+/// Nonces remembered.
 pub const MAX_PROBES: usize = 64;
+/// Sessions remembered per nonce, for canaries and for reports.
+pub const MAX_PER_NONCE: usize = 4;
+/// An entry younger than this is never evicted to make room (security review S2): a full store
+/// refuses new nonces instead, so flooding it can't wipe a report `ms doctor --live` is waiting
+/// for. Longer than a live run (180 s per agent, two agents).
+pub const MIN_AGE_TO_EVICT_MS: u64 = 10 * 60 * 1000;
 /// The canary host suffix. `.invalid` never resolves (RFC 6761), so nothing leaves the machine.
 pub const CANARY_SUFFIX: &str = ".doctor.morsec.invalid";
 
 #[derive(Debug, Default, Clone)]
 struct Entry {
     nonce: String,
-    canary: Option<ProbeSighting>,
-    report: Option<(ProbeReport, ProbeSighting)>,
+    created_ms: u64,
+    canaries: Vec<ProbeSighting>,
+    reports: Vec<(ProbeReport, ProbeSighting)>,
 }
 
 /// The probe store.
@@ -44,32 +51,52 @@ pub fn canary_nonce(host: &str) -> Option<&str> {
     host.strip_suffix(CANARY_SUFFIX).filter(|n| valid_nonce(n))
 }
 
+/// Adds `item` unless this session already has one there (the first per session wins, so a
+/// later "blocked" from the same session can't replace an "open") or the list is full.
+fn add_once<T>(list: &mut Vec<T>, item: T, session: impl Fn(&T) -> &Option<SessionId>) -> bool {
+    if list.len() >= MAX_PER_NONCE || list.iter().any(|x| session(x) == session(&item)) {
+        return false;
+    }
+    list.push(item);
+    true
+}
+
 impl Probes {
-    fn with<R>(&self, nonce: &str, f: impl FnOnce(&mut Entry) -> R) -> R {
+    /// Runs `f` on the entry for `nonce`, making one if there is room. `None`: the store is full
+    /// of recent entries.
+    fn with<R>(&self, nonce: &str, now_ms: u64, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
         let mut q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = q.iter_mut().find(|e| e.nonce == nonce) {
-            return f(e);
+            return Some(f(e));
         }
         if q.len() >= MAX_PROBES {
+            let old = q
+                .front()
+                .is_some_and(|e| now_ms.saturating_sub(e.created_ms) >= MIN_AGE_TO_EVICT_MS);
+            if !old {
+                return None;
+            }
             q.pop_front();
         }
         q.push_back(Entry {
             nonce: nonce.to_owned(),
+            created_ms: now_ms,
             ..Entry::default()
         });
-        f(q.back_mut().expect("just pushed"))
+        q.back_mut().map(f)
     }
 
-    /// The proxy refused a canary CONNECT. The first sighting is kept.
+    /// The proxy refused a canary CONNECT.
     pub fn sighted(&self, nonce: &str, session: Option<SessionId>, now_ms: u64) {
         if !valid_nonce(nonce) {
             return;
         }
-        self.with(nonce, |e| {
-            e.canary.get_or_insert(ProbeSighting {
-                session,
-                seen_unix_ms: now_ms,
-            });
+        let s = ProbeSighting {
+            session,
+            seen_unix_ms: now_ms,
+        };
+        let _ = self.with(nonce, now_ms, |e| {
+            add_once(&mut e.canaries, s, |c| &c.session)
         });
     }
 
@@ -95,26 +122,26 @@ impl Probes {
                         "morsec: the probe report's detail is too long",
                     );
                 }
-                // First report wins, so a later "blocked" can't overwrite an "open".
-                let stored = self.with(nonce, |e| {
-                    if e.report.is_some() {
-                        return false;
-                    }
-                    e.report = Some((
-                        r,
-                        ProbeSighting {
-                            session,
-                            seen_unix_ms: now_ms,
+                let item = (
+                    r,
+                    ProbeSighting {
+                        session,
+                        seen_unix_ms: now_ms,
+                    },
+                );
+                match self.with(nonce, now_ms, |e| {
+                    add_once(&mut e.reports, item, |(_, by)| &by.session)
+                }) {
+                    None => ResponseBody::error(
+                        ErrorCode::Busy,
+                        "morsec: too many doctor probes in flight; try again in a few minutes",
+                    ),
+                    Some(stored) => ResponseBody::Ok {
+                        message: if stored {
+                            "morsec: probe report recorded".into()
+                        } else {
+                            "morsec: a probe report from this session was already recorded; kept the first".into()
                         },
-                    ));
-                    true
-                });
-                ResponseBody::Ok {
-                    message: if stored {
-                        "morsec: probe report recorded".into()
-                    } else {
-                        "morsec: a probe report for this nonce was already recorded; kept the first"
-                            .into()
                     },
                 }
             }
@@ -126,8 +153,8 @@ impl Probes {
                     .cloned()
                     .unwrap_or_default();
                 ResponseBody::Probe {
-                    canary: e.canary,
-                    report: e.report,
+                    canaries: e.canaries,
+                    reports: e.reports,
                 }
             }
         }
@@ -159,10 +186,10 @@ mod tests {
 
     const N: &str = "0123456789abcdef0123456789abcdef";
 
-    fn s() -> SessionId {
+    fn s(pid: u32) -> SessionId {
         SessionId {
             agent: AgentKind::ClaudeCode,
-            pid: 42,
+            pid,
             started_unix_ms: 7,
         }
     }
@@ -172,6 +199,13 @@ mod tests {
             proxy_reached: true,
             direct_open: open,
             detail: String::new(),
+        }
+    }
+
+    fn lookup(p: &Probes) -> (Vec<ProbeSighting>, Vec<(ProbeReport, ProbeSighting)>) {
+        match p.handle(None, Some(N), None, 0) {
+            ResponseBody::Probe { canaries, reports } => (canaries, reports),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -193,41 +227,45 @@ mod tests {
         let p = Arc::new(Probes::default());
         let o = CanaryObserver { probes: p.clone() };
         o.blocked(&BlockEvent {
-            session: Some(s()),
+            session: Some(s(42)),
             host: format!("{N}.doctor.morsec.invalid"),
             port: 443,
             kind: BlockKind::NotAllowed,
         });
-        match p.handle(None, Some(N), None, 0) {
-            ResponseBody::Probe {
-                canary: Some(c),
-                report: None,
-            } => assert_eq!(c.session, Some(s())),
-            other => panic!("{other:?}"),
-        }
+        let (c, r) = lookup(&p);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].session, Some(s(42)));
+        assert!(r.is_empty());
     }
 
-    // protects=a later "blocked" report can't overwrite an "open" one for the same nonce, and
-    // malformed nonces and oversized details are refused; fails_when=the second report replaces
-    // the first or a bad nonce is stored; no_claim=who may send a report (anyone; doctor weighs it)
+    // protects=security review S1: another process can't crowd out the real agent's evidence by
+    // getting in first: the first canary and report of each session are kept (a few sessions per
+    // nonce), and within one session a later "blocked" can't replace an "open"; malformed nonces
+    // and oversized details are refused; fails_when=a second session's evidence is dropped or a
+    // session's first report is replaced; no_claim=which session doctor trusts (ms-cli judge)
     #[test]
-    fn first_report_wins_and_input_is_checked() {
+    fn first_per_session_and_input_is_checked() {
         let p = Probes::default();
         assert!(matches!(
-            p.handle(Some(s()), Some(N), Some(report(true)), 1),
+            p.handle(Some(s(1)), Some(N), Some(report(false)), 1),
             ResponseBody::Ok { .. }
         ));
-        p.handle(None, Some(N), Some(report(false)), 2);
-        match p.handle(None, Some(N), None, 3) {
-            ResponseBody::Probe {
-                report: Some((r, by)),
-                ..
-            } => {
-                assert!(r.direct_open);
-                assert_eq!(by.session, Some(s()));
-            }
-            other => panic!("{other:?}"),
+        p.handle(Some(s(2)), Some(N), Some(report(true)), 2);
+        p.handle(Some(s(2)), Some(N), Some(report(false)), 3);
+        p.sighted(N, Some(s(1)), 4);
+        p.sighted(N, Some(s(1)), 5);
+        p.sighted(N, Some(s(2)), 6);
+        let (c, r) = lookup(&p);
+        assert_eq!(c.len(), 2);
+        assert_eq!(r.len(), 2);
+        assert!(
+            r.iter()
+                .any(|(rep, by)| by.session == Some(s(2)) && rep.direct_open)
+        );
+        for i in 3..10 {
+            p.sighted(N, Some(s(i)), 7);
         }
+        assert_eq!(lookup(&p).0.len(), MAX_PER_NONCE);
         for bad in [None, Some("abc"), Some("0123456789ABCDEF0123456789ABCDEF")] {
             assert!(matches!(
                 p.handle(None, bad, None, 0),
@@ -246,18 +284,31 @@ mod tests {
         ));
     }
 
-    // protects=the store is bounded: flooding it with nonces drops the oldest, never grows past
-    // MAX_PROBES; fails_when=it grows without bound; no_claim=timing
+    // protects=security review S2: the store is bounded, and flooding it with fresh nonces can't
+    // evict a recent entry (new nonces are refused instead); old entries are evicted;
+    // fails_when=it grows past MAX_PROBES or a recent nonce's evidence is lost; no_claim=timing
     #[test]
-    fn bounded() {
+    fn bounded_and_recent_entries_survive_a_flood() {
         let p = Probes::default();
-        for i in 0..(MAX_PROBES + 10) {
-            p.sighted(&format!("{i:032x}"), None, 0);
+        p.handle(Some(s(1)), Some(N), Some(report(true)), 1_000);
+        for i in 1..(MAX_PROBES + 10) {
+            p.sighted(&format!("{i:032x}"), None, 2_000);
         }
         assert_eq!(p.entries.lock().unwrap().len(), MAX_PROBES);
+        assert_eq!(lookup(&p).1.len(), 1, "the real report was evicted");
         assert!(matches!(
-            p.handle(None, Some(&format!("{:032x}", 0)), None, 0),
-            ResponseBody::Probe { canary: None, .. }
+            p.handle(None, Some(&"e".repeat(32)), Some(report(false)), 3_000),
+            ResponseBody::Error {
+                code: ErrorCode::Busy,
+                ..
+            }
         ));
+        // Once old enough, entries make room again.
+        let later = 1_000 + MIN_AGE_TO_EVICT_MS;
+        assert!(matches!(
+            p.handle(None, Some(&"e".repeat(32)), Some(report(false)), later),
+            ResponseBody::Ok { .. }
+        ));
+        assert!(lookup(&p).1.is_empty());
     }
 }

@@ -93,7 +93,7 @@ pub enum RequestBody {
         limit: u32,
     },
     /// `ms doctor --probe` (L17). With `report`: the probe's result from inside an agent's
-    /// sandbox, stored under `nonce` (first report wins). Without: what msd holds for `nonce`
+    /// sandbox, stored under `nonce` (first per session wins). Without: what msd holds for `nonce`
     /// (the canary its proxy saw, and the report), answered with [`ResponseBody::Probe`].
     DoctorProbe {
         /// 32 lowercase hex characters, made fresh by `ms doctor --live`.
@@ -328,14 +328,16 @@ pub enum ResponseBody {
         /// The request, or none.
         pending: Option<PendingApproval>,
     },
-    /// What msd holds for a probe nonce (`DoctorProbe` lookup, L17).
+    /// What msd holds for a probe nonce (`DoctorProbe` lookup, L17). The first of each per
+    /// session, a few sessions at most: `ms doctor` keeps only what came from the agent it
+    /// started, so another process can't get in first and crowd it out.
     Probe {
-        /// The proxy refused the canary CONNECT for this nonce (so the request reached msd).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        canary: Option<ProbeSighting>,
-        /// The probe's report and who sent it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        report: Option<(ProbeReport, ProbeSighting)>,
+        /// Canary CONNECTs the proxy refused for this nonce (so the request reached msd).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        canaries: Vec<ProbeSighting>,
+        /// Probe reports and who sent each.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reports: Vec<(ProbeReport, ProbeSighting)>,
     },
     /// An error; `message` is shown to people as is.
     Error {

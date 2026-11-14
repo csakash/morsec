@@ -476,15 +476,15 @@ fn every_variant_round_trips() {
         ResponseBody::error(ErrorCode::NotInitialized, "x"),
         ResponseBody::error(ErrorCode::Invalid, "x"),
         ResponseBody::Probe {
-            canary: None,
-            report: None,
+            canaries: vec![],
+            reports: vec![],
         },
         ResponseBody::Probe {
-            canary: Some(ms_ipc::ProbeSighting {
+            canaries: vec![ms_ipc::ProbeSighting {
                 session: None,
                 seen_unix_ms: 1,
-            }),
-            report: Some((
+            }],
+            reports: vec![(
                 ms_ipc::ProbeReport {
                     proxy_reached: false,
                     direct_open: true,
@@ -498,7 +498,7 @@ fn every_variant_round_trips() {
                     }),
                     seen_unix_ms: 3,
                 },
-            )),
+            )],
         },
     ];
     for (i, b) in all_requests.iter().enumerate() {

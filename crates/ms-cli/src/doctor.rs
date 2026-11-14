@@ -53,9 +53,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_TIMEOUT: Duration = Duration::from_secs(180);
 /// Most output kept from an agent.
 const MAX_AGENT_OUTPUT: usize = 64 * 1024;
-/// A session counts as started by this live run if it started no earlier than this before it
-/// (process start times are read at millisecond resolution from a different clock source).
-const START_SLACK_MS: u64 = 2_000;
+/// How often `--live` asks msd what it has seen while an agent runs.
+const TICK: Duration = Duration::from_millis(200);
 
 pub(crate) fn run(a: &DoctorArgs) -> ExitCode {
     if a.probe {
@@ -643,18 +642,25 @@ fn live(report: &mut Report) {
                 continue;
             }
         };
-        let started = crate::import::now_unix_ms();
         let argv = agent_argv(&t, &bin, &ms_quoted, &nonce);
-        let (outcome, output) = run_agent(&argv);
-        let held = match ask(RequestBody::DoctorProbe {
-            nonce: Some(nonce.clone()),
-            report: None,
-        }) {
-            Ok(ResponseBody::Probe { canary, report }) => Ok((canary, report)),
-            Ok(ResponseBody::Error { message, .. }) => Err(message),
-            Ok(_) => Err("unexpected answer from msd".into()),
-            Err(e) => Err(e.to_string()),
-        };
+        // While the agent runs, ask msd what it has seen and decide for each session there
+        // whether it is the agent doctor started (or below it): its parent chain, read live,
+        // must reach the spawned process. A session that can't be checked while it runs is not
+        // trusted (security review S1).
+        let mut bound: Vec<(ms_core::SessionId, bool)> = Vec::new();
+        let mut last: Result<Lookup, String> = Err("msd was not asked".into());
+        let (outcome, output) = run_agent(&argv, &mut |child| {
+            last = lookup(&nonce);
+            if let Ok(l) = &last {
+                for sess in l.sessions() {
+                    if !bound.iter().any(|(s, _)| s == sess) {
+                        let ok = descends(&ms_session::OsProcessTable, sess, child);
+                        bound.push((sess.clone(), ok));
+                    }
+                }
+            }
+        });
+        let held = lookup(&nonce).or(last);
         let mut items = vec![Item::info(format!("{} ran: {outcome}", t.bin))];
         if outcome != "exit 0" {
             // Why it failed (not signed in, a bad flag...): its last lines, as inert text.
@@ -676,16 +682,11 @@ fn live(report: &mut Report) {
                     )));
                 }
             }
-            Ok((canary, rep)) => {
-                let v = judge(
-                    t.id,
-                    &t.kind,
-                    started,
-                    &nonce,
-                    canary.as_ref(),
-                    rep.as_ref(),
-                    &output,
-                );
+            Ok(l) => {
+                let is_ours = |sess: &ms_core::SessionId| {
+                    sess.agent == t.kind && bound.iter().any(|(s, ok)| s == sess && *ok)
+                };
+                let v = judge(t.id, &nonce, &l, &output, &is_ours);
                 report.direct_open |= v.direct_open;
                 items.extend(v.items);
             }
@@ -696,7 +697,7 @@ fn live(report: &mut Report) {
 
 /// Runs an agent with stdin closed, in a fresh private directory, in its own process group so a
 /// timeout kills everything it started. Returns (how it ended, its output, capped).
-fn run_agent(argv: &[String]) -> (String, String) {
+fn run_agent(argv: &[String], tick: &mut dyn FnMut(Child)) -> (String, String) {
     let dir = std::env::temp_dir().join(format!(
         "morsec-doctor-live-{}-{}",
         std::process::id(),
@@ -708,12 +709,12 @@ fn run_agent(argv: &[String]) -> (String, String) {
             return (format!("not started: {e}"), String::new());
         }
     }
-    let result = run_agent_in(argv, &dir);
+    let result = run_agent_in(argv, &dir, tick);
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
 
-fn run_agent_in(argv: &[String], dir: &Path) -> (String, String) {
+fn run_agent_in(argv: &[String], dir: &Path, tick: &mut dyn FnMut(Child)) -> (String, String) {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
@@ -725,6 +726,13 @@ fn run_agent_in(argv: &[String], dir: &Path) -> (String, String) {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (format!("not started: {e}"), String::new()),
+    };
+    // The spawned process, with its start time so a reused PID can't stand in for it.
+    let me = Child {
+        pid: child.id(),
+        started_unix_ms: ms_session::ProcessTable::info(&ms_session::OsProcessTable, child.id())
+            .map(|i| i.started_unix_ms)
+            .ok(),
     };
     // Keep the first MAX_AGENT_OUTPUT bytes and discard the rest, so a chatty agent never
     // blocks on a full pipe. Bytes land in a shared buffer as they arrive, so if something that
@@ -766,7 +774,12 @@ fn run_agent_in(argv: &[String], dir: &Path) -> (String, String) {
             .map(|s| Box::new(s) as Box<dyn Read + Send>),
     );
     let deadline = Instant::now() + AGENT_TIMEOUT;
+    let mut next_tick = Instant::now();
     let outcome = loop {
+        if Instant::now() >= next_tick {
+            tick(me);
+            next_tick = Instant::now() + TICK;
+        }
         match child.try_wait() {
             Ok(Some(st)) => break format!("exit {}", st.code().unwrap_or(-1)),
             Ok(None) if Instant::now() >= deadline => {
@@ -775,7 +788,7 @@ fn run_agent_in(argv: &[String], dir: &Path) -> (String, String) {
                 let _ = child.wait();
                 break format!("killed after {}s", AGENT_TIMEOUT.as_secs());
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => break format!("wait failed: {e}"),
         }
     };
@@ -832,61 +845,117 @@ struct Verdict {
     direct_open: bool,
 }
 
-/// Does a sighting come from a session of `kind` that started during this live run?
-fn from_this_run(s: &ProbeSighting, kind: &AgentKind, started_ms: u64) -> bool {
-    s.session.as_ref().is_some_and(|sess| {
-        sess.agent == *kind && sess.started_unix_ms + START_SLACK_MS >= started_ms
-    })
+/// The process doctor spawned for a live run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Child {
+    pid: u32,
+    /// `None` if it could not be read right after spawning: then nothing is bound to it.
+    started_unix_ms: Option<u64>,
 }
 
-/// The live verdict for one agent. Passes come only from what msd saw; an "open" claim is
-/// believed from any source (msd's report, or the agent's output carrying the probe's machine
-/// line for this nonce).
+/// What msd held for a nonce.
+struct Lookup {
+    canaries: Vec<ProbeSighting>,
+    reports: Vec<(ProbeReport, ProbeSighting)>,
+}
+
+impl Lookup {
+    fn sessions(&self) -> impl Iterator<Item = &ms_core::SessionId> {
+        self.canaries
+            .iter()
+            .chain(self.reports.iter().map(|(_, by)| by))
+            .filter_map(|s| s.session.as_ref())
+    }
+}
+
+fn lookup(nonce: &str) -> Result<Lookup, String> {
+    match ask(RequestBody::DoctorProbe {
+        nonce: Some(nonce.to_owned()),
+        report: None,
+    }) {
+        Ok(ResponseBody::Probe { canaries, reports }) => Ok(Lookup { canaries, reports }),
+        Ok(ResponseBody::Error { message, .. }) => Err(message),
+        Ok(_) => Err("unexpected answer from msd".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Is `session`'s root process, alive now with the same start time, `child` or below it? Read
+/// from the process table while the agent runs; anything unreadable is "no" (fail closed).
+fn descends<T: ms_session::ProcessTable>(
+    table: &T,
+    session: &ms_core::SessionId,
+    child: Child,
+) -> bool {
+    let Some(child_started) = child.started_unix_ms else {
+        return false;
+    };
+    let Ok(mut cur) = table.info(session.pid) else {
+        return false;
+    };
+    if cur.started_unix_ms != session.started_unix_ms {
+        return false;
+    }
+    for _ in 0..ms_session::MAX_DEPTH {
+        if cur.pid == child.pid {
+            return cur.started_unix_ms == child_started;
+        }
+        if cur.ppid <= 1 || cur.ppid == cur.pid {
+            return false;
+        }
+        match table.info(cur.ppid) {
+            // A parent can't start after its child; if it did, the PID was reused.
+            Ok(p) if p.started_unix_ms <= cur.started_unix_ms => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The live verdict for one agent. Passes come only from what msd saw, from a session that
+/// `is_ours` (the agent doctor started); an "open" claim is believed from any source (any report,
+/// or the agent's output carrying the probe's machine line for this nonce).
 fn judge(
     id: &str,
-    kind: &AgentKind,
-    started_ms: u64,
     nonce: &str,
-    canary: Option<&ProbeSighting>,
-    report: Option<&(ProbeReport, ProbeSighting)>,
+    held: &Lookup,
     agent_output: &str,
+    is_ours: &dyn Fn(&ms_core::SessionId) -> bool,
 ) -> Verdict {
+    let ours = |s: &ProbeSighting| s.session.as_ref().is_some_and(is_ours);
     let mut items = Vec::new();
-    items.push(match canary {
-        Some(c) if from_this_run(c, kind, started_ms) => {
-            Item::pass("canary reached morsec's proxy from this agent's sandbox")
-        }
-        Some(_) => Item::fail(
-            "a canary reached morsec's proxy, but not from this agent's session; commands may not route through morsec",
-        ),
-        None => Item::fail(format!(
+    items.push(if held.canaries.iter().any(ours) {
+        Item::pass("canary reached morsec's proxy from this agent's sandbox")
+    } else if held.canaries.is_empty() {
+        Item::fail(format!(
             "commands in {id}'s sandbox did not reach morsec's proxy (the canary never arrived) · check: ms doctor, and that the sandbox allows the proxy"
-        )),
+        ))
+    } else {
+        Item::fail(
+            "a canary reached morsec's proxy, but not from the agent doctor started; not trusted",
+        )
     });
     let said_open = output_says_open(agent_output, nonce);
-    let direct_open = report.is_some_and(|(r, _)| r.direct_open) || said_open;
+    let direct_open = held.reports.iter().any(|(r, _)| r.direct_open) || said_open;
     if direct_open {
         items.push(Item::fail(format!(
             "DIRECT INTERNET IS OPEN in {id}'s sandbox: commands there can reach the internet without morsec"
         )));
     } else {
-        items.push(match report {
-            Some((r, by)) if from_this_run(by, kind, started_ms) => {
-                if r.detail.is_empty() {
-                    Item::pass(format!("direct internet blocked in {id}'s sandbox"))
-                } else {
-                    Item::pass(format!(
-                        "direct internet blocked in {id}'s sandbox ({})",
-                        r.detail
-                    ))
-                }
+        items.push(match held.reports.iter().find(|(_, by)| ours(by)) {
+            Some((r, _)) if r.detail.is_empty() => {
+                Item::pass(format!("direct internet blocked in {id}'s sandbox"))
             }
-            Some(_) => Item::fail(
-                "a probe report arrived, but not from this agent's session; not trusted",
-            ),
-            None => Item::fail(format!(
+            Some((r, _)) => Item::pass(format!(
+                "direct internet blocked in {id}'s sandbox ({})",
+                r.detail
+            )),
+            None if held.reports.is_empty() => Item::fail(format!(
                 "the probe did not report to msd: {id} did not run it, or its sandbox blocks the msd socket"
             )),
+            None => Item::fail(
+                "a probe report arrived, but not from the agent doctor started; not trusted",
+            ),
         });
     }
     Verdict { items, direct_open }
@@ -1114,124 +1183,199 @@ mod tests {
 
     const N: &str = "0123456789abcdef0123456789abcdef";
 
-    fn sighting(kind: AgentKind, started: u64) -> ProbeSighting {
-        ProbeSighting {
-            session: Some(SessionId {
-                agent: kind,
-                pid: 10,
-                started_unix_ms: started,
-            }),
-            seen_unix_ms: started + 1,
+    fn sess(kind: AgentKind, pid: u32) -> SessionId {
+        SessionId {
+            agent: kind,
+            pid,
+            started_unix_ms: 100,
         }
     }
 
-    fn rep(open: bool, by: ProbeSighting) -> (ProbeReport, ProbeSighting) {
-        (
-            ProbeReport {
-                proxy_reached: true,
-                direct_open: open,
-                detail: String::new(),
-            },
-            by,
-        )
+    fn by(s: SessionId) -> ProbeSighting {
+        ProbeSighting {
+            session: Some(s),
+            seen_unix_ms: 1,
+        }
+    }
+
+    fn held(canaries: Vec<ProbeSighting>, reports: Vec<(bool, ProbeSighting)>) -> Lookup {
+        Lookup {
+            canaries,
+            reports: reports
+                .into_iter()
+                .map(|(open, b)| {
+                    (
+                        ProbeReport {
+                            proxy_reached: true,
+                            direct_open: open,
+                            detail: String::new(),
+                        },
+                        b,
+                    )
+                })
+                .collect(),
+        }
     }
 
     fn marks(v: &Verdict) -> Vec<Mark> {
         v.items.iter().map(|i| i.mark).collect()
     }
 
-    // protects=INJ-4 live verdict: both checks pass only on msd's own evidence from a session of
-    // the agent under test that started in this run; fails_when=a pass is given without that
-    // evidence; no_claim=running a real agent
+    // protects=INJ-4 live verdict and security review S1: both checks pass only on msd's own
+    // evidence from a session that is the agent doctor started; the same evidence from any other
+    // session (another process that forged a canary and a "blocked" report first) passes
+    // nothing, and the agent's text claiming success passes nothing; fails_when=a pass is given
+    // without evidence from our session; no_claim=how "ours" is decided (descends test)
     #[test]
     fn live_pass_needs_msds_evidence_from_this_agent() {
-        let k = AgentKind::ClaudeCode;
-        let ok = sighting(k.clone(), 100_000);
+        let ours = sess(AgentKind::ClaudeCode, 10);
+        let forger = sess(AgentKind::ClaudeCode, 99);
+        let is_ours = |s: &SessionId| *s == ours;
         let v = judge(
             "claude-code",
-            &k,
-            100_000,
             N,
-            Some(&ok),
-            Some(&rep(false, ok.clone())),
+            &held(vec![by(ours.clone())], vec![(false, by(ours.clone()))]),
             "",
+            &is_ours,
         );
         assert_eq!(marks(&v), [Mark::Pass, Mark::Pass]);
         assert!(!v.direct_open);
 
+        // A forger's canary and report, even first and alongside nothing of ours.
+        let v = judge(
+            "claude-code",
+            N,
+            &held(vec![by(forger.clone())], vec![(false, by(forger.clone()))]),
+            "",
+            &is_ours,
+        );
+        assert_eq!(marks(&v), [Mark::Fail, Mark::Fail]);
+        assert!(
+            v.items[0]
+                .text
+                .contains("not from the agent doctor started")
+        );
+
         // The agent claims success in text but msd saw nothing.
         let claim = format!("morsec-probe nonce={N} proxy=reached direct=blocked");
-        let v = judge("claude-code", &k, 100_000, N, None, None, &claim);
+        let v = judge("claude-code", N, &held(vec![], vec![]), &claim, &is_ours);
         assert_eq!(marks(&v), [Mark::Fail, Mark::Fail]);
 
-        // Evidence from another agent kind, from an older session, or from no session.
-        for wrong in [
-            sighting(AgentKind::Codex, 100_000),
-            sighting(k.clone(), 1_000),
-            ProbeSighting {
-                session: None,
-                seen_unix_ms: 100_001,
-            },
-        ] {
-            let v = judge(
-                "claude-code",
-                &k,
-                100_000,
-                N,
-                Some(&wrong),
-                Some(&rep(false, wrong.clone())),
-                "",
-            );
-            assert_eq!(marks(&v), [Mark::Fail, Mark::Fail], "{wrong:?}");
-        }
+        // No session at all.
+        let none = ProbeSighting {
+            session: None,
+            seen_unix_ms: 1,
+        };
+        let v = judge(
+            "claude-code",
+            N,
+            &held(vec![none.clone()], vec![(false, none)]),
+            "",
+            &is_ours,
+        );
+        assert_eq!(marks(&v), [Mark::Fail, Mark::Fail]);
     }
 
-    // protects=SPEC: when direct egress is open, doctor fails loudly, whether msd's report or only
-    // the agent's own output (the probe's machine line for this nonce) says so, even if a later
-    // report says blocked; fails_when=an open sandbox is not a failure or not flagged loud;
-    // no_claim=what the probe measures
+    // protects=SPEC: when direct egress is open, doctor fails loudly, whether a report from any
+    // session or only the agent's own output (the probe's machine line for this nonce) says so,
+    // even if our own report says blocked; fails_when=an open sandbox is not a failure or not
+    // flagged loud; no_claim=what the probe measures
     #[test]
     fn open_egress_fails_loudly_from_any_source() {
-        let k = AgentKind::Codex;
-        let ok = sighting(k.clone(), 5_000);
+        let ours = sess(AgentKind::Codex, 10);
+        let other = sess(AgentKind::Codex, 11);
+        let is_ours = |s: &SessionId| *s == ours;
         let v = judge(
             "codex",
-            &k,
-            5_000,
             N,
-            Some(&ok),
-            Some(&rep(true, ok.clone())),
+            &held(
+                vec![by(ours.clone())],
+                vec![(false, by(ours.clone())), (true, by(other))],
+            ),
             "",
+            &is_ours,
         );
         assert!(v.direct_open);
         assert!(v.items[1].text.contains("DIRECT INTERNET IS OPEN"));
         assert_eq!(v.items[1].mark, Mark::Fail);
 
+        let ok = held(vec![by(ours.clone())], vec![(false, by(ours.clone()))]);
         let line = format!("morsec-probe nonce={N} proxy=no direct=OPEN");
-        let v = judge(
-            "codex",
-            &k,
-            5_000,
-            N,
-            Some(&ok),
-            Some(&rep(false, ok.clone())),
-            &line,
-        );
-        assert!(v.direct_open);
-        // Another nonce's line (e.g. echoed from elsewhere) is not this run's.
-        let other = "morsec-probe nonce=ffffffffffffffffffffffffffffffff proxy=no direct=OPEN";
-        let v = judge(
-            "codex",
-            &k,
-            5_000,
-            N,
-            Some(&ok),
-            Some(&rep(false, ok.clone())),
-            other,
-        );
-        assert!(!v.direct_open);
-
+        assert!(judge("codex", N, &ok, &line, &is_ours).direct_open);
+        let other_nonce =
+            "morsec-probe nonce=ffffffffffffffffffffffffffffffff proxy=no direct=OPEN";
+        assert!(!judge("codex", N, &ok, other_nonce, &is_ours).direct_open);
         assert!(loud_banner().contains("DIRECT INTERNET IS OPEN"));
+    }
+
+    struct Table(Vec<ms_session::ProcInfo>);
+    impl ms_session::ProcessTable for Table {
+        fn info(&self, pid: u32) -> std::io::Result<ms_session::ProcInfo> {
+            self.0
+                .iter()
+                .find(|p| p.pid == pid)
+                .cloned()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+    }
+
+    fn proc(pid: u32, ppid: u32, started: u64, name: &str) -> ms_session::ProcInfo {
+        ms_session::ProcInfo {
+            pid,
+            ppid,
+            uid: 501,
+            started_unix_ms: started,
+            name: name.into(),
+        }
+    }
+
+    // protects=security review S1: a session is ours only if its root process is the spawned
+    // child or below it (e.g. Codex's node shim → native codex), alive with the start time msd
+    // recorded; a detached process with the same name, a reused PID, an exited process or an
+    // unreadable child start are not; fails_when=any of those is accepted; no_claim=the OS
+    // process table itself (ms-session tests)
+    #[test]
+    fn descends_binds_to_the_spawned_child() {
+        let t = Table(vec![
+            proc(1, 0, 0, "launchd"),
+            proc(50, 1, 10, "zsh"),
+            proc(60, 50, 20, "ms"),
+            proc(70, 60, 30, "node"),   // spawned child (Codex's npm shim)
+            proc(71, 70, 31, "codex"),  // the real agent below it
+            proc(80, 1, 40, "claude"),  // detached forger, reparented to launchd
+            proc(90, 70, 25, "claude"), // claims a parent that started after it: reused PID
+        ]);
+        let child = Child {
+            pid: 70,
+            started_unix_ms: Some(30),
+        };
+        let s = |pid, started| SessionId {
+            agent: AgentKind::Codex,
+            pid,
+            started_unix_ms: started,
+        };
+        assert!(descends(&t, &s(71, 31), child));
+        assert!(descends(&t, &s(70, 30), child));
+        assert!(!descends(&t, &s(80, 40), child), "detached forger");
+        assert!(
+            !descends(&t, &s(71, 999), child),
+            "start time differs from msd's"
+        );
+        assert!(
+            !descends(&t, &s(90, 25), child),
+            "parent started after child"
+        );
+        assert!(!descends(&t, &s(12345, 1), child), "exited");
+        let wrong_child = Child {
+            pid: 70,
+            started_unix_ms: Some(29),
+        };
+        assert!(!descends(&t, &s(71, 31), wrong_child), "child PID reused");
+        let unread = Child {
+            pid: 70,
+            started_unix_ms: None,
+        };
+        assert!(!descends(&t, &s(71, 31), unread));
     }
 
     // protects=SPEC acceptance 2: a connector check that failed (e.g. the proxy variable removed)
@@ -1440,7 +1584,9 @@ mod tests {
         .map(|s| (*s).to_owned())
         .collect();
         let t = Instant::now();
-        let (outcome, text) = run_agent_in(&argv, dir.path());
+        let mut ticks = 0;
+        let (outcome, text) = run_agent_in(&argv, dir.path(), &mut |_| ticks += 1);
+        assert!(ticks >= 1);
         assert_eq!(outcome, "exit 0");
         assert!(text.contains("morsec-probe-line"), "{text:?}");
         assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
