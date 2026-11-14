@@ -13,6 +13,7 @@ mod connect_codex;
 mod doctor;
 mod import;
 mod log;
+mod run;
 mod service;
 mod stats;
 mod tty;
@@ -66,7 +67,7 @@ enum Command {
     /// Remove a coding agent's morsec settings.
     Disconnect(connect::DisconnectArgs),
     /// Run a command with references resolved by the broker.
-    Run(Rest),
+    Run(run::RunArgs),
     /// Show or change a key's hosts, commands, tier and session length.
     Rules(rules::RulesArgs),
     /// Show receipts; --verify checks the chain; --export for a security review.
@@ -93,9 +94,9 @@ impl Command {
     /// (subcommand name, loop that builds it) for stubs; None when implemented.
     fn stub(&self) -> Option<(&'static str, &'static str)> {
         Some(match self {
-            Command::Run(_) => ("run", "L12 run-core"),
             Command::Mcp(_) => ("mcp", "L14 mcp-server"),
             Command::Status
+            | Command::Run(_)
             | Command::Init(_)
             | Command::Stop
             | Command::Start
@@ -187,6 +188,7 @@ async fn main() -> ExitCode {
         Command::Connect(a) => on_own_thread(move || connect::connect(&a)),
         Command::Disconnect(a) => on_own_thread(move || connect::disconnect(&a)),
         Command::Scan(a) => scan::run(&a).await,
+        Command::Run(a) => on_own_thread(move || run::run(&a)),
         Command::Approve(a) => on_own_thread(move || approve::run(&a)),
         Command::Doctor(a) => on_own_thread(move || doctor::run(&a)),
         _ => unreachable!("every other command is a stub"),
