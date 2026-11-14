@@ -572,24 +572,39 @@ fn acl_other_binary_is_denied() {
     );
     let r = run_child(&other, &t.service, k.as_str(), "get");
     assert!(r.starts_with("DENIED"), "after update-attr: {r}");
-    // Data, worst case first: overwritten through a trusted binary (as if the user had clicked
-    // Allow for an attacker), the item is refused by the seal, never used as a value.
-    let r = run_child(&same, &t.service, k.as_str(), "update-data");
+    // Data, from the other binary first, which raises no dialog. Whether the keychain refuses it
+    // or lets it through, the item never yields a value we use (denied by the keychain, or
+    // refused by the seal): denial of service, not a leak.
+    let r = run_child(&other, &t.service, k.as_str(), "update-data");
+    assert!(r == "UPDATED" || r.starts_with("DENIED"), "{r}");
+    if r == "UPDATED" {
+        assert!(t.vault.read_with(&k, |b| b.to_vec()).is_err());
+    } else {
+        assert_eq!(
+            t.vault.read_with(&k, |b| b.to_vec()).unwrap(),
+            CANARY.as_bytes()
+        );
+    }
+    let r = run_child(&other, &t.service, k.as_str(), "get");
+    assert!(r.starts_with("DENIED"), "after update-data: {r}");
+    // The worst case, on a second item: data overwritten through a trusted binary (as if the
+    // user had clicked Allow for an attacker) is refused by the seal, never used as a value.
+    let k2 = key("stripe/live2");
+    t.vault
+        .put(
+            &k2,
+            SecretBytes::from(CANARY.to_owned()),
+            meta(&k2, Tier::Production),
+        )
+        .unwrap();
+    let r = run_child(&same, &t.service, k2.as_str(), "update-data");
     assert_eq!(r, "UPDATED");
     let e = t
         .vault
-        .read_with(&k, |b| b.to_vec())
+        .read_with(&k2, |b| b.to_vec())
         .unwrap_err()
         .to_string();
     assert!(e.contains("seal check failed"), "{e}");
-    // Then the other binary's own data update, which raises no dialog. Whether the keychain
-    // refuses it or lets it through, the item never yields a value we use (denied by the keychain
-    // or refused by the seal): denial of service, not a leak.
-    let r = run_child(&other, &t.service, k.as_str(), "update-data");
-    assert!(r == "UPDATED" || r.starts_with("DENIED"), "{r}");
-    assert!(t.vault.read_with(&k, |b| b.to_vec()).is_err());
-    let r = run_child(&other, &t.service, k.as_str(), "get");
-    assert!(r.starts_with("DENIED"), "after update-data: {r}");
 }
 
 // protects=GW-1 with real signing: an item written by a Developer ID-signed binary is readable by
@@ -618,7 +633,13 @@ fn acl_developer_id() {
         fn drop(&mut self) {
             // A second panic while unwinding (a cleanup child that also hangs) would abort the
             // whole test binary, so skip cleanup then.
-            if !std::thread::panicking() {
+            if std::thread::panicking() {
+                eprintln!(
+                    "WARNING: skipped cleanup after a failure; test items may remain under service \
+                     {} (remove with: security delete-generic-password -s {})",
+                    self.1, self.1
+                );
+            } else {
                 let _ = run_child(self.0, self.1, self.2, "wipe");
             }
         }
@@ -841,7 +862,13 @@ fn ca_rejects_planted_keys() {
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
             // See WriterCleanup: never panic again while unwinding.
-            if !std::thread::panicking() {
+            if std::thread::panicking() {
+                eprintln!(
+                    "WARNING: skipped cleanup after a failure; test items may remain under service \
+                     {} (remove with: security delete-generic-password -s {})",
+                    self.1, self.1
+                );
+            } else {
                 let _ = run_child(self.0, self.1, "x", "delca");
             }
         }

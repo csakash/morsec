@@ -260,7 +260,7 @@ reports prompts per session and blocks per day.
 | Core language | Rust (stable, `cargo --locked`) | Memory safety in the component that holds secrets, plus `zeroize` and `secrecy` for wiping values (PRD §9 "values wiped after use"). Go's GC copies make wiping unreliable. |
 | Async and HTTP | `tokio`, `hyper` 1.x, `rustls`, `rcgen` | Standard and auditable; no OpenSSL in the proxy. |
 | macOS Keychain | `security-framework` (data-protection keychain, access control, user-presence for production items) | Lets the Keychain itself require biometry for production keys. |
-| Touch ID | `LocalAuthentication` (`LAContext`) called from the Rust CLI; the request itself is printed in the terminal | CLI only (2026-11-14). The system Touch ID sheet can't show the full command, so the terminal shows it and the sheet only confirms. |
+| Touch ID | `LocalAuthentication` (`LAContext`) called from the Rust CLI; the request itself is printed in the terminal | CLI only (2026-11-14). The system Touch ID sheet can't show the full command, so the terminal shows it; but a same-uid agent can redraw the terminal, so the sheet carries the binding (key, tier and a request code the terminal repeats). |
 | MCP server | the official Rust MCP SDK (`rmcp`) | Pin the exact version (MCP-1). |
 | CLI | `clap` | One binary; `mors` is a symlink. |
 | Storage | JSONL receipts; TOML rules | Readable, diffable, easy to export. |
@@ -602,6 +602,13 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
   - `ms` (or msd) confirms with Touch ID through `LocalAuthentication` (`LAContext`,
     `.deviceOwnerAuthenticationWithBiometrics`), falling back to the login password
     (`.deviceOwnerAuthentication`) when there is no Touch ID or it fails.
+  - **The terminal text is not trusted** (security review of `cli-scope`, S1): the agent runs as
+    the same uid, so it can write to the user's tty and redraw the prompt with a harmless-looking
+    request. The binding therefore goes in the system sheet, which no same-uid process can draw
+    on: `localizedReason` names the key, its tier and a short request code (6 characters of the
+    token HMAC over session, argv hash, cwd and expiry), and the terminal prints the same code
+    and tells the user to approve only if the two match. Production requests also show the
+    command's binary name in the sheet.
   - An agent can't approve its own request: the approving `ms` must be outside every agent
     session (the check today's `at_terminal` path uses, L06 process tree) and attached to a
     terminal, and msd shows the prompt for its own pending request, never for text a caller sent.
@@ -611,8 +618,10 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
     from L05, S4).
   - Replace `msd::approve::DenyApprover` and remove the pre-L11 `at_terminal` paths (L07 hand-over).
 - **Verify:** "change one argument after approval → the executor refuses"; "timeout → rejected";
-  "approve from inside an agent session → refused"; a rendering test with ANSI, RTL-override and
-  newline payloads (INJ-3); Touch ID itself is a recorded manual check.
+  "approve from inside an agent session → refused"; "the sheet's reason lacks the request's code
+  or key → the approval is refused" (the code is derived from the token being approved); a
+  rendering test with ANSI, RTL-override and newline payloads (INJ-3); Touch ID itself is a
+  recorded manual check.
 - **ARI-42:** AUTH-3, INJ-3.
 
 #### L12 `run-core` · L
@@ -712,7 +721,8 @@ Follow-up D2 from L08, written up by `cli-scope` (too big for that loop).
 - **Build:**
   - The allowlist lives in the MAC'd `rules.toml`: `[egress] allow = ["registry.npmjs.org",
     "*.github.com"]` (exact names or `*.suffix`, validated like `ProxyConfig.allow`). Empty by
-    default. msd never reads it from an agent-writable file: not Claude Code's `settings.json`,
+    default. A wildcard over a public suffix or a single label (`*.com`, `*.github.io`, where
+    anyone can host) is rejected, with a test (security review of `cli-scope`, S2). msd never reads it from an agent-writable file: not Claude Code's `settings.json`,
     not the connector state, not `.morsec.toml`.
   - Adding a host loosens the rules, so it needs an approval (`RulesProposeLoosen`, Touch ID once
     L11 lands); removing one tightens and is saved. A project `.morsec.toml` may only narrow it

@@ -16,7 +16,9 @@ the gate, and settles the L08 follow-up D2 (the empty msd tunnel allowlist).
   truncated in a way that hides arguments. `ms` (or msd) confirms with Touch ID through
   `LocalAuthentication` (`LAContext`, biometrics, falling back to the login password). An agent
   can't approve its own request: the approving process must be outside every agent session (the
-  same check as today's `at_terminal` path), and the token binds the request it approves.
+  same check as today's `at_terminal` path), and the token binds the request it approves. Because
+  a same-uid agent can redraw the terminal, the Touch ID sheet itself carries the binding (key,
+  tier and a request code the terminal repeats) (security review S1).
 - **L28 `release-1.0`: a CLI release.** Homebrew formula, docs and the signed release; no app cask.
 - **First public CLI release after v0.2.** Add a note: the first public CLI release is cut after
   v0.2 (L11–L17), with a light hardening pass pulled forward from L24: the threat model and fuzz
