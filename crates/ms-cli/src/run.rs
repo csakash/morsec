@@ -124,7 +124,7 @@ fn shim_name_ok(n: &str) -> bool {
 }
 
 /// The bare program names the run rules allow (first token of each literal-program pattern).
-fn wanted(rules: &ms_rules::Rules) -> BTreeSet<String> {
+pub(crate) fn wanted(rules: &ms_rules::Rules) -> BTreeSet<String> {
     rules
         .keys
         .values()
@@ -174,7 +174,7 @@ fn link_shims() -> ExitCode {
     }
 }
 
-fn fetch_rules() -> Result<ms_rules::Rules, String> {
+pub(crate) fn fetch_rules() -> Result<ms_rules::Rules, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
