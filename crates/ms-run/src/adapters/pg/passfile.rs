@@ -247,11 +247,12 @@ mod tests {
         File::open(&path).unwrap().read_to_string(&mut s).unwrap();
         assert_eq!(s, "h:*:*:u:pw\n");
         let deadline = Instant::now() + Duration::from_secs(2);
-        while path.exists() {
+        // The watcher unlinks the file and then its directory, so wait for both: checking the
+        // directory right after the file vanishes races the second unlink under a loaded gate.
+        while path.exists() || path.parent().unwrap().exists() {
             assert!(Instant::now() < deadline, "still there after it was read");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(!path.parent().unwrap().exists());
         drop(pf);
 
         let pf = Passfile::create_in(top.path(), b"x").unwrap();
