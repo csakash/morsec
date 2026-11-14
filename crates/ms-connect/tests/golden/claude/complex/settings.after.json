@@ -8,6 +8,7 @@
         "SSL_CERT_FILE": "$HOME/.morsec/ca-bundle.pem",
         "REQUESTS_CA_BUNDLE": "$HOME/.morsec/ca-bundle.pem",
         "CURL_CA_BUNDLE": "$HOME/.morsec/ca-bundle.pem",
+        "GIT_SSL_CAINFO": "$HOME/.morsec/ca-bundle.pem",
         "STRIPE_API_KEY": "ms://stripe/test"
     },
     "permissions": {

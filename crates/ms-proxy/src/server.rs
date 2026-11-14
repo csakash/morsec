@@ -53,6 +53,9 @@ struct Inner {
     body_budget: Arc<Semaphore>,
     #[cfg(test)]
     loopback_ok: bool,
+    /// The L30 QA hook: exactly these loopback addresses are reachable (debug builds only).
+    #[cfg(any(test, debug_assertions))]
+    loopback_only: Option<Vec<SocketAddr>>,
 }
 
 /// How long a request waits for room in the body budget before `503`.
@@ -155,6 +158,8 @@ impl Proxy {
                 body_budget: Arc::new(Semaphore::new(budget_kib)),
                 #[cfg(test)]
                 loopback_ok: false,
+                #[cfg(any(test, debug_assertions))]
+                loopback_only: None,
             }),
         })
     }
@@ -165,6 +170,15 @@ impl Proxy {
         Arc::get_mut(&mut self.inner)
             .expect("not serving yet")
             .loopback_ok = true;
+    }
+
+    /// The L30 QA hook: lets the proxy reach exactly `addrs` on loopback, and no other loopback
+    /// address (IP literals included). Debug builds only.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn allow_loopback_upstreams_only(&mut self, addrs: Vec<SocketAddr>) {
+        Arc::get_mut(&mut self.inner)
+            .expect("not serving yet")
+            .loopback_only = Some(addrs);
     }
 
     /// The address actually bound (useful with port 0).
@@ -206,6 +220,25 @@ impl Proxy {
 }
 
 impl Inner {
+    fn loopback_only(&self) -> Option<&[SocketAddr]> {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.loopback_only.as_deref()
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            None
+        }
+    }
+
+    /// With the QA hook, drops every loopback address it doesn't list.
+    fn only_listed_loopback(&self, c: std::io::Result<Checked>) -> std::io::Result<Checked> {
+        match self.loopback_only() {
+            Some(only) => only_listed(c, only),
+            None => c,
+        }
+    }
+
     fn loopback_ok(&self) -> bool {
         #[cfg(test)]
         {
@@ -347,7 +380,14 @@ impl Inner {
         port: u16,
         session: &SessionId,
     ) -> Result<Vec<SocketAddr>, Response<Body>> {
-        match ssrf::check(&*self.deps.resolver, host, port, self.loopback_ok()).await {
+        let checked = ssrf::check(
+            &*self.deps.resolver,
+            host,
+            port,
+            self.loopback_ok() || self.loopback_only().is_some(),
+        )
+        .await;
+        match self.only_listed_loopback(checked) {
             Ok(Checked::Ok(a)) => Ok(a),
             Ok(Checked::Refused(ip, why)) => {
                 self.block(Some(session), host, port, BlockKind::NonPublicAddress);
@@ -933,4 +973,56 @@ fn relay(resp: Response<Incoming>) -> Response<Body> {
     rewrite::strip_hop_by_hop(&mut parts.headers);
     parts.version = http::Version::HTTP_11;
     Response::from_parts(parts, body.map_err(|e| Box::new(e) as BoxError).boxed())
+}
+
+/// Keeps the loopback addresses (every form the SSRF guard counts as loopback) that `only` lists, and every
+/// non-loopback one; refuses when nothing is left. The L30 QA hook's SSRF rule.
+fn only_listed(c: std::io::Result<Checked>, only: &[SocketAddr]) -> std::io::Result<Checked> {
+    match c {
+        Ok(Checked::Ok(addrs)) => {
+            let first = addrs.first().map(SocketAddr::ip);
+            let kept: Vec<SocketAddr> = addrs
+                .into_iter()
+                .filter(|a| {
+                    ssrf::classify(a.ip()) != Some(ssrf::Blocked::Loopback) || only.contains(a)
+                })
+                .collect();
+            match (kept.is_empty(), first) {
+                (true, Some(ip)) => Ok(Checked::Refused(ip, ssrf::Blocked::Loopback)),
+                _ => Ok(Checked::Ok(kept)),
+            }
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+
+    // protects=L30 D5 with the QA hook, only the mapped loopback addresses pass the SSRF guard
+    // (review finding 1): another port, ::1 and every embedded-v4 loopback form are refused, public addresses
+    // still pass; fails_when=any unlisted loopback address is kept; no_claim=the resolver map
+    #[test]
+    fn hook_allows_only_listed_loopback() {
+        let only: Vec<SocketAddr> = vec!["127.0.0.1:4571".parse().unwrap()];
+        let run = |a: &str| match only_listed(Ok(Checked::Ok(vec![a.parse().unwrap()])), &only) {
+            Ok(Checked::Ok(v)) => !v.is_empty(),
+            _ => false,
+        };
+        assert!(run("127.0.0.1:4571"));
+        assert!(run("93.184.216.34:443"));
+        for refused in [
+            "127.0.0.1:22",
+            "127.0.0.2:4571",
+            "[::1]:4571",
+            "[::ffff:127.0.0.1]:4571",
+            // Other encodings the guard counts as loopback (security review round 2).
+            "[::127.0.0.1]:4571",
+            "[64:ff9b::7f00:1]:4571",
+            "[2002:7f00:1::]:4571",
+        ] {
+            assert!(!run(refused), "{refused}");
+        }
+    }
 }

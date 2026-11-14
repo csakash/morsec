@@ -8,7 +8,7 @@ network_access = true
 [mcp_servers.github]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_PERSONAL_ACCESS_TOKEN = "ms://github/pat" , HTTPS_PROXY = "http://127.0.0.1:4401", HTTP_PROXY = "http://127.0.0.1:4401", https_proxy = "http://127.0.0.1:4401", http_proxy = "http://127.0.0.1:4401", SSL_CERT_FILE = "$HOME/.morsec/codex-ca-bundle.pem", REQUESTS_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem", CURL_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem", NODE_EXTRA_CA_CERTS = "$HOME/.morsec/codex-ca-bundle.pem" }
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "ms://github/pat" , HTTPS_PROXY = "http://127.0.0.1:4401", HTTP_PROXY = "http://127.0.0.1:4401", https_proxy = "http://127.0.0.1:4401", http_proxy = "http://127.0.0.1:4401", SSL_CERT_FILE = "$HOME/.morsec/codex-ca-bundle.pem", REQUESTS_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem", CURL_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem", NODE_EXTRA_CA_CERTS = "$HOME/.morsec/codex-ca-bundle.pem", GIT_SSL_CAINFO = "$HOME/.morsec/codex-ca-bundle.pem" }
 
 [mcp_servers.ms]
 command = "/usr/bin/env"
@@ -27,4 +27,5 @@ SSL_CERT_FILE = "$HOME/.morsec/codex-ca-bundle.pem"
 REQUESTS_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
 CURL_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
 NODE_EXTRA_CA_CERTS = "$HOME/.morsec/codex-ca-bundle.pem"
+GIT_SSL_CAINFO = "$HOME/.morsec/codex-ca-bundle.pem"
 STRIPE_API_KEY = "ms://stripe/test"
