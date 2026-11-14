@@ -3,7 +3,7 @@
 //! The user rules come from msd (`RulesGet`), which verified their MAC; the project
 //! `.morsec.toml` is merged here, so msd never reads a path a client names. Changes go to msd as a
 //! proposed rule (`RulesProposeLoosen`, L07): msd classifies them, saves tightening at once, and
-//! needs an approval to loosen (until L11, `--at-terminal` from your own terminal). With msd down,
+//! needs a person's approval with Touch ID to loosen (L11; reviewed inline or with `ms approve`). With msd down,
 //! or with `--rules <path>`, the file is read locally and labelled unverified; nothing is written.
 
 use std::path::{Path, PathBuf};
@@ -77,9 +77,8 @@ pub struct RulesArgs {
     /// Propose read-write access.
     #[arg(long)]
     writable: bool,
-    /// Loosening without Touch ID (until loop L11): confirm at your own terminal, outside any
-    /// agent session.
-    #[arg(long)]
+    /// Removed in L11 (loosening needs Touch ID now); accepted and ignored so scripts keep working.
+    #[arg(long, hide = true)]
     at_terminal: bool,
 }
 
@@ -199,7 +198,10 @@ fn ask(body: RequestBody) -> ms_core::Result<ResponseBody> {
     let rt = runtime().map_err(ms_core::Error::Protocol)?;
     rt.block_on(async {
         let path = ms_ipc::default_socket_path()?;
-        Client::connect(&path).await?.request(body).await
+        Client::connect(&path)
+            .await?
+            .request_within(body, crate::approve::APPROVAL_WAIT)
+            .await
     })
 }
 
@@ -245,28 +247,22 @@ fn load_user_rules(a: &RulesArgs) -> Result<(Rules, Source), ExitCode> {
 /// Sends a proposed rule to msd.
 fn propose(name: &KeyName, user: &Rules, proposed: KeyRule, at_terminal: bool) -> ExitCode {
     if at_terminal {
-        match crate::tty::confirm_at_terminal(&format!(
-            "Apply this change to {name} without Touch ID (until loop L11)?"
-        )) {
-            Ok(true) => {}
-            Ok(false) => return err("Cancelled. Nothing was changed."),
-            Err(e) => {
-                return err(&format!(
-                    "morsec: --at-terminal must be confirmed at your own terminal ({e})"
-                ));
-            }
-        }
+        eprintln!("note: --at-terminal was removed; loosening a rule needs Touch ID now");
     }
     let mut one = Rules {
         version: user.version,
         ..Rules::default()
     };
     one.keys.insert(name.clone(), proposed);
-    match ask(RequestBody::RulesProposeLoosen {
+    // A loosening waits for a person's approval with Touch ID (L11); review it right here.
+    let review = crate::approve::inline_review("This rules change");
+    let reply = ask(RequestBody::RulesProposeLoosen {
         key: name.clone(),
         rule: Some(one.to_toml()),
-        at_terminal,
-    }) {
+        at_terminal: false,
+    });
+    drop(review);
+    match reply {
         Ok(ResponseBody::Ok { message }) => {
             out(&message);
             ExitCode::SUCCESS

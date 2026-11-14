@@ -22,7 +22,7 @@ ms-rules = { workspace = true }
 ms-receipts = { workspace = true }
 ms-proxy = { workspace = true }
 ms-session = { workspace = true }
-ms-approve = { workspace = true }
+ms-approve = { workspace = true, features = ["touch-id"] }
 ms-import = { workspace = true }
 ms-scan = { workspace = true }
 ms-run = { workspace = true }

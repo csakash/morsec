@@ -7,7 +7,9 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod add;
+mod approve;
 mod connect;
+mod connect_codex;
 mod import;
 mod log;
 mod run;
@@ -71,8 +73,10 @@ enum Command {
     Log(log::LogArgs),
     /// Revoke every grant now (kill switch).
     Stop,
-    /// Resume after ms stop.
+    /// Resume after ms stop (needs Touch ID).
     Start,
+    /// Review and answer the request waiting for your approval (Touch ID).
+    Approve(approve::ApproveArgs),
     /// Show whether morsec is on.
     Status,
     /// Check that every connected agent routes through morsec.
@@ -103,6 +107,7 @@ impl Command {
             | Command::Stats(_)
             | Command::Connect(_)
             | Command::Disconnect(_)
+            | Command::Approve(_)
             | Command::Scan(_) => return None,
         })
     }
@@ -183,6 +188,7 @@ async fn main() -> ExitCode {
         Command::Disconnect(a) => on_own_thread(move || connect::disconnect(&a)),
         Command::Scan(a) => scan::run(&a).await,
         Command::Run(a) => on_own_thread(move || run::run(&a)),
+        Command::Approve(a) => on_own_thread(move || approve::run(&a)),
         _ => unreachable!("every other command is a stub"),
     }
 }

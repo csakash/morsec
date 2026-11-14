@@ -7,13 +7,25 @@
 //!
 //! The ACL test copies this test binary, re-signs the copy, and runs one `#[ignore]`d child test
 //! in it (`acl_child`) to act as "another binary".
+//!
+//! No test may raise a keychain dialog, because a dialog blocks the gate until someone clicks it.
+//! Turning interaction off (`quiet`, `SecKeychainSetUserInteractionAllowed(false)`) covers ACL
+//! prompts but not one kind: when a differently signed binary updates our item's *attributes*
+//! (`SecItemUpdate`), securityd asks the user about the item's partition list (a "XARA" dialog)
+//! whatever the flag says (seen on macOS 26.2, `docs/evidence/cli-scope.md`; its data-only
+//! updates raise none). So the re-signed child never updates attributes; that tamper step is done
+//! by the trusted copy instead. And every child runs
+//! under [`CHILD_TIMEOUT`]: one that hangs is killed (which withdraws any dialog) and the test
+//! fails, rather than waiting on a human.
 
 // The child tests report to the parent over stdout, and skips are printed so they are never silent.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use core_foundation::data::CFData;
 use ms_core::{Error, KeyMeta, KeyName, Mode, SecretBytes, Tier};
@@ -424,19 +436,65 @@ fn signed_copy(dir: &Path, file: &str, identity: &str, ident: &str) -> PathBuf {
     dst
 }
 
-fn run_child(bin: &Path, service: &str, name: &str, op: &str) -> String {
-    let out = Command::new(bin)
-        .args([
-            "--exact",
-            "macos::tests::acl_child",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env("MORSEC_ACL_SERVICE", service)
-        .env("MORSEC_ACL_KEY", name)
-        .env("MORSEC_ACL_OP", op)
-        .output()
+/// How long one child may run. A child op takes well under a second; one that runs this long is
+/// almost certainly waiting on a keychain dialog.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs `cmd` to completion like `Command::output`, but kills it after [`CHILD_TIMEOUT`] and
+/// fails the test, so a keychain dialog can never block the gate until someone clicks it. Killing
+/// the child also withdraws its dialog.
+fn output_within(cmd: &mut Command, what: &str) -> Output {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    let drain = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.read_to_end(&mut b);
+            b
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().unwrap()));
+    let err = drain(Box::new(child.stderr.take().unwrap()));
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{what} ran longer than {CHILD_TIMEOUT:?}, so it was killed. It was most likely \
+                 waiting on a keychain dialog (SecurityAgent); a keychain test must never prompt"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Output {
+        status,
+        stdout: out.join().unwrap(),
+        stderr: err.join().unwrap(),
+    }
+}
+
+fn run_child(bin: &Path, service: &str, name: &str, op: &str) -> String {
+    let out = output_within(
+        Command::new(bin)
+            .args([
+                "--exact",
+                "macos::tests::acl_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MORSEC_ACL_SERVICE", service)
+            .env("MORSEC_ACL_KEY", name)
+            .env("MORSEC_ACL_OP", op),
+        &format!("child op {op} ({})", bin.display()),
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(!stdout.contains(CANARY), "child printed the value");
     stdout
@@ -452,11 +510,12 @@ fn run_child(bin: &Path, service: &str, name: &str, op: &str) -> String {
 
 // protects=GW-1: a value stored by this binary can't be read, deleted, replaced through the vault
 // or signed with by a differently signed binary, while an exact copy (same signature) can read
-// it; a direct SecItemUpdate of the data is detected by the seal and refused; fails_when=the
-// re-signed copy reads, deletes or replaces the item, uses the CA key, or its overwritten data
-// is returned as the value;
-// no_claim=Developer ID binding (acl_developer_id) or protection against the user clicking
-// "Always Allow" in a keychain dialog raised by another binary
+// it; a direct SecItemUpdate of the data is detected by the seal and refused; no step raises a
+// keychain dialog; fails_when=the re-signed copy reads, deletes or replaces the item, uses the
+// CA key, or overwritten data is returned as the value, or a child hangs on a dialog;
+// no_claim=Developer ID binding (acl_developer_id), protection against the user clicking
+// "Always Allow" in a keychain dialog raised by another binary, or what macOS does when another
+// binary updates our item's attributes (it asks the user, so the test can't run that unattended)
 #[test]
 fn acl_other_binary_is_denied() {
     if skip() {
@@ -494,11 +553,14 @@ fn acl_other_binary_is_denied() {
         CANARY.as_bytes()
     );
 
-    // The legacy keychain lets any binary of the user SecItemUpdate an item's attributes and
-    // data (both report UPDATED on macOS 26.2). Attributes: the comment is only a display copy of
-    // the metadata, so nothing we trust changes.
-    let r = run_child(&other, &t.service, k.as_str(), "update-attr");
-    assert!(r == "UPDATED" || r.starts_with("DENIED"), "{r}");
+    // Tampering with SecItemUpdate. Attributes: when a differently signed binary updates them,
+    // macOS shows a partition ("XARA") dialog even with interaction disabled, and if the user
+    // clicks Allow the update goes through (docs/evidence/cli-scope.md). A test can't wait on that
+    // dialog, so the trusted copy rewrites the comment instead: the worst case, as if the user had
+    // clicked Allow for an attacker. The comment is only a display copy of the metadata, so
+    // nothing we trust changes.
+    let r = run_child(&same, &t.service, k.as_str(), "update-attr");
+    assert_eq!(r, "UPDATED");
     assert_eq!(
         t.vault.read_with(&k, |b| b.to_vec()).unwrap(),
         CANARY.as_bytes()
@@ -510,15 +572,39 @@ fn acl_other_binary_is_denied() {
     );
     let r = run_child(&other, &t.service, k.as_str(), "get");
     assert!(r.starts_with("DENIED"), "after update-attr: {r}");
-    // Data: the item becomes unusable (denied by the keychain, or refused by the seal), never a
-    // value we use, and stays unreadable by the other binary. Denial of service, not a leak.
+    // Data, from the other binary first, which raises no dialog. Whether the keychain refuses it
+    // or lets it through, the item never yields a value we use (denied by the keychain, or
+    // refused by the seal): denial of service, not a leak.
     let r = run_child(&other, &t.service, k.as_str(), "update-data");
     assert!(r == "UPDATED" || r.starts_with("DENIED"), "{r}");
     if r == "UPDATED" {
         assert!(t.vault.read_with(&k, |b| b.to_vec()).is_err());
+    } else {
+        assert_eq!(
+            t.vault.read_with(&k, |b| b.to_vec()).unwrap(),
+            CANARY.as_bytes()
+        );
     }
     let r = run_child(&other, &t.service, k.as_str(), "get");
     assert!(r.starts_with("DENIED"), "after update-data: {r}");
+    // The worst case, on a second item: data overwritten through a trusted binary (as if the
+    // user had clicked Allow for an attacker) is refused by the seal, never used as a value.
+    let k2 = key("stripe/live2");
+    t.vault
+        .put(
+            &k2,
+            SecretBytes::from(CANARY.to_owned()),
+            meta(&k2, Tier::Production),
+        )
+        .unwrap();
+    let r = run_child(&same, &t.service, k2.as_str(), "update-data");
+    assert_eq!(r, "UPDATED");
+    let e = t
+        .vault
+        .read_with(&k2, |b| b.to_vec())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("seal check failed"), "{e}");
 }
 
 // protects=GW-1 with real signing: an item written by a Developer ID-signed binary is readable by
@@ -545,7 +631,17 @@ fn acl_developer_id() {
     struct WriterCleanup<'a>(&'a Path, &'a str, &'a str);
     impl Drop for WriterCleanup<'_> {
         fn drop(&mut self) {
-            let _ = run_child(self.0, self.1, self.2, "wipe");
+            // A second panic while unwinding (a cleanup child that also hangs) would abort the
+            // whole test binary, so skip cleanup then.
+            if std::thread::panicking() {
+                eprintln!(
+                    "WARNING: skipped cleanup after a failure; test items may remain under service \
+                     {} (remove with: security delete-generic-password -s {})",
+                    self.1, self.1
+                );
+            } else {
+                let _ = run_child(self.0, self.1, self.2, "wipe");
+            }
         }
     }
     let _cleanup = WriterCleanup(&writer, &t.service, name);
@@ -765,7 +861,16 @@ fn ca_rejects_planted_keys() {
     struct Cleanup<'a>(&'a Path, &'a str);
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
-            let _ = run_child(self.0, self.1, "x", "delca");
+            // See WriterCleanup: never panic again while unwinding.
+            if std::thread::panicking() {
+                eprintln!(
+                    "WARNING: skipped cleanup after a failure; test items may remain under service \
+                     {} (remove with: security delete-generic-password -s {})",
+                    self.1, self.1
+                );
+            } else {
+                let _ = run_child(self.0, self.1, "x", "delca");
+            }
         }
     }
     let _cleanup = Cleanup(&other, &t.service);
@@ -873,19 +978,20 @@ fn home_env_is_ignored() {
     std::fs::create_dir_all(dir.path().join("Library/Keychains")).unwrap();
     let same = dir.path().join("same");
     std::fs::copy(std::env::current_exe().unwrap(), &same).unwrap();
-    let out = Command::new(&same)
-        .args([
-            "--exact",
-            "macos::tests::acl_child",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env("HOME", dir.path())
-        .env("MORSEC_ACL_SERVICE", &t.service)
-        .env("MORSEC_ACL_KEY", k.as_str())
-        .env("MORSEC_ACL_OP", "get")
-        .output()
-        .unwrap();
+    let out = output_within(
+        Command::new(&same)
+            .args([
+                "--exact",
+                "macos::tests::acl_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HOME", dir.path())
+            .env("MORSEC_ACL_SERVICE", &t.service)
+            .env("MORSEC_ACL_KEY", k.as_str())
+            .env("MORSEC_ACL_OP", "get"),
+        "child op get with HOME changed",
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(&format!("ACL_RESULT=READ {} bytes", CANARY.len())),

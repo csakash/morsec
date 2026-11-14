@@ -21,7 +21,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use ms_approve::ApprovalOutcome;
 use ms_core::{Decision, KeyName, Mode, Reason, ReceiptEvent, ReceiptResult, SecretRef, SessionId};
 use ms_ipc::{ErrorCode, PeerInfo, ResponseBody, RunEnv, StreamIo};
 use ms_receipts::ReceiptDetail;
@@ -30,7 +29,7 @@ use ms_rules::{PROJECT_FILE, Rules};
 use ms_run::{ExecIo, Prepared, RunError, RunInput, Runner, RunnerConfig};
 use tokio::sync::{Semaphore, mpsc};
 
-use super::{APPROVAL_TIMEOUT, Daemon, PRE_L11, now_ms, reply_err, session_of};
+use super::{Daemon, now_ms, reply_err, session_of};
 
 /// Most runs at once.
 pub const MAX_RUNS: usize = 8;
@@ -222,24 +221,16 @@ impl Daemon {
                 }
                 Decision::NeedsApproval { mut request } => {
                     request.effect = runner().preview(&call).map(|p| p.summary);
-                    match self.approver.ask(&request, APPROVAL_TIMEOUT) {
-                        ApprovalOutcome::Approved(token) => decided.push(Decided {
+                    // L11: a person approves in `ms approve` with Touch ID; the token is then
+                    // checked against this exact request (key, argv hash, cwd, session) before
+                    // anything runs, and the plan below is built from that same argv and cwd.
+                    match self.approve_exact(&request) {
+                        Ok(token) => decided.push(Decided {
                             key: k.clone(),
                             result: ReceiptResult::Approved,
                             approval_id: Some(token.id),
                         }),
-                        ApprovalOutcome::Denied | ApprovalOutcome::TimedOut => {
-                            return Err(refuse(
-                                k,
-                                ReceiptResult::Denied,
-                                reply_err(
-                                    ErrorCode::NeedsApproval,
-                                    format!(
-                                        "morsec: {k} is a production key, so this command needs an approval, which was not given. ({PRE_L11})"
-                                    ),
-                                ),
-                            ));
-                        }
+                        Err(reply) => return Err(refuse(k, ReceiptResult::Denied, reply)),
                     }
                 }
             }
@@ -569,15 +560,17 @@ mod tests {
     use crate::backend::Backend;
     use crate::daemon::Identify;
     use crate::paths::Paths;
-    use ms_approve::ApprovalToken;
-    use ms_approve::fake::FakeApprover;
+    use ms_approve::HumanApprover;
+    use ms_approve::auth::fake::FakeAuthenticator;
     use ms_core::{AgentKind, KeyMeta, SecretBytes, Tier};
-    use ms_ipc::RequestBody;
+    use ms_ipc::{ApprovalScope, RequestBody};
     use ms_session::Caller;
     use ms_vault::memory::MemoryVault;
     use std::sync::Mutex;
 
     const VALUE: &str = "pk_live_RUNMSD_canary_93a1";
+    /// The PID the person answering approvals connects from (outside every agent tree).
+    const PERSON_PID: i32 = 7001;
 
     fn peer() -> PeerInfo {
         PeerInfo {
@@ -588,141 +581,114 @@ mod tests {
         }
     }
 
-    // protects=AUTH-3 / D8: a production run key goes through the Approver with a request built
-    // by msd (normalised argv, canonical cwd, argv hash); a denial refuses the run (and the
-    // pre-L11 deny-stub behaves like that denial); an approval runs exactly the approved argv and
-    // output comes back redacted; both are recorded; fails_when=a production run runs without an
-    // approval, the request shows something other than what runs, or the value is returned;
-    // no_claim=the L11 token MAC check (L11)
+    fn person() -> PeerInfo {
+        PeerInfo {
+            pid: Some(PERSON_PID),
+            ..peer()
+        }
+    }
+
+    /// Answers the next pending approval as the person (`ms approve`), approving or denying.
+    fn answer(
+        d: &Arc<Daemon>,
+        approve: bool,
+        expect_argv: Option<&'static [&'static str]>,
+    ) -> std::thread::JoinHandle<ResponseBody> {
+        let d = d.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match d.handle(&person(), RequestBody::ApprovalPending, None) {
+                    ResponseBody::Approval { pending: Some(p) } => {
+                        if let Some(want) = expect_argv {
+                            assert_eq!(p.request.argv_display, want);
+                        }
+                        return d.handle(
+                            &person(),
+                            RequestBody::ApprovalDecide {
+                                id: p.id,
+                                approve,
+                                scope: Some(ApprovalScope::Once),
+                            },
+                            None,
+                        );
+                    }
+                    ResponseBody::Approval { pending: None } => {}
+                    other => return other,
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no approval was requested"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    }
+
+    // protects=AUTH-3 with L11's real approver: a production run key waits for a person
+    // (`ms approve` + Touch ID, here the fake authenticator), the request shows the normalised
+    // argv and canonical cwd that run, the token is checked against that request, and only then
+    // does the command run, with redacted output; a denial, or Touch ID failing, refuses it; all
+    // are recorded; fails_when=a production run runs without a verified approval or the value is
+    // returned; no_claim=the real Touch ID sheet (manual, L11 evidence)
     #[test]
     fn production_runs_need_the_approver() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap().join("proj");
-        std::fs::create_dir(&root).unwrap();
-        let tok = ApprovalToken {
-            id: "tok-1".into(),
-            mac: [7; 32],
-            expires_unix_ms: u64::MAX,
-        };
-        let approver = Arc::new(FakeApprover::new([
-            ApprovalOutcome::Denied,
-            ApprovalOutcome::Approved(tok),
-        ]));
-        let who: Arc<Mutex<Option<Caller>>> = Arc::new(Mutex::new(Some(Caller::Unattributed {
-            pid: 43,
-            started_unix_ms: 1,
-        })));
-        let w = who.clone();
-        let identify: Identify = Arc::new(move |_| w.lock().unwrap().clone());
-        let d = Daemon::open(
-            Backend::Memory(Arc::new(MemoryVault::new())),
-            Paths::under(dir.path()),
-            0,
-            approver.clone(),
-            identify,
-        )
-        .unwrap();
-        let k = KeyName::new("svc/prod").unwrap();
-        let put = d.handle(
-            &peer(),
-            RequestBody::PutKey {
-                name: k.clone(),
-                meta: KeyMeta {
-                    name: k.clone(),
-                    mode: Mode::Run,
-                    tier: Tier::Production,
-                    created_unix_ms: 1,
-                },
-            },
-            Some(SecretBytes::new(VALUE.as_bytes().to_vec())),
-        );
-        assert!(matches!(put, ResponseBody::Ok { .. }), "{put:?}");
-        let rule = format!(
-            "version = 1\n[keys.\"svc/prod\"]\nmode = \"run\"\ntier = \"production\"\ncommands = [[\"env\"]]\nroots = [\"{}\"]\nenv = [\"TOKEN\"]\n",
-            root.display()
-        );
-        let saved = d.handle(
-            &peer(),
-            RequestBody::RulesProposeLoosen {
-                key: k.clone(),
-                rule: Some(rule),
-                at_terminal: true,
-            },
-            None,
-        );
-        assert!(matches!(saved, ResponseBody::Ok { .. }), "{saved:?}");
-        *who.lock().unwrap() = Some(Caller::Agent(SessionId {
-            agent: AgentKind::ClaudeCode,
-            pid: 42,
-            started_unix_ms: 1,
-        }));
-
-        let run = |d: Arc<Daemon>| {
-            let root = root.clone();
-            rt.block_on(async move {
-                tokio::task::spawn_blocking(move || {
-                    d.handle(
-                        &peer(),
-                        RequestBody::Run {
-                            argv: vec!["env".into()],
-                            cwd: root.join("."),
-                            env: vec![RunEnv {
-                                name: "TOKEN".into(),
-                                value: "ms://svc/prod".into(),
-                            }],
-                        },
-                        None,
-                    )
-                })
-                .await
+        let rt = rt();
+        // (Touch ID failing is L11's broker test; here the setup itself needs Touch ID to pass.)
+        for approve in [false, true] {
+            let touch_id_ok = true;
+            let (d, dir, root) = test_daemon_with(
+                Tier::Production,
+                "commands = [[\"env\"]]\nenv = [\"TOKEN\"]",
+                FakeAuthenticator::approve(),
+            );
+            let decider = answer(&d, approve, Some(&["env"]));
+            let r = buffered(&rt, &d, &root, &["env"], &[("TOKEN", "ms://svc/test")]);
+            let decision = decider.join().unwrap();
+            let receipts = std::fs::read_dir(dir.path().join("receipts"))
                 .unwrap()
-            })
-        };
-
-        let denied = run(d.clone());
-        assert!(
-            matches!(
-                &denied,
-                ResponseBody::Error {
-                    code: ErrorCode::NeedsApproval,
-                    ..
-                }
-            ),
-            "{denied:?}"
-        );
-        let approved = run(d.clone());
-        let ResponseBody::RunResult { code, stdout, .. } = approved else {
-            panic!("{approved:?}")
-        };
-        assert_eq!(code, Some(0));
-        let out = String::from_utf8(ms_ipc::b64_decode(&stdout).unwrap()).unwrap();
-        assert!(out.contains("TOKEN=[redacted ms://svc/prod]"), "{out}");
-        assert!(!out.contains(VALUE));
-
-        let asked = approver.asked();
-        assert_eq!(asked.len(), 2);
-        for a in &asked {
-            assert_eq!(a.key, k);
-            assert_eq!(a.argv_display, ["env"]);
-            assert_eq!(a.argv_hash, ms_rules::argv_hash(&["env"]));
-            assert_eq!(a.cwd, root);
+                .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+                .collect::<String>();
+            assert!(!receipts.contains(VALUE));
+            if touch_id_ok && approve {
+                assert!(matches!(decision, ResponseBody::Ok { .. }), "{decision:?}");
+                let ResponseBody::RunResult { code, stdout, .. } = r else {
+                    panic!("{r:?}")
+                };
+                assert_eq!(code, Some(0));
+                let out = String::from_utf8(ms_ipc::b64_decode(&stdout).unwrap()).unwrap();
+                assert!(out.contains("TOKEN=[redacted ms://svc/test]"), "{out}");
+                assert!(!out.contains(VALUE));
+                assert!(receipts.contains("\"approved\""), "{receipts}");
+            } else {
+                assert!(
+                    matches!(
+                        &r,
+                        ResponseBody::Error {
+                            code: ErrorCode::NeedsApproval,
+                            ..
+                        }
+                    ),
+                    "touch_id_ok={touch_id_ok} approve={approve}: {r:?}"
+                );
+                assert!(receipts.contains("\"denied\""), "{receipts}");
+            }
         }
-        let receipts = std::fs::read_dir(dir.path().join("receipts"))
-            .unwrap()
-            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
-            .collect::<String>();
-        assert!(receipts.contains("tok-1"), "{receipts}");
-        assert!(receipts.contains("denied"), "{receipts}");
-        assert!(!receipts.contains(VALUE));
     }
 
     /// A daemon with one test-tier run key `svc/test` (value VALUE) under `rule_body`, roots =
     /// `<tmp>/proj`; the caller is an agent session.
     fn test_daemon(rule_body: &str) -> (Arc<Daemon>, tempfile::TempDir, PathBuf) {
+        test_daemon_with(Tier::Test, rule_body, FakeAuthenticator::approve())
+    }
+
+    /// Like [`test_daemon`], with the key's tier and the Touch ID stand-in chosen. The person
+    /// answering approvals connects from PERSON_PID.
+    fn test_daemon_with(
+        tier: Tier,
+        rule_body: &str,
+        auth: FakeAuthenticator,
+    ) -> (Arc<Daemon>, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap().join("proj");
         std::fs::create_dir(&root).unwrap();
@@ -731,12 +697,20 @@ mod tests {
             started_unix_ms: 1,
         })));
         let w = who.clone();
-        let identify: Identify = Arc::new(move |_| w.lock().unwrap().clone());
+        let identify: Identify = Arc::new(move |p: &PeerInfo| match p.pid {
+            Some(PERSON_PID) => Some(Caller::Unattributed {
+                pid: 99,
+                started_unix_ms: 1,
+            }),
+            _ => w.lock().unwrap().clone(),
+        });
+        let approvals = Arc::new(HumanApprover::new(Arc::new(auth)).unwrap());
+        approvals.set_cooldown(std::time::Duration::ZERO);
         let d = Daemon::open(
             Backend::Memory(Arc::new(MemoryVault::new())),
             Paths::under(dir.path()),
             0,
-            Arc::new(crate::approve::DenyApprover),
+            approvals,
             identify,
         )
         .unwrap();
@@ -748,26 +722,33 @@ mod tests {
                 meta: KeyMeta {
                     name: k.clone(),
                     mode: Mode::Run,
-                    tier: Tier::Test,
+                    tier,
                     created_unix_ms: 1,
                 },
             },
             Some(SecretBytes::new(VALUE.as_bytes().to_vec())),
         );
         assert!(matches!(put, ResponseBody::Ok { .. }), "{put:?}");
+        let tier_s = match tier {
+            Tier::Test => "test",
+            Tier::Production => "production",
+        };
         let rule = format!(
-            "version = 1\n[keys.\"svc/test\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"{}\"]\n{rule_body}\n",
+            "version = 1\n[keys.\"svc/test\"]\nmode = \"run\"\ntier = \"{tier_s}\"\nroots = [\"{}\"]\n{rule_body}\n",
             root.display()
         );
+        // Loosening needs the person's approval (L11): answer it as they would in ms approve.
+        let decider = answer(&d, true, None);
         let saved = d.handle(
             &peer(),
             RequestBody::RulesProposeLoosen {
                 key: k,
                 rule: Some(rule),
-                at_terminal: true,
+                at_terminal: false,
             },
             None,
         );
+        assert!(matches!(decider.join().unwrap(), ResponseBody::Ok { .. }));
         assert!(matches!(saved, ResponseBody::Ok { .. }), "{saved:?}");
         *who.lock().unwrap() = Some(Caller::Agent(SessionId {
             agent: AgentKind::ClaudeCode,

@@ -328,7 +328,7 @@ fn refusals() {
         "{stderr}"
     );
     assert!(!fx.home().join(".claude").exists() && !fx.home().join(".morsec").exists());
-    let (code, _, _) = fx.ms(&["connect", "codex"]);
+    let (code, _, _) = fx.ms(&["connect", "cursor"]);
     assert_eq!(code, 69);
     let (code, _, _) = fx.ms(&["connect", "nope"]);
     assert_eq!(code, 2);

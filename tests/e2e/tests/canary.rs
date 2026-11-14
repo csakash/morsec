@@ -191,6 +191,9 @@ impl World {
             .arg("--state-dir")
             .arg(dir.path().join("state"))
             .args(["--proxy-port", &proxy_port.to_string()])
+            // L11: ms scan needs a person's approval. The review in ms (on a pseudo-terminal)
+            // is real; only the Touch ID sheet is stood in for (debug build, memory vault only).
+            .args(["--test-touch-id", "allow"])
             .stdout(Stdio::null())
             .stderr(log);
         base_env(&mut cmd, dir.path(), &home, &sock);
@@ -325,6 +328,13 @@ impl World {
 
     /// Runs `command` (in the repo) detached from this process tree, as the user's own terminal
     /// would. Returns (exit code, stdout + stderr).
+    /// `ms scan` from the user's terminal, approved by typing `o` at its inline review (L11).
+    fn scan_approved(&self) -> (i32, String) {
+        let (code, out) =
+            self.outside("(sleep 2; printf 'o\\n'; sleep 8) | script -q /dev/null ms scan");
+        (code, out.replace("\r\n", "\n"))
+    }
+
     fn outside(&self, command: &str) -> (i32, String) {
         let n = RUNS.fetch_add(1, Ordering::Relaxed);
         let d = self.dir.path();
@@ -559,7 +569,7 @@ fn ms_scan_catches_a_leaky_transcript() {
     .unwrap();
     std::fs::write(sessions.join("rollout-clean.jsonl"), "{\"cmd\":\"ls\"}\n").unwrap();
 
-    let (code, out) = w.outside("ms scan");
+    let (code, out) = w.scan_approved();
     assert_eq!(code, 0, "{out}");
     assert!(
         out.contains("no vault value found in 2 transcript files (3 keys checked)"),
@@ -609,7 +619,7 @@ fn ms_scan_catches_a_leaky_transcript() {
     std::fs::write(&outside, format!("{}\n", stripe.value)).unwrap();
     std::os::unix::fs::symlink(&outside, projects.join("link.jsonl")).unwrap();
 
-    let (code, out) = w.outside("ms scan");
+    let (code, out) = w.scan_approved();
     assert_eq!(code, 3, "{out}");
     // msd resolves its transcript roots (/tmp is a link on macOS).
     let leaky = std::fs::canonicalize(&leaky).unwrap();
@@ -773,6 +783,9 @@ fn run_mode_through_shims() {
     let value = format!("rk_{}", random_hex(20));
     let mut needles = Needles::new();
     assert!(needles.add(0, value.as_bytes()));
+    let prod_value = format!("pk_{}", random_hex(20));
+    assert!(needles.add(1, prod_value.as_bytes()));
+    std::fs::write(w.dir.path().join("pvalue"), &prod_value).unwrap();
     let clean = |what: &str, blob: &[u8]| {
         let hits = ms_scan::find_in(&needles, blob);
         assert!(hits.is_empty(), "run value leaked into {what}: {hits:?}");
@@ -782,13 +795,16 @@ fn run_mode_through_shims() {
     let repo = std::fs::canonicalize(&w.repo).unwrap();
     let setup = format!(
         r#"ms add run/canary --stdin --mode run --tier test < '{v}' && rm '{v}' &&
-(sleep 1; printf 'yes\n'; sleep 3) | script -q /dev/null ms rules run/canary --at-terminal --add-root '{repo}' --add-env RUN_TOKEN \
+(sleep 1; printf 'o\n'; sleep 3) | script -q /dev/null ms rules run/canary --add-root '{repo}' --add-env RUN_TOKEN \
   --add-command '["env"]' \
   --add-command '["printf", "**"]' \
   --add-command '["sh", "-c", "printf %s \"$RUN_TOKEN\" | base64"]' \
   --add-command '["sh", "-c", "exit 7"]' &&
+ms add run/prod --stdin --mode run --tier production < '{pv}' && rm '{pv}' &&
+(sleep 1; printf 'o\n'; sleep 3) | script -q /dev/null ms rules run/prod --add-root '{repo}' --add-env PROD_TOKEN --add-command '["env"]' &&
 ms run --link-shims"#,
         v = w.dir.path().join("value").display(),
+        pv = w.dir.path().join("pvalue").display(),
         repo = repo.display()
     );
     let (code, out) = w.outside(&setup);
@@ -902,6 +918,46 @@ echo '== done'
     assert!(took < 10, "the shim waited on an idle stdin: {out}");
     clean("the fake agent's output", out.as_bytes());
 
+    // A production key through L11's real approver: the agent's command waits; the person
+    // answers in `ms approve` from their own terminal (a detached pty here), msd raises Touch ID
+    // (this dev msd runs with --test-touch-id allow, the fake LAContext), and only an approval
+    // runs it. A denial refuses it with 77.
+    for (answer, want_rc) in [("o", "rc=0"), ("d", "rc=77")] {
+        let (agent, person) = std::thread::scope(|sc| {
+            let a = sc.spawn(|| {
+                w.in_agent(&format!(
+                    "export PATH='{}':\"$PATH\"; PROD_TOKEN=ms://run/prod env; echo \"rc=$?\"",
+                    shims.display()
+                ))
+            });
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let p = w.outside(&format!(
+                "(sleep 1; printf '{answer}\\n'; sleep 3) | script -q /dev/null ms approve"
+            ));
+            (a.join().unwrap(), p)
+        });
+        assert!(
+            agent.1.contains(want_rc),
+            "answer {answer}: {}\nperson: {}",
+            agent.1,
+            person.1
+        );
+        assert!(
+            person.1.contains("run/prod") && person.1.contains("env"),
+            "{}",
+            person.1
+        );
+        if answer == "o" {
+            assert!(
+                agent.1.contains("PROD_TOKEN=[redacted ms://run/prod]"),
+                "{}",
+                agent.1
+            );
+        }
+        clean("the production run's output", agent.1.as_bytes());
+        clean("ms approve's screen", person.1.as_bytes());
+    }
+
     let state = World::files_under(&w.dir.path().join("state"));
     let receipts: String = state
         .iter()
@@ -915,6 +971,10 @@ echo '== done'
     assert!(
         receipts.contains("blocked"),
         "refusals not recorded: {receipts}"
+    );
+    assert!(
+        receipts.contains("run/prod") && receipts.contains("\"approved\""),
+        "production run not recorded as approved: {receipts}"
     );
     for (p, bytes) in state {
         clean(&p.display().to_string(), &bytes);
