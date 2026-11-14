@@ -48,6 +48,9 @@ pub enum Change {
         shell: bool,
         /// It had an `args` member before.
         had_args: bool,
+        /// For hooks: the (group, hook) index of the wrapped hook under `path`. Undo unwraps
+        /// that hook only, so two hooks of the same shape can't be swapped (review F1).
+        at: Option<(usize, usize)>,
     },
 }
 
@@ -55,6 +58,12 @@ pub enum Change {
 pub fn wrap_shape_sha256(v: &Value) -> String {
     let mut shape = v.clone();
     shape.remove("command");
+    // A server's `env` values can hold secrets: hash only its names (review F3).
+    if let Some(Value::Object(m)) = shape.get_mut("env") {
+        for (_, x) in m.iter_mut() {
+            *x = Value::Null;
+        }
+    }
     let n = v.get("args").and_then(Value::as_array).map_or(0, Vec::len);
     shape.set("args", Value::int(i64::try_from(n).unwrap_or(i64::MAX)));
     super::skel::sha256(&super::json::print(&shape, ""))
@@ -259,6 +268,7 @@ pub fn undo(root: &mut Value, edits: &Edits) -> Vec<String> {
                 sha256,
                 shell,
                 had_args,
+                at,
             } => {
                 let hit = |o: &Value| {
                     wrap_shape_sha256(o) == *sha256
@@ -267,17 +277,20 @@ pub fn undo(root: &mut Value, edits: &Edits) -> Vec<String> {
                             .and_then(|a| a.first())
                             == Some(&Value::str("run"))
                 };
-                let done = match root.at_mut(path) {
-                    Some(Value::Array(groups)) => groups
-                        .iter_mut()
-                        .filter_map(|g| match g.get_mut("hooks") {
-                            Some(Value::Array(hs)) => Some(hs),
+                let done = match (root.at_mut(path), at) {
+                    // Only the hook at the recorded place: another of the same shape may have
+                    // been wrapped differently (review F1).
+                    (Some(Value::Array(groups)), Some((g, h))) => groups
+                        .get_mut(*g)
+                        .and_then(|g| match g.get_mut("hooks") {
+                            Some(Value::Array(hs)) => hs.get_mut(*h),
                             _ => None,
                         })
-                        .flat_map(|hs| hs.iter_mut())
-                        .find(|h| hit(h))
+                        .filter(|h| hit(h))
                         .is_some_and(|h| unwrap_command(h, *shell, *had_args)),
-                    Some(o @ Value::Object(_)) if hit(o) => unwrap_command(o, *shell, *had_args),
+                    (Some(o @ Value::Object(_)), None) if hit(o) => {
+                        unwrap_command(o, *shell, *had_args)
+                    }
                     _ => false,
                 };
                 if !done {
@@ -360,12 +373,18 @@ pub fn edits_to_value(e: &Edits) -> Value {
                     sha256,
                     shell,
                     had_args,
+                    at,
                 } => {
                     o.set("op", Value::str("wrap"));
                     o.set("path", path_value(path));
                     o.set("sha256", Value::str(sha256.clone()));
                     o.set("shell", Value::Bool(*shell));
                     o.set("had_args", Value::Bool(*had_args));
+                    if let Some((g, h)) = at {
+                        let int = |n: usize| Value::int(i64::try_from(n).unwrap_or(i64::MAX));
+                        o.set("group", int(*g));
+                        o.set("hook", int(*h));
+                    }
                 }
             }
             o
@@ -378,6 +397,14 @@ pub fn edits_to_value(e: &Edits) -> Value {
         Value::Array(e.created.iter().map(|p| path_value(p)).collect()),
     );
     o
+}
+
+/// A non-negative integer index from the state file.
+fn index(v: &Value) -> Result<usize, String> {
+    match v {
+        Value::Number(n) => n.parse().map_err(|_| "state: bad wrap position".into()),
+        _ => Err("state: bad wrap position".into()),
+    }
 }
 
 /// Edits from the state file.
@@ -419,6 +446,11 @@ pub fn edits_from_value(v: &Value) -> Result<Edits, String> {
                 sha256: need_str("sha256")?,
                 shell: c.get("shell") == Some(&Value::Bool(true)),
                 had_args: c.get("had_args") == Some(&Value::Bool(true)),
+                at: match (c.get("group"), c.get("hook")) {
+                    (None, None) => None,
+                    (Some(g), Some(h)) => Some((index(g)?, index(h)?)),
+                    _ => return Err("state: wrap position is incomplete".into()),
+                },
             },
             _ => return Err("state: unknown change".into()),
         });
@@ -477,6 +509,21 @@ mod tests {
             Some(&Value::str("mine"))
         );
         assert!(u.get("env").is_none() && u.get("new").is_none());
+    }
+
+    // protects=review F3: the wrap shape hash covers a server's env names but not their
+    // values, so the state can't be used to test a guess at a secret; fails_when=a value changes
+    // the hash or a name doesn't
+    #[test]
+    fn shape_hash_ignores_env_values() {
+        let a =
+            parse(r#"{"command":"x","args":["run","--","s"],"env":{"TOKEN":"ghp_A"}}"#).unwrap();
+        let b =
+            parse(r#"{"command":"y","args":["run","--","t"],"env":{"TOKEN":"ghp_B"}}"#).unwrap();
+        let c =
+            parse(r#"{"command":"x","args":["run","--","s"],"env":{"OTHER":"ghp_A"}}"#).unwrap();
+        assert_eq!(wrap_shape_sha256(&a), wrap_shape_sha256(&b));
+        assert_ne!(wrap_shape_sha256(&a), wrap_shape_sha256(&c));
     }
 
     #[test]

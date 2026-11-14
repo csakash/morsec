@@ -1141,3 +1141,90 @@ fn redacted_ref_survives_rerun() {
         "{after}"
     );
 }
+
+// protects=review F1: two hooks of one event that look alike once wrapped (a shell-form hook and
+// an exec-form `/bin/sh -c` hook) each unwrap to themselves, so disconnect restores the file byte
+// for byte; fails_when=undo picks a hook by shape and swaps their forms
+#[test]
+fn same_shape_hooks_unwrap_by_position() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    let original = "{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"echo hi\"\n          },\n          {\n            \"type\": \"command\",\n            \"command\": \"/bin/sh\",\n            \"args\": [\"-c\", \"x\"]\n          }\n        ]\n      },\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/bin/sh\",\n            \"args\": [\"-c\", \"y\"]\n          }\n        ]\n      }\n    ]\n  }\n}\n";
+    std::fs::write(h.settings(), original).unwrap();
+    let opts = Options {
+        wrap: true,
+        ..Options::default()
+    };
+    connect(&h, opts);
+    let wrapped = h.read(&h.settings()).unwrap();
+    assert!(wrapped.contains("\"run\""), "{wrapped}");
+    let c = h.connector(opts);
+    let plan = c.plan_remove().unwrap().unwrap();
+    assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+    c.apply_remove(&plan).unwrap();
+    assert_eq!(h.read(&h.settings()).unwrap(), original);
+}
+
+// protects=review F2: changing the ref of a variable whose raw value a ref already replaced
+// updates that one record: no second "doesn't keep" warning, one record per name, a re-run is a
+// no-op, and disconnect removes the variable; fails_when=records pile up or a re-run rewrites
+#[test]
+fn changed_ref_updates_the_redacted_record() {
+    let h = Home::new();
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    std::fs::write(
+        h.settings(),
+        "{\"env\": {\"STRIPE_API_KEY\": \"sk_live_CANARY_F2\", \"Z\": \"1\"}}",
+    )
+    .unwrap();
+    connect(&h, Options::default());
+    let c = h.connector(Options::default());
+    let mut cfg = h.cfg(&c);
+    for (n, v) in cfg.env.iter_mut() {
+        if n == "STRIPE_API_KEY" {
+            *v = "ms://stripe/live".into();
+        }
+    }
+    for round in 0..3 {
+        let p = c.try_plan(&cfg).unwrap();
+        assert!(p.warnings.is_empty(), "round {round}: {:?}", p.warnings);
+        if round > 0 {
+            assert!(
+                p.diff.changes.is_empty(),
+                "round {round}: {:?}",
+                p.diff.changes
+            );
+        }
+        c.apply(&p.diff).unwrap();
+        assert_eq!(
+            c.previous_env_refs().unwrap(),
+            vec![("STRIPE_API_KEY".to_owned(), "ms://stripe/live".to_owned())]
+        );
+        let state = h
+            .read(&h.home().join(".morsec/connect/claude-code.json"))
+            .unwrap();
+        assert_eq!(state.matches("\"set_redacted\"").count(), 1, "{state}");
+        assert!(!state.contains("CANARY_F2"));
+    }
+    let t = h.read(&h.settings()).unwrap();
+    assert!(
+        t.contains("\"STRIPE_API_KEY\": \"ms://stripe/live\""),
+        "{t}"
+    );
+    let plan = c.plan_remove().unwrap().unwrap();
+    assert_eq!(
+        plan.notes
+            .iter()
+            .filter(|n| n.contains("never keeps values"))
+            .count(),
+        1,
+        "{:?}",
+        plan.notes
+    );
+    c.apply_remove(&plan).unwrap();
+    let after = h.read(&h.settings()).unwrap();
+    assert!(
+        !after.contains("STRIPE") && after.contains("\"Z\": \"1\""),
+        "{after}"
+    );
+}

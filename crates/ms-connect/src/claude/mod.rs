@@ -353,25 +353,26 @@ impl ClaudeConnector {
         let Some(st) = self.read_state()? else {
             return Ok(Vec::new());
         };
-        Ok(st
-            .settings_edits
-            .changes
-            .iter()
-            .filter_map(|c| match c {
-                Change::Set {
-                    path,
-                    after: Value::String(v),
-                    ..
-                }
-                | Change::SetRedacted {
-                    path,
-                    after: Value::String(v),
-                } if path.len() == 2 && path[0] == "env" => check_ref_env(&path[1], v)
-                    .ok()
-                    .map(|()| (path[1].clone(), v.clone())),
-                _ => None,
-            })
-            .collect())
+        // One per name, the newest record winning (review F2: an older state may hold two).
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (n, v) in st.settings_edits.changes.iter().filter_map(|c| match c {
+            Change::Set {
+                path,
+                after: Value::String(v),
+                ..
+            }
+            | Change::SetRedacted {
+                path,
+                after: Value::String(v),
+            } if path.len() == 2 && path[0] == "env" => check_ref_env(&path[1], v)
+                .ok()
+                .map(|()| (path[1].clone(), v.clone())),
+            _ => None,
+        }) {
+            out.retain(|(m, _)| *m != n);
+            out.push((n, v));
+        }
+        Ok(out)
     }
 
     /// The string values morsec itself writes, for the plan preview: everything else is redacted
@@ -849,6 +850,22 @@ impl ClaudeConnector {
         for (name, value) in &cfg.env {
             let p = path(&["env", name]);
             let new = Value::str(value.clone());
+            // A ref that already replaced a value of the user's (a carried record, R13): change
+            // that record in place. A second record would warn again and grow with every
+            // re-run (review F2); the user's value is gone either way.
+            if let Some(Change::SetRedacted { after, .. }) = e
+                .changes
+                .iter_mut()
+                .find(|c| matches!(c, Change::SetRedacted { path: q, .. } if *q == p))
+            {
+                if *after != new {
+                    *after = new.clone();
+                    if let Some(env) = v.get_mut("env") {
+                        env.set(name, new);
+                    }
+                }
+                continue;
+            }
             match v.at(&p).cloned() {
                 // A value of the user's under a name an --env ref takes over: not kept (S1).
                 Some(old) if old != new && !CA_VARS.contains(&name.as_str()) => {
@@ -952,7 +969,12 @@ impl ClaudeConnector {
     }
 
     /// Wraps `o` (a command hook or stdio server) in place; returns the record to undo it.
-    fn wrap_one(&self, o: &mut Value, at: &[String]) -> Option<Change> {
+    fn wrap_one(
+        &self,
+        o: &mut Value,
+        path: &[String],
+        at: Option<(usize, usize)>,
+    ) -> Option<Change> {
         let had_args = o.get("args").is_some();
         let argv = self.wrapped(o.get("command")?, o.get("args"))?;
         let shell = !had_args && argv.get(2) == Some(&Value::str("/bin/sh"));
@@ -960,10 +982,11 @@ impl ClaudeConnector {
         // Exec form: `shell` is ignored with `args`, so nothing else changes.
         o.set("args", Value::Array(argv));
         Some(Change::Wrap {
-            path: at.to_vec(),
+            path: path.to_vec(),
             sha256: edit::wrap_shape_sha256(o),
             shell,
             had_args,
+            at,
         })
     }
 
@@ -977,17 +1000,17 @@ impl ClaudeConnector {
             let Some(Value::Array(groups)) = v.at_mut(&at) else {
                 continue;
             };
-            for g in groups.iter_mut() {
+            for (gi, g) in groups.iter_mut().enumerate() {
                 let Some(Value::Array(hooks)) = g.get_mut("hooks") else {
                     continue;
                 };
-                for h in hooks.iter_mut() {
+                for (hi, h) in hooks.iter_mut().enumerate() {
                     if h.get("type") != Some(&Value::str("command"))
                         || h.get("shell") == Some(&Value::str("powershell"))
                     {
                         continue;
                     }
-                    if let Some(c) = self.wrap_one(h, &at) {
+                    if let Some(c) = self.wrap_one(h, &at, Some((gi, hi))) {
                         e.changes.push(c);
                     }
                 }
@@ -1056,8 +1079,9 @@ impl ClaudeConnector {
                     sha256: edit::wrap_shape_sha256(s),
                     shell: false,
                     had_args: false,
+                    at: None,
                 });
-            } else if let Some(c) = self.wrap_one(s, &at) {
+            } else if let Some(c) = self.wrap_one(s, &at, None) {
                 e.changes.push(c);
             }
         }
