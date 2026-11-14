@@ -300,11 +300,19 @@ fn user_values_never_kept_and_refs_only() {
     let bundle = std::fs::read_to_string(&e.c.paths.bundle).unwrap();
     assert!(!state.contains("CANARY") && !bundle.contains("CANARY"));
     assert!(!config(&e.c).unwrap().contains("CANARY"));
-    // The preview of that change hides the old value.
+    // The preview of that change (changed lines only, as `ms connect` prints them) hides the
+    // old value.
     let safe = e.c.display_safe(Some(&cfg(&[])));
-    let shown: Vec<String> = fixture("complex.toml")
-        .lines()
-        .map(|l| tedit::redact_line(l, &|s| safe.iter().any(|x| x == s)))
+    let before = fixture("complex.toml");
+    let after = config(&e.c).unwrap();
+    use crate::claude::diff::{Line, changed_lines, significant};
+    let shown: Vec<String> = significant(changed_lines(&before, &after).unwrap())
+        .into_iter()
+        .map(|l| match l {
+            Line::Removed(_, t) | Line::Added(_, t) => {
+                tedit::redact_line(t, &|s| safe.iter().any(|x| x == s))
+            }
+        })
         .collect();
     assert!(shown.iter().all(|l| !l.contains("CANARY")));
     assert!(shown.iter().any(|l| l == "PGPASSWORD = \"…\""));
@@ -539,6 +547,25 @@ fn sdlc2_never_loosens_and_warns() {
                 "wrote {first}"
             );
         }
+        // Nothing in the written config adds a sandbox, approval, feature, permission or
+        // network setting (review R6: check the text, not only the records).
+        let written = &p
+            .diff
+            .changes
+            .iter()
+            .find(|c| c.path == e.c.paths.config)
+            .unwrap()
+            .after;
+        for k in [
+            "network_access",
+            "sandbox_mode",
+            "approval_policy",
+            "[features",
+            "[permissions",
+            "sandbox_workspace_write",
+        ] {
+            assert_eq!(written.matches(k).count(), t.matches(k).count(), "{k}");
+        }
         let w = p.warnings.join("\n");
         if t.is_empty() {
             assert!(w.contains("network turned off"));
@@ -691,4 +718,111 @@ fn final_newline_only_removed_when_unchanged() {
         config(&e.c).unwrap(),
         "model = \"o3\"\n\n[projects.\"/w\"]\ntrust_level = \"trusted\"\n"
     );
+}
+
+// protects=review R1 (SPEC D6/D10): after --force replaced a proxy, a user who puts their own
+// value back must not have it replaced by a plain re-run (which an agent may run): only a value
+// morsec itself left is replaceable without --force; fails_when=the plain re-run overwrites it
+#[test]
+fn restored_user_value_needs_force_again() {
+    let t = "[shell_environment_policy.set]\nHTTPS_PROXY = \"http://corp:8080\"\n";
+    let mut e = env();
+    write_config(&e.c, t);
+    e.c.opts.force = true;
+    connect(&e.c, &cfg(&[]));
+    e.c.opts.force = false;
+    let edited = config(&e.c).unwrap().replace(
+        "HTTPS_PROXY = \"http://127.0.0.1:4401\"",
+        "HTTPS_PROXY = \"http://corp:8080\"",
+    );
+    std::fs::write(&e.c.paths.config, &edited).unwrap();
+    let r = e.c.try_plan(&cfg(&[]));
+    assert!(r.unwrap_err().to_string().contains("--force"));
+    assert_eq!(config(&e.c).unwrap(), edited);
+}
+
+// protects=review R3: a proxy --force replaced without keeping it (it held credentials) is
+// re-pointed on a re-run (new msd port) without --force, and the record stays one redacted
+// record; fails_when=the re-run asks for --force over morsec's own old value
+#[test]
+fn redacted_forced_value_follows_port_changes() {
+    let mut e = env();
+    write_config(
+        &e.c,
+        "[shell_environment_policy.set]\nHTTPS_PROXY = \"http://u:CANARY@corp:1\"\n",
+    );
+    e.c.opts.force = true;
+    connect(&e.c, &cfg(&[]));
+    e.c.opts.force = false;
+    connect(
+        &e.c,
+        &ConnectCfg {
+            proxy_port: 4999,
+            ..cfg(&[])
+        },
+    );
+    let s = config(&e.c).unwrap();
+    assert!(s.contains("HTTPS_PROXY = \"http://127.0.0.1:4999\""));
+    let st = std::fs::read_to_string(&e.c.paths.state).unwrap();
+    assert!(!st.contains("CANARY") && !st.contains("4401"));
+    disconnect(&e.c);
+    assert!(!config(&e.c).unwrap().contains("HTTPS_PROXY"));
+}
+
+// protects=review R2: a server given --mcp-env earlier and removed from Codex since doesn't
+// break a plain re-run (its carried reference is dropped with a note); a server named on this
+// run must exist; fails_when=the re-run fails or a new unknown server is accepted
+#[test]
+fn carried_ref_for_removed_server_is_dropped() {
+    let mut e = env();
+    write_config(&e.c, "[mcp_servers.gh]\ncommand = \"gh-mcp\"\n");
+    e.c.mcp_refs = vec![McpRef::parse("gh:GH_TOKEN=ms://gh/t").unwrap()];
+    connect(&e.c, &cfg(&[]));
+    // `codex mcp remove gh`.
+    let mut d: DocumentMut = config(&e.c).unwrap().parse().unwrap();
+    d["mcp_servers"].as_table_like_mut().unwrap().remove("gh");
+    std::fs::write(&e.c.paths.config, d.to_string()).unwrap();
+    let mut again = e.c.clone();
+    again.mcp_refs = e.c.previous_mcp_refs().unwrap();
+    assert!(again.mcp_refs.iter().all(|r| r.carried));
+    let p = again.try_plan(&cfg(&[])).unwrap();
+    assert!(p.warnings.iter().any(|w| w.contains("is gone")));
+    again.apply(&p.diff).unwrap();
+    assert!(again.previous_mcp_refs().unwrap().is_empty());
+    again.mcp_refs = vec![McpRef::parse("gh:GH_TOKEN=ms://gh/t").unwrap()];
+    assert!(again.try_plan(&cfg(&[])).is_err());
+}
+
+// protects=review R4: a config the user deleted after connect, re-created by a re-run, is
+// removed again by disconnect; fails_when=an empty config.toml is left behind
+#[test]
+fn deleted_config_is_recreated_and_removed() {
+    let e = env();
+    write_config(&e.c, "model = \"o3\"\n");
+    connect(&e.c, &cfg(&[]));
+    std::fs::remove_file(&e.c.paths.config).unwrap();
+    connect(&e.c, &cfg(&[]));
+    assert!(config(&e.c).unwrap().contains("MORSEC_CONNECTED"));
+    disconnect(&e.c);
+    assert!(!e.c.paths.config.exists());
+}
+
+// protects=review R7: after an edit inside a table morsec created, an unchanged re-run doesn't
+// reorder the recorded tables, so the state file is not rewritten; fails_when=it is
+#[test]
+fn rerun_after_edit_keeps_created_order() {
+    let mut e = env();
+    write_config(&e.c, "[mcp_servers.gh]\ncommand = \"gh-mcp\"\n");
+    e.c.mcp_refs = vec![McpRef::parse("gh:GH_TOKEN=ms://gh/t").unwrap()];
+    connect(&e.c, &cfg(&[]));
+    let mut d: DocumentMut = config(&e.c).unwrap().parse().unwrap();
+    d["mcp_servers"]["gh"]["env"]["USER_ADDED"] = toml_edit::value("1");
+    std::fs::write(&e.c.paths.config, d.to_string()).unwrap();
+    let st = std::fs::read_to_string(&e.c.paths.state).unwrap();
+    let p = e.c.try_plan(&cfg(&[])).unwrap();
+    let new_state = p.diff.changes.iter().find(|c| c.path == e.c.paths.state);
+    let created = |t: &str| json::parse(t).unwrap().get("created").cloned();
+    if let Some(c) = new_state {
+        assert_eq!(created(&c.after), created(&st));
+    }
 }

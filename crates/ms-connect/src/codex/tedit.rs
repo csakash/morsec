@@ -620,13 +620,44 @@ pub fn redact_line(line: &str, safe: &dyn Fn(&str) -> bool) -> String {
         return line.to_owned();
     }
     if t.starts_with('[') {
-        // A header holds only keys; check it parses as one.
-        let ok = format!("{t}\n").parse::<DocumentMut>().is_ok();
-        return if ok {
-            line.to_owned()
-        } else {
-            "…".to_owned()
+        // A header: rebuilt from its parsed keys, without any comment, and only when every key
+        // is a plain name or one morsec wrote (a `["value"]` line from inside a multi-line
+        // array also parses as a header: review R5).
+        let Ok(d) = format!("{t}\n").parse::<DocumentMut>() else {
+            return "…".to_owned();
         };
+        let mut keys = Vec::new();
+        let mut cur = d.as_item();
+        let mut array = false;
+        loop {
+            let Some(tl) = cur.as_table_like() else { break };
+            let mut it = tl.iter();
+            let (Some((k, next)), None) = (it.next(), it.next()) else {
+                break;
+            };
+            // Written bare in the file (not quoted), so it is a name, not a value.
+            let bare = tl
+                .key(k)
+                .and_then(|key| key.as_repr())
+                .and_then(|r| r.as_raw().as_str())
+                .is_some_and(|raw| !raw.starts_with(['"', '\'']));
+            keys.push((k.to_owned(), bare));
+            match next {
+                Item::Table(t) if t.is_implicit() => cur = next,
+                Item::ArrayOfTables(_) => {
+                    array = true;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        if keys.is_empty() || !keys.iter().all(|(k, bare)| *bare || safe(k)) {
+            return "…".to_owned();
+        }
+        let keys: Vec<String> = keys.into_iter().map(|(k, _)| k).collect();
+        let indent = &line[..line.len() - line.trim_start().len()];
+        let (o, c) = if array { ("[[", "]]") } else { ("[", "]") };
+        return format!("{indent}{o}{}{c}", show_path(&keys));
     }
     let Ok(d) = format!("{t}\n").parse::<DocumentMut>() else {
         return "…".to_owned();
@@ -702,5 +733,14 @@ mod redact_tests {
         assert_eq!(redact_line("  \"ghp_SECRET\",", &safe), "…");
         assert_eq!(redact_line("x = \"\"\"ghp_SECRET", &safe), "…");
         assert_eq!(redact_line("# token ghp_SECRET", &safe), "…");
+        // Header-shaped lines (review R5): keys only, no comments, no unknown quoted keys.
+        assert_eq!(redact_line("  [\"ghp_SECRET\"]", &safe), "…");
+        assert_eq!(redact_line("[[\"ghp_SECRET\"]]", &safe), "…");
+        assert_eq!(
+            redact_line("[mcp_servers.gh] # ghp_SECRET", &safe),
+            "[mcp_servers.gh]"
+        );
+        assert_eq!(redact_line("[[skills.config]]", &safe), "[[skills.config]]");
+        assert_eq!(redact_line("[projects.\"/Users/me\"]", &safe), "…");
     }
 }

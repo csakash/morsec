@@ -93,6 +93,9 @@ pub struct McpRef {
     pub name: String,
     /// The reference.
     pub value: String,
+    /// Carried from the previous connect, not given on this run: a server removed since is
+    /// skipped with a note instead of failing the re-run (review R2).
+    pub carried: bool,
 }
 
 impl McpRef {
@@ -116,6 +119,7 @@ impl McpRef {
             server: server.to_owned(),
             name: name.to_owned(),
             value: value.to_owned(),
+            carried: false,
         })
     }
 }
@@ -268,6 +272,7 @@ impl CodexConnector {
                         server: server.clone(),
                         name: name.clone(),
                         value: v.to_owned(),
+                        carried: true,
                     })
                 }
                 _ => None,
@@ -503,12 +508,16 @@ impl CodexConnector {
 
         // The text without the previous connect. A reference that replaced a value of the
         // user's stays (that value is gone) and its record is carried (SPEC D6).
-        let (base_text, original, created_file, carried) = match &prev {
+        // `ours`: the previous records whose key still holds what morsec wrote, judged on the
+        // file as it is now. Only these may be replaced again without --force (review R1: once
+        // undo puts the user's old value back, "ours" can't be told apart on the base text).
+        let (base_text, original, created_file, carried, ours) = match &prev {
             None => (
                 cur_text.to_owned(),
                 cur.as_deref().map(sha256),
                 cur.is_none(),
                 Edits::default(),
+                None,
             ),
             Some(p) => {
                 let doc = parse_doc(&self.paths.config, cur_text)?;
@@ -549,14 +558,29 @@ impl CodexConnector {
                         .collect(),
                     no_final_newline: false,
                 };
+                let ours = State {
+                    edits: Edits {
+                        records: p
+                            .edits
+                            .records
+                            .iter()
+                            .filter(|r| still(r))
+                            .cloned()
+                            .collect(),
+                        ..Edits::default()
+                    },
+                    ..p.clone()
+                };
                 let original = if unchanged {
                     p.original.clone()
-                } else if !keep.is_empty() {
+                } else if !keep.is_empty() || cur.is_none() {
                     None
                 } else {
                     Some(sha256(&text))
                 };
-                (text, original, p.created_file, carried)
+                // A config the user deleted since is one morsec creates again (review R4).
+                let created = p.created_file || cur.is_none();
+                (text, original, created, carried, Some(ours))
             }
         };
 
@@ -564,7 +588,7 @@ impl CodexConnector {
         let mut e = Edits::starting_from(&base_text);
         e.records = carried.records;
         e.created = carried.created;
-        let extra_ca = self.plan_doc(&mut doc, cfg, prev.as_ref(), &mut e, &mut warnings)?;
+        let extra_ca = self.plan_doc(&mut doc, cfg, ours.as_ref(), &mut e, &mut warnings)?;
         // Keep an unchanged re-run's records in their earlier order, so it writes nothing.
         if let Some(p) = &prev {
             let rank = |r: &Record| {
@@ -575,6 +599,15 @@ impl CodexConnector {
                     .unwrap_or(usize::MAX)
             };
             e.records.sort_by_key(rank);
+            // Created tables too (review R7).
+            let crank = |c: &Vec<String>| {
+                p.edits
+                    .created
+                    .iter()
+                    .position(|x| x == c)
+                    .unwrap_or(usize::MAX)
+            };
+            e.created.sort_by_key(crank);
         }
         let after = doc.to_string();
         // SPEC D4: prove the change undoes to the exact bytes before writing anything.
@@ -616,14 +649,18 @@ impl CodexConnector {
         })
     }
 
-    /// The old value a previous `--force` replaced at `p`, if `cur` is it: a re-run may replace
-    /// it again without `--force` (L08 review R7).
-    fn forced_before(prev: Option<&State>, p: &[String], cur: &Item) -> bool {
-        prev.and_then(|s| s.edits.get(p))
-            .is_some_and(|r| match &r.kind {
+    /// How an earlier `--force` replaced `p`, when `cur` is the value it left there: a re-run
+    /// may replace it again without `--force` (L08 review R7). `ours` holds only the records
+    /// whose key still held morsec's value in the file (review R1); a carried redacted record's
+    /// value is morsec's own (review R3).
+    fn forced_before(ours: Option<&State>, p: &[String], cur: &Item) -> Option<OnConflict> {
+        ours.and_then(|s| s.edits.get(p))
+            .and_then(|r| match &r.kind {
                 Kind::Replaced { before } => tedit::parse_value(before)
-                    .is_ok_and(|b| Some(tedit::canon_value(&b)) == tedit::canon_item(cur)),
-                _ => false,
+                    .is_ok_and(|b| Some(tedit::canon_value(&b)) == tedit::canon_item(cur))
+                    .then_some(OnConflict::Keep),
+                Kind::Redacted { .. } => Some(OnConflict::Drop),
+                Kind::Added => None,
             })
     }
 
@@ -640,8 +677,10 @@ impl CodexConnector {
         what: &str,
     ) -> Result<()> {
         let cur = tedit::get(doc, p).cloned();
+        let again = cur.as_ref().and_then(|c| Self::forced_before(prev, p, c));
         let on = match &cur {
-            Some(c) if self.opts.force || Self::forced_before(prev, p, c) => {
+            Some(_) if again == Some(OnConflict::Drop) => OnConflict::Drop,
+            Some(c) if self.opts.force || again.is_some() => {
                 let secretish = match c {
                     Item::Value(v) => v.as_str().is_none_or(has_userinfo),
                     _ => true,
@@ -755,6 +794,13 @@ impl CodexConnector {
         for r in &self.mcp_refs {
             let sp = path(&["mcp_servers", &r.server]);
             let Some(s) = tedit::get(doc, &sp).and_then(Item::as_table_like) else {
+                if r.carried {
+                    warnings.push(format!(
+                        "the MCP server \"{}\" is gone from your Codex config, so morsec dropped its reference {}",
+                        r.server, r.name
+                    ));
+                    continue;
+                }
                 return Err(err(format!(
                     "{} has no MCP server \"{}\" (mcp_servers.{}). Add it to Codex first (codex mcp add), then connect",
                     self.paths.config.display(),
