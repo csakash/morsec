@@ -10,5 +10,22 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The real Touch ID authenticator (LocalAuthentication). Only msd turns it on; `ms` uses the
+# rendering and wire types without linking the framework.
+touch-id = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-local-authentication", "dep:block2"]
+
 [dependencies]
 ms-core = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3", optional = true, default-features = false, features = ["std", "LAContext", "LAError", "block2"] }
+block2 = { version = "0.6", optional = true }

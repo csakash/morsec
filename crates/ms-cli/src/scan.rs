@@ -13,8 +13,8 @@ use crate::terminal_safe;
 
 /// Exit code when a value was found.
 pub(crate) const EXIT_LEAK: u8 = 3;
-/// How long to wait for msd (its own budget is 240 s).
-const WAIT: Duration = Duration::from_secs(300);
+/// How long to wait for msd: up to 120 s for your approval (L11), then its own 240 s budget.
+const WAIT: Duration = Duration::from_secs(420);
 
 #[derive(Debug, Args)]
 #[command(after_help = "\
@@ -113,6 +113,8 @@ pub(crate) fn render(resp: &ResponseBody) -> (Vec<String>, Vec<String>, u8) {
 }
 
 pub(crate) async fn run(_a: &ScanArgs) -> ExitCode {
+    // msd asks for a person's approval (Touch ID) before reading any value (L11).
+    let _review = crate::approve::inline_review("ms scan");
     let resp = async {
         let path = ms_ipc::default_socket_path()?;
         Client::connect(&path)

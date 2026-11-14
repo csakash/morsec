@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 use ms_core::Error;
-use ms_ipc::{Client, ErrorCode, RequestBody, ResponseBody};
+use ms_ipc::{Client, RequestBody, ResponseBody};
 
 use crate::terminal_safe;
 
@@ -29,8 +29,8 @@ pub struct InitArgs {
     /// Add the morsec CA certificate to your login keychain's trust settings (macOS asks you).
     #[arg(long, conflicts_with_all = ["force", "resume"])]
     trust: bool,
-    /// Resume after `ms stop` from your own terminal, until Touch ID approvals arrive (L11).
-    #[arg(long, conflicts_with_all = ["force", "trust"])]
+    /// Old name for `ms start` (kept so scripts keep working; it needs Touch ID now).
+    #[arg(long, conflicts_with_all = ["force", "trust"], hide = true)]
     resume: bool,
 }
 
@@ -68,7 +68,7 @@ pub(crate) fn status_line(resp: &ResponseBody) -> Option<String> {
     let protected = keys.map(|k| format!(" · {k} {} protected", plural(k)));
     Some(match running {
         Some(false) => format!(
-            "morsec stopped{} · resume with: ms init --resume",
+            "morsec stopped{} · resume with: ms start",
             protected.unwrap_or_default()
         ),
         Some(true) => format!("morsec on{}", protected.unwrap_or_default()),
@@ -86,6 +86,9 @@ pub(crate) async fn status() -> ExitCode {
                 for a in alerts {
                     eprintln!("warning: {}", terminal_safe(a));
                 }
+            }
+            if let Some(hint) = crate::approve::status_hint().await {
+                say(&hint);
             }
             ExitCode::SUCCESS
         }
@@ -179,8 +182,19 @@ pub(crate) async fn stop() -> ExitCode {
     }
 }
 
+/// Like [`request`], waiting long enough for a person's approval.
+async fn request_approved(body: RequestBody) -> ms_core::Result<ResponseBody> {
+    let path = ms_ipc::default_socket_path()?;
+    Client::connect(&path)
+        .await?
+        .request_within(body, crate::approve::APPROVAL_WAIT)
+        .await
+}
+
 pub(crate) async fn start() -> ExitCode {
-    let first = request(RequestBody::Start { at_terminal: false }).await;
+    // Resuming needs a person's approval with Touch ID (L11); review it right here.
+    let _review = crate::approve::inline_review("ms start");
+    let first = request_approved(RequestBody::Start { at_terminal: false }).await;
     let resp = match first {
         Err(Error::DaemonUnavailable { .. }) => {
             if let Err(e) = tokio::task::spawn_blocking(kickstart)
@@ -189,7 +203,7 @@ pub(crate) async fn start() -> ExitCode {
             {
                 return fail(&e);
             }
-            request(RequestBody::Start { at_terminal: false }).await
+            request_approved(RequestBody::Start { at_terminal: false }).await
         }
         other => other,
     };
@@ -325,40 +339,13 @@ async fn trust() -> ExitCode {
     }
 }
 
-async fn resume() -> ExitCode {
-    let ok = tokio::task::spawn_blocking(|| {
-        crate::tty::confirm_at_terminal(
-            "Resume morsec after ms stop? Agents can use your keys again under your rules.",
-        )
-    })
-    .await;
-    match ok {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => return fail("Cancelled. morsec stays stopped."),
-        Ok(Err(e)) => {
-            return fail(&format!(
-                "morsec: --resume must be confirmed at your own terminal ({e})"
-            ));
-        }
-        Err(e) => return fail(&format!("morsec: {e}")),
-    }
-    let resp = request(RequestBody::Start { at_terminal: true }).await;
-    if let Ok(ResponseBody::Error {
-        code: ErrorCode::Denied,
-        ..
-    }) = &resp
-    {
-        eprintln!("(This must run in a terminal outside any agent session.)");
-    }
-    print_reply(resp)
-}
-
 pub(crate) async fn init(a: &InitArgs) -> ExitCode {
     if a.trust {
         return trust().await;
     }
     if a.resume {
-        return resume().await;
+        eprintln!("note: ms init --resume is now ms start, which asks for Touch ID");
+        return start().await;
     }
     let msd = match msd_path() {
         Ok(p) => p,
@@ -415,7 +402,7 @@ mod tests {
         }
         assert_eq!(
             status_line(&r).unwrap(),
-            "morsec stopped · 3 secrets protected · resume with: ms init --resume"
+            "morsec stopped · 3 secrets protected · resume with: ms start"
         );
     }
 

@@ -26,6 +26,7 @@ tokio = { workspace = true }
 ms-import = { workspace = true }
 ms-connect = { workspace = true }
 ms-session = { workspace = true }
+ms-approve = { workspace = true }
 libc = { workspace = true }
 zeroize = { workspace = true }
 rustix = { version = "1", default-features = false, features = ["std", "termios", "process"] }

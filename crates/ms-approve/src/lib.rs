@@ -1,9 +1,23 @@
 //! Approvals for production-tier requests.
 //!
-//! L00 freezes [`Approver`] and ships [`fake::FakeApprover`]. L11 builds the macOS Touch ID
-//! helper and the token binding; L21 the Linux polkit prompt.
+//! L00 froze [`Approver`] and shipped [`fake::FakeApprover`]. L11 (CLI only, no Swift helper)
+//! adds the production approver: [`broker::HumanApprover`] (one pending request, decided through
+//! `ms approve`, confirmed with Touch ID that msd raises itself), the bound token
+//! ([`token::TokenIssuer`]), inert rendering of agent-supplied text ([`render`]), and the Touch ID
+//! authenticator behind a trait ([`auth::Authenticator`]; [`macos::TouchId`] with the `touch-id`
+//! feature). L21 adds the Linux polkit prompt.
 
 use std::time::Duration;
+
+pub mod auth;
+pub mod broker;
+#[cfg(all(target_os = "macos", feature = "touch-id"))]
+pub mod macos;
+pub mod render;
+pub mod token;
+
+pub use broker::{DecideError, HumanApprover, Pending};
+pub use token::{Binding, Scope, TokenError};
 
 use ms_core::ApprovalRequest;
 
