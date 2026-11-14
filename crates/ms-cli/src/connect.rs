@@ -156,7 +156,7 @@ pub(crate) fn ms_path() -> Result<String, String> {
         .ok_or_else(|| format!("morsec: the path of ms ({}) is not UTF-8", p.display()))
 }
 
-fn connector(opts: Options) -> Result<ClaudeConnector, String> {
+pub(crate) fn connector(opts: Options) -> Result<ClaudeConnector, String> {
     let home = home()?;
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|d| !d.is_empty())

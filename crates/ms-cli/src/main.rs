@@ -10,6 +10,7 @@ mod add;
 mod approve;
 mod connect;
 mod connect_codex;
+mod doctor;
 mod import;
 mod log;
 mod mcp;
@@ -18,12 +19,10 @@ mod service;
 mod stats;
 mod tty;
 
-use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
-use ms_core::Error;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod rules;
 mod scan;
@@ -43,13 +42,6 @@ struct Cli {
     version: bool,
     #[command(subcommand)]
     command: Option<Command>,
-}
-
-/// Arguments of a command that is not built yet; accepted and ignored.
-#[derive(Debug, Args)]
-struct Rest {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    args: Vec<OsString>,
 }
 
 // Parsed once per process; the size difference between variants doesn't matter.
@@ -81,37 +73,13 @@ enum Command {
     /// Show whether morsec is on.
     Status,
     /// Check that every connected agent routes through morsec.
-    Doctor(Rest),
+    Doctor(doctor::DoctorArgs),
     /// Run the MCP server for an agent: your run commands as typed tools.
     Mcp(mcp::McpArgs),
     /// Scan agent transcripts for leaked secret values.
     Scan(scan::ScanArgs),
     /// Prompts per session, blocks and approvals.
     Stats(stats::StatsArgs),
-}
-
-impl Command {
-    /// (subcommand name, loop that builds it) for stubs; None when implemented.
-    fn stub(&self) -> Option<(&'static str, &'static str)> {
-        Some(match self {
-            Command::Doctor(_) => ("doctor", "L17 doctor"),
-            Command::Status
-            | Command::Run(_)
-            | Command::Mcp(_)
-            | Command::Init(_)
-            | Command::Stop
-            | Command::Start
-            | Command::Add(_)
-            | Command::Import(_)
-            | Command::Rules(_)
-            | Command::Log(_)
-            | Command::Stats(_)
-            | Command::Connect(_)
-            | Command::Disconnect(_)
-            | Command::Approve(_)
-            | Command::Scan(_) => return None,
-        })
-    }
 }
 
 /// The name this binary was invoked as: `ms` or `mors` (or whatever the symlink is called).
@@ -165,16 +133,6 @@ async fn main() -> ExitCode {
             .print_help();
         return ExitCode::from(2);
     };
-    if let Some((sub, loop_id)) = command.stub() {
-        eprintln!(
-            "{}",
-            Error::NotImplemented {
-                command: format!("{name} {sub}"),
-                loop_id
-            }
-        );
-        return ExitCode::from(EXIT_NOT_BUILT);
-    }
     match command {
         Command::Status => service::status().await,
         Command::Init(a) => service::init(&a).await,
@@ -191,7 +149,7 @@ async fn main() -> ExitCode {
         Command::Run(a) => on_own_thread(move || run::run(&a)),
         Command::Mcp(a) => mcp::run(&a, VERSION).await,
         Command::Approve(a) => on_own_thread(move || approve::run(&a)),
-        _ => unreachable!("every other command is a stub"),
+        Command::Doctor(a) => on_own_thread(move || doctor::run(&a)),
     }
 }
 

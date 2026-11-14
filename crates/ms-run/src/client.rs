@@ -205,6 +205,7 @@ fn kind(r: &ResponseBody) -> &'static str {
         ResponseBody::Rules { .. } => "rules",
         ResponseBody::ScanReport { .. } => "scan report",
         ResponseBody::Approval { .. } => "approval",
+        ResponseBody::Probe { .. } => "doctor probe",
         ResponseBody::RunStarted => "run started",
         ResponseBody::RunOutput { .. } => "run output",
         ResponseBody::RunExit { .. } => "run exit",

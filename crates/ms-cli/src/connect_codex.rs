@@ -13,7 +13,7 @@ use crate::connect::{
 };
 use crate::terminal_safe;
 
-fn connector(opts: Options) -> Result<CodexConnector, String> {
+pub(crate) fn connector(opts: Options) -> Result<CodexConnector, String> {
     let home = home()?;
     let codex_home = std::env::var_os("CODEX_HOME")
         .filter(|d| !d.is_empty())
