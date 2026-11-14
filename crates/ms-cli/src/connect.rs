@@ -33,7 +33,7 @@ pub struct ConnectArgs {
     /// --mcp-env github:GITHUB_TOKEN=ms://github/token. Only ms:// references are accepted.
     #[arg(long = "mcp-env", value_name = "SERVER:NAME=ms://REF")]
     pub(crate) mcp_env: Vec<String>,
-    /// Also add the `ms mcp` server (off until ms mcp ships, L14).
+    /// Also add the `ms mcp` server: your run commands as typed MCP tools.
     #[arg(long)]
     pub(crate) with_mcp: bool,
     /// Also run your hooks and local MCP servers through `ms run --` (off until ms run ships, L12).

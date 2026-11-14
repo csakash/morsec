@@ -27,6 +27,7 @@ ms-import = { workspace = true }
 ms-connect = { workspace = true }
 ms-session = { workspace = true }
 ms-run = { workspace = true }
+ms-mcp = { workspace = true }
 ms-approve = { workspace = true }
 libc = { workspace = true }
 zeroize = { workspace = true }

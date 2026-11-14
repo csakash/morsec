@@ -130,27 +130,6 @@ fn version_under_both_names() {
     assert_eq!((code2, out2), (0, out));
 }
 
-// protects=every PRD command not built yet exits 69 and names its loop, under the invoked name;
-// fails_when=a stub exits 0, prints to stdout, or names the wrong binary/loop; no_claim=behaviour
-// once the owning loop lands
-#[test]
-fn stubs_exit_69_and_name_their_loop() {
-    let d = tmpdir();
-    let sock = d.path().join("none.sock");
-    let table = [("mcp", "L14 mcp-server")];
-    let alias = mors(d.path());
-    for (cmd, loop_id) in table {
-        for (bin, name) in [(ms(), "ms"), (alias.clone(), "mors")] {
-            let (code, out, err) = run(&bin, &[cmd, "--some-flag", ".env"], &sock);
-            assert_eq!(code, 69, "{name} {cmd}: {err}");
-            assert!(out.is_empty(), "{name} {cmd} printed to stdout: {out}");
-            let want =
-                format!("morsec: '{name} {cmd}' is not built yet (planned in loop {loop_id}).\n");
-            assert_eq!(err, want);
-        }
-    }
-}
-
 // protects=`ms status` reports the running daemon over IPC (on, protected-key count) and exits 0;
 // with no daemon it fails closed with the ms start hint and exits 1; fails_when=status claims "on"
 // without a daemon or fails with one running; no_claim=launchd or the production socket path

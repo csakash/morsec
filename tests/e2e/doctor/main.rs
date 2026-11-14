@@ -402,8 +402,8 @@ fn line_with<'a>(out: &'a str, needle: &str) -> &'a str {
 // Tests
 
 // protects=SPEC acceptance 1/4: with msd up and both connectors applied (temp HOME), doctor finds
-// no problems, checks every connector item and the port against msd, and reports ms mcp as not
-// installed without failing; fails_when=a healthy setup exits non-zero or a check is missing;
+// no problems, checks every connector item and the port against msd, and reports the ms mcp
+// catalog hash as not checked yet without failing; fails_when=a healthy setup exits non-zero or a check is missing;
 // no_claim=a signed release build (dev builds are ad-hoc: a warning)
 fn healthy_setup_has_no_problems() {
     let w = World::new();
@@ -416,7 +416,7 @@ fn healthy_setup_has_no_problems() {
         "✓ Claude Code connected",
         "✓ Claude Code sandbox uses the morsec proxy",
         "✓ Codex commands use the morsec proxy",
-        "- ms mcp not installed",
+        "- ms mcp tool catalog hash not checked yet",
     ] {
         line_with(&out, want);
     }
