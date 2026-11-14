@@ -26,8 +26,9 @@ which is what `ms import` already stores (L12 SPEC, "DSN userinfo refs").
 
 - `psql ms://pg/prod -c "UPDATE orders SET …"` — the ref is psql's connection argument (the
   positional dbname or the value of `-d` / `--dbname`), as a whole argument.
-- `DATABASE_URL=ms://pg/prod prisma migrate deploy` (also `npx prisma …`, `pnpm [exec] prisma …`,
-  `yarn prisma …`, `bunx prisma …`) — Prisma reads its URL from the environment, through L12's
+- `DATABASE_URL=ms://pg/prod prisma migrate deploy` (also `npx|bunx|pnpx prisma …` and
+  `npm|pnpm|yarn|bun exec|dlx|x prisma …`; `yarn prisma` / `npm run prisma` run a package script,
+  which morsec can't see into, so they always need an approval) — Prisma reads its URL from the environment, through L12's
   env channel (the variable must be in the key's `env` rule).
 
 ## Decisions (made in this loop; flagged for the orchestrator)
@@ -76,19 +77,25 @@ which is what `ms import` already stores (L12 SPEC, "DSN userinfo refs").
   `db seed`, `studio` and any subcommand not known to be read-only are refused, and the allowed
   ones (`migrate status|diff`, `db pull`, `generate`, `validate`, `format`, `version`, `--help`)
   run after the same role check as D3. Refs in argv are refused.
-- **D5 — effect preview.** Only when an approval is asked (production key, or D4). For psql with
-  exactly one `-c` and no `-f`, whose command is a single simple `UPDATE` / `DELETE` (a strict
-  token check: no comments, `$`, backslash, `:` variables, prefixed strings, `RETURNING`,
-  `DEFAULT`, `WHERE CURRENT OF`, `WITH`, extra `;`), morsec runs a fixed psql script on its own
-  connection: `BEGIN`, timeouts (`statement_timeout` 5 s, `lock_timeout` 2 s), then a DO block
-  that refuses unless the table is a plain table without rules, row security, user triggers or
-  FK-referencing tables with user triggers or rules, every called function exists and none is
-  volatile, no operator used is backed by a volatile function — and then executes
-  `WITH morsec_preview AS (<statement> RETURNING 1) SELECT count(*)` — then `ROLLBACK`. The
-  statement reaches the server only as a quoted literal (`:'stmt'`, `set_config`), never through
-  psql's lexer, and transaction control inside the DO block is an error, so it can't commit. The
-  summary is "3 rows in orders"; anything else is "rows changed: unknown (<why>)". Read-only keys
-  and other forms preview as unknown. Prisma previews as unknown (the reason says what it does).
+- **D5 — effect preview (amended after review cycle 3, approved by the user: count without
+  writing).** Only when an approval is asked (production key, or D4). For psql with exactly one
+  `-c` and no `-f`, whose command is a single simple `UPDATE` / `DELETE` (a strict token check: no
+  comments, `$`, backslash, `:` variables, prefixed strings, `RETURNING`, `DEFAULT`, `WHERE
+  CURRENT OF`, `WITH`, subqueries or other relations, dotted names, extra `;`), morsec counts the
+  rows it would change **without executing the write**: on its own connection it runs `BEGIN READ
+  ONLY`, timeouts (`statement_timeout` 5 s, `lock_timeout` 2 s), then a DO block that refuses
+  unless every function called in the `WHERE` clause exists and none is volatile, no operator
+  there is backed by a volatile function and every cast there is to a `pg_catalog` type, and then
+  runs `SELECT count(*) FROM [ONLY] <table> WHERE <the statement's WHERE clause>` — then
+  `ROLLBACK`. The `SET` list is never evaluated. Nothing is written, so no trigger, rule, cascade,
+  default or constraint runs, and a read-only transaction refuses any write (and `nextval`) even
+  if the filter text were misread. The clause reaches the server only as a quoted literal
+  (`:'filter'`, `set_config`), never through psql's lexer. The summary is "3 rows in orders" (the
+  rows the statement matches; row security for UPDATE/DELETE may differ from SELECT's); anything
+  else is "rows changed: unknown (<why>)". Read-only keys and other forms preview as unknown.
+  Prisma previews as unknown (the reason says what it does). This replaces the card's "simple
+  DML runs inside `BEGIN … ROLLBACK`": executing the write kept running code the checks couldn't
+  see (domain and CHECK constraints, cascades, inheritance children).
 - **D6 — hosts.** The adapters don't read the rule's `hosts` (empty would have to mean "none",
   per the rules model): the connection target comes only from the user's stored URL, and the
   agent can't change host, port or user (D2). Flagged for the orchestrator.
