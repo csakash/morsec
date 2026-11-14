@@ -160,7 +160,14 @@ impl Daemon {
                 .keys
                 .get(&k)
                 .is_some_and(|rule| rule.env.contains(&name));
-            if !allowed || !ms_run::input::env_name_allowed(&name) {
+            if !ms_run::input::env_name_allowed(&name) {
+                let msg = format!(
+                    "morsec: {name} can't carry a key's value: it changes how programs load code or run commands"
+                );
+                let result = ReceiptResult::Blocked(Reason::CommandNotAllowed);
+                return Err(refuse(&k, result, reply_err(ErrorCode::Denied, msg)));
+            }
+            if !allowed {
                 let msg = format!(
                     "morsec: {k}'s value may not go into {name}. If that variable is how the tool takes it, allow it from your own terminal: ms rules {k} --add-env {name}"
                 );
