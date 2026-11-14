@@ -4,6 +4,11 @@ Status: draft, 13 November 2026. Source of truth for *what* we build: the PRD an
 Intraface board (https://app.intraface.cc/b/warden-keys-mockup-gfnm5). This document is *how*:
 architecture, interfaces, and the gstack-loops breakdown that builds it end to end.
 
+**Scope, 14 November 2026: CLI only.** morsec ships as a command-line tool for now, with no app:
+no Swift approval helper and no menu-bar app. Approvals happen in the terminal with Touch ID (L11),
+L25 `menubar-app` is deferred, and L28 is a CLI release. The first public CLI release comes after
+v0.2 (see "First public CLI release" after the v0.2 gate).
+
 Every loop below becomes `gloop new <slug>` → `/gloop-spec` (its card here is the brief for
 `SPEC.md`) → `/gloop-build` → `/gloop-ship`. Every loop follows the ARI-42 skill: each card names
 the requirements it touches and the test that proves them.
@@ -12,13 +17,13 @@ the requirements it touches and the test that proves them.
 
 ## 1. At a glance
 
-- **29 loops in 6 waves**, from an empty repo to v1.0. Loops inside a wave run in parallel; waves
-  run in order.
+- **30 loops in 6 waves**, from an empty repo to v1.0; 29 are active, because L25 `menubar-app`
+  is deferred (CLI only). Loops inside a wave run in parallel; waves run in order.
 - **Critical path:** `foundation` → `swap-proxy` → `daemon` → `connect-claude` → `e2e-canary`
   (v0.1), then `run-core` → `run-postgres` (v0.2), `mint-*` and `linux-platform` (v0.3),
-  `menubar-app` (v1.0).
-- **Stack:** Rust for everything that touches a secret (CLI, daemon, proxy, runner, minting);
-  Swift for macOS UI (Touch ID approval helper, menu-bar app). One `ms` binary installed under
+  `release-1.0` (v1.0).
+- **Stack:** Rust for everything, CLI only. Approvals are shown in the terminal and confirmed with
+  Touch ID through `LocalAuthentication`; there is no Swift app. One `ms` binary installed under
   two names, `ms` and `mors`.
 - **Parallel safety:** `foundation` creates every crate as a stub and freezes the shared
   interfaces, so parallel loops each own separate folders and never edit the same files.
@@ -50,6 +55,7 @@ flowchart TB
     L15["L15 run-postgres"]
     L16["L16 run-ssh-git"]
     L17["L17 doctor"]
+    L29["L29 egress-allowlist"]
   end
   subgraph W4["Wave 4 · v0.3"]
     L18["L18 mint-aws"]
@@ -61,7 +67,7 @@ flowchart TB
     L24["L24 hardening"]
   end
   subgraph W5["Wave 5 · v1.0"]
-    L25["L25 menubar-app"]
+    L25["L25 menubar-app (deferred)"]
     L26["L26 import-password-managers"]
     L27["L27 export-ari42"]
     L28["L28 release-1.0"]
@@ -72,17 +78,23 @@ flowchart TB
   L07 --> L11 & L12 & L13
   L12 --> L14 & L15 & L16
   L11 --> L15 & L16
-  L08 & L13 --> L17
+  L08 & L13 & L29 --> L17
+  L07 & L08 --> L29
   L11 --> L18 & L19 & L21
   L15 --> L20
   L17 --> L22
   L12 --> L23
   L18 & L19 & L20 & L21 & L22 & L23 --> L24
-  L24 --> L25 & L26 & L27
-  L25 & L26 & L27 --> L28
+  L24 --> L26 & L27
+  L26 & L27 --> L28
+  L11 -.-> L25
+  classDef deferred stroke-dasharray: 5 5,color:#888
+  class L25 deferred
 ```
 
 Arrows are hard dependencies. Wave 5 also uses L02, L04 and L11, which are merged long before.
+L25 (dashed) is deferred by the CLI-only decision and is not on the path to v1.0. The first
+public CLI release is cut once L11–L17 and L29 have merged (see "First public CLI release").
 
 ---
 
@@ -109,7 +121,7 @@ without an owner.
 | Mint: AWS 15-minute sessions | L18 |
 | Mint: GitHub App tokens | L19 |
 | Mint: Postgres temporary roles | L20 |
-| Production keys ask first: dialog by morsec with exact command, key, effect, "this exact command only, once", Touch ID | L11, L15 |
+| Production keys ask first: morsec shows the exact command, key, effect and "this exact command only, once" (in the terminal, as inert text, under the CLI-only decision; the mockup draws a dialog), Touch ID | L11, L15 |
 | Approval bound to arguments; once per session option | L11 |
 | `ms connect claude-code` (terminal, desktop app, IDE): env, sandbox proxy, allowed domains, MCP, hooks through `ms run` | L08 |
 | `ms connect codex` (CLI, app, IDE): `shell_environment_policy`, network proxy, `mcp_servers.ms` | L13 |
@@ -127,7 +139,8 @@ without an owner.
 | Linux: TPM-backed storage under a separate system user | L21 |
 | Run-mode output redaction, including base64 and URL-encoded forms | L12 |
 | Fail closed and loud | L05, L12, L07 |
-| Menu-bar app: keys, connected agents, today's record, Add key, Export for review, Stop all agent access | L25 |
+| Hosts an agent's sandbox may reach without a key (npm, git hosts) work through msd, allowlisted and nothing else | L29 |
+| Menu-bar app: keys, connected agents, today's record, Add key, Export for review, Stop all agent access | **Deferred** (CLI only, 2026-11-14): L25 is out of scope. The CLI covers each item: `ms status`, `ms log`, `ms log --export`, `ms add`, `ms stop` |
 | Signed releases, reproducible builds, no unsigned auto-update | L10, L28 |
 | Success measures: time to first protected session, prompts per session, zero leaks in transcripts | L09 (`ms scan`), L02 (`ms stats`), L28 |
 | PRD open question 2: does the Codex app read `~/.codex/config.toml` like the CLI? | L13 (spike, first task) |
@@ -144,8 +157,8 @@ without an owner.
 | `msd` | Broker daemon: vault access, swap proxy, command runner, minter, approvals, receipts. LaunchAgent on macOS, systemd service on Linux. Hardened runtime, so same-user processes can't attach a debugger. | the user (macOS v0.1–v0.2); `_morsec` system user (Linux, and macOS after L23) | Yes, briefly, in zeroized buffers |
 | `ms-shim` | Tiny binary hard-linked as `psql`, `prisma`, `ssh`… in a shim directory placed first on the agent's `PATH`. Forwards to `msd` only when the command line contains an `ms://` ref; otherwise execs the real tool unchanged. | the agent | No |
 | `ms mcp` | stdio MCP server started by the agent; a thin client of `msd`. | the agent | No |
-| `Morsec Approve` | Signed Swift helper launched by `msd` to show the approval dialog and run Touch ID. | the user | No (sees the command, never the value) |
-| `Morsec.app` | Menu-bar app (v1.0). | the user | No |
+| Approval prompt (L11) | Part of `ms` / `msd`, no separate app: prints the request on the user's terminal as inert text and asks for Touch ID through `LocalAuthentication`, with the login password as fallback. | the user | No (sees the command, never the value) |
+| ~~`Morsec.app`~~ | Menu-bar app: deferred (L25, CLI-only decision). | | |
 
 ### 3.2 The three mechanisms
 
@@ -154,7 +167,7 @@ For hosts bound to a key, `msd` terminates TLS with a leaf certificate from the 
 replaces the `ms://` placeholder in the configured location (a header, basic auth or a query
 parameter, set per provider in the catalog), strips any other credential the agent added, and
 forwards over a fresh TLS connection. Hosts no key is bound to are tunnelled without inspection
-when they are on the allowlist, and refused otherwise. A placeholder seen on a request to a host
+when they are on the allowlist (kept in the MAC'd rules, L29), and refused otherwise. A placeholder seen on a request to a host
 it is not bound to is blocked and recorded.
 
 - CA: generated at `ms init`. Its private key lives in the vault and never leaves `msd`. The CA
@@ -204,7 +217,7 @@ anyway:
 | Read `msd`'s memory | Hardened runtime, no `get-task-allow`; values are zeroized after use. |
 | Loosen the rules file | Rules are MAC'd with a key in the vault; `msd` rejects a file with a bad MAC. Loosening goes through `ms rules`, which needs Touch ID. A project `.morsec.toml` may only tighten. |
 | Edit its own connector settings to skip the proxy | It never had a value, so nothing leaks; it only loses the ability to use keys. `msd` watches those files and alerts on change, and `ms doctor` reports drift. Optional: Claude Code managed settings (root-owned). |
-| Fake an approval | The dialog is drawn by `Morsec Approve`, which `msd` launches, from the real exec plan. The approval token is an HMAC over (session, key, argv hash, cwd, expiry), checked by the executor. |
+| Fake an approval | The prompt is rendered by morsec from the real exec plan, never from agent text, on the user's terminal, and needs Touch ID (or the password). A caller inside an agent session can't approve, its own request or any other. The approval token is an HMAC over (session, key, argv hash, cwd, expiry), checked by the executor. |
 | Forge receipts | The chain is hash-linked and every record is HMAC'd with a vault key, so a rewrite fails verification. |
 | Read the secret from a run-mode child's env or passfile | **Residual risk in v0.2.** A same-user process can read another process's environment and files. Mitigations: prefer agent and helper protocols (SSH agent, git credential helper, AWS endpoint) that never put the value in a child; keep passfiles short-lived. **L23 `isolated-runner`** runs children as `_morsec`, which closes this. Recorded in `ARI42.md` as Partial until then. |
 
@@ -247,12 +260,12 @@ reports prompts per session and blocks per day.
 | Core language | Rust (stable, `cargo --locked`) | Memory safety in the component that holds secrets, plus `zeroize` and `secrecy` for wiping values (PRD §9 "values wiped after use"). Go's GC copies make wiping unreliable. |
 | Async and HTTP | `tokio`, `hyper` 1.x, `rustls`, `rcgen` | Standard and auditable; no OpenSSL in the proxy. |
 | macOS Keychain | `security-framework` (data-protection keychain, access control, user-presence for production items) | Lets the Keychain itself require biometry for production keys. |
-| Touch ID and dialogs | Swift helper using `LocalAuthentication` and AppKit | Native UI; the system Touch ID sheet alone can't show the full command. |
+| Touch ID | `LocalAuthentication` (`LAContext`) called from the Rust CLI; the request itself is printed in the terminal | CLI only (2026-11-14). The system Touch ID sheet can't show the full command, so the terminal shows it and the sheet only confirms. |
 | MCP server | the official Rust MCP SDK (`rmcp`) | Pin the exact version (MCP-1). |
 | CLI | `clap` | One binary; `mors` is a symlink. |
 | Storage | JSONL receipts; TOML rules | Readable, diffable, easy to export. |
 | Linux vault | TPM2-sealed key encrypting a vault file owned by `_morsec`; falls back to a file readable only by `_morsec` when there's no TPM | PRD §6. |
-| Menu-bar app | SwiftUI, client of `msd` | v1.0. |
+| Menu-bar app | none (L25 deferred) | CLI only for now. |
 | Release | A local release script on macOS (no hosted CI in v1, D7): Developer ID signing and notarization, Homebrew tap, SBOM, signed checksums | PRD §9 supply chain. |
 
 ### 3.7 Repository layout (loop ownership)
@@ -275,10 +288,7 @@ crates/
   ms-mcp/                  MCP server                                                   (L14)
   msd/                     daemon binary, service wiring, launchd/systemd units         (L07)
   ms-cli/                  `ms` binary; each command in its own module                  (L00 skeleton; owners per command)
-apps/
-  MorsecApprove/           Swift approval helper                                        (L11)
-  MorsecBar/               Swift menu-bar app                                           (L25)
-packaging/                 Homebrew formula and cask, signing, notarization, SBOM       (L10, L28)
+packaging/                 Homebrew formula, signing, notarization, SBOM                (L10, L28)
 tests/e2e/                 fake agent, canary secrets, real-agent runs                  (L09, L17)
 docs/                      this plan, threat model (L24), evidence/<slug>.md per loop
 ```
@@ -561,7 +571,8 @@ may change, besides its own `docs/evidence/<slug>.md` and its rows in `ARI42.md`
 - **Depends on:** L07. **Owns:** `packaging/`, `scripts/release.sh` (local; no hosted CI in v1, D7).
 - **Build:**
   - Reproducible builds (`SOURCE_DATE_EPOCH`, `--locked`, `--remap-path-prefix`).
-  - Developer ID signing, hardened runtime and notarization for `ms`, `msd` and the helper app.
+  - Developer ID signing, hardened runtime and notarization for `ms` and `msd` (there is no
+    helper app since the CLI-only decision).
   - Homebrew tap `csakash/tap` with the formula `morsec`, installing `ms` and the `mors`
     symlink. `brew install morsec` works once the tap is added; homebrew-core comes later.
   - SBOM (CycloneDX) and signed checksums (minisign).
@@ -580,18 +591,28 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
 **3a: parallel**
 
 #### L11 `approvals-macos` · L
-- **Depends on:** L07. **Owns:** `crates/ms-approve/src/macos/`, `apps/MorsecApprove/`.
+- **Depends on:** L07. **Owns:** `crates/ms-approve/src/macos/`, the approval prompt in `ms-cli`.
+  No `apps/MorsecApprove/`: approvals happen in the CLI (decision of 2026-11-14).
 - **Build:**
-  - The Swift helper draws the mockup's dialog: agent, project, session start, exact command,
-    key and tier, effect preview, scope, and Deny / Approve with Touch ID.
-  - `LAContext` with `.deviceOwnerAuthenticationWithBiometrics`, falling back to the password.
+  - The approval details are printed on the user's own terminal (`/dev/tty`, never stdout or
+    stderr, which an agent may read or fake): agent, project, session start, exact command, key
+    and tier, effect preview, scope, and Deny / Approve.
+  - Agent-supplied strings are shown as inert text: control characters, ANSI and bidi overrides
+    escaped, nothing truncated in a way that hides arguments, long arguments wrapped in full.
+  - `ms` (or msd) confirms with Touch ID through `LocalAuthentication` (`LAContext`,
+    `.deviceOwnerAuthenticationWithBiometrics`), falling back to the login password
+    (`.deviceOwnerAuthentication`) when there is no Touch ID or it fails.
+  - An agent can't approve its own request: the approving `ms` must be outside every agent
+    session (the check today's `at_terminal` path uses, L06 process tree) and attached to a
+    terminal, and msd shows the prompt for its own pending request, never for text a caller sent.
   - Bound token: HMAC(session, key, argv hash, cwd, scope, expiry). Scopes are "this exact command
     once" (the default) and "this exact command for this session" (PRD §7.2).
-  - A timeout rejects. One approval prompt is shown at a time.
-  - Agent-supplied strings are shown as inert text: control characters escaped, nothing truncated
-    in a way that hides arguments, and long arguments scrollable.
+  - A timeout rejects. One approval prompt is shown at a time, and prompts are rate-limited (open
+    from L05, S4).
+  - Replace `msd::approve::DenyApprover` and remove the pre-L11 `at_terminal` paths (L07 hand-over).
 - **Verify:** "change one argument after approval → the executor refuses"; "timeout → rejected";
-  a dialog-rendering test with ANSI, RTL-override and newline payloads (INJ-3).
+  "approve from inside an agent session → refused"; a rendering test with ANSI, RTL-override and
+  newline payloads (INJ-3); Touch ID itself is a recorded manual check.
 - **ARI-42:** AUTH-3, INJ-3.
 
 #### L12 `run-core` · L
@@ -649,7 +670,7 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
   - Read-only rules set `default_transaction_read_only=on` and check a read-only role.
   - Effect preview for production writes: simple DML runs inside `BEGIN … ROLLBACK` to get a row
     count ("3 rows in orders"), skipped when the statement has volatile functions or triggers. If
-    the count can't be computed safely, the dialog says "unknown".
+    the count can't be computed safely, the approval prompt says "unknown".
 - **Verify:** a write on a read-only rule fails; the password never appears in `argv` (`ps`
   check); the production `update` from the mockup prompts, and once approved runs exactly once;
   the preview never commits.
@@ -677,8 +698,53 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
   doctor fails loudly.
 - **ARI-42:** INJ-4 (verify from inside the runtime), SDLC-2.
 
+#### L29 `egress-allowlist` · M
+Follow-up D2 from L08, written up by `cli-scope` (too big for that loop).
+- **Problem:** `ms connect claude-code` points Claude Code's sandbox at msd
+  (`sandbox.network.httpProxyPort`). With a custom proxy port, Claude Code stops filtering and
+  msd filters everything, but msd's tunnel allowlist (`ProxyConfig.allow`) is always empty
+  (`crates/msd/src/proxy.rs` `build`). So every host no key is bound to is refused, including the
+  user's own `allowedDomains` (npm, git hosts) and rule hosts that can't be bound (wildcards, a
+  provider with no credential location). Sandboxed Bash can reach only key-bound hosts.
+- **Depends on:** L07, L08. **Owns:** an `[egress]` section in `crates/ms-rules/`, the allowlist
+  wiring in `crates/msd/src/proxy.rs`, the tunnel kill-switch check in `crates/ms-proxy/`,
+  `ms rules` support, and the allowlist in the Claude connector.
+- **Build:**
+  - The allowlist lives in the MAC'd `rules.toml`: `[egress] allow = ["registry.npmjs.org",
+    "*.github.com"]` (exact names or `*.suffix`, validated like `ProxyConfig.allow`). Empty by
+    default. msd never reads it from an agent-writable file: not Claude Code's `settings.json`,
+    not the connector state, not `.morsec.toml`.
+  - Adding a host loosens the rules, so it needs an approval (`RulesProposeLoosen`, Touch ID once
+    L11 lands); removing one tightens and is saved. A project `.morsec.toml` may only narrow it
+    (intersection), like every other rule.
+  - msd sets `ProxyConfig.allow` from it, and the proxy rebuilds when the allowlist changes (today
+    it rebuilds only when bindings change).
+  - Kill switch: the allow-listed tunnel path doesn't consult policy today, so `ms stop` would
+    not close it. Allow-listed CONNECTs and plain requests must check the stop flag and the
+    session's LOG-2 stop, and `ms stop` closes open tunnels (AUTH-4).
+  - `ms connect claude-code` writes the same list to `allowedDomains` (plus rule hosts), and warns
+    about `allowedDomains` entries the user already had that msd will refuse, with the
+    `ms rules` command that would allow them.
+  - Tunnelled hosts are never MITM'd and never get a key; a `ms://` ref sent to one is still
+    refused and recorded (L05 behaviour).
+- **Verify:** an allow-listed host tunnels and an unlisted one gets `403` plus a block event; a
+  wildcard matches subdomains only; a tampered rules file gives an empty allowlist (fail closed);
+  adding a host without approval is refused; a project file can't widen it (property test);
+  after `ms stop` an allow-listed CONNECT is refused and an open tunnel is closed; the connector
+  golden includes the list.
+- **ARI-42:** INJ-4, AUTH-4, SDLC-2, SDLC-4.
+
 **v0.2 gate** (PRD: run mode for Postgres and SSH/git, Codex connector, Touch ID approvals,
-`ms doctor`): L11–L17 merged. `ms scan` across the dogfood users' transcripts finds zero values.
+`ms doctor`): L11–L17 and L29 merged. `ms scan` across the dogfood users' transcripts finds zero
+values.
+
+**First public CLI release (after v0.2).** The first public release is the CLI, cut once the
+v0.2 gate passes, with `scripts/release.sh` (L10) and the Homebrew tap. Before it, a light
+hardening pass is pulled forward from L24 (as one small loop, `hardening-lite`): the STRIDE threat
+model (`docs/threat-model.md`) and fuzz targets for the dotenv parser, the proxy request head and
+the IPC framing, each run until it stops finding new coverage, with any crash fixed. The rest of
+L24 (Miri and sanitizers, long fuzzing runs, the review of every `ARI42.md` row, the external
+review package) stays in L24.
 
 ### Wave 4 (v0.3)
 
@@ -716,7 +782,8 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
   - A `_morsec` system user owns the daemon (systemd), the vault and the receipts.
   - TPM2-sealed vault key, with a fallback to a file readable only by `_morsec`.
   - `SO_PEERCRED` and `/proc` session identity.
-  - polkit-based approval prompt showing the exact command.
+  - The L11 terminal approval prompt, confirmed through polkit (or the user's password) instead of
+    Touch ID.
   - System CA trust differs per distro: use bundle variables plus `update-ca-certificates`.
   - `.deb` and `.rpm` packages and Homebrew on Linux.
 - **Verify:** the agent's user can't read the vault files or the daemon's memory; the approval
@@ -746,6 +813,8 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
 
 #### L24 `hardening` · M
 - **Depends on:** all of wave 4a. **Owns:** `docs/threat-model.md`, `fuzz/`, fixes routed as small follow-up loops.
+  The threat model and the dotenv, request-head and IPC fuzz targets are started earlier, by the
+  pre-release hardening pass (see "First public CLI release"); L24 extends them.
 - **Build:** a STRIDE threat model for every process boundary; continuous fuzzing of the dotenv
   parser, the proxy request head and the IPC framing; a pass with Miri and sanitizers over
   `unsafe`; a review of every `ARI42.md` row; an external review package (architecture, threat
@@ -759,9 +828,14 @@ security review): L18–L24 merged. **Human:** the external review is booked and
 
 ### Wave 5 (v1.0)
 
-**5a: parallel**
+**5a: parallel** (L26 and L27; L25 is deferred)
 
-#### L25 `menubar-app` · L
+#### L25 `menubar-app` · L · **deferred (out of scope)**
+- **Out of scope as of 14 November 2026.** The user decided morsec ships as a CLI only for now.
+  Every item on this screen already has a CLI command (`ms status`, `ms log`, `ms log --export`,
+  `ms add`, `ms stop`), and an app would add a signed Swift target, UI tests and a second approval
+  surface to build and review for a solo maintainer. L28 no longer depends on it. It can come back
+  as its own loop after 1.0; the card below is kept as it was for that.
 - **Depends on:** L11, L02. **Owns:** `apps/MorsecBar/`.
 - **Build:** the mockup's screen 4. Keys (name, mode, tier) with Add key going through the `ms add`
   flow; connected agents; today's record; Export for review; Stop all agent access. Approvals move
@@ -790,14 +864,15 @@ security review): L18–L24 merged. **Human:** the external review is booked and
 **5b: sequential**
 
 #### L28 `release-1.0` · M
-- **Depends on:** L25–L27. **Owns:** `packaging/` (cask), `docs/`, `README.md`.
-- **Build:** a notarized app cask, onboarding docs, a measured time to first protected session,
-  migration notes from v0.x, and the 1.0 signed release.
+- **Depends on:** L26, L27. **Owns:** `packaging/` (Homebrew formula), `docs/`, `README.md`.
+- **Build:** a CLI release: the Homebrew formula (`ms` and `mors`), onboarding docs, a measured
+  time to first protected session, migration notes from v0.x, and the 1.0 signed and notarized
+  release of `ms` and `msd`. No app and no cask (CLI-only decision).
 - **Verify:** a clean-machine install-to-protected-session run under 5 minutes; release artifacts
   verified.
 
-**v1.0 gate** (PRD: menu-bar app, 1Password/Bitwarden import, ARI-42 export): **Human:** 3 startups
-use the export in a real customer security review.
+**v1.0 gate** (PRD: 1Password/Bitwarden import, ARI-42 export; the PRD's menu-bar app is deferred
+by the CLI-only decision): **Human:** 3 startups use the export in a real customer security review.
 
 ---
 
@@ -850,9 +925,9 @@ Every loop's `PROOF.md` lists the ARI-42 checks it ran and their results.
 | D1 | GitHub plan: protect `main` (Pro), or keep relying on loop discipline | Pro, before wave 1, when parallel loops start merging | nothing technical |
 | D2 | Apple Developer Program ($99/yr) for Developer ID signing and notarization | Yes. Keychain binding to the signed binary (L01) and the release (L10) need it | L01 spike, L10 |
 | D3 | Make the isolated runner (separate `_morsec` user, admin prompt at install) the macOS default | Opt-in at v0.3, default at v1.0 if onboarding stays under 5 minutes | L23 |
-| D4 | Rust core and Swift UI (vs Go) | Rust, for reliable zeroization and memory safety | L00 |
+| D4 | Rust core and Swift UI (vs Go) | Rust, for reliable zeroization and memory safety. **Decided 2026-11-14: CLI only, no Swift UI** (L11 approves in the terminal; L25 deferred) | L00 |
 | D5 | Homebrew tap now, homebrew-core later | Tap (`csakash/tap`) | L10 |
-| D6 | Approval scope default: "exact command once" (mockup) vs "once per session" (PRD §5) | Exact command once by default; "for this session" as an explicit choice in the dialog | L11 |
+| D6 | Approval scope default: "exact command once" (mockup) vs "once per session" (PRD §5) | Exact command once by default; "for this session" as an explicit choice in the prompt | L11 |
 | D7 | Hosted CI (GitHub Actions) in v1 | **Decided 2026-11-13: no.** All checks run locally in `scripts/check.sh`; gloop's build gate runs it via `package.json`. Revisit if the GitHub plan changes. | L00, L09, L10 |
 
 ## 9. Risks specific to the build
