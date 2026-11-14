@@ -74,6 +74,22 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<RunEnv>,
     },
+    /// Call an `ms mcp` tool (L14). msd rebuilds the tool catalog from its own rules, refuses
+    /// the call when `rules_version` is not the version in force, validates `arguments` against
+    /// the tool's JSON Schema, builds the argv and environment from the tool (the key is the
+    /// tool's, never an argument) and runs it like `Run`. Answered with
+    /// [`ResponseBody::RunResult`] or [`ResponseBody::Error`]; every call leaves a receipt.
+    McpCall {
+        /// Tool name, as the agent sent it.
+        tool: String,
+        /// The rules version the caller's tool list was built from.
+        rules_version: u64,
+        /// Working directory of the `ms mcp` process.
+        cwd: PathBuf,
+        /// The tool arguments, as the agent sent them (unvalidated).
+        #[serde(default)]
+        arguments: serde_json::Value,
+    },
     /// Stdin bytes for the running `RunStream` (base64). Only valid inside a stream.
     RunInput {
         /// Standard base64.
@@ -191,6 +207,7 @@ impl RequestBody {
             | RequestBody::RunStream { .. }
             | RequestBody::RunInput { .. }
             | RequestBody::RunInputEnd => "L12 run-core",
+            RequestBody::McpCall { .. } => "L14 mcp-server",
             RequestBody::Mint { .. } => "L18 mint-aws",
             RequestBody::RulesGet { .. } | RequestBody::RulesProposeLoosen { .. } => "L07 daemon",
             RequestBody::Stop | RequestBody::Start { .. } => "L07 daemon",

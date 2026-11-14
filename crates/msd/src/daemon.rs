@@ -20,6 +20,7 @@ use ms_session::Caller;
 use ms_vault::{Vault, VaultExt};
 use tokio::sync::watch;
 
+mod mcp;
 mod run;
 
 use crate::backend::{Backend, DAEMON_STATE_KEY, RULES_HMAC_KEY};
@@ -645,7 +646,15 @@ impl Daemon {
                 "morsec: ms scan can't run inside an agent session. Run it from your own terminal",
             ),
             RequestBody::Scan => self.scan(&session),
-            RequestBody::Run { argv, cwd, env } => run::run_buffered(self, peer, argv, cwd, env),
+            RequestBody::Run { argv, cwd, env } => {
+                run::run_buffered(self, peer, argv, cwd, env, None)
+            }
+            RequestBody::McpCall {
+                tool,
+                rules_version,
+                cwd,
+                arguments,
+            } => mcp::call(self, peer, &session, &tool, rules_version, cwd, &arguments),
             RequestBody::RunStream { .. }
             | RequestBody::RunInput { .. }
             | RequestBody::RunInputEnd => reply_err(
