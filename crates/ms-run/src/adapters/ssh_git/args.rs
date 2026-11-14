@@ -43,27 +43,46 @@ pub fn check(tool: Tool, args: &[String], pins: &[HostPin]) -> Result<(), RunErr
     }
 }
 
+/// The git subcommands a morsec key can run with (review R1): the ones that talk to a remote and
+/// start no program the caller chose. Aliases, `rebase --exec`, `submodule foreach`,
+/// `bisect run`, `difftool -x`, `clone -c/--template` and the like are refused with them.
+pub const GIT_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "ls-remote"];
+
 fn check_git(args: &[String]) -> Result<(), RunError> {
-    match args.first() {
-        None => Err(RunError::invalid(
+    let Some(sub) = args.first() else {
+        return Err(RunError::invalid(
             "morsec: name a git subcommand, e.g. git push",
-        )),
-        Some(a) if a.starts_with('-') => Err(RunError::denied(format!(
+        ));
+    };
+    if sub.starts_with('-') {
+        return Err(RunError::denied(format!(
             "morsec: git options before the subcommand ({}) are refused with a morsec key: they can change which config, repository or programs git uses. Run from the repository directory instead",
-            crate::printable(a)
-        ))),
-        Some(_) if args.iter().any(|a| a.starts_with("--recurse-submodules")) => {
-            Err(RunError::denied(
-                "morsec: --recurse-submodules is refused with a morsec key: a submodule's own git config is not checked",
-            ))
-        }
-        Some(sub) if sub == "credential" || sub.starts_with("credential-") => {
-            Err(RunError::denied(
-                "morsec: git credential commands print credentials, so they don't run with a morsec key",
-            ))
-        }
-        Some(_) => Ok(()),
+            crate::printable(sub)
+        )));
     }
+    if !GIT_SUBCOMMANDS.contains(&sub.as_str()) {
+        return Err(RunError::denied(format!(
+            "morsec: git {} doesn't run with a morsec key; only git {} do",
+            crate::printable(sub),
+            GIT_SUBCOMMANDS.join(", git ")
+        )));
+    }
+    for a in &args[1..] {
+        if a == "--" {
+            break;
+        }
+        if a.starts_with("--recurse-submodules") {
+            return Err(RunError::denied(
+                "morsec: --recurse-submodules is refused with a morsec key: a submodule's own git config is not checked",
+            ));
+        }
+        if a.starts_with("--signed") || a.starts_with("--gpg-sign") || a.starts_with("-S") {
+            return Err(RunError::denied(
+                "morsec: signing (--signed, -S) is refused with a morsec key: it runs a signing program",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn check_ssh(args: &[String], pins: &[HostPin]) -> Result<(), RunError> {
@@ -347,6 +366,13 @@ mod tests {
             &["--config-env=a=b", "push"],
             &["credential", "fill"],
             &["credential-store", "get"],
+            &["x"],
+            &["rebase", "--exec", "sh", "main"],
+            &["submodule", "foreach", "sh"],
+            &["bisect", "run", "sh"],
+            &["clone", "-c", "a=b", "https://x/y"],
+            &["push", "--signed", "origin"],
+            &["pull", "-S"],
             &["push", "--recurse-submodules=on-demand"],
             &[],
         ] {

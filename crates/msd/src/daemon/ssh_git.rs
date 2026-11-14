@@ -274,7 +274,7 @@ impl Daemon {
         run_keys: &std::collections::BTreeSet<KeyName>,
         run: RunContext,
     ) -> Result<Prepared, RunError> {
-        let git = if sg.cred.is_some() {
+        let git = if sg.tool == Tool::Git {
             Some(runner.resolver().resolve("git")?)
         } else {
             None

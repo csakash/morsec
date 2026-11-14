@@ -161,7 +161,7 @@ pub struct Setup {
     pub cred: Option<CredSetup>,
     /// The run's canonical working directory.
     pub cwd: PathBuf,
-    /// Absolute path of `git` (for the credential config check), when `cred` is set.
+    /// Absolute path of `git`, for the repository config check (required when `tool` is git).
     pub git: Option<PathBuf>,
     /// `PATH` and the base environment the child gets (for the config check).
     pub base_env: Vec<(OsString, OsString)>,
@@ -284,6 +284,21 @@ impl Session {
             tasks: Vec::new(),
         };
         let _enter = rt.enter();
+        // Before git starts (review R1): the repository's own config may hold only plain keys,
+        // and the credential side compares against this snapshot when it is asked.
+        let snapshot = if setup.tool == Tool::Git {
+            let git = setup.git.as_deref().ok_or_else(|| {
+                RunError::internal("morsec: no git to check the repository's config with")
+            })?;
+            let raw = cred::read_config(git, &setup.cwd, &git_env(&setup.base_env))
+                .map_err(|e| RunError::denied(format!("morsec: {e}")))?;
+            if let Some(why) = cred::config_violation(&raw) {
+                return Err(RunError::denied(format!("morsec: {why}")));
+            }
+            raw
+        } else {
+            Vec::new()
+        };
         if let Some(ssh) = &setup.ssh {
             let public = vault
                 .read_with(&ssh.key, |v| {
@@ -333,6 +348,7 @@ impl Session {
                 git,
                 cwd: setup.cwd.clone(),
                 env: git_env(&setup.base_env),
+                snapshot: snapshot.clone(),
                 answers: AtomicUsize::new(0),
             });
             let listener = listen(&sock)?;
@@ -456,16 +472,21 @@ where
             tokio::time::sleep(Duration::from_millis(20)).await;
             continue;
         };
-        if !shared.peer_ok(&stream).await {
-            continue;
-        }
-        let Some(std) = shared.adopt(stream) else {
-            continue;
-        };
+        // Checked on a task of its own, so a peer that connects before the run's group is
+        // known can't hold up the others (review R8).
+        let shared = shared.clone();
         let h = handle.clone();
-        tokio::task::spawn_blocking(move || {
-            h(&std);
-            hang_up(&std);
+        tokio::spawn(async move {
+            if !shared.peer_ok(&stream).await {
+                return;
+            }
+            let Some(std) = shared.adopt(stream) else {
+                return;
+            };
+            tokio::task::spawn_blocking(move || {
+                h(&std);
+                hang_up(&std);
+            });
         });
     }
 }
@@ -606,6 +627,15 @@ impl RunAdapter for SshGitAdapter<'_> {
                 for (k, v) in git_env(&[]) {
                     env.push((k, EnvValue::Plain(v)));
                 }
+                // Programs git would start for the caller: none (review R1).
+                for (k, v) in [
+                    ("GIT_PAGER", "cat"),
+                    ("GIT_EDITOR", "true"),
+                    ("GIT_SEQUENCE_EDITOR", "true"),
+                    ("GIT_MERGE_AUTOEDIT", "no"),
+                ] {
+                    env.push(plain(k, v));
+                }
                 let mut config: Vec<(String, String)> = vec![
                     ("core.hooksPath".into(), "/dev/null".into()),
                     ("core.fsmonitor".into(), "false".into()),
@@ -614,6 +644,10 @@ impl RunAdapter for SshGitAdapter<'_> {
                     ("submodule.recurse".into(), "false".into()),
                     ("push.recurseSubmodules".into(), "no".into()),
                     ("fetch.recurseSubmodules".into(), "false".into()),
+                    ("gpg.program".into(), "false".into()),
+                    ("gpg.ssh.program".into(), "false".into()),
+                    ("gpg.x509.program".into(), "false".into()),
+                    ("diff.external".into(), String::new()),
                 ];
                 // Only the transports this run needs (review R1): no local paths (a local
                 // push runs receive-pack and the remote's hooks inside the run), no `ext::`,

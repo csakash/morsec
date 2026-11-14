@@ -8,7 +8,7 @@
 
 use std::ffi::OsString;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,6 +46,8 @@ pub(crate) struct CredCtx {
     pub(crate) git: PathBuf,
     pub(crate) cwd: PathBuf,
     pub(crate) env: Vec<(OsString, OsString)>,
+    /// The config as checked before the child started ([`read_config`]).
+    pub(crate) snapshot: Vec<u8>,
     pub(crate) answers: AtomicUsize,
 }
 
@@ -206,37 +208,33 @@ pub(crate) fn allowed_repo_key(scope: &str, name: &str) -> bool {
         || (n.starts_with("branch.") && ["remote", "merge", "rebase", "pushremote"].contains(&last))
 }
 
-/// Why the repository's config makes the credential unsafe to hand out, if it does. Runs
-/// `git config --list --show-scope --name-only --includes` in the run's directory with the run's
-/// git environment (no system or global config); a failure or timeout refuses (fail closed).
-fn config_problem(ctx: &CredCtx) -> Option<String> {
-    let child = Command::new(&ctx.git)
-        .args([
-            "config",
-            "--list",
-            "--show-scope",
-            "--name-only",
-            "--includes",
-        ])
+/// The repository's effective git config, as `git config --list --show-scope --includes -z`
+/// prints it, run in `cwd` with the run's git environment (no system or global config). A
+/// failure or a timeout (an include pointing at a FIFO) is an error: callers fail closed.
+pub(crate) fn read_config(
+    git: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+) -> Result<Vec<u8>, String> {
+    const CANT: &str = "the repository's git config could not be checked";
+    let mut child = Command::new(git)
+        .args(["config", "--list", "--show-scope", "--includes", "-z"])
         .env_clear()
-        .envs(ctx.env.iter().map(|(k, v)| (k, v)))
-        .current_dir(&ctx.cwd)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(_) => return Some("the repository's git config could not be checked".into()),
-    };
-    // Read on a thread so a hung git (an include pointing at a FIFO) can't block msd.
+        .spawn()
+        .map_err(|_| CANT.to_owned())?;
+    // Read on a thread so a hung git can't block msd.
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
-        let mut text = String::new();
+        let mut raw = Vec::new();
         if let Some(out) = stdout {
-            let _ = out.take(MAX_CONFIG_OUTPUT).read_to_string(&mut text);
+            let _ = out.take(MAX_CONFIG_OUTPUT).read_to_end(&mut raw);
         }
-        text
+        raw
     });
     let deadline = Instant::now() + CONFIG_CHECK_TIMEOUT;
     let status = loop {
@@ -250,32 +248,55 @@ fn config_problem(ctx: &CredCtx) -> Option<String> {
             }
         }
     };
-    let text = reader.join().unwrap_or_default();
-    if !status.is_some_and(|s| s.success()) {
-        return Some("the repository's git config could not be checked".into());
+    let raw = reader.join().unwrap_or_default();
+    if status.is_some_and(|s| s.success()) {
+        Ok(raw)
+    } else {
+        Err(CANT.to_owned())
     }
-    let bad: Vec<&str> = text
-        .lines()
-        .filter_map(|l| l.split_once('\t'))
-        .filter(|(scope, name)| !allowed_repo_key(scope, name))
-        .map(|(_, name)| name)
-        .take(3)
-        .collect();
+}
+
+/// Why `raw` (from [`read_config`]) is unsafe for a run with a morsec key, if it is: any key in
+/// the repository's own files outside [`allowed_repo_key`].
+pub(crate) fn config_violation(raw: &[u8]) -> Option<String> {
+    let mut fields = raw.split(|b| *b == 0);
+    let mut bad = Vec::new();
+    while let (Some(scope), Some(entry)) = (fields.next(), fields.next()) {
+        let scope = String::from_utf8_lossy(scope);
+        let name_bytes = entry.split(|b| *b == b'\n').next().unwrap_or_default();
+        let name = String::from_utf8_lossy(name_bytes);
+        if !allowed_repo_key(&scope, &name) && bad.len() < 3 {
+            bad.push(
+                name.chars()
+                    .take(80)
+                    .flat_map(char::escape_default)
+                    .collect::<String>(),
+            );
+        }
+    }
     if bad.is_empty() {
         None
     } else {
         Some(format!(
-            "the repository's git config sets {} (with a git credential, a repository may set only plain keys such as remote.<name>.url and branch.<name>.merge: others can run programs or send the token elsewhere); remove them from .git/config",
-            bad.iter()
-                .map(|n| n
-                    .chars()
-                    .take(80)
-                    .flat_map(char::escape_default)
-                    .collect::<String>())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "the repository's git config sets {} (with a morsec key a repository may set only plain keys such as remote.<name>.url and branch.<name>.merge: others can run programs or send a credential elsewhere); remove them from .git/config",
+            bad.join(", ")
         ))
     }
+}
+
+/// The check at credential time: the config must be the one checked before git started
+/// (review R1: a program could change it in between), and still allowed.
+fn config_problem(ctx: &CredCtx) -> Option<String> {
+    let raw = match read_config(&ctx.git, &ctx.cwd, &ctx.env) {
+        Ok(r) => r,
+        Err(e) => return Some(e),
+    };
+    if raw != ctx.snapshot {
+        return Some(
+            "the repository's git config changed while the command ran, so morsec gives no credential".into(),
+        );
+    }
+    config_violation(&raw)
 }
 
 #[cfg(test)]
@@ -283,7 +304,15 @@ mod tests {
     use super::*;
     use crate::adapters::ssh_git::tests_support::{FakeAudit, vault_with};
 
+    fn env() -> Vec<(OsString, OsString)> {
+        vec![
+            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+        ]
+    }
+
     fn ctx(cwd: PathBuf) -> (CredCtx, Arc<FakeAudit>) {
+        let snapshot = read_config(Path::new("/usr/bin/git"), &cwd, &env()).unwrap();
         let audit = Arc::new(FakeAudit::default());
         let (vault, key) = vault_with("ghp_CREDCANARY_1234");
         (
@@ -294,10 +323,8 @@ mod tests {
                 audit: audit.clone(),
                 git: PathBuf::from("/usr/bin/git"),
                 cwd,
-                env: vec![
-                    ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
-                    ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
-                ],
+                snapshot,
+                env: env(),
                 answers: AtomicUsize::new(0),
             },
             audit,
@@ -353,29 +380,43 @@ mod tests {
             assert!(e.len() == 1 && e[0].refused.is_some(), "{e:?}");
         }
 
-        // A repository that adds a proxy or a credential helper: refused.
+        // A repository that adds a proxy, a helper, an include or an alias: refused, whether
+        // the key was there before the run started or added while it ran (review R1).
+        let git = |a: &[&str]| {
+            let ok = Command::new("/usr/bin/git")
+                .args(a)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(ok.success(), "{a:?}");
+        };
         for (k, v) in [
             ("http.https://git.example.com/.proxy", "http://127.0.0.1:9"),
             ("credential.helper", "!cat"),
             ("include.path", "/tmp/x"),
             ("remote.origin.proxy", "http://127.0.0.1:9"),
+            ("alias.x", "!sh -c true"),
         ] {
-            let (c, _) = ctx(repo.clone());
-            let set = Command::new("/usr/bin/git")
-                .args(["config", "--local", k, v])
-                .current_dir(&repo)
-                .status()
-                .unwrap();
-            assert!(set.success());
-            let a = ask(&c, good);
-            assert_eq!(a, "", "{k}");
-            let unset = Command::new("/usr/bin/git")
-                .args(["config", "--local", "--unset-all", k])
-                .current_dir(&repo)
-                .status()
-                .unwrap();
-            assert!(unset.success());
+            git(&["config", "--local", k, v]);
+            let (c, audit) = ctx(repo.clone());
+            assert_eq!(ask(&c, good), "", "{k}");
+            let why = audit.events()[0].refused.clone().unwrap();
+            assert!(why.contains("sets"), "{why}");
+            git(&["config", "--local", "--unset-all", k]);
         }
+        // Even a plain key changed after the run started refuses: the config is not the one
+        // that was checked.
+        let (c, audit) = ctx(repo.clone());
+        git(&["config", "--local", "user.name", "x"]);
+        assert_eq!(ask(&c, good), "");
+        assert!(
+            audit.events()[0]
+                .refused
+                .as_deref()
+                .unwrap()
+                .contains("changed")
+        );
+        git(&["config", "--local", "--unset", "user.name"]);
 
         // The cap: 4 answers, then one receipt for the limit, then silence.
         let (c, audit) = ctx(repo);

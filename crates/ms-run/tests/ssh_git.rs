@@ -104,7 +104,11 @@ fn run_git(repo: &Path, args: &[&str], request: &str) -> (Option<i32>, String, V
     };
     let keys = BTreeSet::from([k]);
     let (code, out) = rt.block_on(async {
-        let session = Session::start(setup, v.clone(), log.clone()).unwrap();
+        let session = match Session::start(setup, v.clone(), log.clone()) {
+            Ok(s) => s,
+            // Refused before git starts: no exit code, the message as output.
+            Err(e) => return (None, e.message),
+        };
         let adapter = SshGitAdapter::new(&resolver, &session);
         let mut prepared = runner
             .plan_with(&adapter, &input, &call, &keys, &*v)
@@ -206,15 +210,10 @@ fn helper_gives_the_token_only_to_bound_hosts() {
     );
     let (code, out, events) = fill(&repo, "protocol=https\nhost=git.example.com\n\n");
     assert!(!marker.exists());
-    // The repository helper is also a reason to refuse.
-    assert_ne!(code, Some(0), "{out}");
-    assert!(
-        events[0]
-            .refused
-            .as_deref()
-            .unwrap()
-            .contains("credential.helper")
-    );
+    // The repository helper refuses the run before git starts (review R1).
+    assert_eq!(code, None, "{out}");
+    assert!(out.contains("credential.helper"), "{out}");
+    assert!(events.is_empty());
     git(
         &repo,
         &["config", "--local", "--unset-all", "credential.helper"],
@@ -283,11 +282,9 @@ fn repository_config_cant_start_a_token_reader() {
         &["config", "--local", "protocol.file.allow", "always"],
     );
     let (code, out, _) = run_git(&repo, &["push", "origin", "main"], "");
-    assert_ne!(code, Some(0), "{out}");
-    assert!(
-        !leak.exists() || std::fs::read_to_string(&leak).unwrap().is_empty(),
-        "{out}"
-    );
+    assert_eq!(code, None, "{out}");
+    assert!(out.contains("remote.origin.receivepack"), "{out}");
+    assert!(!leak.exists());
     // The config check alone would catch the keys above; with only a remote URL (an allowed
     // key) left, the forced protocol policy is what stops an `ext::` remote.
     git(
