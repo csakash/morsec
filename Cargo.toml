@@ -16,6 +16,8 @@ members = [
     "crates/ms-mcp",
     "crates/msd",
     "crates/ms-cli",
+    "crates/ms-scan",
+    "tests/e2e",
 ]
 
 [workspace.package]
@@ -53,6 +55,7 @@ ms-mint = { path = "crates/ms-mint" }
 ms-approve = { path = "crates/ms-approve" }
 ms-connect = { path = "crates/ms-connect" }
 ms-mcp = { path = "crates/ms-mcp" }
+ms-scan = { path = "crates/ms-scan" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
 serde = { version = "1", features = ["derive"] }

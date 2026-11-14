@@ -19,6 +19,7 @@ need cargo "https://rustup.rs"
 need cargo-deny "cargo install --locked cargo-deny"
 need cargo-audit "cargo install --locked cargo-audit"
 need python3 "your OS package manager"
+need shellcheck "brew install shellcheck"
 
 step() { printf '\n== %s\n' "$*"; }
 
@@ -32,7 +33,8 @@ step "3/8 cargo clippy"
 cargo clippy --workspace --all-targets --locked -- -D warnings
 
 step "4/8 cargo test"
-cargo test --workspace --locked
+# The canary suite runs in its own step below, so a failure there is named as a security eval.
+cargo test --workspace --locked --exclude ms-e2e
 
 step "5/8 cargo deny"
 cargo deny --locked check
@@ -44,7 +46,20 @@ step "7/8 no patches or overrides; path packages are workspace members"
 # cargo-deny's [sources] does not police path dependencies or patches; this does.
 cargo metadata --format-version 1 --locked | python3 -I scripts/supply_chain_check.py
 
+step "7b release tooling: packaging tests and shellcheck (L10)"
+python3 -I -m unittest discover -s packaging/tests
+shellcheck scripts/release.sh
+
 step "8/8 ARI-42 scan"
 python3 .claude/skills/ari42/scripts/ari42_scan.py check . --fail-on high
+
+step "security-evals (EVAL-1): canary suite, a fake agent against a throwaway msd (L09)"
+# tests/e2e: no canary may reach an agent's output, env, files or receipts, and ms scan must
+# catch a planted leak. Memory vault only; never the login keychain. The real-agent job
+# (tests/e2e/real-agent.sh) is manual or nightly and is not run here.
+cargo test --locked -p ms-e2e
+# msd's own fake-agent test (rules loosening refused, exfiltration blocked, kill switch). It also
+# runs in step 4; it is repeated here so this step holds every security eval.
+cargo test --locked -p msd --test agent_e2e
 
 printf '\ncheck.sh: all checks passed\n'

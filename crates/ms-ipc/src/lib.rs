@@ -14,7 +14,7 @@ pub mod server;
 
 pub use client::Client;
 pub use paths::default_socket_path;
-pub use protocol::{ErrorCode, PROTOCOL_VERSION, RequestBody, ResponseBody};
+pub use protocol::{ErrorCode, PROTOCOL_VERSION, RequestBody, ResponseBody, ScanFinding};
 pub use server::{Handler, PeerCheck, PeerInfo, SameUid, Server, ServerLimits, now_unix_ms};
 
 /// Largest frame accepted, in bytes (1 MiB).

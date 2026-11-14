@@ -1,0 +1,27 @@
+[package]
+name = "ms-e2e"
+description = "End-to-end canary suite (L09): a fake agent against a throwaway msd; run by the security-evals step of scripts/check.sh."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+ms-core = { workspace = true }
+ms-ipc = { workspace = true }
+ms-scan = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+
+# The suite is its own fake agent: copied as `claude`, it runs a shell command as its child, so
+# it needs its own main instead of libtest (same approach as crates/msd/tests/agent_e2e.rs).
+[[test]]
+name = "canary"
+path = "tests/canary.rs"
+harness = false

@@ -1,0 +1,8 @@
+# What scripts/release.sh signs, one per line: <path inside the release, under bin/> <identifier>
+# The identifiers are frozen. The L01 keychain ACL trusts msd's designated requirement
+# (identifier + Developer ID team): changing cc.morsec.msd locks every user out of their keys
+# after an upgrade. packaging/tests pins these values.
+# L11 adds its helper app here, and extends the signing loop in scripts/release.sh for a .app
+# bundle (inside-out signing; machocmp handles thin Mach-O files only). Today only bin/ tools.
+ms cc.morsec.ms
+msd cc.morsec.msd
