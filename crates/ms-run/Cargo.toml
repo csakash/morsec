@@ -14,10 +14,6 @@ workspace = true
 name = "ms-shim"
 path = "src/bin/ms-shim.rs"
 
-[[bin]]
-name = "ms-git-credential"
-path = "src/bin/ms-git-credential.rs"
-
 [dependencies]
 ms-core = { workspace = true }
 ms-vault = { workspace = true }

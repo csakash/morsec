@@ -48,6 +48,29 @@ pub fn check(tool: Tool, args: &[String], pins: &[HostPin]) -> Result<(), RunErr
 /// `bisect run`, `difftool -x`, `clone -c/--template` and the like are refused with them.
 pub const GIT_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "ls-remote"];
 
+/// Long options git would read as one of these (git accepts any unambiguous prefix, so
+/// `--recurse=yes` is `--recurse-submodules=yes`; review R1).
+const REFUSED_GIT_LONG: &[&str] = &["--recurse-submodules", "--signed", "--gpg-sign"];
+
+/// True for `--recurse-submodules`, `--signed`, `--gpg-sign`, any prefix of them git would
+/// accept as an abbreviation (`--rec`, `--gpg`), and `-S` (`--gpg-sign`, also bundled).
+fn refused_git_option(a: &str) -> bool {
+    if let Some(long) = a.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or("");
+        return name.len() >= 2
+            && REFUSED_GIT_LONG
+                .iter()
+                .any(|r| r.trim_start_matches("--").starts_with(name));
+    }
+    // A bundle of short options, e.g. `-vS<keyid>`: refused if it holds S before any value.
+    a.strip_prefix('-').is_some_and(|short| {
+        short
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .any(|c| c == 'S')
+    })
+}
+
 fn check_git(args: &[String]) -> Result<(), RunError> {
     let Some(sub) = args.first() else {
         return Err(RunError::invalid(
@@ -71,15 +94,12 @@ fn check_git(args: &[String]) -> Result<(), RunError> {
         if a == "--" {
             break;
         }
-        if a.starts_with("--recurse-submodules") {
-            return Err(RunError::denied(
-                "morsec: --recurse-submodules is refused with a morsec key: a submodule's own git config is not checked",
-            ));
-        }
-        if a.starts_with("--signed") || a.starts_with("--gpg-sign") || a.starts_with("-S") {
-            return Err(RunError::denied(
-                "morsec: signing (--signed, -S) is refused with a morsec key: it runs a signing program",
-            ));
+        if refused_git_option(a) {
+            return Err(RunError::denied(format!(
+                "morsec: git {} {} is refused with a morsec key: submodule recursion runs with a submodule's own unchecked config, and signing runs a signing program",
+                crate::printable(sub),
+                crate::printable(a)
+            )));
         }
     }
     Ok(())
@@ -357,7 +377,16 @@ mod tests {
     // no_claim=-
     #[test]
     fn git_takes_no_global_options() {
-        assert!(check(Tool::Git, &v(&["push", "origin", "main"]), &[]).is_ok());
+        for ok in [
+            &["push", "origin", "main"][..],
+            &["push", "--force-with-lease", "origin", "main"],
+            &["fetch", "--prune", "origin"],
+            &["pull", "--ff-only"],
+            &["push", "--no-recurse-submodules", "origin"],
+            &["push", "origin", "--", "--recurse"],
+        ] {
+            assert!(check(Tool::Git, &v(ok), &[]).is_ok(), "{ok:?}");
+        }
         for bad in [
             &["-c", "core.sshCommand=x", "push"][..],
             &["-C", "/x", "push"],
@@ -373,6 +402,13 @@ mod tests {
             &["clone", "-c", "a=b", "https://x/y"],
             &["push", "--signed", "origin"],
             &["pull", "-S"],
+            &["pull", "-vS"],
+            &["pull", "--recurse=yes"],
+            &["push", "--recurse=on-demand", "origin"],
+            &["push", "--rec", "origin"],
+            &["fetch", "--recurse-sub"],
+            &["pull", "--gpg"],
+            &["push", "--sign", "origin"],
             &["push", "--recurse-submodules=on-demand"],
             &[],
         ] {

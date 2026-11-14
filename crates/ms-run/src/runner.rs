@@ -81,8 +81,8 @@ impl RunnerConfig {
     }
 }
 
-/// Something that must live exactly as long as a run (L16: the per-run SSH agent and
-/// credential sockets). It learns the child's PID (its process-group id) once the child started,
+/// Something that must live exactly as long as a run (L16: the per-run SSH agent
+/// socket). It learns the child's PID (its process-group id) once the child started,
 /// and is dropped when the run ends, however it ends.
 pub trait RunGuard: Send + Sync + std::fmt::Debug {
     /// The child started with this PID, which is also its process-group id.

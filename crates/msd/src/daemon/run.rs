@@ -202,7 +202,7 @@ impl Daemon {
         };
 
         let rules = effective_for(&user, &real_cwd);
-        // L16: `MS_SSH_KEY` / `MS_GIT_CREDENTIAL` are taken out of the call here (their value
+        // L16: `MS_SSH_KEY` is taken out of the call here (its value
         // never reaches the child) and the ssh/git call is checked against the effective rules.
         let ssh_git = match self.ssh_git_call(runner(), &mut input, &rules) {
             Ok(sg) => sg,

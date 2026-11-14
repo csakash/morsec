@@ -1,21 +1,20 @@
-//! L16 in msd: `ssh` / `git` runs with `MS_SSH_KEY` or `MS_GIT_CREDENTIAL` (SPEC.md).
+//! L16 in msd: `ssh` / `git` runs with `MS_SSH_KEY` (SPEC.md).
 //!
-//! [`Daemon::ssh_git_call`] takes those variables out of a checked call (so the value never goes
-//! into the child's environment, though it is still redacted from the output) and checks the call against the effective rules: the tool, the
-//! pinned host keys or HTTPS hosts, and the caller's arguments. [`Daemon::plan_ssh_git`] starts
-//! the run's [`Session`] (agent and credential sockets), builds the plan with the session's
-//! adapter, and ties the session to the run. Each signature and credential becomes a receipt
-//! through [`RunAudit`] before anything is released.
+//! [`Daemon::ssh_git_call`] takes the variable out of a checked call (so the value never goes
+//! into the child's environment, though it is still redacted from the output) and checks the
+//! call against the effective rules: the tool, the pinned host keys and the caller's arguments.
+//! [`Daemon::plan_ssh_git`] starts the run's [`Session`] (the agent socket), builds the plan
+//! with the session's adapter, and ties the session to the run. Each sign request becomes a
+//! receipt through [`RunAudit`] before anything is signed.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use ms_core::{KeyName, Mode, Reason, ReceiptEvent, ReceiptResult, SecretRef, SessionId};
 use ms_receipts::ReceiptDetail;
-use ms_rules::{NormalHost, Rules};
+use ms_rules::Rules;
 use ms_run::adapters::ssh_git::{
-    self, Action, Audit, AuditEvent, CRED_VAR, CredSetup, HELPER_NAME, HostPin, SSH_VAR, Session,
-    Setup, SshGitAdapter, SshSetup, Tool,
+    self, Action, Audit, AuditEvent, HostPin, SSH_VAR, Session, Setup, SshGitAdapter, SshSetup,
+    Tool,
 };
 use ms_run::{Prepared, RunCall, RunError, RunInput, Runner};
 
@@ -25,18 +24,17 @@ use super::{Daemon, TOUCH_ID_METHOD, now_ms};
 #[derive(Debug)]
 pub(super) struct SshGitCall {
     tool: Tool,
-    ssh: Option<SshSetup>,
-    cred: Option<CredSetup>,
+    ssh: SshSetup,
 }
 
 impl SshGitCall {
     /// The effect line for an approval.
     pub(super) fn effect(&self) -> String {
-        ssh_git::effect(self.ssh.as_ref(), self.cred.as_ref())
+        ssh_git::effect(Some(&self.ssh))
     }
 }
 
-/// What a receipt for one signature or credential carries from its run.
+/// What a receipt for one signature carries from its run.
 #[derive(Debug, Clone)]
 pub(super) struct RunContext {
     pub(super) session: SessionId,
@@ -47,7 +45,7 @@ pub(super) struct RunContext {
     pub(super) approvals: Vec<(KeyName, Option<String>)>,
 }
 
-/// Writes receipts for a run's signatures and credentials, and answers `ms stop`.
+/// Writes receipts for a run's signatures, and answers `ms stop`.
 #[derive(Debug)]
 struct RunAudit {
     daemon: Weak<Daemon>,
@@ -63,10 +61,8 @@ impl Audit for RunAudit {
             .daemon
             .upgrade()
             .ok_or_else(|| "msd is shutting down".to_owned())?;
-        let (what, host) = match &event.action {
-            Action::Sign { host } => ("ssh-sign", host),
-            Action::Credential { host } => ("git-credential", host),
-        };
+        let Action::Sign { host } = &event.action;
+        let what = "ssh-sign";
         let approval_id = self
             .run
             .approvals
@@ -125,19 +121,10 @@ impl Audit for RunAudit {
     }
 }
 
-/// `ms-git-credential` next to msd (or one directory up, for test binaries in `deps/`).
-fn helper_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    [dir.join(HELPER_NAME), dir.parent()?.join(HELPER_NAME)]
-        .into_iter()
-        .find(|p| p.is_file())
-}
-
 impl Daemon {
-    /// Takes `MS_SSH_KEY` / `MS_GIT_CREDENTIAL` out of `input` and checks the call against
-    /// `rules` (the effective rules for its directory). `Ok(None)`: neither is set, an ordinary
-    /// run. `Err((key, message))`: refused.
+    /// Takes `MS_SSH_KEY` out of `input` and checks the call against `rules` (the effective
+    /// rules for its directory). `Ok(None)`: not set, an ordinary run. `Err((key, message))`:
+    /// refused.
     pub(super) fn ssh_git_call(
         &self,
         runner: &Runner,
@@ -145,123 +132,64 @@ impl Daemon {
         rules: &Rules,
     ) -> Result<Option<SshGitCall>, (KeyName, String)> {
         let mut ssh_key = None;
-        let mut cred_key = None;
         let mut kept = Vec::new();
         for (name, value) in std::mem::take(&mut input.env) {
-            let slot = match name.as_str() {
-                SSH_VAR => &mut ssh_key,
-                CRED_VAR => &mut cred_key,
-                _ => {
-                    kept.push((name, value));
-                    continue;
+            if name == SSH_VAR {
+                // The env policy before this already required exactly `ms://<run key>`.
+                if let Ok(r) = SecretRef::parse(&value) {
+                    ssh_key = Some(r.name().clone());
                 }
-            };
-            // The env policy before this already required exactly `ms://<run key>`.
-            if let Ok(r) = SecretRef::parse(&value) {
-                *slot = Some(r.name().clone());
+            } else {
+                kept.push((name, value));
             }
         }
-        // `env_keys` keeps the taken keys: the runner then reads their values only to redact
-        // them from the output (a `git` subcommand that prints a credential shows a label).
+        // `env_keys` keeps the taken key: the runner then reads its value only to redact it
+        // from the output.
         input.env = kept;
-        let Some(first) = ssh_key.clone().or_else(|| cred_key.clone()) else {
+        let Some(k) = ssh_key else {
             return Ok(None);
         };
-        let refuse = |k: &KeyName, m: String| Err((k.clone(), m));
+        let refuse = |m: String| Err((k.clone(), m));
         let Some(tool) = ssh_git::tool_of(&input.argv[0]) else {
-            return refuse(
-                &first,
-                format!(
-                    "morsec: {SSH_VAR} and {CRED_VAR} work only with ssh and git, not {}",
-                    printable(&input.argv[0])
-                ),
-            );
+            return refuse(format!(
+                "morsec: {SSH_VAR} works only with ssh and git, not {}",
+                printable(&input.argv[0])
+            ));
         };
-        let ssh = match &ssh_key {
-            None => None,
-            Some(k) => {
-                let pins: Vec<HostPin> = rules
-                    .keys
-                    .get(k)
-                    .map(|r| {
-                        r.ssh_host_keys
-                            .iter()
-                            .map(|p| HostPin {
-                                host: p.host.clone(),
-                                port: p.port,
-                                key: p.key,
-                            })
-                            .collect()
+        let pins: Vec<HostPin> = rules
+            .keys
+            .get(&k)
+            .map(|r| {
+                r.ssh_host_keys
+                    .iter()
+                    .map(|p| HostPin {
+                        host: p.host.clone(),
+                        port: p.port,
+                        key: p.key,
                     })
-                    .unwrap_or_default();
-                if pins.is_empty() {
-                    return refuse(
-                        k,
-                        format!(
-                            "morsec: {k} has no pinned SSH host keys, so it can't sign any login. Pin the server's key from your own terminal: ms rules {k} --add-ssh-host-key \"$(ssh-keyscan -t ed25519 HOST)\""
-                        ),
-                    );
-                }
-                let ssh = runner
-                    .resolver()
-                    .resolve("ssh")
-                    .map_err(|e| (k.clone(), e.message))?;
-                Some(SshSetup {
-                    key: k.clone(),
-                    pins,
-                    ssh,
-                })
-            }
-        };
-        let cred = match &cred_key {
-            None => None,
-            Some(k) => {
-                let hosts = rules
-                    .keys
-                    .get(k)
-                    .map(|r| r.hosts.clone())
-                    .unwrap_or_default();
-                if hosts.is_empty() {
-                    return refuse(
-                        k,
-                        format!(
-                            "morsec: {k} has no hosts, so git gets no credential anywhere. Bind the git host from your own terminal: ms rules {k} --add-host github.com"
-                        ),
-                    );
-                }
-                if tool != Tool::Git {
-                    return refuse(k, format!("morsec: {CRED_VAR} works only with git"));
-                }
-                let Some(helper) = helper_path() else {
-                    return refuse(
-                        k,
-                        format!(
-                            "morsec: {HELPER_NAME} was not found next to msd, so git can't get the credential. Reinstall morsec"
-                        ),
-                    );
-                };
-                let helper = runner
-                    .resolver()
-                    .resolve(&helper.to_string_lossy())
-                    .map_err(|e| (k.clone(), e.message))?;
-                let shown = hosts.iter().map(ToString::to_string).collect();
-                let allowed = hosts.clone();
-                Some(CredSetup {
-                    key: k.clone(),
-                    host_allowed: Arc::new(move |h: &str| {
-                        NormalHost::parse(h).is_some_and(|n| allowed.iter().any(|p| p.matches(&n)))
-                    }),
-                    hosts_shown: shown,
-                    helper,
-                })
-            }
-        };
-        if tool == Tool::Ssh && ssh.is_none() {
-            return refuse(&first, format!("morsec: ssh needs {SSH_VAR}=ms://<key>"));
+                    .collect()
+            })
+            .unwrap_or_default();
+        if pins.is_empty() {
+            return refuse(format!(
+                "morsec: {k} has no pinned SSH host keys, so it can't sign any login. Pin the server's key from your own terminal: ms rules {k} --add-ssh-host-key \"$(ssh-keyscan -t ed25519 HOST)\""
+            ));
         }
-        let pins = ssh.as_ref().map(|s| s.pins.clone()).unwrap_or_default();
-        ssh_git::args::check(tool, &input.argv[1..], &pins).map_err(|e| (first, e.message))?;
-        Ok(Some(SshGitCall { tool, ssh, cred }))
+        let ssh = match runner.resolver().resolve("ssh") {
+            Ok(p) => p,
+            Err(e) => return refuse(e.message),
+        };
+        if let Err(e) = ssh_git::args::check(tool, &input.argv[1..], &pins) {
+            return refuse(e.message);
+        }
+        Ok(Some(SshGitCall {
+            tool,
+            ssh: SshSetup {
+                key: k.clone(),
+                pins,
+                ssh,
+            },
+        }))
     }
 
     /// Starts the run's session and builds its plan; the session lives as long as the run.
@@ -288,8 +216,7 @@ impl Daemon {
         ];
         let setup = Setup {
             tool: sg.tool,
-            ssh: sg.ssh,
-            cred: sg.cred,
+            ssh: Some(sg.ssh),
             cwd: call.cwd.clone(),
             git,
             base_env,
@@ -322,7 +249,7 @@ mod tests {
     use ms_ipc::{ApprovalScope, ErrorCode, PeerInfo, RequestBody, ResponseBody, RunEnv};
     use ms_session::Caller;
     use ms_vault::memory::MemoryVault;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::sync::Mutex;
 
@@ -744,26 +671,43 @@ mod tests {
         v
     }
 
-    // protects=SPEC D1/D2: MS_SSH_KEY on a key without pinned host keys, MS_GIT_CREDENTIAL on a
-    // key without hosts, and MS_GIT_CREDENTIAL with ssh are refused with a receipt; the variable
-    // never reaches the child; fails_when=any of these runs; no_claim=-
+    // protects=SPEC D1/D2: MS_SSH_KEY on a key without pinned host keys, with a tool other
+    // than ssh or git, or with a git subcommand that runs the caller's commands is refused with
+    // a receipt before anything runs; fails_when=any of these runs; no_claim=-
     #[test]
-    fn needs_pins_and_hosts() {
+    fn needs_pins_and_a_known_call() {
         let tmp = tempfile::tempdir().unwrap();
         let t = std::fs::canonicalize(tmp.path()).unwrap();
         let proj = t.join("proj");
         std::fs::create_dir(&proj).unwrap();
-        let body = format!(
-            "commands = [[\"git\", \"push\"], [\"ssh\", \"h\"]]\nenv = [\"MS_SSH_KEY\", \"MS_GIT_CREDENTIAL\"]\nroots = [\"{}\"]",
-            proj.display()
+        let pin = "AAAAC3NzaC1lZDI1NTE5AAAAIPtd2fa6erUsRui9x7T64boFCGFRwuEig/mwpm4LdTO7";
+        let body = |pins: &str| {
+            format!(
+                "commands = [[\"git\", \"**\"], [\"cat\"]]\nenv = [\"MS_SSH_KEY\"]\nroots = [\"{}\"]{pins}",
+                proj.display()
+            )
+        };
+        let d = daemon(
+            &t,
+            &[
+                ("gh/bare", "x", Tier::Test, body("")),
+                (
+                    "gh/pinned",
+                    "x",
+                    Tier::Test,
+                    body(&format!(
+                        "\nssh_host_keys = [\"h.example ssh-ed25519 {pin}\"]"
+                    )),
+                ),
+            ],
         );
-        let d = daemon(&t, &[("gh/bare", "x", Tier::Test, body)]);
-        for (argv, var) in [
-            (&["git", "push"][..], "MS_SSH_KEY"),
-            (&["git", "push"], "MS_GIT_CREDENTIAL"),
-            (&["ssh", "h"], "MS_GIT_CREDENTIAL"),
+        for (argv, key) in [
+            (&["git", "push"][..], "gh/bare"),
+            (&["cat"], "gh/pinned"),
+            (&["git", "rebase", "--exec", "sh"], "gh/pinned"),
+            (&["git", "pull", "--recurse=yes"], "gh/pinned"),
         ] {
-            let r = run(&d, &proj, argv, &[(var, "ms://gh/bare")]);
+            let r = run(&d, &proj, argv, &[("MS_SSH_KEY", &format!("ms://{key}"))]);
             assert!(
                 matches!(
                     &r,
@@ -772,10 +716,10 @@ mod tests {
                         ..
                     }
                 ),
-                "{argv:?} {var}: {r:?}"
+                "{argv:?} {key}: {r:?}"
             );
         }
         let rec = receipts(&t);
-        assert_eq!(rec.matches("blocked").count(), 3, "{rec}");
+        assert_eq!(rec.matches("blocked").count(), 4, "{rec}");
     }
 }

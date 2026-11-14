@@ -1,28 +1,26 @@
-//! `ssh` and `git` with a key msd holds (L16, SPEC.md).
+//! `ssh` and `git` with an SSH key msd holds (L16, SPEC.md).
 //!
-//! Two mechanisms, chosen by the variable the call carries (msd takes it out of the call, so the
-//! value never reaches the child's environment):
+//! A call that carries [`SSH_VAR`] `=ms://<key>` (msd takes the variable out of the call, so the
+//! value never reaches the child's environment) gets an SSH agent msd serves for the run
+//! ([`agent`]). The private key stays in msd; the agent signs only logins to host keys pinned in
+//! the key's rule (`session-bind@openssh.com`), and ssh is started with options that turn off
+//! forwarding, other configs, proxies and the user's own keys ([`args`]). git runs only the
+//! subcommands that talk to a remote, with forced settings that start no program, and only in a
+//! repository whose own config holds data keys only ([`repo`]).
 //!
-//! - [`SSH_VAR`] `=ms://<key>`: msd serves an SSH agent for the run ([`agent`]). The private
-//!   key stays in msd; the agent signs only logins to host keys pinned in the key's rule
-//!   (`session-bind@openssh.com`), and ssh is started with options that turn off forwarding,
-//!   other configs, proxies and the user's own keys ([`args`]).
-//! - [`CRED_VAR`] `=ms://<key>`: git gets the `ms-git-credential` helper, which asks the run's
-//!   credential socket; msd answers only for the key's HTTPS hosts ([`cred`]).
-//!
-//! A [`Session`] owns both sockets and their private directory for one run. msd starts it after
+//! A [`Session`] owns the agent socket and its private directory for one run. msd starts it after
 //! policy allowed the run, builds the plan with [`SshGitAdapter`] through
 //! [`Runner::plan_with`](crate::Runner::plan_with), and hands it to the run with
 //! [`Prepared::hold`](crate::Prepared::hold): it accepts connections only from the run's process
 //! group, and when the run ends, however it ends, it stops and its directory is removed.
 //!
-//! Every signature and credential request goes through [`Audit`] first (msd writes a receipt);
-//! when recording fails, nothing is released.
+//! Every sign request goes through [`Audit`] first (msd writes a receipt); when recording fails,
+//! nothing is signed.
 
 pub mod agent;
 pub mod args;
-pub mod cred;
 mod key;
+pub mod repo;
 mod wire;
 
 use std::ffi::OsString;
@@ -36,29 +34,19 @@ use std::time::Duration;
 
 use ms_core::{KeyName, Result as CoreResult};
 use ms_vault::{Vault, VaultExt};
-use zeroize::Zeroizing;
 
 use crate::error::{RunError, adapter_refuse};
 use crate::resolve::Resolver;
 use crate::{EffectPreview, EnvValue, ExecPlan, RunAdapter, RunCall, RunGuard};
 
 pub use args::{Tool, tool_of};
-pub use cred::HostCheck;
 
 /// The variable that selects the SSH agent: `MS_SSH_KEY=ms://<key>`.
 pub const SSH_VAR: &str = "MS_SSH_KEY";
-/// The variable that selects the git credential helper: `MS_GIT_CREDENTIAL=ms://<key>`.
-pub const CRED_VAR: &str = "MS_GIT_CREDENTIAL";
-/// The variable the helper finds its socket in.
-pub const CRED_SOCK_VAR: &str = "MS_GIT_CREDENTIAL_SOCK";
-/// The helper's file name, next to `msd`.
-pub const HELPER_NAME: &str = "ms-git-credential";
 /// Largest agent message accepted.
 const MAX_AGENT_MESSAGE: usize = 256 * 1024;
 /// Most connections one run's sockets accept, in all.
 const MAX_CONNECTIONS: usize = 64;
-/// How long a credential connection may take to send its request.
-const CRED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One pinned SSH host key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,14 +78,9 @@ pub enum Action {
         /// The pinned host the connection is bound to.
         host: String,
     },
-    /// A git credential for `host` (`protocol://host` as asked).
-    Credential {
-        /// The URL origin asked for.
-        host: String,
-    },
 }
 
-/// One signature or credential request, for a receipt.
+/// One sign request, for a receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
     /// The key.
@@ -127,29 +110,6 @@ pub struct SshSetup {
     pub ssh: PathBuf,
 }
 
-/// The git credential side of a session.
-#[derive(Clone)]
-pub struct CredSetup {
-    /// The key holding the token.
-    pub key: KeyName,
-    /// The key's bound hosts.
-    pub host_allowed: HostCheck,
-    /// The hosts as the rule names them, for the approval preview.
-    pub hosts_shown: Vec<String>,
-    /// Absolute path of `ms-git-credential`.
-    pub helper: PathBuf,
-}
-
-impl std::fmt::Debug for CredSetup {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CredSetup")
-            .field("key", &self.key)
-            .field("hosts", &self.hosts_shown)
-            .field("helper", &self.helper)
-            .finish_non_exhaustive()
-    }
-}
-
 /// Everything a session needs.
 #[derive(Debug, Clone)]
 pub struct Setup {
@@ -157,8 +117,6 @@ pub struct Setup {
     pub tool: Tool,
     /// The SSH agent, if the call carries [`SSH_VAR`].
     pub ssh: Option<SshSetup>,
-    /// The credential helper, if the call carries [`CRED_VAR`].
-    pub cred: Option<CredSetup>,
     /// The run's canonical working directory.
     pub cwd: PathBuf,
     /// Absolute path of `git`, for the repository config check (required when `tool` is git).
@@ -168,7 +126,7 @@ pub struct Setup {
 }
 
 /// The effect line shown in an approval: where the key can be used in this run.
-pub fn effect(ssh: Option<&SshSetup>, cred: Option<&CredSetup>) -> String {
+pub fn effect(ssh: Option<&SshSetup>) -> String {
     let mut parts = Vec::new();
     if let Some(s) = ssh {
         let hosts: Vec<String> = s
@@ -180,13 +138,6 @@ pub fn effect(ssh: Option<&SshSetup>, cred: Option<&CredSetup>) -> String {
             "SSH logins with {} to {} only",
             s.key,
             hosts.join(", ")
-        ));
-    }
-    if let Some(c) = cred {
-        parts.push(format!(
-            "git HTTPS credential {} for {} only",
-            c.key,
-            c.hosts_shown.join(", ")
         ));
     }
     parts.join("; ")
@@ -256,7 +207,6 @@ pub struct Session {
     agent: Option<PathBuf>,
     public: Option<PathBuf>,
     known_hosts: Option<PathBuf>,
-    cred: Option<PathBuf>,
     setup: Setup,
     shared: Arc<Shared>,
     tasks: Vec<tokio::task::AbortHandle>,
@@ -278,27 +228,22 @@ impl Session {
             agent: None,
             public: None,
             known_hosts: None,
-            cred: None,
             setup: setup.clone(),
             shared: Arc::new(Shared::default()),
             tasks: Vec::new(),
         };
         let _enter = rt.enter();
-        // Before git starts (review R1): the repository's own config may hold only plain keys,
-        // and the credential side compares against this snapshot when it is asked.
-        let snapshot = if setup.tool == Tool::Git {
+        // Before git starts (review R1): the repository's own config may hold only data keys.
+        if setup.tool == Tool::Git {
             let git = setup.git.as_deref().ok_or_else(|| {
                 RunError::internal("morsec: no git to check the repository's config with")
             })?;
-            let raw = cred::read_config(git, &setup.cwd, &git_env(&setup.base_env))
+            let raw = repo::read_config(git, &setup.cwd, &git_env(&setup.base_env))
                 .map_err(|e| RunError::denied(format!("morsec: {e}")))?;
-            if let Some(why) = cred::config_violation(&raw) {
+            if let Some(why) = repo::config_violation(&raw) {
                 return Err(RunError::denied(format!("morsec: {why}")));
             }
-            raw
-        } else {
-            Vec::new()
-        };
+        }
         if let Some(ssh) = &setup.ssh {
             let public = vault
                 .read_with(&ssh.key, |v| {
@@ -334,28 +279,6 @@ impl Session {
             session.agent = Some(sock);
             session.public = Some(pub_file);
             session.known_hosts = Some(kh);
-        }
-        if let Some(c) = &setup.cred {
-            let git = setup.git.clone().ok_or_else(|| {
-                RunError::internal("morsec: no git to check the repository's config with")
-            })?;
-            let sock = dir.join("cred.sock");
-            let ctx = Arc::new(cred::CredCtx {
-                key: c.key.clone(),
-                host_allowed: c.host_allowed.clone(),
-                vault: vault.clone(),
-                audit: audit.clone(),
-                git,
-                cwd: setup.cwd.clone(),
-                env: git_env(&setup.base_env),
-                snapshot: snapshot.clone(),
-                answers: AtomicUsize::new(0),
-            });
-            let listener = listen(&sock)?;
-            let shared = session.shared.clone();
-            let task = tokio::spawn(serve(listener, shared, move |s| serve_cred(s, &ctx)));
-            session.tasks.push(task.abort_handle());
-            session.cred = Some(sock);
         }
         Ok(session)
     }
@@ -515,46 +438,12 @@ fn serve_agent(mut s: &StdStream, ctx: &agent::AgentCtx) {
     }
 }
 
-fn serve_cred(mut s: &StdStream, ctx: &cred::CredCtx) {
-    let _ = s.set_read_timeout(Some(CRED_READ_TIMEOUT));
-    let mut req = Vec::new();
-    if s.take(cred::MAX_MESSAGE as u64)
-        .read_to_end(&mut req)
-        .is_err()
-    {
-        return;
-    }
-    let answer = cred::answer(ctx, &req);
-    let _ = s.write_all(&answer);
-    hang_up(s);
-}
-
 /// Ends a connection for the peer. The session keeps a clone of every connection (to cut them
 /// when the run ends), so dropping this one would not send EOF; and `shutdown(Both)` fails on
 /// macOS once the peer closed its writing side, so each direction is shut separately.
 fn hang_up(s: &StdStream) {
     let _ = s.shutdown(std::net::Shutdown::Write);
     let _ = s.shutdown(std::net::Shutdown::Read);
-}
-
-/// The helper's side: sends git's request to the socket in [`CRED_SOCK_VAR`] and returns the
-/// answer (empty on any failure). Used by the `ms-git-credential` binary.
-pub fn helper_get(sock: &Path, request: &[u8]) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::new());
-    let Ok(mut s) = StdStream::connect(sock) else {
-        return out;
-    };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
-    if s.write_all(&request[..request.len().min(cred::MAX_MESSAGE)])
-        .is_err()
-        || s.shutdown(std::net::Shutdown::Write).is_err()
-    {
-        return out;
-    }
-    let _ = (&mut s)
-        .take(cred::MAX_MESSAGE as u64)
-        .read_to_end(&mut out);
-    out
 }
 
 /// Builds the exec plan for one call, from a started [`Session`].
@@ -659,7 +548,7 @@ impl RunAdapter for SshGitAdapter<'_> {
                     ("ext", false),
                     ("git", false),
                     ("http", false),
-                    ("https", setup.cred.is_some()),
+                    ("https", false),
                     ("ssh", setup.ssh.is_some()),
                 ] {
                     config.push((
@@ -674,16 +563,6 @@ impl RunAdapter for SshGitAdapter<'_> {
                         .collect();
                     env.push(plain("GIT_SSH_COMMAND", &cmd.join(" ")));
                     env.push(plain("GIT_SSH_VARIANT", "ssh"));
-                }
-                if let (Some(sock), Some(c)) = (&self.session.cred, &setup.cred) {
-                    config.push(("credential.helper".into(), String::new()));
-                    // `!cmd` runs through sh with the operation appended; quoted, so a path
-                    // with spaces stays one word (a bare quoted path would not count as absolute).
-                    config.push((
-                        "credential.helper".into(),
-                        format!("!{}", args::shell_quote(&c.helper.display().to_string())),
-                    ));
-                    env.push(plain(CRED_SOCK_VAR, &sock.display().to_string()));
                 }
                 env.push(plain("GIT_CONFIG_COUNT", &config.len().to_string()));
                 for (i, (k, v)) in config.iter().enumerate() {
@@ -704,7 +583,7 @@ impl RunAdapter for SshGitAdapter<'_> {
     fn preview(&self, _call: &RunCall) -> Option<EffectPreview> {
         let s = &self.session.setup;
         Some(EffectPreview {
-            summary: effect(s.ssh.as_ref(), s.cred.as_ref()),
+            summary: effect(s.ssh.as_ref()),
         })
     }
 }
@@ -785,17 +664,10 @@ mod tests {
             }],
             ssh: "/usr/bin/ssh".into(),
         };
-        let cred = CredSetup {
-            key: k,
-            host_allowed: Arc::new(|h| h == "git.example.com"),
-            hosts_shown: vec!["git.example.com".into()],
-            helper: "/opt/ms/ms-git-credential".into(),
-        };
         (
             Setup {
                 tool,
                 ssh: Some(ssh),
-                cred: Some(cred),
                 cwd: std::env::temp_dir(),
                 git: Some("/usr/bin/git".into()),
                 base_env: vec![],
@@ -876,11 +748,47 @@ mod tests {
         for want in [
             "GIT_SSH_COMMAND",
             "GIT_CONFIG_GLOBAL",
-            CRED_SOCK_VAR,
             "GIT_CONFIG_COUNT",
+            "GIT_PAGER",
+            "GIT_EDITOR",
         ] {
             assert!(names.iter().any(|n| n == want), "{names:?}");
         }
+        // The forced git settings (review R1): only ssh among the transports, no hooks, no
+        // fsmonitor, no submodule recursion, no signing program.
+        let plain_of = |name: &str| {
+            plan.env.iter().find_map(|(k, v)| match v {
+                EnvValue::Plain(v) if k == name => Some(v.to_string_lossy().into_owned()),
+                _ => None,
+            })
+        };
+        let n: usize = plain_of("GIT_CONFIG_COUNT").unwrap().parse().unwrap();
+        let forced: std::collections::BTreeMap<String, String> = (0..n)
+            .map(|i| {
+                (
+                    plain_of(&format!("GIT_CONFIG_KEY_{i}")).unwrap(),
+                    plain_of(&format!("GIT_CONFIG_VALUE_{i}")).unwrap(),
+                )
+            })
+            .collect();
+        for (k, v) in [
+            ("protocol.allow", "never"),
+            ("protocol.file.allow", "never"),
+            ("protocol.ext.allow", "never"),
+            ("protocol.https.allow", "never"),
+            ("protocol.ssh.allow", "always"),
+            ("core.hooksPath", "/dev/null"),
+            ("core.fsmonitor", "false"),
+            ("submodule.recurse", "false"),
+            ("gpg.program", "false"),
+        ] {
+            assert_eq!(
+                forced.get(k).map(String::as_str),
+                Some(v),
+                "{k}: {forced:?}"
+            );
+        }
+        assert!(!forced.contains_key("credential.helper"));
         assert!(
             adapter
                 .preview(&call)
