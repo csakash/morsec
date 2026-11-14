@@ -172,6 +172,22 @@ pub fn bindings(rules: &Rules) -> (Vec<Binding>, Vec<String>) {
                 "{key}: wildcard and IP hosts can't be swapped (the CA only issues for exact names); bind exact hosts"
             ));
         }
+        // L30: git hosts get their own binding, with the key in the Basic-auth password (where
+        // git sends a token); the rest keep the catalog location.
+        let (git, hosts): (Vec<String>, Vec<String>) =
+            hosts.into_iter().partition(|h| rule.git_hosts.contains(h));
+        if !git.is_empty() {
+            out.push(Binding {
+                key: key.clone(),
+                provider: format!("{}-git", key.as_str().replace('/', "-")),
+                hosts: git,
+                port: 443,
+                location: Location::Basic {
+                    field: BasicField::Password,
+                },
+                shaped_placeholder: None,
+            });
+        }
         if hosts.is_empty() {
             continue;
         }
@@ -262,6 +278,66 @@ fn export_pem(d: &Daemon, pem: &str) {
     }
 }
 
+/// The L30 QA hook (SPEC D5): test upstreams for a debug build with the memory vault. Empty
+/// otherwise; a release build refuses the flags and has no hook to hold.
+#[derive(Debug, Clone, Default)]
+pub struct TestHook(#[cfg(debug_assertions)] Option<Arc<ms_proxy::test_upstreams::TestUpstreams>>);
+
+impl TestHook {
+    /// From `--test-upstream` and `--test-upstream-ca`. Refused outside a debug build or without
+    /// the memory vault.
+    pub fn new(
+        specs: &[String],
+        ca: Option<&std::path::Path>,
+        memory_vault: bool,
+    ) -> Result<Self, String> {
+        if specs.is_empty() && ca.is_none() {
+            return Ok(Self::default());
+        }
+        if !cfg!(debug_assertions) {
+            return Err(
+                "morsec: --test-upstream is for tests and works only in a debug build".into(),
+            );
+        }
+        if !memory_vault {
+            return Err(
+                "morsec: --test-upstream only works with --vault memory (an ephemeral dev vault)"
+                    .into(),
+            );
+        }
+        let Some(ca) = ca else {
+            return Err("morsec: --test-upstream needs --test-upstream-ca".into());
+        };
+        let pem = std::fs::read_to_string(ca)
+            .map_err(|e| format!("morsec: can't read {}: {e}", ca.display()))?;
+        #[cfg(debug_assertions)]
+        {
+            let t = ms_proxy::test_upstreams::TestUpstreams::new(specs, &pem)
+                .map_err(|e| format!("morsec: {e}"))?;
+            Ok(Self(Some(Arc::new(t))))
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = pem;
+            Err("morsec: --test-upstream works only in a debug build".into())
+        }
+    }
+
+    fn configure(&self, _cfg: &mut ProxyConfig, _deps: &mut Deps) {
+        #[cfg(debug_assertions)]
+        if let Some(t) = &self.0 {
+            t.configure(_cfg, _deps);
+        }
+    }
+
+    fn allow(&self, _proxy: &mut Proxy) {
+        #[cfg(debug_assertions)]
+        if let Some(t) = &self.0 {
+            t.allow(_proxy);
+        }
+    }
+}
+
 /// Builds a proxy config and its dependencies from the daemon's current state.
 pub fn build(d: &Arc<Daemon>, listen: SocketAddr) -> Result<(ProxyConfig, Deps), String> {
     let rules = d.rules();
@@ -297,7 +373,7 @@ pub fn build(d: &Arc<Daemon>, listen: SocketAddr) -> Result<(ProxyConfig, Deps),
 
 /// Runs the proxy on `127.0.0.1:<port>` until `shutdown` is set, rebuilding on every rules
 /// change.
-pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
+pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>, test: TestHook) {
     let listen = SocketAddr::from(([127, 0, 0, 1], d.proxy_port()));
     let mut changes = d.proxy_changes();
     loop {
@@ -305,16 +381,24 @@ pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
             return;
         }
         changes.borrow_and_update();
-        let dd = d.clone();
-        let built = tokio::task::spawn_blocking(move || build(&dd, listen))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
+        let (dd, t) = (d.clone(), test.clone());
+        let built = tokio::task::spawn_blocking(move || {
+            build(&dd, listen).map(|(mut cfg, mut deps)| {
+                t.configure(&mut cfg, &mut deps);
+                (cfg, deps)
+            })
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
         let bound = match built {
             Ok((cfg, deps)) => {
                 let current = cfg.bindings.clone();
                 Proxy::bind(cfg, deps)
                     .await
-                    .map(|p| (p, current))
+                    .map(|mut p| {
+                        test.allow(&mut p);
+                        (p, current)
+                    })
                     .map_err(|e| e.to_string())
             }
             Err(e) => Err(e),
@@ -399,5 +483,65 @@ commands = [["psql", "**"]]
         let mut t = r.clone();
         t.tampered = true;
         assert!(bindings(&t).0.is_empty());
+    }
+
+    // protects=L30 D2 a key's git hosts get their own Basic-password binding and its other hosts
+    // keep the catalog location; a key with only git hosts needs no catalog entry;
+    // fails_when=a git host keeps the Bearer location, or an API host gets the Basic one;
+    // no_claim=the swap itself (ms-proxy git itest)
+    #[test]
+    fn git_hosts_bind_basic_password() {
+        let r = rules(
+            r#"
+version = 1
+[keys."github/test"]
+mode = "swap"
+tier = "test"
+hosts = ["api.github.com", "github.com"]
+git_hosts = ["github.com"]
+[keys."zzz/git"]
+mode = "swap"
+tier = "test"
+hosts = ["git.example.com"]
+git_hosts = ["git.example.com"]
+"#,
+        );
+        let (b, skipped) = bindings(&r);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let by = |p: &str| b.iter().find(|b| b.provider == p).unwrap();
+        let api = by("github-test");
+        assert_eq!(api.hosts, ["api.github.com"]);
+        assert!(matches!(api.location, Location::Header { .. }));
+        let basic = Location::Basic {
+            field: BasicField::Password,
+        };
+        let git = by("github-test-git");
+        assert_eq!(
+            (git.hosts.as_slice(), &git.location, git.port),
+            (&["github.com".to_string()][..], &basic, 443)
+        );
+        let other = by("zzz-git-git");
+        assert_eq!(
+            (other.key.as_str(), other.hosts.as_slice(), &other.location),
+            ("zzz/git", &["git.example.com".to_string()][..], &basic)
+        );
+        assert_eq!(b.len(), 3);
+    }
+
+    // protects=L30 D5 the test-upstream hook needs the memory vault, a CA and loopback targets,
+    // and nothing given means no hook; fails_when=it is accepted with the keychain vault or
+    // without a CA; no_claim=the release-build refusal (cfg!(debug_assertions) is false only
+    // there; checked by building release in the gate)
+    #[test]
+    fn test_upstreams_need_the_memory_vault() {
+        let d = tempfile::tempdir().unwrap();
+        let ca = d.path().join("ca.pem");
+        std::fs::write(&ca, ms_proxy::Ca::generate(["x.test"]).unwrap().cert_pem()).unwrap();
+        let spec = vec!["git.test=127.0.0.1:4471".to_string()];
+        assert!(TestHook::new(&[], None, false).is_ok());
+        assert!(TestHook::new(&spec, Some(&ca), false).is_err());
+        assert!(TestHook::new(&spec, None, true).is_err());
+        assert!(TestHook::new(&["git.test=10.1.1.1:443".into()], Some(&ca), true).is_err());
+        assert!(TestHook::new(&spec, Some(&ca), true).is_ok());
     }
 }

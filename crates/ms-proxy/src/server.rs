@@ -51,7 +51,7 @@ struct Inner {
     client_tls: Arc<rustls::ClientConfig>,
     /// Bytes (in KiB) that inspected request bodies may hold in memory at once.
     body_budget: Arc<Semaphore>,
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     loopback_ok: bool,
 }
 
@@ -153,14 +153,15 @@ impl Proxy {
                 deps,
                 client_tls,
                 body_budget: Arc::new(Semaphore::new(budget_kib)),
-                #[cfg(test)]
+                #[cfg(any(test, debug_assertions))]
                 loopback_ok: false,
             }),
         })
     }
 
-    /// Lets the in-crate tests reach upstream servers on 127.0.0.1.
-    #[cfg(test)]
+    /// Lets tests reach upstream servers on 127.0.0.1: the in-crate tests, and in debug builds
+    /// the L30 QA hook ([`crate::test_upstreams`]). Release builds don't have it.
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn allow_loopback_upstreams_for_tests(&mut self) {
         Arc::get_mut(&mut self.inner)
             .expect("not serving yet")
@@ -207,11 +208,11 @@ impl Proxy {
 
 impl Inner {
     fn loopback_ok(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         {
             self.loopback_ok
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, debug_assertions)))]
         {
             false
         }

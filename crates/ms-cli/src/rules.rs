@@ -46,6 +46,13 @@ pub struct RulesArgs {
     /// Propose removing a host.
     #[arg(long, value_name = "HOST")]
     remove_host: Vec<String>,
+    /// Propose sending a swap key to a git host over HTTPS (github.com): adds the host, and on it
+    /// the key goes in the Basic-auth password, where git sends a token.
+    #[arg(long, value_name = "HOST")]
+    add_git_host: Vec<String>,
+    /// Stop treating a host as a git host (the host itself stays; see --remove-host).
+    #[arg(long, value_name = "HOST")]
+    remove_git_host: Vec<String>,
     /// Propose adding a command, as a JSON array: '["psql", "-c", "*"]'.
     #[arg(long, value_name = "JSON")]
     add_command: Vec<String>,
@@ -86,6 +93,8 @@ impl RulesArgs {
     fn has_changes(&self) -> bool {
         !self.add_host.is_empty()
             || !self.remove_host.is_empty()
+            || !self.add_git_host.is_empty()
+            || !self.remove_git_host.is_empty()
             || !self.add_command.is_empty()
             || !self.remove_command.is_empty()
             || !self.add_root.is_empty()
@@ -379,9 +388,33 @@ pub fn run(a: RulesArgs) -> ExitCode {
             );
             return ExitCode::from(EXIT_USAGE);
         }
-        return propose(&name, &user, proposed, a.at_terminal);
+        let code = propose(&name, &user, proposed, a.at_terminal);
+        if code == ExitCode::SUCCESS {
+            for h in &a.add_git_host {
+                for line in git_recipe(&name, h) {
+                    out(&line);
+                }
+            }
+        }
+        return code;
     }
     ExitCode::SUCCESS
+}
+
+/// How to make git send the placeholder to a git host (SPEC D4). The helper prints only
+/// `ms://<key>`; the empty entry first stops a global helper (the keychain) from sending, and
+/// after a 401 erasing, the person's own credentials.
+fn git_recipe(name: &KeyName, host: &str) -> Vec<String> {
+    vec![
+        String::new(),
+        format!("to use {name} with git over https://{host}, in the repository:"),
+        format!("  git config credential.https://{host}.helper ''"),
+        format!(
+            "  git config --add credential.https://{host}.helper '!f() {{ echo username=x-access-token; echo password=ms://{name}; }}; f'"
+        ),
+        "git then sends only the placeholder; morsec's proxy puts the token in on the way out."
+            .into(),
+    ]
 }
 
 fn check(file: &Path) -> ExitCode {
@@ -484,6 +517,9 @@ fn show(name: &KeyName, r: &KeyRule) {
     if r.mode == ms_core::Mode::Swap || !r.hosts.is_empty() {
         list("hosts", r.hosts.iter().map(ToString::to_string).collect());
     }
+    if !r.git_hosts.is_empty() {
+        list("git hosts", r.git_hosts.clone());
+    }
     out(&format!("  ttl        {} s", r.session_ttl_secs));
     out(&format!(
         "  read-only  {}",
@@ -527,6 +563,17 @@ fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRu
     for h in &a.remove_host {
         let p = HostPattern::parse(h).map_err(|e| format!("morsec: {e}"))?;
         r.hosts.retain(|x| *x != p);
+        r.git_hosts.retain(|g| HostPattern::Exact(g.clone()) != p);
+    }
+    for h in &a.add_git_host {
+        let p = HostPattern::parse(h).map_err(|e| format!("morsec: {e}"))?;
+        if !r.hosts.contains(&p) {
+            r.hosts.push(p);
+        }
+        r.git_hosts.push(h.clone());
+    }
+    for h in &a.remove_git_host {
+        r.git_hosts.retain(|g| g != h);
     }
     for c in &a.add_command {
         r.commands.push(parse_command(c)?);

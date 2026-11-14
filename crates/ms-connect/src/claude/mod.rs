@@ -24,11 +24,13 @@ pub const ID: &str = "claude-code";
 /// The marker `env` entry (SPEC D7).
 pub const MARKER: &str = "MORSEC_CONNECTED";
 /// The CA variables pointed at the bundle (SPEC D6).
-pub const CA_VARS: [&str; 4] = [
+pub const CA_VARS: [&str; 5] = [
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
+    // git (Apple's and Homebrew's) trusts only this one on macOS (L30).
+    "GIT_SSL_CAINFO",
 ];
 /// Largest `~/.claude.json` read (Claude Code keeps project history there).
 pub const MAX_CLAUDE_JSON: u64 = 64 << 20;

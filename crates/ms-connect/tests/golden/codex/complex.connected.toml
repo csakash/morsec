@@ -11,6 +11,7 @@ shell_environment_policy.set.http_proxy = "http://127.0.0.1:4401"
 shell_environment_policy.set.REQUESTS_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
 shell_environment_policy.set.CURL_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
 shell_environment_policy.set.NODE_EXTRA_CA_CERTS = "$HOME/.morsec/codex-ca-bundle.pem"
+shell_environment_policy.set.GIT_SSL_CAINFO = "$HOME/.morsec/codex-ca-bundle.pem"
 shell_environment_policy.set.STRIPE_API_KEY = "ms://stripe/test"
 
 [notice]
@@ -39,6 +40,7 @@ SSL_CERT_FILE = "$HOME/.morsec/codex-ca-bundle.pem"
 REQUESTS_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
 CURL_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
 NODE_EXTRA_CA_CERTS = "$HOME/.morsec/codex-ca-bundle.pem"
+GIT_SSL_CAINFO = "$HOME/.morsec/codex-ca-bundle.pem"
 
 [mcp_servers.ms]
 command = "/usr/bin/env"

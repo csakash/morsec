@@ -52,6 +52,11 @@ token. Today:
   - redirects are not followed;
   - production keys need approval;
   - every swap is a receipt.
+- A production key goes through L11's approver per request, as every swap does. A git push or
+  fetch makes two or three authenticated requests (`info/refs`, then `git-receive-pack` or
+  `git-upload-pack`), so a "once" approval covers only the first, and the next one waits for
+  another prompt. For production git keys, the person approves "for this agent session". QA
+  found this; the approval model itself is unchanged.
 - A push larger than the proxy's body limit (16 MiB per request) fails with 413. That is a
   documented limit of this loop.
 
