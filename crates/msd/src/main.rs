@@ -14,6 +14,7 @@
 mod approve;
 mod backend;
 mod daemon;
+mod doctor;
 mod drift;
 mod paths;
 mod proxy;

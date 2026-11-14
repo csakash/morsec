@@ -15,6 +15,25 @@ never touched: the suite checks the daemon reports `dev-memory` before it stores
 | `real_agent_job_skips_without_opt_in` | `real-agent.sh` does nothing (and spends nothing) without `MORSEC_REAL_AGENT=1`. |
 | `gate_requires_security_evals` | `npm run build` → `scripts/check.sh` → this suite; no real agent in the gate. |
 
+## `ms doctor` (L17): `doctor/main.rs`
+
+Same throwaway msd and temp `HOME` (both connectors applied with `ms connect --yes`); the binary
+is its own fake `claude` and `codex`, so `ms doctor --live` runs without spending tokens. The
+suite checks the real `~/.claude/settings.json`, `~/.codex/config.toml` and morsec connector
+state are unchanged when it ends.
+
+| Test | What it proves |
+|---|---|
+| `healthy_setup_has_no_problems` | Static doctor: msd, vault, CA, both connectors and the port cross-check pass; `ms mcp` is "not installed" (info), exit 0. |
+| `broken_connector_is_reported` | Removing Claude Code's `httpProxyPort` and Codex's `HTTPS_PROXY` is reported with the fix, exit 1. |
+| `daemon_down_is_reported` | No daemon: `msd not running`, connectors still checked, exit 1, no hang. |
+| `probe_open_egress_fails_loudly` | Inside an agent, open direct egress → banner, `direct=OPEN`, exit 1; msd holds the canary from that session and the report; a malformed target is refused. |
+| `live_with_fake_agents` | `--live` passes a routed, blocked sandbox; fails loudly on open egress (from msd's report or the agent's output); fails an agent that only claims success. |
+| `live_refused_inside_an_agent` | `--live` refuses to run inside an agent session. |
+
+`ms doctor --live` with real agents spends tokens and is never in the gate; run it by hand from
+your own terminal.
+
 ## Real agents (manual or nightly)
 
 `real-agent.sh` runs `claude -p` and `codex exec` against a temp copy of `fixture/` with fresh

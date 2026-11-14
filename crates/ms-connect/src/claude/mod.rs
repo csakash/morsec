@@ -463,6 +463,11 @@ impl ClaudeConnector {
         self.paths.state.exists()
     }
 
+    /// The msd proxy port the last connect wrote (`ms doctor` compares it with msd's, L17).
+    pub fn recorded_proxy_port(&self) -> Result<Option<u16>> {
+        Ok(self.read_state()?.map(|st| st.proxy_port))
+    }
+
     fn read_state(&self) -> Result<Option<State>> {
         let Some(text) = fsio::read_text(&self.paths.state).map_err(err)? else {
             return Ok(None);

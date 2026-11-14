@@ -292,6 +292,7 @@ pub fn build(d: &Arc<Daemon>, listen: SocketAddr) -> Result<(ProxyConfig, Deps),
         ca,
     );
     deps.approver = Some(d.approver());
+    deps.egress = Arc::new(crate::doctor::CanaryObserver { probes: d.probes() });
     Ok((cfg, deps))
 }
 

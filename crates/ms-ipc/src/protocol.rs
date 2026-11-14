@@ -119,8 +119,17 @@ pub enum RequestBody {
         /// Most records to return.
         limit: u32,
     },
-    /// `ms doctor --probe` report from inside an agent.
-    DoctorProbe,
+    /// `ms doctor --probe` (L17). With `report`: the probe's result from inside an agent's
+    /// sandbox, stored under `nonce` (first per session wins). Without: what msd holds for `nonce`
+    /// (the canary its proxy saw, and the report), answered with [`ResponseBody::Probe`].
+    DoctorProbe {
+        /// 32 lowercase hex characters, made fresh by `ms doctor --live`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nonce: Option<String>,
+        /// The probe's findings; absent for a lookup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<ProbeReport>,
+    },
     /// Search the agent transcripts msd knows about for vault values (`ms scan`, L09). No
     /// fields: msd picks the directories itself, so a client can't point it at a file.
     Scan,
@@ -195,7 +204,7 @@ impl RequestBody {
             RequestBody::RulesGet { .. } | RequestBody::RulesProposeLoosen { .. } => "L07 daemon",
             RequestBody::Stop | RequestBody::Start { .. } => "L07 daemon",
             RequestBody::LogQuery { .. } => "L02 receipts",
-            RequestBody::DoctorProbe => "L17 doctor",
+            RequestBody::DoctorProbe { .. } => "L17 doctor",
             RequestBody::Scan => "L09 e2e-canary",
             RequestBody::ApprovalPending | RequestBody::ApprovalDecide { .. } => {
                 "L11 approvals-macos"
@@ -252,6 +261,36 @@ pub enum OutStream {
     Stdout,
     /// Standard error.
     Stderr,
+}
+
+/// What `ms doctor --probe` found inside an agent's sandbox (L17). Written by the probe, which
+/// the agent can replace, so msd and `ms doctor` trust a "blocked" here only for a session of the
+/// agent under test, and believe an "open" from anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeReport {
+    /// The canary CONNECT got morsec's own refusal back from the proxy.
+    pub proxy_reached: bool,
+    /// A direct connection (no proxy) to an internet address succeeded.
+    pub direct_open: bool,
+    /// Short human detail (at most [`ProbeReport::MAX_DETAIL`] characters).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+impl ProbeReport {
+    /// Longest `detail` msd accepts.
+    pub const MAX_DETAIL: usize = 512;
+}
+
+/// Who did something msd saw for a probe nonce (L17).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeSighting {
+    /// The agent session it came from; `None` when the caller was in no agent session.
+    pub session: Option<ms_core::SessionId>,
+    /// When msd saw it, Unix ms.
+    pub seen_unix_ms: u64,
 }
 
 /// Where a vault value was found (`ScanReport`, L09). Location and key name only: there is no
@@ -383,6 +422,22 @@ pub enum ResponseBody {
     Approval {
         /// The request, or none.
         pending: Option<PendingApproval>,
+    },
+    /// What msd holds for a probe nonce (`DoctorProbe` lookup, L17). The first of each per
+    /// session, a few sessions at most: `ms doctor` keeps only what came from the agent it
+    /// started, so another process can't get in first and crowd it out.
+    Probe {
+        /// Canary CONNECTs the proxy refused for this nonce (so the request reached msd).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        canaries: Vec<ProbeSighting>,
+        /// Probe reports and who sent each.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reports: Vec<(ProbeReport, ProbeSighting)>,
+        /// Some report for this nonce, from anyone, said direct egress is open, even one that
+        /// was not kept in `reports` (full, or not its session's first): "open" can't be crowded
+        /// out.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        any_open: bool,
     },
     /// An error; `message` is shown to people as is.
     Error {
