@@ -82,7 +82,7 @@ impl Resolve for MapResolver {
             let all = SystemResolver.resolve(host, port).await?;
             Ok(all
                 .into_iter()
-                .filter(|a| !a.ip().to_canonical().is_loopback())
+                .filter(|a| crate::ssrf::classify(a.ip()) != Some(crate::ssrf::Blocked::Loopback))
                 .collect())
         })
     }

@@ -975,7 +975,7 @@ fn relay(resp: Response<Incoming>) -> Response<Body> {
     Response::from_parts(parts, body.map_err(|e| Box::new(e) as BoxError).boxed())
 }
 
-/// Keeps the loopback addresses (IPv4-mapped forms included) that `only` lists, and every
+/// Keeps the loopback addresses (every form the SSRF guard counts as loopback) that `only` lists, and every
 /// non-loopback one; refuses when nothing is left. The L30 QA hook's SSRF rule.
 fn only_listed(c: std::io::Result<Checked>, only: &[SocketAddr]) -> std::io::Result<Checked> {
     match c {
@@ -983,7 +983,9 @@ fn only_listed(c: std::io::Result<Checked>, only: &[SocketAddr]) -> std::io::Res
             let first = addrs.first().map(SocketAddr::ip);
             let kept: Vec<SocketAddr> = addrs
                 .into_iter()
-                .filter(|a| !a.ip().to_canonical().is_loopback() || only.contains(a))
+                .filter(|a| {
+                    ssrf::classify(a.ip()) != Some(ssrf::Blocked::Loopback) || only.contains(a)
+                })
                 .collect();
             match (kept.is_empty(), first) {
                 (true, Some(ip)) => Ok(Checked::Refused(ip, ssrf::Blocked::Loopback)),
@@ -999,7 +1001,7 @@ mod loopback_tests {
     use super::*;
 
     // protects=L30 D5 with the QA hook, only the mapped loopback addresses pass the SSRF guard
-    // (review finding 1): another port, ::1 and ::ffff:127.0.0.1 are refused, public addresses
+    // (review finding 1): another port, ::1 and every embedded-v4 loopback form are refused, public addresses
     // still pass; fails_when=any unlisted loopback address is kept; no_claim=the resolver map
     #[test]
     fn hook_allows_only_listed_loopback() {
@@ -1015,6 +1017,10 @@ mod loopback_tests {
             "127.0.0.2:4571",
             "[::1]:4571",
             "[::ffff:127.0.0.1]:4571",
+            // Other encodings the guard counts as loopback (security review round 2).
+            "[::127.0.0.1]:4571",
+            "[64:ff9b::7f00:1]:4571",
+            "[2002:7f00:1::]:4571",
         ] {
             assert!(!run(refused), "{refused}");
         }
