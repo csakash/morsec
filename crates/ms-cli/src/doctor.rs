@@ -857,6 +857,7 @@ struct Child {
 struct Lookup {
     canaries: Vec<ProbeSighting>,
     reports: Vec<(ProbeReport, ProbeSighting)>,
+    any_open: bool,
 }
 
 impl Lookup {
@@ -873,7 +874,15 @@ fn lookup(nonce: &str) -> Result<Lookup, String> {
         nonce: Some(nonce.to_owned()),
         report: None,
     }) {
-        Ok(ResponseBody::Probe { canaries, reports }) => Ok(Lookup { canaries, reports }),
+        Ok(ResponseBody::Probe {
+            canaries,
+            reports,
+            any_open,
+        }) => Ok(Lookup {
+            canaries,
+            reports,
+            any_open,
+        }),
         Ok(ResponseBody::Error { message, .. }) => Err(message),
         Ok(_) => Err("unexpected answer from msd".into()),
         Err(e) => Err(e.to_string()),
@@ -925,7 +934,7 @@ fn judge(
     let ours = |s: &ProbeSighting| s.session.as_ref().is_some_and(is_ours);
     let mut items = Vec::new();
     items.push(if held.canaries.iter().any(ours) {
-        Item::pass("canary reached morsec's proxy from this agent's sandbox")
+        Item::pass("canary reached morsec's proxy from the agent doctor started")
     } else if held.canaries.is_empty() {
         Item::fail(format!(
             "commands in {id}'s sandbox did not reach morsec's proxy (the canary never arrived) · check: ms doctor, and that the sandbox allows the proxy"
@@ -936,7 +945,7 @@ fn judge(
         )
     });
     let said_open = output_says_open(agent_output, nonce);
-    let direct_open = held.reports.iter().any(|(r, _)| r.direct_open) || said_open;
+    let direct_open = held.any_open || held.reports.iter().any(|(r, _)| r.direct_open) || said_open;
     if direct_open {
         items.push(Item::fail(format!(
             "DIRECT INTERNET IS OPEN in {id}'s sandbox: commands there can reach the internet without morsec"
@@ -1200,6 +1209,7 @@ mod tests {
 
     fn held(canaries: Vec<ProbeSighting>, reports: Vec<(bool, ProbeSighting)>) -> Lookup {
         Lookup {
+            any_open: false,
             canaries,
             reports: reports
                 .into_iter()
@@ -1300,6 +1310,12 @@ mod tests {
         assert_eq!(v.items[1].mark, Mark::Fail);
 
         let ok = held(vec![by(ours.clone())], vec![(false, by(ours.clone()))]);
+        // S3: msd's any_open flag counts even when no kept report says open.
+        let flagged = Lookup {
+            any_open: true,
+            ..held(vec![by(ours.clone())], vec![(false, by(ours.clone()))])
+        };
+        assert!(judge("codex", N, &flagged, "", &is_ours).direct_open);
         let line = format!("morsec-probe nonce={N} proxy=no direct=OPEN");
         assert!(judge("codex", N, &ok, &line, &is_ours).direct_open);
         let other_nonce =

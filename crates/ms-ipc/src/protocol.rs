@@ -338,6 +338,11 @@ pub enum ResponseBody {
         /// Probe reports and who sent each.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reports: Vec<(ProbeReport, ProbeSighting)>,
+        /// Some report for this nonce, from anyone, said direct egress is open, even one that
+        /// was not kept in `reports` (full, or not its session's first): "open" can't be crowded
+        /// out.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        any_open: bool,
     },
     /// An error; `message` is shown to people as is.
     Error {

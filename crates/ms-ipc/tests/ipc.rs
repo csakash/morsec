@@ -478,6 +478,7 @@ fn every_variant_round_trips() {
         ResponseBody::Probe {
             canaries: vec![],
             reports: vec![],
+            any_open: false,
         },
         ResponseBody::Probe {
             canaries: vec![ms_ipc::ProbeSighting {
@@ -499,6 +500,7 @@ fn every_variant_round_trips() {
                     seen_unix_ms: 3,
                 },
             )],
+            any_open: true,
         },
     ];
     for (i, b) in all_requests.iter().enumerate() {

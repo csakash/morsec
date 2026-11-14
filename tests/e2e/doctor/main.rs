@@ -500,7 +500,9 @@ fn probe_open_egress_fails_loudly() {
             report: None,
         },
     ) {
-        ResponseBody::Probe { canaries, reports } => {
+        ResponseBody::Probe {
+            canaries, reports, ..
+        } => {
             assert_eq!(
                 (canaries.len(), reports.len()),
                 (1, 1),
@@ -556,7 +558,7 @@ fn live_with_fake_agents() {
     let claude = out.split("live: claude-code").nth(1).unwrap();
     let claude = claude.split("live: codex").next().unwrap();
     assert!(
-        claude.contains("✓ canary reached morsec's proxy from this agent's sandbox"),
+        claude.contains("✓ canary reached morsec's proxy from the agent doctor started"),
         "{out}"
     );
     assert!(

@@ -31,6 +31,9 @@ struct Entry {
     created_ms: u64,
     canaries: Vec<ProbeSighting>,
     reports: Vec<(ProbeReport, ProbeSighting)>,
+    /// Any report said direct egress is open (security review S3: kept even when the report
+    /// itself isn't).
+    any_open: bool,
 }
 
 /// The probe store.
@@ -122,6 +125,7 @@ impl Probes {
                         "morsec: the probe report's detail is too long",
                     );
                 }
+                let open = r.direct_open;
                 let item = (
                     r,
                     ProbeSighting {
@@ -130,6 +134,7 @@ impl Probes {
                     },
                 );
                 match self.with(nonce, now_ms, |e| {
+                    e.any_open |= open;
                     add_once(&mut e.reports, item, |(_, by)| &by.session)
                 }) {
                     None => ResponseBody::error(
@@ -155,6 +160,7 @@ impl Probes {
                 ResponseBody::Probe {
                     canaries: e.canaries,
                     reports: e.reports,
+                    any_open: e.any_open,
                 }
             }
         }
@@ -204,7 +210,9 @@ mod tests {
 
     fn lookup(p: &Probes) -> (Vec<ProbeSighting>, Vec<(ProbeReport, ProbeSighting)>) {
         match p.handle(None, Some(N), None, 0) {
-            ResponseBody::Probe { canaries, reports } => (canaries, reports),
+            ResponseBody::Probe {
+                canaries, reports, ..
+            } => (canaries, reports),
             other => panic!("{other:?}"),
         }
     }
@@ -266,6 +274,24 @@ mod tests {
             p.sighted(N, Some(s(i)), 7);
         }
         assert_eq!(lookup(&p).0.len(), MAX_PER_NONCE);
+        // S3: once the report slots are full, or a session already reported "blocked", a later
+        // "open" is still recorded as any_open.
+        let m = "a".repeat(32);
+        for i in 0..MAX_PER_NONCE as u32 {
+            p.handle(Some(s(100 + i)), Some(&m), Some(report(false)), 8);
+        }
+        p.handle(Some(s(100)), Some(&m), Some(report(true)), 9);
+        p.handle(Some(s(999)), Some(&m), Some(report(true)), 9);
+        match p.handle(None, Some(&m), None, 10) {
+            ResponseBody::Probe {
+                reports, any_open, ..
+            } => {
+                assert_eq!(reports.len(), MAX_PER_NONCE);
+                assert!(reports.iter().all(|(r, _)| !r.direct_open));
+                assert!(any_open);
+            }
+            other => panic!("{other:?}"),
+        }
         for bad in [None, Some("abc"), Some("0123456789ABCDEF0123456789ABCDEF")] {
             assert!(matches!(
                 p.handle(None, bad, None, 0),
