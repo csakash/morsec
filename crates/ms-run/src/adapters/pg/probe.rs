@@ -47,6 +47,15 @@ SELECT coalesce((SELECT reason FROM (
     FROM r, pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind = 'S' AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
       AND has_sequence_privilege(r.oid, c.oid, 'UPDATE, USAGE')
+  UNION ALL SELECT 9, format('role %I owns this database', r.rolname) FROM r, pg_database b
+    WHERE b.datname = current_database() AND b.datdba = r.oid
+  UNION ALL SELECT 10, format('role %I owns objects in schema %I (it could alter or drop them)', r.rolname, n.nspname)
+    FROM r, pg_namespace n
+    WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema' AND (
+      n.nspowner = r.oid
+      OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = n.oid AND c.relowner = r.oid)
+      OR EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = n.oid AND p.proowner = r.oid)
+      OR EXISTS (SELECT 1 FROM pg_type y WHERE y.typnamespace = n.oid AND y.typowner = r.oid))
 ) x ORDER BY o LIMIT 1), 'ok') AS morsec_role_check;
 "#;
 
@@ -75,6 +84,7 @@ DECLARE
   fns text[] := array_remove(string_to_array(current_setting('morsec.fns'), ','), '');
   ops text[] := array_remove(string_to_array(current_setting('morsec.ops'), ' '), '');
   casts text[] := array_remove(string_to_array(current_setting('morsec.casts'), ','), '');
+  rels oid[];
   n bigint;
 BEGIN
   IF t IS NULL THEN RAISE EXCEPTION 'morsec-why: the table was not found'; END IF;
@@ -84,16 +94,36 @@ BEGIN
     RAISE EXCEPTION 'morsec-why: the table has rules or row security'; END IF;
   IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = t AND NOT tgisinternal) THEN
     RAISE EXCEPTION 'morsec-why: the table has triggers'; END IF;
-  -- Every table a cascade can reach, at any depth.
-  IF EXISTS (WITH RECURSIVE reach(rel) AS (
-               SELECT k.conrelid FROM pg_constraint k WHERE k.contype = 'f' AND k.confrelid = t
-               UNION
-               SELECT k.conrelid FROM pg_constraint k JOIN reach ON k.confrelid = reach.rel
-               WHERE k.contype = 'f')
-             SELECT 1 FROM reach JOIN pg_class c ON c.oid = reach.rel
-             WHERE c.relhasrules OR c.relrowsecurity OR EXISTS (
-               SELECT 1 FROM pg_trigger g WHERE g.tgrelid = reach.rel AND NOT g.tgisinternal)) THEN
+  -- The table and every table a cascade can reach from it, at any depth.
+  rels := ARRAY(WITH RECURSIVE reach(rel) AS (
+                  SELECT t
+                  UNION
+                  SELECT k.conrelid FROM pg_constraint k JOIN reach ON k.confrelid = reach.rel
+                  WHERE k.contype = 'f')
+                SELECT rel FROM reach);
+  IF EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = ANY (rels) AND c.oid <> t
+             AND (c.relhasrules OR c.relrowsecurity OR EXISTS (
+               SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid AND NOT g.tgisinternal))) THEN
     RAISE EXCEPTION 'morsec-why: a table that references it (at any depth) has triggers or rules'; END IF;
+  -- ON DELETE/UPDATE SET DEFAULT evaluates a column default (nextval …).
+  IF EXISTS (SELECT 1 FROM pg_constraint k WHERE k.contype = 'f' AND k.confrelid = ANY (rels)
+             AND (k.confdeltype = 'd' OR k.confupdtype = 'd')) THEN
+    RAISE EXCEPTION 'morsec-why: a foreign key on it (at any depth) is ON ... SET DEFAULT'; END IF;
+  -- CHECK constraints of those tables and of the domains their columns use (nested domains
+  -- too) must not call volatile functions.
+  IF EXISTS (WITH RECURSIVE doms(typ) AS (
+               SELECT a.atttypid FROM pg_attribute a
+               WHERE a.attrelid = ANY (rels) AND a.attnum > 0 AND NOT a.attisdropped
+               UNION
+               SELECT y.typbasetype FROM pg_type y JOIN doms ON y.oid = doms.typ
+               WHERE y.typtype = 'd')
+             SELECT 1 FROM pg_constraint k
+             JOIN pg_depend d ON d.classid = 'pg_constraint'::regclass AND d.objid = k.oid
+                              AND d.refclassid = 'pg_proc'::regclass
+             JOIN pg_proc p ON p.oid = d.refobjid
+             WHERE p.provolatile = 'v'
+               AND (k.conrelid = ANY (rels) OR k.contypid IN (SELECT typ FROM doms))) THEN
+    RAISE EXCEPTION 'morsec-why: a CHECK or domain constraint it touches calls a volatile function'; END IF;
   IF EXISTS (SELECT 1 FROM unnest(casts) c WHERE to_regtype(c) IS NULL OR NOT EXISTS (
                SELECT 1 FROM pg_type y JOIN pg_namespace n ON n.oid = y.typnamespace
                WHERE y.oid = to_regtype(c) AND n.nspname = 'pg_catalog')) THEN

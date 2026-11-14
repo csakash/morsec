@@ -80,6 +80,9 @@ fn passfile_line(url: &PgUrl) -> Result<Option<Zeroizing<Vec<u8>>>> {
         .map_err(adapter_refuse)
 }
 
+/// Longest the read-only check may take over all databases.
+pub const READ_ONLY_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Runs the read-only role check for `url` with `psql`, in the URL's database and in every
 /// other database the role can connect to: psql's `\c otherdb` reuses the password it already
 /// has, so a role that can write anywhere on the server is refused.
@@ -93,8 +96,15 @@ fn check_read_only(resolver: &Resolver, psql: &Path, key: &KeyName, url: &PgUrl)
     };
     let refuse = |m: String| adapter_refuse(format!("{key}: {m}"));
     let home = target(url.rewritten(true));
+    let started = std::time::Instant::now();
     probe::role_check(&home).map_err(refuse)?;
     for db in probe::databases(&home).map_err(refuse)? {
+        if started.elapsed() > READ_ONLY_CHECK_BUDGET {
+            return Err(refuse(format!(
+                "checking that the role can only read took longer than {} s (one check per database it can connect to), so the command is refused",
+                READ_ONLY_CHECK_BUDGET.as_secs()
+            )));
+        }
         probe::role_check(&target(url.rewritten_db(true, &db)))
             .map_err(|m| refuse(format!("in database {}: {m}", crate::printable(&db))))?;
     }

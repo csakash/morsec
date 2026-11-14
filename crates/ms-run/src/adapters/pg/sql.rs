@@ -44,6 +44,30 @@ pub struct Simple {
 
 const OP_CHARS: &str = "+-*/<>=~!@#%^&|";
 
+/// Keywords a literal may follow without being a typed literal (`type 'text'`).
+const LITERAL_KEYWORDS: &[&str] = &[
+    "and",
+    "or",
+    "not",
+    "is",
+    "like",
+    "ilike",
+    "similar",
+    "to",
+    "escape",
+    "between",
+    "when",
+    "then",
+    "else",
+    "in",
+    "where",
+    "set",
+    "distinct",
+    "from",
+    "symmetric",
+    "collate",
+];
+
 /// Words that are followed by `(` without being function calls.
 const NOT_FUNCTIONS: &[&str] = &[
     "and", "or", "not", "in", "exists", "any", "all", "some", "where", "set", "values", "select",
@@ -236,6 +260,15 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
     }
     let mut casts = Vec::new();
     for w in toks.windows(2) {
+        // `type 'literal'` is a cast too (`date '2024-01-01'`, `mydomain '1'`).
+        if let (Tok::Word(t), Tok::Literal) = (&w[0], &w[1])
+            && !LITERAL_KEYWORDS.contains(&t.as_str())
+        {
+            casts.push(t.clone());
+        }
+        if let (Tok::Quoted(q), Tok::Literal) = (&w[0], &w[1]) {
+            casts.push(q.clone());
+        }
         if w[0] == Tok::Cast {
             match &w[1] {
                 Tok::Word(t) => casts.push(t.clone()),
@@ -311,6 +344,9 @@ mod tests {
         let s = simple("update t set a = \"My Fn\"(b)::int, c = 'it''s; fine'").unwrap();
         assert_eq!(s.functions, ["My Fn"]);
         assert_eq!(s.casts, ["int"]);
+        let s =
+            simple("update t set a = mydom '1', b = date '2024-01-01' where c like 'x%'").unwrap();
+        assert_eq!(s.casts, ["date", "mydom"]);
 
         for bad in [
             "update t set a = 1; commit",

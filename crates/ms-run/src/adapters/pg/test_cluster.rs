@@ -13,7 +13,8 @@
 //!   `writer` (so it can write through that membership); `split`: `SELECT` only in `shop` but
 //!   `INSERT` on `other.t` (psql could `\c other`);
 //! - `parent` ← `child` ← `grandchild` (cascading FKs; a user trigger on `grandchild`), a domain
-//!   `posint`.
+//!   `posint`; `gauges.v` of domain `voldom` (CHECK calls a volatile function); `tagged.tag_id`
+//!   → `tags` `ON DELETE SET DEFAULT` with a `nextval` default.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -149,6 +150,14 @@ impl Cluster {
              CREATE TRIGGER grandchild_t BEFORE DELETE ON grandchild FOR EACH ROW EXECUTE FUNCTION audit_trg();
              INSERT INTO parent VALUES (1);
              CREATE DOMAIN posint AS int CHECK (VALUE >= 0);
+             CREATE FUNCTION vol_ok(int) RETURNS bool LANGUAGE plpgsql VOLATILE AS
+               $$ BEGIN RETURN true; END $$;
+             CREATE DOMAIN voldom AS int CHECK (vol_ok(VALUE));
+             CREATE TABLE gauges (id int PRIMARY KEY, v voldom);
+             CREATE TABLE tags (id int PRIMARY KEY);
+             CREATE SEQUENCE tag_seq;
+             CREATE TABLE tagged (id int PRIMARY KEY,
+               tag_id int DEFAULT nextval('tag_seq') REFERENCES tags ON DELETE SET DEFAULT);
              GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader, sneaky, split;
              RESET ROLE;
              REVOKE CREATE ON SCHEMA public FROM PUBLIC;",

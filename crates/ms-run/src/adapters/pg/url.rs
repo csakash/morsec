@@ -85,6 +85,21 @@ fn encode(s: &str) -> String {
     out
 }
 
+/// Every `host[:port]` / `[v6][:port]` in a host list has a numeric (or no) port.
+fn ports_numeric(hosts: &str) -> bool {
+    let digits = |p: &str| p.is_empty() || p.bytes().all(|b| b.is_ascii_digit());
+    hosts.split(',').all(|h| {
+        if let Some(r) = h.strip_prefix('[') {
+            match r.split_once(']') {
+                Some((_, rest)) => rest.is_empty() || rest.strip_prefix(':').is_some_and(digits),
+                None => false,
+            }
+        } else {
+            h.split_once(':').is_none_or(|(_, p)| digits(p))
+        }
+    })
+}
+
 impl PgUrl {
     /// Parses a key's value.
     pub fn parse(value: &[u8]) -> Result<Self, String> {
@@ -114,6 +129,11 @@ impl PgUrl {
             Some((p, q)) => (p, Some(q)),
             None => (after_host, None),
         };
+        // A password with an unencoded '/' or a second '@' leaves part of it in the host or
+        // database, which would go into argv: refuse rather than follow libpq there.
+        if hosts_raw.contains('@') || path_raw.contains('@') || !ports_numeric(hosts_raw) {
+            return Err("the key's URL has an unencoded '@', '/' or ':' in its user or password (or a port that isn't a number); %-encode them".into());
+        }
         let mut user_raw = None;
         let mut user = None;
         let mut password = None;
@@ -354,6 +374,9 @@ mod tests {
             b"postgres://u:p@h/d b",
             b"postgres://u:p@h/db?options=%ff",
             b"postgres://u:p@h/db?dbname=other",
+            b"postgres://app:pa/ss@db/shop",
+            b"postgres://app:p@ss@db/shop",
+            b"postgres://h:5x/db",
             b"\xff",
         ] {
             assert!(

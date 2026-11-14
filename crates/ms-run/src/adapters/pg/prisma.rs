@@ -28,7 +28,7 @@ fn is_prisma(a: &str) -> bool {
 }
 
 /// Index in `argv` of the `prisma` word, when this is a Prisma CLI call: `prisma …`, or a
-/// package runner (`npx`, `bunx`, `pnpx`, `pnpm`, `yarn`, `bun`) with any argument that is
+/// package runner (`npx`, `bunx`, `pnpx`, `npm`, `pnpm`, `yarn`, `bun`) with any argument that is
 /// `prisma` / `prisma@<v>` (or a path to one). Runner options can take values (`pnpm --filter
 /// api exec prisma …`), so morsec doesn't try to parse them: the first such argument counts, and
 /// whatever follows it is classified (an option's value of `prisma` then reads as an unknown
@@ -38,7 +38,10 @@ pub fn locate(argv: &[String]) -> Option<usize> {
     if first == "prisma" {
         return Some(0);
     }
-    if !matches!(first, "npx" | "bunx" | "pnpx" | "pnpm" | "yarn" | "bun") {
+    if !matches!(
+        first,
+        "npx" | "bunx" | "pnpx" | "npm" | "pnpm" | "yarn" | "bun"
+    ) {
         return None;
     }
     argv.iter()
@@ -111,6 +114,10 @@ mod tests {
         );
         assert_eq!(
             locate(&a(&["yarn", "--cwd", "app", "prisma", "migrate"])),
+            Some(3)
+        );
+        assert_eq!(
+            locate(&a(&["npm", "exec", "--", "prisma", "migrate"])),
             Some(3)
         );
         assert_eq!(

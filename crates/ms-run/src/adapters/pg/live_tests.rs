@@ -350,6 +350,17 @@ fn preview_never_commits(env: &Env) {
         "update orders set counter = 1::posint",
     ]);
     assert!(unknown.contains("pg_catalog"), "{unknown}");
+    let unknown = preview(&[
+        "psql",
+        "ms://pg/w",
+        "-c",
+        "update orders set counter = posint '1'",
+    ]);
+    assert!(unknown.contains("pg_catalog"), "{unknown}");
+    let unknown = preview(&["psql", "ms://pg/w", "-c", "update gauges set v = 1"]);
+    assert!(unknown.contains("volatile"), "{unknown}");
+    let unknown = preview(&["psql", "ms://pg/w", "-c", "delete from tags where id = 1"]);
+    assert!(unknown.contains("SET DEFAULT"), "{unknown}");
     assert_eq!(
         preview(&[
             "psql",
