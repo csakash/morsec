@@ -22,6 +22,7 @@ use tokio::sync::watch;
 
 mod mcp;
 mod run;
+mod ssh_git;
 
 use crate::backend::{Backend, DAEMON_STATE_KEY, RULES_HMAC_KEY};
 use crate::paths::Paths;
@@ -129,6 +130,9 @@ pub struct Daemon {
     stops: std::sync::atomic::AtomicU64,
     /// The proxy CA in use (certificate PEM, hosts), when a host is bound.
     ca: Mutex<Option<(String, Vec<String>)>>,
+    /// This daemon, for work that outlives a request (L16: a run's SSH agent records receipts
+    /// and checks `ms stop` while the run lasts).
+    me: std::sync::Weak<Daemon>,
     /// What `ms doctor --probe` runs reported, and the canaries the proxy saw (L17).
     probes: Arc<crate::doctor::Probes>,
 }
@@ -296,7 +300,8 @@ impl Daemon {
         rules.stopped = stopped;
 
         let (proxy_gen, _) = watch::channel(0);
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             backend,
             vault,
             paths,

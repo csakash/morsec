@@ -88,11 +88,16 @@ pub struct Prepared {
     plan: ExecPlan,
     arg0: OsString,
     patterns: Arc<Patterns>,
-    /// A contextual adapter's guard, dropped when the run ends (L15).
-    guard: Option<Box<dyn RunGuard>>,
+    /// Guards kept alive for the run: a contextual adapter's (L15) and any msd added (L16).
+    guards: Vec<Box<dyn RunGuard>>,
 }
 
 impl Prepared {
+    /// Keeps `guard` alive for the run and tells it the child's PID when the child starts.
+    pub fn hold(&mut self, guard: Box<dyn RunGuard>) {
+        self.guards.push(guard);
+    }
+
     /// The program that will run.
     pub fn program(&self) -> &Path {
         &self.plan.program
@@ -264,6 +269,30 @@ impl Runner {
         run_keys: &BTreeSet<KeyName>,
         ctx: &CallContext<'_>,
     ) -> Result<Prepared, RunError> {
+        self.plan_chosen(self.adapter(&call.argv), input, call, run_keys, ctx)
+    }
+
+    /// Like [`Runner::plan_in`], with an adapter msd built for this one call (L16) instead of
+    /// the registered ones. The same checks apply to its plan.
+    pub fn plan_with(
+        &self,
+        adapter: &dyn RunAdapter,
+        input: &RunInput,
+        call: &RunCall,
+        run_keys: &BTreeSet<KeyName>,
+        ctx: &CallContext<'_>,
+    ) -> Result<Prepared, RunError> {
+        self.plan_chosen(Chosen::Plain(adapter), input, call, run_keys, ctx)
+    }
+
+    fn plan_chosen(
+        &self,
+        chosen: Chosen<'_>,
+        input: &RunInput,
+        call: &RunCall,
+        run_keys: &BTreeSet<KeyName>,
+        ctx: &CallContext<'_>,
+    ) -> Result<Prepared, RunError> {
         let vault = ctx.vault;
         // The adapter sees which keys travel in the environment from the input itself, not from
         // whatever the caller put in the context.
@@ -276,7 +305,7 @@ impl Runner {
             exec: mut plan,
             secrets,
             guard,
-        } = match self.adapter(&call.argv) {
+        } = match chosen {
             Chosen::Contextual(a) => a.plan(call, ctx),
             // Only a contextual adapter can enforce a read-only rule (L15 review R10).
             Chosen::Plain(_) if ctx.keys.values().any(|f| f.read_only) => {
@@ -341,20 +370,19 @@ impl Runner {
             plan,
             arg0: OsString::from(&input.argv[0]),
             patterns: Arc::new(builder.build()),
-            guard,
+            guards: guard.into_iter().collect(),
         })
     }
 
     /// Runs a prepared plan. Dropping the returned future kills the child's process group.
     pub async fn execute(&self, prepared: Prepared, io: ExecIo) -> Result<Exit, RunError> {
+        // The guards live until this function returns: after the group was killed.
         let Prepared {
             plan,
             arg0,
             patterns,
-            guard,
+            guards,
         } = prepared;
-        // Kept until this function returns: the run is over (or was cancelled) by then.
-        let _guard = guard;
         let mut cmd = tokio::process::Command::new(&plan.program);
         cmd.arg0(&arg0)
             .args(&plan.args)
@@ -363,8 +391,10 @@ impl Runner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
+            .kill_on_drop(true);
+        // Its own session (and process group, id = its PID): nothing outside can join the
+        // group (security review S1, L16).
+        crate::sys::new_session(&mut cmd);
         for (k, v) in &plan.env {
             match v {
                 EnvValue::Plain(s) => cmd.env(k, s),
@@ -380,6 +410,11 @@ impl Runner {
         let mut child = spawned
             .map_err(|e| RunError::internal(format!("morsec: could not start {shown}: {e}")))?;
         let group = GroupGuard::new(child.id());
+        if let Some(pid) = child.id() {
+            for g in &guards {
+                g.started(pid);
+            }
+        }
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();

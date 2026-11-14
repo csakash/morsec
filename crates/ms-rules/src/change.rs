@@ -40,6 +40,7 @@ pub fn classify_rule(old: Option<&KeyRule>, new: Option<&KeyRule>) -> Change {
                     .iter()
                     .all(|r| o.roots.iter().any(|old| crate::model::within_root(r, old)))
                 && n.env.iter().all(|e| o.env.contains(e))
+                && n.ssh_host_keys.iter().all(|k| o.ssh_host_keys.contains(k))
                 && n.git_hosts.iter().all(|g| o.git_hosts.contains(g));
             if narrower {
                 Change::Tighten
@@ -79,8 +80,13 @@ mod tests {
     use ms_core::{Mode, Tier};
     use std::collections::BTreeMap;
 
+    const PIN: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIPtd2fa6erUsRui9x7T64boFCGFRwuEig/mwpm4LdTO7";
+
     fn base() -> KeyRule {
         let mut r = KeyRule::new(Mode::Run, Tier::Test);
+        r.ssh_host_keys = vec![
+            crate::model::SshHostKey::parse(&format!("git.example ssh-ed25519 {PIN}")).unwrap(),
+        ];
         r.commands = vec![CommandPattern::parse(&["psql".into(), "**".into()]).unwrap()];
         r.hosts = vec![HostPattern::parse("*.db.internal").unwrap()];
         r.session_ttl_secs = 600;
@@ -113,6 +119,13 @@ mod tests {
             // A sibling that shares a string prefix is not inside the root.
             Box::new(|r| r.roots = vec!["/r/application".into()]),
             Box::new(|r| r.env.push("CURL_HOME".into())),
+            // L16: a new pinned SSH host key lets the key sign logins somewhere new.
+            Box::new(|r| {
+                r.ssh_host_keys.push(
+                    crate::model::SshHostKey::parse(&format!("other.example ssh-ed25519 {PIN}"))
+                        .unwrap(),
+                )
+            }),
             // L30: a git host changes where the key goes on a host, even one already bound.
             Box::new(|r| r.git_hosts.push("a.db.internal".into())),
         ];
@@ -139,6 +152,7 @@ mod tests {
         assert_eq!(classify_rule(Some(&o), Some(&n)), Change::Tighten);
         n.roots.clear();
         n.env.clear();
+        n.ssh_host_keys.clear();
         assert_eq!(classify_rule(Some(&o), Some(&n)), Change::Tighten);
         assert_eq!(classify_rule(Some(&o), None), Change::Tighten);
         assert_eq!(classify_rule(None, Some(&o)), Change::Loosen);

@@ -63,8 +63,13 @@ impl<'a> CallContext<'a> {
 }
 
 /// Something kept alive until the run ends, then dropped (for example a passfile that its
-/// `Drop` removes).
-pub trait RunGuard: Send + Sync + std::fmt::Debug {}
+/// `Drop` removes, L15, or the per-run SSH agent socket, L16). It is dropped however the run
+/// ends, and also when the plan is dropped without running.
+pub trait RunGuard: Send + Sync + std::fmt::Debug {
+    /// The child started with this PID, which is also its process-group id (L16). Most guards
+    /// don't need it.
+    fn started(&self, _pid: u32) {}
+}
 
 /// What a contextual adapter returns.
 #[derive(Debug)]

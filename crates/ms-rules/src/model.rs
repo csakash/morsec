@@ -25,6 +25,8 @@ pub const MAX_ROOTS: usize = 64;
 pub const MAX_ROOT_LEN: usize = 1024;
 /// Most environment variable names in one rule.
 pub const MAX_ENV_NAMES: usize = 32;
+/// Most pinned SSH host keys in one rule (L16).
+pub const MAX_SSH_HOST_KEYS: usize = 32;
 /// Most git hosts in one rule.
 pub const MAX_GIT_HOSTS: usize = 16;
 
@@ -53,6 +55,10 @@ pub struct KeyRule {
     /// Environment variables the key's value may be put in for its commands (run only, L12):
     /// a call may set one of these to exactly `ms://<this key>`. Empty means none.
     pub env: Vec<String>,
+    /// SSH host keys the key may sign logins for (run only, L16), in known_hosts form
+    /// `HOST ssh-ed25519 BASE64` or `[HOST]:PORT ssh-ed25519 BASE64`, normalised by
+    /// [`SshHostKey`]. Empty means no SSH destination: the SSH agent refuses every signature.
+    pub ssh_host_keys: Vec<SshHostKey>,
     /// Hosts where git sends the key over HTTPS (swap only, L30): there the proxy swaps the
     /// placeholder in the Basic-auth password, which is where git puts a token. Exact DNS names,
     /// each also in `hosts`, so the host allowlist is `hosts` alone.
@@ -72,6 +78,7 @@ impl KeyRule {
             read_only: false,
             roots: Vec::new(),
             env: Vec::new(),
+            ssh_host_keys: Vec::new(),
             git_hosts: Vec::new(),
         }
     }
@@ -125,6 +132,14 @@ impl KeyRule {
         for n in &self.env {
             validate_env_name(n).map_err(&bad)?;
         }
+        if self.ssh_host_keys.len() > MAX_SSH_HOST_KEYS {
+            return Err(bad(format!("more than {MAX_SSH_HOST_KEYS} ssh host keys")));
+        }
+        if self.mode != Mode::Run && !self.ssh_host_keys.is_empty() {
+            return Err(bad(
+                "ssh_host_keys are only allowed on a run-mode key".into()
+            ));
+        }
         if self.git_hosts.len() > MAX_GIT_HOSTS {
             return Err(bad(format!("more than {MAX_GIT_HOSTS} git hosts")));
         }
@@ -155,6 +170,8 @@ impl KeyRule {
         self.roots.dedup();
         self.env.sort();
         self.env.dedup();
+        self.ssh_host_keys.sort();
+        self.ssh_host_keys.dedup();
         self.git_hosts.sort();
         self.git_hosts.dedup();
         Ok(self)
@@ -211,6 +228,107 @@ pub fn validate_env_name(n: &str) -> std::result::Result<(), String> {
             "env name {n:?} must be letters, digits and '_', not starting with a digit"
         ))
     }
+}
+
+/// The only SSH host key type accepted in rules (L16).
+pub const SSH_ED25519: &str = "ssh-ed25519";
+
+/// One pinned SSH host key (L16): where the host is and its ed25519 public key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SshHostKey {
+    /// The normalised host name or IP literal.
+    pub host: String,
+    /// The SSH port.
+    pub port: u16,
+    /// The raw 32-byte ed25519 public key.
+    pub key: [u8; 32],
+}
+
+impl SshHostKey {
+    /// Parses a known_hosts-style line: `HOST ssh-ed25519 BASE64` or
+    /// `[HOST]:PORT ssh-ed25519 BASE64`, with an optional trailing comment. Only `ssh-ed25519`
+    /// keys, plain host names and IP literals (no patterns, no hashed names, no lists).
+    pub fn parse(line: &str) -> std::result::Result<Self, String> {
+        use base64::Engine as _;
+        let shown: String = line
+            .chars()
+            .take(80)
+            .flat_map(char::escape_default)
+            .collect();
+        let bad = |why: &str| format!("ssh host key {shown:?}: {why}");
+        let mut parts = line.split_ascii_whitespace();
+        let (Some(who), Some(kind), Some(b64)) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(bad("expected HOST ssh-ed25519 BASE64"));
+        };
+        if kind != SSH_ED25519 {
+            return Err(bad(
+                "only ssh-ed25519 host keys are supported (ask the server for its ed25519 key: ssh-keyscan -t ed25519 HOST)",
+            ));
+        }
+        let (host, port) = match who.strip_prefix('[') {
+            Some(rest) => {
+                let (h, p) = rest
+                    .split_once("]:")
+                    .ok_or_else(|| bad("expected [HOST]:PORT"))?;
+                let port: u16 = p
+                    .parse()
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| bad("the port must be 1 to 65535"))?;
+                (h, port)
+            }
+            None => (who, 22),
+        };
+        let host = crate::pattern::NormalHost::parse(host)
+            .ok_or_else(|| bad("HOST must be one plain host name or IP address"))?
+            .as_str()
+            .to_owned();
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| bad("the key is not valid base64"))?;
+        let key =
+            ed25519_blob(&blob).ok_or_else(|| bad("the key is not an ssh-ed25519 public key"))?;
+        Ok(Self { host, port, key })
+    }
+
+    /// The SSH wire blob of the key (`string "ssh-ed25519", string key`).
+    pub fn blob(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(51);
+        out.extend_from_slice(&(SSH_ED25519.len() as u32).to_be_bytes());
+        out.extend_from_slice(SSH_ED25519.as_bytes());
+        out.extend_from_slice(&32u32.to_be_bytes());
+        out.extend_from_slice(&self.key);
+        out
+    }
+
+    /// The host as known_hosts writes it: `host`, or `[host]:port` for another port than 22.
+    pub fn host_field(&self) -> String {
+        if self.port == 22 {
+            self.host.clone()
+        } else {
+            format!("[{}]:{}", self.host, self.port)
+        }
+    }
+}
+
+impl std::fmt::Display for SshHostKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use base64::Engine as _;
+        write!(
+            f,
+            "{} {SSH_ED25519} {}",
+            self.host_field(),
+            base64::engine::general_purpose::STANDARD.encode(self.blob())
+        )
+    }
+}
+
+/// The 32-byte key inside an `ssh-ed25519` public key blob, if `blob` is exactly one.
+fn ed25519_blob(blob: &[u8]) -> Option<[u8; 32]> {
+    let rest = blob.strip_prefix(&(SSH_ED25519.len() as u32).to_be_bytes()[..])?;
+    let rest = rest.strip_prefix(SSH_ED25519.as_bytes())?;
+    let rest = rest.strip_prefix(&32u32.to_be_bytes()[..])?;
+    rest.try_into().ok()
 }
 
 /// A git host is an exact DNS name (no wildcard, no IP) that is also one of the key's `hosts`.
@@ -342,6 +460,8 @@ pub(crate) struct KeyRuleFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     env: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ssh_host_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     git_hosts: Vec<String>,
 }
 
@@ -394,6 +514,7 @@ impl KeyRuleFile {
             read_only: self.read_only,
             roots: self.roots.into_iter().map(PathBuf::from).collect(),
             env: self.env,
+            ssh_host_keys: parse_ssh_host_keys(&self.ssh_host_keys, file, key)?,
             git_hosts: self.git_hosts,
         }
         .normalise(file, key)
@@ -414,9 +535,24 @@ impl KeyRuleFile {
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
             env: r.env.clone(),
+            ssh_host_keys: r.ssh_host_keys.iter().map(ToString::to_string).collect(),
             git_hosts: r.git_hosts.clone(),
         }
     }
+}
+
+fn parse_ssh_host_keys(raw: &[String], file: &str, key: &KeyName) -> Result<Vec<SshHostKey>> {
+    if raw.len() > MAX_SSH_HOST_KEYS {
+        return Err(RulesError::invalid(
+            file,
+            format!("key {key}: more than {MAX_SSH_HOST_KEYS} ssh host keys"),
+        ));
+    }
+    raw.iter()
+        .map(|l| {
+            SshHostKey::parse(l).map_err(|e| RulesError::invalid(file, format!("key {key}: {e}")))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -520,6 +656,57 @@ mint_scopes = ["s3:read"]
         }
     }
 
+    const PIN: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIPtd2fa6erUsRui9x7T64boFCGFRwuEig/mwpm4LdTO7";
+
+    // protects=L16 pinned SSH host keys: the documented forms parse, normalise (host lowercased,
+    // comment dropped, port 22 written bare) and round-trip through the file; fails_when=a pin is
+    // lost or changes on a save; no_claim=the agent's use of the pins (ms-run ssh_git tests)
+    #[test]
+    fn ssh_host_keys_roundtrip() {
+        let text = format!(
+            "version = 1\n[keys.\"gh/deploy\"]\nmode = \"run\"\ntier = \"test\"\ncommands = [[\"git\", \"push\"]]\nssh_host_keys = [\"GitHub.com ssh-ed25519 {PIN} comment\", \"[127.0.0.1]:4422 ssh-ed25519 {PIN}\", \"[h.example]:22 ssh-ed25519 {PIN}\"]\n"
+        );
+        let r = Rules::from_toml(&text, "rules.toml").unwrap();
+        let pins = &r.keys[&KeyName::new("gh/deploy").unwrap()].ssh_host_keys;
+        let shown: Vec<String> = pins.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                format!("[127.0.0.1]:4422 ssh-ed25519 {PIN}"),
+                format!("github.com ssh-ed25519 {PIN}"),
+                format!("h.example ssh-ed25519 {PIN}"),
+            ]
+        );
+        assert_eq!(pins[0].port, 4422);
+        assert_eq!(Rules::from_toml(&r.to_toml(), "rules.toml").unwrap(), r);
+    }
+
+    // protects=L16: only exact ed25519 pins on run keys are accepted; fails_when=a pattern, a
+    // hashed or listed host, another key type, a truncated key or a pin on a swap key parses;
+    // no_claim=every malformed line
+    #[test]
+    fn rejects_bad_ssh_host_keys() {
+        let rsa = "AAAAB3NzaC1yc2EAAAADAQABAAABAQ";
+        let short = "AAAAC3NzaC1lZDI1NTE5AAAAIPtd2fa6erUsRui9x7T64boFCGFRwuEig/mwpm4L";
+        for line in [
+            format!("*.example.com ssh-ed25519 {PIN}"),
+            format!("a.example,b.example ssh-ed25519 {PIN}"),
+            format!("|1|abc=|def= ssh-ed25519 {PIN}"),
+            format!("[h]:0 ssh-ed25519 {PIN}"),
+            format!("[h]:x ssh-ed25519 {PIN}"),
+            format!("h ssh-rsa {rsa}"),
+            format!("h ssh-ed25519 {short}"),
+            "h ssh-ed25519 !!!".into(),
+            "h ssh-ed25519".into(),
+        ] {
+            assert!(SshHostKey::parse(&line).is_err(), "accepted {line:?}");
+        }
+        let swap = format!(
+            "version = 1\n[keys.\"a\"]\nmode = \"swap\"\ntier = \"test\"\nssh_host_keys = [\"h ssh-ed25519 {PIN}\"]"
+        );
+        assert!(Rules::from_toml(&swap, "rules.toml").is_err());
+    }
+
     // protects=error text from a hostile file can't carry terminal escapes; fails_when=a raw ESC
     // or newline reaches the message; no_claim=CLI output (cli tests)
     #[test]
@@ -542,6 +729,21 @@ mint_scopes = ["s3:read"]
         assert_eq!(k.git_hosts, ["git.example.com", "github.com"]);
         let back = Rules::from_toml(&r.to_toml(), "rules.toml").unwrap();
         assert_eq!(back, r);
+    }
+
+    // protects=a rules file written before L16 and L30 still parses (both fields are optional and
+    // left out when empty); fails_when=either field loses its serde default; no_claim=project files
+    #[test]
+    fn older_files_without_ssh_or_git_fields_parse() {
+        let t = "version = 1\n[keys.\"stripe/test\"]\nmode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\"]";
+        let r = Rules::from_toml(t, "rules.toml").unwrap();
+        let k = &r.keys[&KeyName::new("stripe/test").unwrap()];
+        assert!(k.git_hosts.is_empty() && k.ssh_host_keys.is_empty());
+        let out = r.to_toml();
+        assert!(
+            !out.contains("git_hosts") && !out.contains("ssh_host_keys"),
+            "{out}"
+        );
     }
 
     // protects=L30 D1 a git host must be an exact lowercase DNS name that is also a host of a swap
