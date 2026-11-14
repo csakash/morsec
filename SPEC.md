@@ -62,8 +62,8 @@ receipt chain, and output that comes back as redacted, inert data.
   buffered run. So validation and receipts can't be skipped by a modified `ms mcp`, and a call
   can't name another key: the key comes only from the tool. Refusals before the run (unknown
   tool, version changed, schema violation) get a receipt too (blocked, counting toward LOG-2;
-  except a changed rules version, which is the person's doing: recorded as failed): under the tool's key when the tool
-  exists, else under msd's own key; target `mcp:<tool>` (escaped, bounded) and the reason.
+  except a changed rules version, which is the person's doing: recorded as failed): under the tool's key for invalid
+  arguments, else (unknown tool, changed rules version) under msd's own key; target `mcp:<tool>` (escaped, bounded) and the reason.
 - **D4 — identity from the peer.** msd identifies the `McpCall` connection by its kernel peer
   (L06/L07, the same as `Run`): `ms mcp` is a child of the agent, so its calls are the agent's
   session. Nothing in the call names a session. A LOG-2-stopped session or `ms stop` refuses.
