@@ -727,22 +727,30 @@ fn run_agent_in(argv: &[String], dir: &Path) -> (String, String) {
         Err(e) => return (format!("not started: {e}"), String::new()),
     };
     // Keep the first MAX_AGENT_OUTPUT bytes and discard the rest, so a chatty agent never
-    // blocks on a full pipe. The result comes back on a channel, so a grandchild that left the
-    // group holding the pipe can't hold doctor past its timeout.
+    // blocks on a full pipe. Bytes land in a shared buffer as they arrive, so if something that
+    // left the group still holds the pipe, doctor stops waiting after READ_TIMEOUT and keeps
+    // everything captured so far (review R6).
     let reader = |r: Option<Box<dyn Read + Send>>| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut r) = r {
-                let _ = r
-                    .by_ref()
-                    .take(MAX_AGENT_OUTPUT as u64)
-                    .read_to_end(&mut buf);
-                let _ = std::io::copy(&mut r, &mut std::io::sink());
-            }
-            let _ = tx.send(buf);
-        });
-        rx
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(r.is_none()));
+        if let Some(mut r) = r {
+            let (b, d) = (buf.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match r.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut g = b.lock().unwrap_or_else(|e| e.into_inner());
+                            let room = MAX_AGENT_OUTPUT.saturating_sub(g.len());
+                            g.extend_from_slice(&chunk[..n.min(room)]);
+                        }
+                    }
+                }
+                d.store(true, std::sync::atomic::Ordering::Release);
+            });
+        }
+        (buf, done)
     };
     let out = reader(
         child
@@ -772,10 +780,19 @@ fn run_agent_in(argv: &[String], dir: &Path) -> (String, String) {
     };
     // Children left holding the pipes would keep the readers open: end the group either way.
     kill_group(child.id());
-    let collect =
-        |rx: std::sync::mpsc::Receiver<Vec<u8>>| rx.recv_timeout(READ_TIMEOUT).unwrap_or_default();
-    let mut text = String::from_utf8_lossy(&collect(out)).into_owned();
-    text.push_str(&String::from_utf8_lossy(&collect(err)));
+    // One deadline for both pipes (review R7).
+    let drained = Instant::now() + READ_TIMEOUT;
+    while !(out.1.load(std::sync::atomic::Ordering::Acquire)
+        && err.1.load(std::sync::atomic::Ordering::Acquire))
+        && Instant::now() < drained
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let take = |b: &std::sync::Mutex<Vec<u8>>| {
+        String::from_utf8_lossy(&b.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+    };
+    let mut text = take(&out.0);
+    text.push_str(&take(&err.0));
     (outcome, text)
 }
 
@@ -1404,6 +1421,28 @@ mod tests {
             "morsec-probe nonce=ffffffffffffffffffffffffffffffff proxy=no direct=OPEN",
             N
         ));
+    }
+
+    // protects=R6: output already printed is kept when something that left the agent's process
+    // group still holds the pipe, and doctor stops waiting soon after the agent exits;
+    // fails_when=the captured line is lost or run_agent_in waits for the orphan;
+    // no_claim=real agents
+    #[test]
+    fn output_kept_when_an_orphan_holds_the_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            "echo morsec-probe-line; /usr/bin/perl -e 'use POSIX; exit if fork; POSIX::setsid(); sleep 20'",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let t = Instant::now();
+        let (outcome, text) = run_agent_in(&argv, dir.path());
+        assert_eq!(outcome, "exit 0");
+        assert!(text.contains("morsec-probe-line"), "{text:?}");
+        assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
     }
 
     #[test]
