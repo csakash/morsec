@@ -80,16 +80,25 @@ fn passfile_line(url: &PgUrl) -> Result<Option<Zeroizing<Vec<u8>>>> {
         .map_err(adapter_refuse)
 }
 
-/// Runs the read-only role check for `url` with `psql`.
+/// Runs the read-only role check for `url` with `psql`, in the URL's database and in every
+/// other database the role can connect to: psql's `\c otherdb` reuses the password it already
+/// has, so a role that can write anywhere on the server is refused.
 fn check_read_only(resolver: &Resolver, psql: &Path, key: &KeyName, url: &PgUrl) -> Result<()> {
     let line = passfile_line(url)?;
-    let t = probe::Target {
+    let target = |u: String| probe::Target {
         psql,
         path_var: resolver.path_var(),
-        url: url.rewritten(true),
+        url: u,
         passfile_line: line.as_deref().map(|l| l.as_slice()),
     };
-    probe::role_check(&t).map_err(|m| adapter_refuse(format!("{key}: {m}")))
+    let refuse = |m: String| adapter_refuse(format!("{key}: {m}"));
+    let home = target(url.rewritten(true));
+    probe::role_check(&home).map_err(refuse)?;
+    for db in probe::databases(&home).map_err(refuse)? {
+        probe::role_check(&target(url.rewritten_db(true, &db)))
+            .map_err(|m| refuse(format!("in database {}: {m}", crate::printable(&db))))?;
+    }
+    Ok(())
 }
 
 /// `psql` with a key as its connection (SPEC D2, D3, D5).
@@ -119,7 +128,7 @@ impl PsqlAdapter {
         let argv = utf8_argv(&call.argv)?;
         let args = psql_args::parse(&argv).map_err(adapter_refuse)?;
         let f = facts(ctx, &args.key)?;
-        if ctx.keys.keys().any(|k| *k != args.key) {
+        if !ctx.env_keys.is_empty() || ctx.keys.keys().any(|k| *k != args.key) {
             return Err(adapter_refuse(
                 "psql takes a key only as its connection argument (psql ms://<key> …), not through an environment variable",
             ));
@@ -312,12 +321,199 @@ impl ContextAdapter for PrismaAdapter {
         })
     }
 
-    fn needs_approval(&self, call: &RunCall, _ctx: &CallContext<'_>) -> Option<String> {
+    fn needs_approval(&self, call: &RunCall, ctx: &CallContext<'_>) -> Option<String> {
         match Self::class(call)? {
+            // A read-only key refuses it in `plan` anyway; don't ask a person first (review R7).
+            prisma::Class::Schema(_) if ctx.keys.values().any(|f| f.read_only) => None,
             prisma::Class::Schema(w) => Some(format!(
                 "{w} changes the database schema, so it always needs an approval"
             )),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RunInput, Runner, RunnerConfig};
+    use ms_core::{AgentKind, KeyMeta, Mode, SecretBytes, SessionId, Tier};
+    use ms_vault::Vault;
+    use ms_vault::memory::MemoryVault;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct T {
+        runner: Runner,
+        vault: MemoryVault,
+        cwd: PathBuf,
+        _d: tempfile::TempDir,
+    }
+
+    /// A runner whose only program directory holds a fake `prisma` (prints its args and
+    /// whether DATABASE_URL is set) and nothing else (no psql).
+    fn setup() -> T {
+        let d = tempfile::tempdir().unwrap();
+        let bin = std::fs::canonicalize(d.path()).unwrap().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake = bin.join("prisma");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"prisma-ran $*\"\necho \"url=$DATABASE_URL\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolver = Resolver::new(vec![bin, "/bin".into()], Vec::new());
+        let mut runner = Runner::new(RunnerConfig {
+            resolver: resolver.clone(),
+            base_env: Vec::new(),
+            max_runtime: std::time::Duration::from_secs(10),
+        });
+        runner.register_contextual(Box::new(PsqlAdapter::new(resolver.clone())));
+        runner.register_contextual(Box::new(PrismaAdapter::new(resolver)));
+        let vault = MemoryVault::new();
+        let k = KeyName::new("pg/x").unwrap();
+        vault
+            .put(
+                &k,
+                SecretBytes::from("postgres://u:VERYSECRETPW@127.0.0.1:1/db".to_owned()),
+                KeyMeta {
+                    name: k.clone(),
+                    mode: Mode::Run,
+                    tier: Tier::Test,
+                    created_unix_ms: 0,
+                },
+            )
+            .unwrap();
+        T {
+            runner,
+            vault,
+            cwd: std::fs::canonicalize(d.path()).unwrap(),
+            _d: d,
+        }
+    }
+
+    impl T {
+        fn plan(
+            &self,
+            argv: &[&str],
+            env: &[(&str, &str)],
+            read_only: bool,
+        ) -> (
+            std::result::Result<crate::Prepared, crate::RunError>,
+            Option<String>,
+        ) {
+            let input = RunInput::new(
+                argv.iter().map(|s| s.to_string()).collect(),
+                self.cwd.clone(),
+                env.iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect(),
+            )
+            .unwrap();
+            let call = Runner::call(
+                &input,
+                self.cwd.clone(),
+                SessionId {
+                    agent: AgentKind::ClaudeCode,
+                    pid: 1,
+                    started_unix_ms: 1,
+                },
+            );
+            let k = KeyName::new("pg/x").unwrap();
+            let ctx = CallContext {
+                vault: &self.vault,
+                keys: BTreeMap::from([(
+                    k.clone(),
+                    KeyFacts {
+                        tier: Tier::Test,
+                        read_only,
+                    },
+                )]),
+                // Deliberately empty: plan_in must take it from the input.
+                env_keys: BTreeSet::new(),
+            };
+            let keys = BTreeSet::from([k]);
+            let esc = self.runner.needs_approval(&call, &ctx);
+            (self.runner.plan_in(&input, &call, &keys, &ctx), esc)
+        }
+
+        fn output(&self, p: crate::Prepared) -> String {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (_, out, _, _) = rt.block_on(self.runner.execute_buffered(p, 4096)).unwrap();
+            String::from_utf8(out).unwrap()
+        }
+    }
+
+    // protects=SPEC D4 with a fake prisma (Verify 5): `migrate deploy` asks for an approval on
+    // a test-tier key, also behind a runner whose options take values (`pnpm --filter api exec`,
+    // review R5), and gets the URL only through DATABASE_URL, redacted in its output; on a
+    // read-only key a schema change is refused without asking anyone (R7) and a reading command
+    // needs psql for the role check; fails_when=a migration runs unasked, a read-only key runs a
+    // write, or the URL shows; no_claim=Prisma itself
+    #[test]
+    fn prisma_with_a_fake_binary() {
+        let t = setup();
+        let env = [("DATABASE_URL", "ms://pg/x")];
+        let (p, esc) = t.plan(&["prisma", "migrate", "deploy"], &env, false);
+        assert!(esc.is_some_and(|w| w.contains("schema")));
+        let out = t.output(p.unwrap());
+        assert!(out.contains("prisma-ran migrate deploy"), "{out}");
+        assert!(
+            out.contains("url=[redacted") && !out.contains("VERYSECRETPW"),
+            "{out}"
+        );
+
+        let (_, esc) = t.plan(
+            &[
+                "pnpm", "--filter", "api", "exec", "prisma", "migrate", "deploy",
+            ],
+            &env,
+            false,
+        );
+        assert!(
+            esc.is_some(),
+            "pnpm with a valued option slipped past the prisma adapter"
+        );
+        let (_, esc) = t.plan(&["prisma", "generate"], &env, false);
+        assert!(esc.is_none());
+
+        let (p, esc) = t.plan(&["prisma", "migrate", "deploy"], &env, true);
+        assert!(
+            esc.is_none(),
+            "asked a person for a command that will be refused"
+        );
+        let e = p.unwrap_err().message;
+        assert!(e.contains("read-only"), "{e}");
+        let (p, _) = t.plan(&["prisma", "migrate", "status"], &env, true);
+        let e = p.unwrap_err().message;
+        assert!(e.contains("needs psql"), "{e}");
+        let (p, _) = t.plan(&["prisma", "migrate", "status", "ms://pg/x"], &[], false);
+        assert!(p.is_err());
+    }
+
+    // protects=SPEC D2 / review R2: psql refuses a key forwarded through the environment, even
+    // the same key as its connection argument and even when the caller's context says there is
+    // none; review R10: a read-only key never reaches the generic adapter; fails_when=the full
+    // URL reaches psql's environment or a read-only key runs an arbitrary tool; no_claim=-
+    #[test]
+    fn psql_env_refs_and_generic_read_only_refused() {
+        let t = setup();
+        let (p, _) = t.plan(
+            &["psql", "ms://pg/x", "-c", "select 1"],
+            &[("DATABASE_URL", "ms://pg/x")],
+            false,
+        );
+        let e = p.unwrap_err().message;
+        assert!(e.contains("environment variable"), "{e}");
+        let (p, _) = t.plan(&["echo", "hi"], &[("TOKEN", "ms://pg/x")], true);
+        let e = p.unwrap_err().message;
+        assert!(e.contains("read-only"), "{e}");
+        let (p, _) = t.plan(&["echo", "hi"], &[("TOKEN", "ms://pg/x")], false);
+        assert!(p.is_ok());
     }
 }

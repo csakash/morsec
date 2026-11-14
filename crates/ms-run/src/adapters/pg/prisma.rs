@@ -27,28 +27,25 @@ fn is_prisma(a: &str) -> bool {
     a == "prisma" || a.starts_with("prisma@")
 }
 
-/// Index in `argv` of the `prisma` word, when this is a Prisma CLI call: `prisma …`,
-/// `npx|bunx|pnpx [opts] prisma[@v] …`, `pnpm|yarn|bun [exec|dlx|x|run] [opts] prisma[@v] …`.
+/// Index in `argv` of the `prisma` word, when this is a Prisma CLI call: `prisma …`, or a
+/// package runner (`npx`, `bunx`, `pnpx`, `pnpm`, `yarn`, `bun`) with any argument that is
+/// `prisma` / `prisma@<v>` (or a path to one). Runner options can take values (`pnpm --filter
+/// api exec prisma …`), so morsec doesn't try to parse them: the first such argument counts, and
+/// whatever follows it is classified (an option's value of `prisma` then reads as an unknown
+/// command, which needs an approval: fail closed).
 pub fn locate(argv: &[String]) -> Option<usize> {
     let first = base(argv.first()?);
     if first == "prisma" {
         return Some(0);
     }
-    let skip_runner = match first {
-        "npx" | "bunx" | "pnpx" => false,
-        "pnpm" | "yarn" | "bun" => true,
-        _ => return None,
-    };
-    let mut words = argv
-        .iter()
+    if !matches!(first, "npx" | "bunx" | "pnpx" | "pnpm" | "yarn" | "bun") {
+        return None;
+    }
+    argv.iter()
         .enumerate()
         .skip(1)
-        .filter(|(_, a)| !a.starts_with('-'));
-    let (mut i, mut w) = words.next()?;
-    if skip_runner && matches!(w.as_str(), "exec" | "dlx" | "x" | "run") {
-        (i, w) = words.next()?;
-    }
-    is_prisma(w).then_some(i)
+        .find(|(_, a)| is_prisma(base(a)))
+        .map(|(i, _)| i)
 }
 
 /// Classifies the arguments after the `prisma` word.
@@ -68,7 +65,7 @@ pub fn classify(rest: &[String]) -> Class {
             "-v" | "--version" | "version" | "-h" | "--help" | "help",
             ..,
         ] => Class::ReadOnly,
-        ["generate" | "validate" | "format" | "init" | "debug", ..] => Class::ReadOnly,
+        ["generate" | "validate" | "format", ..] => Class::ReadOnly,
         ["migrate", "status" | "diff"] | ["db", "pull"] => Class::ReadOnly,
         ["db", "seed"] | ["studio", ..] => Class::Write(shown()),
         ["migrate", "deploy" | "dev" | "reset" | "resolve"] | ["db", "push" | "execute"] => {
@@ -106,6 +103,24 @@ mod tests {
         );
         assert_eq!(locate(&a(&["pnpm", "exec", "prisma", "generate"])), Some(2));
         assert_eq!(locate(&a(&["yarn", "prisma", "generate"])), Some(1));
+        assert_eq!(
+            locate(&a(&[
+                "pnpm", "--filter", "api", "exec", "prisma", "migrate", "deploy"
+            ])),
+            Some(4)
+        );
+        assert_eq!(
+            locate(&a(&["yarn", "--cwd", "app", "prisma", "migrate"])),
+            Some(3)
+        );
+        assert_eq!(
+            locate(&a(&["npx", "-p", "prisma", "prisma", "migrate"])),
+            Some(2)
+        );
+        assert!(matches!(
+            classify(&a(&["prisma", "migrate", "deploy"])),
+            Class::Schema(_)
+        ));
         assert_eq!(locate(&a(&["npx", "tsc"])), None);
         assert_eq!(locate(&a(&["psql"])), None);
 
@@ -124,6 +139,8 @@ mod tests {
             &["--schema", "x.prisma", "migrate", "deploy"],
             &["migrate"],
             &["frobnicate"],
+            &["init"],
+            &["debug"],
         ] {
             assert!(matches!(c(schema), Class::Schema(_)), "{schema:?}");
         }

@@ -232,6 +232,7 @@ impl Daemon {
                     })
                 })
                 .collect(),
+            env_keys: input.env_keys.clone(),
         };
         let mut decided = Vec::new();
         for k in &run_keys {
@@ -1099,8 +1100,10 @@ mod tests {
                 .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
                 .collect::<String>();
             if approve {
+                // Prisma isn't in msd's trusted path here, so the approved run fails at
+                // resolve; the receipt still carries the person's Touch ID approval.
                 assert!(
-                    receipts.contains("\"approved\"") || receipts.contains("failed"),
+                    receipts.contains("touch-id") && receipts.contains("once-"),
                     "{receipts}"
                 );
                 assert!(

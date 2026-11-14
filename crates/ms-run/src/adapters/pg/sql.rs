@@ -38,6 +38,8 @@ pub struct Simple {
     pub functions: Vec<String>,
     /// Operators used.
     pub operators: Vec<String>,
+    /// Type names after `::` (each must be a `pg_catalog` type for a preview).
+    pub casts: Vec<String>,
 }
 
 const OP_CHARS: &str = "+-*/<>=~!@#%^&|";
@@ -60,6 +62,14 @@ const REFUSED_WORDS: &[(&str, Why)] = &[
     ("with", "the statement has a WITH clause"),
     ("into", "the statement isn't a simple UPDATE or DELETE"),
     ("nextval", "the statement advances a sequence"),
+    // Another relation (a view, a subquery) could call functions the check can't see.
+    (
+        "select",
+        "the statement reads another relation (a subquery)",
+    ),
+    ("table", "the statement reads another relation (TABLE)"),
+    ("using", "the statement reads another relation (USING)"),
+    ("join", "the statement reads another relation (JOIN)"),
 ];
 
 fn lex(sql: &str) -> Result<Vec<Tok>, Why> {
@@ -209,8 +219,35 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
     if toks.get(i) == Some(&Tok::Word("only".into())) {
         i += 1;
     }
-    if qualified(&toks, i, &mut table).is_none() {
+    let Some(after_table) = qualified(&toks, i, &mut table) else {
         return Err("the statement's table isn't a plain name");
+    };
+    // `DELETE FROM t` is the only FROM; any other reads another relation.
+    let from_at = usize::from(matches!(toks.first(), Some(Tok::Word(w)) if w == "delete"));
+    for (n, t) in toks.iter().enumerate() {
+        if *t == Tok::Word("from".into()) && n != from_at {
+            return Err("the statement reads another relation (FROM)");
+        }
+    }
+    // A dotted name after the table is a qualified column or attribute notation (`t.f`, which
+    // calls f(t)); the check can't tell, so it doesn't preview.
+    if toks[after_table..].contains(&Tok::Punct('.')) {
+        return Err("the statement uses a dotted name (a qualified column or attribute notation)");
+    }
+    let mut casts = Vec::new();
+    for w in toks.windows(2) {
+        if w[0] == Tok::Cast {
+            match &w[1] {
+                Tok::Word(t) => casts.push(t.clone()),
+                Tok::Quoted(q) => casts.push(q.clone()),
+                _ => return Err("the statement has a cast the preview doesn't handle"),
+            }
+        }
+    }
+    casts.sort();
+    casts.dedup();
+    if casts.iter().any(|c| c.contains(',')) {
+        return Err("a type name has a comma");
     }
     let mut functions = Vec::new();
     let mut operators = Vec::new();
@@ -244,6 +281,7 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
         table,
         functions,
         operators,
+        casts,
     })
 }
 
@@ -272,6 +310,7 @@ mod tests {
         assert_eq!(s.operators, [">="]);
         let s = simple("update t set a = \"My Fn\"(b)::int, c = 'it''s; fine'").unwrap();
         assert_eq!(s.functions, ["My Fn"]);
+        assert_eq!(s.casts, ["int"]);
 
         for bad in [
             "update t set a = 1; commit",
@@ -294,6 +333,12 @@ mod tests {
             "update t set a = U&'d!0061t' uescape '!'",
             "update t set a = 1 where current of c",
             "update t set a = 'unterminated",
+            "update t set a = 1 where id in (select id from v)",
+            "update t set a = 1 where id in (table v)",
+            "update t set a = 1 from u where u.id = t.id",
+            "delete from t using u where u.id = t.id",
+            "update t set a = 1 where t.f is null",
+            "update t set a = 1 where t.id = 1",
         ] {
             assert!(simple(bad).is_err(), "{bad}");
         }

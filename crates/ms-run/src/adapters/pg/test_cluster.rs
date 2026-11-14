@@ -10,7 +10,10 @@
 //! - database `shop`, owned by `writer`: `orders(id, status, counter)` with rows 1–3, and
 //!   `audited(id, n)` with a user trigger;
 //! - `writer`: owns everything; `reader`: `SELECT` only; `sneaky`: `SELECT` only but a member of
-//!   `writer` (so it can write through that membership).
+//!   `writer` (so it can write through that membership); `split`: `SELECT` only in `shop` but
+//!   `INSERT` on `other.t` (psql could `\c other`);
+//! - `parent` ← `child` ← `grandchild` (cascading FKs; a user trigger on `grandchild`), a domain
+//!   `posint`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -121,10 +124,12 @@ impl Cluster {
             &format!(
                 "CREATE ROLE writer LOGIN PASSWORD '{w}';
                  CREATE ROLE reader LOGIN PASSWORD '{r}';
-                 CREATE ROLE sneaky LOGIN PASSWORD '{s}' IN ROLE writer;",
+                 CREATE ROLE sneaky LOGIN PASSWORD '{s}' IN ROLE writer;
+                 CREATE ROLE split LOGIN PASSWORD '{x}';",
                 w = c.password("writer"),
                 r = c.password("reader"),
                 s = c.password("sneaky"),
+                x = c.password("split"),
             ),
         );
         c.admin("postgres", "CREATE DATABASE shop OWNER writer");
@@ -138,9 +143,22 @@ impl Cluster {
              CREATE FUNCTION audit_trg() RETURNS trigger LANGUAGE plpgsql AS
                $$ BEGIN RETURN NEW; END $$;
              CREATE TRIGGER audited_t BEFORE UPDATE ON audited FOR EACH ROW EXECUTE FUNCTION audit_trg();
-             GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader, sneaky;
+             CREATE TABLE parent (id int PRIMARY KEY);
+             CREATE TABLE child (id int PRIMARY KEY, parent_id int REFERENCES parent ON DELETE CASCADE);
+             CREATE TABLE grandchild (id int PRIMARY KEY, child_id int REFERENCES child ON DELETE CASCADE);
+             CREATE TRIGGER grandchild_t BEFORE DELETE ON grandchild FOR EACH ROW EXECUTE FUNCTION audit_trg();
+             INSERT INTO parent VALUES (1);
+             CREATE DOMAIN posint AS int CHECK (VALUE >= 0);
+             GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader, sneaky, split;
              RESET ROLE;
              REVOKE CREATE ON SCHEMA public FROM PUBLIC;",
+        );
+        // `split` can only read in shop, but can write in `other`.
+        c.admin("postgres", "CREATE DATABASE other");
+        c.admin(
+            "other",
+            "REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+             CREATE TABLE t (id int); GRANT INSERT ON t TO split;",
         );
         Some(c)
     }

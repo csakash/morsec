@@ -67,6 +67,7 @@ impl Env {
                     read_only,
                 },
             )]),
+            env_keys: BTreeSet::new(),
         }
     }
 
@@ -157,6 +158,7 @@ fn live_postgres() {
     env.put("pg/w", "writer");
     env.put("pg/r", "reader");
     env.put("pg/s", "sneaky");
+    env.put("pg/x", "split");
 
     read_only_rules(&env);
     env.no_passfiles();
@@ -216,8 +218,9 @@ fn read_only_rules(env: &Env) {
     assert_ne!(code, 0);
     assert!(err.contains("permission denied"), "{err}");
 
-    // A role that can write (directly or through a membership) is refused before psql runs.
-    for (k, who) in [("pg/w", "writer"), ("pg/s", "writer")] {
+    // A role that can write (directly, through a membership, or in another database psql could
+    // `\c` to) is refused before psql runs.
+    for (k, who) in [("pg/w", "writer"), ("pg/s", "writer"), ("pg/x", "other")] {
         let e = env
             .run(&["psql", &format!("ms://{k}"), "-c", "select 1"], k, true)
             .unwrap_err();
@@ -338,6 +341,24 @@ fn preview_never_commits(env: &Env) {
         "update orders set counter = 1; commit",
     ]);
     assert!(unknown.contains("unknown"), "{unknown}");
+    let unknown = preview(&["psql", "ms://pg/w", "-c", "delete from parent where id = 1"]);
+    assert!(unknown.contains("any depth"), "{unknown}");
+    let unknown = preview(&[
+        "psql",
+        "ms://pg/w",
+        "-c",
+        "update orders set counter = 1::posint",
+    ]);
+    assert!(unknown.contains("pg_catalog"), "{unknown}");
+    assert_eq!(
+        preview(&[
+            "psql",
+            "ms://pg/w",
+            "-c",
+            "update orders set counter = '4'::int4 where id = 1"
+        ]),
+        "1 row in orders"
+    );
     let unknown = preview(&["psql", "ms://pg/w"]);
     assert!(unknown.contains("unknown"), "{unknown}");
     let ro = a
@@ -367,6 +388,7 @@ fn preview_never_commits(env: &Env) {
         table: "orders".into(),
         functions: Vec::new(),
         operators: vec!["=".into()],
+        casts: Vec::new(),
     };
     let r = probe::preview(&t, &smuggled);
     assert!(r.is_err(), "{r:?}");

@@ -13,7 +13,7 @@
 //!
 //! [`RunAdapter`]: crate::RunAdapter
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 
 use ms_core::{KeyName, Result, Tier};
@@ -38,6 +38,9 @@ pub struct CallContext<'a> {
     pub vault: &'a dyn Vault,
     /// Facts per run-mode key of this call. Empty when the caller gave none.
     pub keys: BTreeMap<KeyName, KeyFacts>,
+    /// The run-mode keys the call forwards through environment variables (the rest are in
+    /// argv). [`crate::Runner::plan_in`] fills this from the checked input itself.
+    pub env_keys: BTreeSet<KeyName>,
 }
 
 impl std::fmt::Debug for CallContext<'_> {
@@ -54,6 +57,7 @@ impl<'a> CallContext<'a> {
         Self {
             vault,
             keys: BTreeMap::new(),
+            env_keys: BTreeSet::new(),
         }
     }
 }

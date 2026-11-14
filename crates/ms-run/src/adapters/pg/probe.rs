@@ -50,6 +50,15 @@ SELECT coalesce((SELECT reason FROM (
 ) x ORDER BY o LIMIT 1), 'ok') AS morsec_role_check;
 "#;
 
+/// The databases the login role can connect to, each name hex-encoded on its own line.
+pub const DATABASES: &str = r#"\set ON_ERROR_STOP 1
+SELECT encode(convert_to(datname, 'UTF8'), 'hex') FROM pg_database
+WHERE datallowconn AND has_database_privilege(datname, 'CONNECT') ORDER BY datname;
+"#;
+
+/// Most databases the read-only check visits.
+pub const MAX_DATABASES: usize = 64;
+
 /// The effect preview: `BEGIN`, safety checks, the statement as a data-modifying CTE that counts
 /// its rows, `ROLLBACK`. Prints `morsec-count=N`; a refusal raises `morsec-why: …`.
 pub const PREVIEW: &str = r#"\set ON_ERROR_STOP 1
@@ -58,12 +67,14 @@ SET LOCAL statement_timeout = '5s';
 SET LOCAL lock_timeout = '2s';
 SET LOCAL standard_conforming_strings = on;
 SELECT set_config('morsec.stmt', :'stmt', true), set_config('morsec.tbl', :'tbl', true),
-  set_config('morsec.fns', :'fns', true), set_config('morsec.ops', :'ops', true) \g /dev/null
+  set_config('morsec.fns', :'fns', true), set_config('morsec.ops', :'ops', true),
+  set_config('morsec.casts', :'casts', true) \g /dev/null
 DO $morsec$
 DECLARE
   t oid := to_regclass(current_setting('morsec.tbl'));
   fns text[] := array_remove(string_to_array(current_setting('morsec.fns'), ','), '');
   ops text[] := array_remove(string_to_array(current_setting('morsec.ops'), ' '), '');
+  casts text[] := array_remove(string_to_array(current_setting('morsec.casts'), ','), '');
   n bigint;
 BEGIN
   IF t IS NULL THEN RAISE EXCEPTION 'morsec-why: the table was not found'; END IF;
@@ -73,11 +84,20 @@ BEGIN
     RAISE EXCEPTION 'morsec-why: the table has rules or row security'; END IF;
   IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = t AND NOT tgisinternal) THEN
     RAISE EXCEPTION 'morsec-why: the table has triggers'; END IF;
-  IF EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
-             WHERE k.contype = 'f' AND k.confrelid = t
-               AND (c.relhasrules OR c.relrowsecurity OR EXISTS (
-                 SELECT 1 FROM pg_trigger g WHERE g.tgrelid = k.conrelid AND NOT g.tgisinternal))) THEN
-    RAISE EXCEPTION 'morsec-why: a table that references it has triggers or rules'; END IF;
+  -- Every table a cascade can reach, at any depth.
+  IF EXISTS (WITH RECURSIVE reach(rel) AS (
+               SELECT k.conrelid FROM pg_constraint k WHERE k.contype = 'f' AND k.confrelid = t
+               UNION
+               SELECT k.conrelid FROM pg_constraint k JOIN reach ON k.confrelid = reach.rel
+               WHERE k.contype = 'f')
+             SELECT 1 FROM reach JOIN pg_class c ON c.oid = reach.rel
+             WHERE c.relhasrules OR c.relrowsecurity OR EXISTS (
+               SELECT 1 FROM pg_trigger g WHERE g.tgrelid = reach.rel AND NOT g.tgisinternal)) THEN
+    RAISE EXCEPTION 'morsec-why: a table that references it (at any depth) has triggers or rules'; END IF;
+  IF EXISTS (SELECT 1 FROM unnest(casts) c WHERE to_regtype(c) IS NULL OR NOT EXISTS (
+               SELECT 1 FROM pg_type y JOIN pg_namespace n ON n.oid = y.typnamespace
+               WHERE y.oid = to_regtype(c) AND n.nspname = 'pg_catalog')) THEN
+    RAISE EXCEPTION 'morsec-why: it casts to a type outside pg_catalog'; END IF;
   IF EXISTS (SELECT 1 FROM unnest(fns) f WHERE NOT EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = f)) THEN
     RAISE EXCEPTION 'morsec-why: a function it calls is not known'; END IF;
   IF EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = ANY (fns) AND p.provolatile = 'v') THEN
@@ -246,10 +266,40 @@ pub fn role_check(t: &Target<'_>) -> Result<(), String> {
     ))
 }
 
+/// The databases the role behind `t` can connect to.
+pub fn databases(t: &Target<'_>) -> Result<Vec<String>, String> {
+    let o = run(t, DATABASES, &[])?;
+    if !o.ok {
+        return Err(format!(
+            "morsec could not list the databases the role can connect to ({})",
+            crate::printable(first_error(&o.stderr).unwrap_or("the query failed"))
+        ));
+    }
+    let mut out = Vec::new();
+    for l in o.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let bytes: Option<Vec<u8>> = (0..l.len())
+            .step_by(2)
+            .map(|i| l.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+            .collect();
+        let name = bytes
+            .and_then(|b| String::from_utf8(b).ok())
+            .ok_or("the database list was not what morsec expected")?;
+        out.push(name);
+    }
+    if out.len() > MAX_DATABASES {
+        return Err(format!(
+            "the role can connect to {} databases; morsec checks at most {MAX_DATABASES} for read-only access",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
 /// Runs the preview of `s`: the row count, or why it is unknown.
 pub fn preview(t: &Target<'_>, s: &super::sql::Simple) -> Result<u64, String> {
     let fns = s.functions.join(",");
     let ops = s.operators.join(" ");
+    let casts = s.casts.join(",");
     let o = run(
         t,
         PREVIEW,
@@ -258,6 +308,7 @@ pub fn preview(t: &Target<'_>, s: &super::sql::Simple) -> Result<u64, String> {
             ("tbl", &s.table),
             ("fns", &fns),
             ("ops", &ops),
+            ("casts", &casts),
         ],
     )?;
     if let Some(e) = first_error(&o.stderr) {

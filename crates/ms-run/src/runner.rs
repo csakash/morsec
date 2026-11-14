@@ -265,12 +265,25 @@ impl Runner {
         ctx: &CallContext<'_>,
     ) -> Result<Prepared, RunError> {
         let vault = ctx.vault;
+        // The adapter sees which keys travel in the environment from the input itself, not from
+        // whatever the caller put in the context.
+        let ctx = &CallContext {
+            vault,
+            keys: ctx.keys.clone(),
+            env_keys: input.env_keys.clone(),
+        };
         let AdapterPlan {
             exec: mut plan,
             secrets,
             guard,
         } = match self.adapter(&call.argv) {
             Chosen::Contextual(a) => a.plan(call, ctx),
+            // Only a contextual adapter can enforce a read-only rule (L15 review R10).
+            Chosen::Plain(_) if ctx.keys.values().any(|f| f.read_only) => {
+                return Err(RunError::denied(
+                    "morsec: this key's rule is read-only, and only the psql and prisma adapters can enforce that, so this command is refused",
+                ));
+            }
             Chosen::Plain(a) => a.plan(call, vault).map(|exec| AdapterPlan {
                 exec,
                 secrets: Vec::new(),

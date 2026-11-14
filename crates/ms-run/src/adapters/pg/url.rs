@@ -1,9 +1,10 @@
 //! Postgres connection URIs: split the password out, rewrite the rest (SPEC D2, D3).
 //!
 //! Only the URI form (`postgres://` / `postgresql://`) is accepted. It is split the way libpq
-//! splits it (the authority ends at the first `/` or `?`; the userinfo ends at the first `@`; the
-//! user ends at the first `:`), so the host and user morsec writes into the passfile are the ones
-//! libpq will connect with.
+//! splits it (`conninfo_uri_parse_options`): the userinfo is everything before the first `@` that
+//! comes before any `/` (a `?` doesn't stop that search); the user ends at the first `:`; the
+//! host list then ends at the first `/` or `?`, and the database at the first `?`. So the host
+//! and user morsec writes into the passfile, and the password it takes out, are libpq's.
 
 use zeroize::Zeroizing;
 
@@ -101,17 +102,17 @@ impl PgUrl {
                 "the key's URL contains whitespace or a control character; %-encode it".into(),
             );
         }
-        let (before_q, query) = match rest.split_once('?') {
-            Some((a, q)) => (a, Some(q)),
-            None => (rest, None),
+        // libpq: scan for '@' stopping only at '/'.
+        let (userinfo, after_user) = match rest.find(['@', '/']) {
+            Some(i) if rest.as_bytes()[i] == b'@' => (Some(&rest[..i]), &rest[i + 1..]),
+            _ => (None, rest),
         };
-        let (authority, path_raw) = match before_q.find('/') {
-            Some(i) => (&before_q[..i], &before_q[i..]),
-            None => (before_q, ""),
-        };
-        let (userinfo, hosts_raw) = match authority.split_once('@') {
-            Some((u, h)) => (Some(u), h),
-            None => (None, authority),
+        let host_end = after_user.find(['/', '?']).unwrap_or(after_user.len());
+        let hosts_raw = &after_user[..host_end];
+        let after_host = &after_user[host_end..];
+        let (path_raw, query) = match after_host.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (after_host, None),
         };
         let mut user_raw = None;
         let mut user = None;
@@ -156,6 +157,13 @@ impl PgUrl {
                     }
                     user = Some(decode_text(v)?);
                     params.push((key, v.to_owned()));
+                }
+                "options" => {
+                    decode_text(v)?;
+                    params.push((key, v.to_owned()));
+                }
+                "dbname" => {
+                    return Err("the key's URL sets dbname=; put the database in the path (postgres://…/db) instead".into());
                 }
                 "host" => {
                     host_param = Some(decode_text(v)?);
@@ -214,13 +222,29 @@ impl PgUrl {
     /// The URL without any password, with `connect_timeout` (when absent) and, for read-only
     /// rules, `default_transaction_read_only=on` in `options`.
     pub fn rewritten(&self, read_only: bool) -> String {
+        self.rewritten_inner(read_only, None)
+    }
+
+    /// [`PgUrl::rewritten`] for another database on the same server (the read-only check
+    /// covers every database the role can connect to, since psql can `\c` to them).
+    pub fn rewritten_db(&self, read_only: bool, db: &str) -> String {
+        self.rewritten_inner(read_only, Some(db))
+    }
+
+    fn rewritten_inner(&self, read_only: bool, db: Option<&str>) -> String {
         let mut out = format!("{}://", self.scheme);
         if let Some(u) = &self.user_raw {
             out.push_str(u);
             out.push('@');
         }
         out.push_str(&self.hosts_raw);
-        out.push_str(&self.path_raw);
+        match db {
+            Some(d) => {
+                out.push('/');
+                out.push_str(&encode(d));
+            }
+            None => out.push_str(&self.path_raw),
+        }
         let mut params: Vec<(String, String)> = Vec::new();
         let mut had_options = false;
         let mut had_timeout = false;
@@ -228,6 +252,7 @@ impl PgUrl {
             match k.as_str() {
                 "options" if read_only => {
                     had_options = true;
+                    // Checked to decode when parsed.
                     let old = decode_text(v).unwrap_or_default();
                     let merged = if old.trim().is_empty() {
                         READ_ONLY_OPTION.to_owned()
@@ -286,11 +311,29 @@ mod tests {
         let r = u.rewritten(false);
         assert!(!r.contains("pw") && !r.contains("password"), "{r}");
         assert!(r.ends_with("?user=ro&connect_timeout=3"), "{r}");
+        assert_eq!(
+            u.rewritten_db(true, "other db"),
+            "postgresql://h/other%20db?user=ro&connect_timeout=3&options=-c%20default_transaction_read_only%3Don"
+        );
 
         let u = PgUrl::parse(b"postgres://u:p@[::1]:5432,other/db").unwrap();
         assert_eq!(u.passfile_host(), "*");
         let u = PgUrl::parse(b"postgres://u:p@[::1]:5432/db").unwrap();
         assert_eq!(u.passfile_host(), "::1");
+        // libpq's split: a '?' in the userinfo is part of the password.
+        let u = PgUrl::parse(b"postgres://app:pa?ss@db/shop").unwrap();
+        assert_eq!(u.password(), Some(&b"pa?ss"[..]));
+        assert_eq!(u.passfile_host(), "db");
+        assert_eq!(
+            u.rewritten(false),
+            "postgres://app@db/shop?connect_timeout=10"
+        );
+        let u = PgUrl::parse(b"postgres://h?application_name=a@b").unwrap();
+        assert_eq!(u.user(), Some("h?application_name=a"));
+        assert_eq!(u.passfile_host(), "b");
+        let u = PgUrl::parse(b"postgres://h/db?application_name=a@b").unwrap();
+        assert_eq!(u.user(), None);
+        assert_eq!(u.passfile_host(), "h");
         let u = PgUrl::parse(b"postgres://u@%2Ftmp%2Fsock/db").unwrap();
         assert_eq!(u.passfile_host(), "*");
         assert!(u.password().is_none());
@@ -309,6 +352,8 @@ mod tests {
             b"postgres://u@h/db?user=v",
             b"postgres://u:p%zz@h/db",
             b"postgres://u:p@h/d b",
+            b"postgres://u:p@h/db?options=%ff",
+            b"postgres://u:p@h/db?dbname=other",
             b"\xff",
         ] {
             assert!(
