@@ -213,7 +213,7 @@ fn wrap_fits(o: &Value, sha256: &str, shell: bool) -> bool {
 
 fn wrap_note(path: &[String]) -> String {
     format!(
-        "a command morsec wrapped in {} was edited or moved after ms connect, so morsec can't tell it apart; it is left as it is now (still run through `ms run --`). Edit it back by hand if you need to",
+        "a command morsec wrapped in {} was edited, moved or removed after ms connect, so morsec can't tell which hook it is; any hook there still run through `ms run --` is left as it is. Edit it back by hand if you need to",
         dotted(path)
     )
 }
