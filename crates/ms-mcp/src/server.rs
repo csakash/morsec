@@ -115,6 +115,10 @@ where
             .as_ref()
             .is_some_and(|i| !(i.is_string() || i.is_number()));
         if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || bad_id {
+            // A malformed notification gets no answer, like any notification (review R8).
+            if id.is_none() {
+                continue;
+            }
             let _ = tx
                 .send(error(
                     Value::Null,
@@ -178,7 +182,7 @@ where
                         .send(error(
                             id,
                             INTERNAL_ERROR,
-                            &format!("{MAX_QUEUED} tool calls are already waiting; retry when one finishes"),
+                            &format!("{MAX_QUEUED} tool calls are already in progress; retry when one finishes"),
                         ))
                         .await;
                     continue;
@@ -186,7 +190,7 @@ where
                 let (tx, backend, calls) = (tx.clone(), backend.clone(), calls.clone());
                 let rv = catalog.rules_version;
                 tokio::spawn(async move {
-                    let _slot = slot;
+                    let slot = slot;
                     let Ok(_permit) = calls.acquire_owned().await else {
                         return;
                     };
@@ -206,6 +210,9 @@ where
                         Err(e) if !known => error(id, INVALID_PARAMS, &result::inert(&e)),
                         Err(e) => ok(id, result::refused(&e)),
                     };
+                    // Free the slot before answering, so a client that saw the answer can call
+                    // again at once.
+                    drop(slot);
                     let _ = tx.send(msg).await;
                 });
             }
@@ -437,5 +444,103 @@ mod tests {
             by_id(&msgs, 1)["result"]["protocolVersion"],
             json!(PROTOCOL_VERSIONS[0])
         );
+    }
+
+    /// A backend whose `slow` calls wait for a permit and whose other calls fail as if msd
+    /// were down.
+    struct Gated(Arc<Semaphore>);
+
+    impl Backend for Gated {
+        fn call(
+            &self,
+            tool: String,
+            _rules_version: u64,
+            _arguments: Value,
+        ) -> BoxFuture<'_, Result<ResponseBody, String>> {
+            Box::pin(async move {
+                if tool != "k__echo" {
+                    return Err("morsec: daemon not running".into());
+                }
+                let _p = self.0.acquire().await.map_err(|e| e.to_string())?;
+                Ok(ResponseBody::RunResult {
+                    code: Some(0),
+                    signal: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    truncated: false,
+                })
+            })
+        }
+    }
+
+    // protects=review R3/R4/R7: at most MAX_QUEUED calls are accepted at once (the next is
+    // answered -32603 without queueing work), and an unknown tool is -32602 even when msd can't
+    // be reached; fails_when=the queue is unbounded or an unknown tool gets a success result;
+    // no_claim=-
+    #[tokio::test]
+    async fn queue_cap_and_unknown_tool_with_msd_down() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let rules = Rules::from_toml(
+            "version = 4\n[keys.\"k\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/w\"]\nenv = [\"T\"]\ncommands = [[\"echo\", \"*\"]]\n",
+            "r",
+        )
+        .unwrap();
+        let gate = Arc::new(Semaphore::new(0));
+        let (mut client_w, server_r) = tokio::io::duplex(1 << 20);
+        let (server_w, client_r) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(serve(
+            BufReader::new(server_r),
+            server_w,
+            Arc::new(Catalog::from_rules(&rules)),
+            Arc::new(Gated(gate.clone())),
+            "0.0.0",
+        ));
+        let call = |id: usize, name: &str| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"{name}\",\"arguments\":{{\"arg1\":\"x\"}}}}}}\n"
+            )
+        };
+        for id in 1..=MAX_QUEUED + 1 {
+            client_w
+                .write_all(call(id, "k__echo").as_bytes())
+                .await
+                .unwrap();
+        }
+        let mut lines = BufReader::new(client_r).lines();
+        let first: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["id"], json!(MAX_QUEUED + 1), "{first}");
+        assert_eq!(first["error"]["code"], json!(INTERNAL_ERROR));
+        gate.add_permits(MAX_QUEUED);
+        for _ in 0..MAX_QUEUED {
+            let v: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(v["result"]["isError"], json!(false), "{v}");
+        }
+        // Every slot is free again once its answer is out; the queue accepts calls again.
+        tokio::task::yield_now().await;
+        client_w
+            .write_all(call(100, "nope__tool").as_bytes())
+            .await
+            .unwrap();
+        drop(client_w);
+        let unknown: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(unknown["id"], json!(100), "{unknown}");
+        assert_eq!(unknown["error"]["code"], json!(INVALID_PARAMS), "{unknown}");
+        assert!(lines.next_line().await.unwrap().is_none());
+        server.await.unwrap().unwrap();
+    }
+
+    // protects=review R8: a malformed notification gets no answer; fails_when=it is answered;
+    // no_claim=-
+    #[tokio::test]
+    async fn malformed_notifications_are_dropped() {
+        let (msgs, _) = session(&[
+            r#"{"method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        ])
+        .await;
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
     }
 }

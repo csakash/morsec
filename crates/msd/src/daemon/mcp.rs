@@ -34,9 +34,15 @@ pub(crate) fn call(
     cwd: PathBuf,
     arguments: &Value,
 ) -> ResponseBody {
+    // The version is compared before the catalog is built, so a stale call costs no catalog
+    // build (security review S1). The catalog is built from the same rules the version came from.
     let (catalog, version) = {
         let live = d.read_live();
-        (Catalog::from_rules(&live.rules), live.rules.version)
+        let v = live.rules.version;
+        (
+            (rules_version == v).then(|| Catalog::from_rules(&live.rules)),
+            v,
+        )
     };
     let shown = shown(tool);
     let refuse_as = |key: &KeyName, why: &str, result: ReceiptResult, reply: ResponseBody| {
@@ -59,6 +65,22 @@ pub(crate) fn call(
             reply,
         )
     };
+    let Some(catalog) = catalog else {
+        // The person changed the rules (or they failed their integrity check and load as
+        // version 0), not the agent's doing: recorded under msd's key as a failure that does not
+        // count toward a LOG-2 session stop (review R2, security review S2).
+        return refuse_as(
+            &daemon_key(),
+            "rules changed",
+            ReceiptResult::Failed("the rules changed; restart the MCP server".into()),
+            reply_err(
+                ErrorCode::Invalid,
+                format!(
+                    "morsec: the rules changed (tools were built from version {rules_version}, the rules are now version {version}), so this tool may not mean what it did. Restart the morsec MCP server to load the current tools"
+                ),
+            ),
+        );
+    };
     let Some(t) = catalog.get(tool) else {
         return refuse(
             &daemon_key(),
@@ -71,21 +93,6 @@ pub(crate) fn call(
             ),
         );
     };
-    if rules_version != version {
-        // The person changed the rules, not the agent's doing: recorded, but as a failure that
-        // does not count toward a LOG-2 session stop (review R2).
-        return refuse_as(
-            &t.key,
-            "rules changed",
-            ReceiptResult::Failed("the rules changed; restart the MCP server".into()),
-            reply_err(
-                ErrorCode::Invalid,
-                format!(
-                    "morsec: the rules changed (tools were built from version {rules_version}, the rules are now version {version}), so this tool may not mean what it did. Restart the morsec MCP server to load the current tools"
-                ),
-            ),
-        );
-    }
     let c = match t.call(arguments) {
         Ok(c) => c,
         Err(e) => {
@@ -294,7 +301,7 @@ mod tests {
         assert_eq!(code(&r), Some(ErrorCode::Invalid), "{r:?}");
         let last = receipts(dir.path()).last().unwrap().to_string();
         assert!(
-            last.contains("rules changed") && last.contains("svc/test"),
+            last.contains("rules changed") && last.contains("morsec/daemon"),
             "{last}"
         );
         assert!(!last.contains("blocked"), "{last}");
