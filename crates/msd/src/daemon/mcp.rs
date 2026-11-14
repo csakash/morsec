@@ -2,8 +2,9 @@
 //!
 //! 1. The caller's session is the kernel peer's (already resolved by `Daemon::handle`); nothing
 //!    in the call names a session.
-//! 2. The catalog is rebuilt from the live, MAC-verified rules. The call must name a tool in it
-//!    and carry the version it was built from, so a tool list can't drift from the rules.
+//! 2. The call must carry the rules version its tool list was built from (checked first; a
+//!    stale call is recorded and refused without further work). Then the catalog is rebuilt from
+//!    the live, MAC-verified rules and the call must name a tool in it.
 //! 3. The arguments are validated against the tool's JSON Schema and the argv and environment
 //!    are built from the tool: the key is the tool's, never an argument.
 //! 4. The call then takes L12's run path (`run_buffered`): project roots, the command

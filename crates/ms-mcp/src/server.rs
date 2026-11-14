@@ -119,12 +119,10 @@ where
             if id.is_none() {
                 continue;
             }
+            // A valid id is echoed so the client can match the error (review R12).
+            let echo = id.filter(|_| !bad_id).unwrap_or(Value::Null);
             let _ = tx
-                .send(error(
-                    Value::Null,
-                    INVALID_REQUEST,
-                    "not a JSON-RPC 2.0 request",
-                ))
+                .send(error(echo, INVALID_REQUEST, "not a JSON-RPC 2.0 request"))
                 .await;
             continue;
         }
@@ -210,10 +208,15 @@ where
                         Err(e) if !known => error(id, INVALID_PARAMS, &result::inert(&e)),
                         Err(e) => ok(id, result::refused(&e)),
                     };
-                    // Free the slot before answering, so a client that saw the answer can call
-                    // again at once.
+                    // Room in the answer channel first, so a finished call holds its slot
+                    // while a client that doesn't read keeps it full (review R11); then free
+                    // the slot before the answer can reach the client, so a client that saw
+                    // the answer can call again at once.
+                    let Ok(room) = tx.reserve().await else {
+                        return;
+                    };
                     drop(slot);
-                    let _ = tx.send(msg).await;
+                    room.send(msg);
                 });
             }
             other => {
@@ -384,6 +387,7 @@ mod tests {
             &long,
             r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#,
             r#"{"id":8,"method":"ping"}"#,
+            r#"{"jsonrpc":"1.0","id":9,"method":"ping"}"#,
             r#"{"jsonrpc":"2.0","id":{"x":1},"method":"ping"}"#,
         ])
         .await;
@@ -416,15 +420,11 @@ mod tests {
             .collect();
         assert_eq!(
             errs,
-            [
-                INVALID_REQUEST,
-                PARSE_ERROR,
-                PARSE_ERROR,
-                INVALID_REQUEST,
-                INVALID_REQUEST
-            ]
+            [INVALID_REQUEST, PARSE_ERROR, PARSE_ERROR, INVALID_REQUEST]
         );
-        assert!(!msgs.iter().any(|m| m["id"] == json!(8)));
+        for id in [8, 9] {
+            assert_eq!(by_id(&msgs, id)["error"]["code"], json!(INVALID_REQUEST));
+        }
         let calls = fake.calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "both calls reached msd");
         assert_eq!(calls[0].0, "k__echo");
@@ -479,6 +479,12 @@ mod tests {
     // no_claim=-
     #[tokio::test]
     async fn queue_cap_and_unknown_tool_with_msd_down() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), queue_cap_inner())
+            .await
+            .expect("the server hung");
+    }
+
+    async fn queue_cap_inner() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let rules = Rules::from_toml(
             "version = 4\n[keys.\"k\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/w\"]\nenv = [\"T\"]\ncommands = [[\"echo\", \"*\"]]\n",
@@ -542,5 +548,44 @@ mod tests {
         ])
         .await;
         assert_eq!(msgs.len(), 1, "{msgs:?}");
+    }
+
+    // protects=review R11: a client that never reads its answers can't make the server run
+    // unbounded calls: a finished call keeps its run permit and its queue slot until its answer
+    // fits in the channel, so calls stop reaching msd after a handful; fails_when=calls keep
+    // reaching msd while nobody reads; no_claim=-
+    #[tokio::test]
+    async fn a_client_that_does_not_read_is_bounded() {
+        use tokio::io::AsyncWriteExt;
+        let rules = Rules::from_toml(
+            "version = 4\n[keys.\"k\"]\nmode = \"run\"\ntier = \"test\"\nroots = [\"/w\"]\nenv = [\"T\"]\ncommands = [[\"echo\", \"*\"]]\n",
+            "r",
+        )
+        .unwrap();
+        let fake = Arc::new(Fake::default());
+        let (mut client_w, server_r) = tokio::io::duplex(1 << 22);
+        // A tiny output pipe nobody reads: the writer blocks almost at once.
+        let (server_w, client_r) = tokio::io::duplex(64);
+        let server = tokio::spawn(serve(
+            BufReader::new(server_r),
+            server_w,
+            Arc::new(Catalog::from_rules(&rules)),
+            fake.clone(),
+            "0.0.0",
+        ));
+        let line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"k__echo\",\"arguments\":{\"arg1\":\"x\"}}}\n";
+        for _ in 0..1000 {
+            client_w.write_all(line.as_bytes()).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let n = fake.calls.lock().unwrap().len();
+        assert!(n <= MAX_QUEUED + 64 + 2, "{n} calls ran while nobody read");
+        drop(client_w);
+        drop(client_r);
+        tokio::time::timeout(std::time::Duration::from_secs(20), server)
+            .await
+            .expect("the server hung once the client left")
+            .unwrap()
+            .unwrap();
     }
 }
