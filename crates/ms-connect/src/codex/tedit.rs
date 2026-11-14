@@ -629,8 +629,7 @@ pub fn redact_line(line: &str, safe: &dyn Fn(&str) -> bool) -> String {
         let mut keys = Vec::new();
         let mut cur = d.as_item();
         let mut array = false;
-        loop {
-            let Some(tl) = cur.as_table_like() else { break };
+        while let Some(tl) = cur.as_table_like() {
             let mut it = tl.iter();
             let (Some((k, next)), None) = (it.next(), it.next()) else {
                 break;
