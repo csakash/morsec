@@ -27,8 +27,8 @@ A traced run matched the prompt to one step: the re-signed `other` copy running 
 (`SecKeychainSetUserInteractionAllowed(false)`) for the call, and the flag is per process
 (checked with `SecKeychainGetUserInteractionAllowed` from two processes). So the flag stops ACL
 prompts (reads, deletes, signing by the other binary all fail with `-25293` / `-25244`, no
-dialog), but **not** the partition ("XARA") prompt that a modification by a differently signed
-binary triggers. The old assertion accepted `UPDATED`, so the test passed only because someone
+dialog), but **not** the partition ("XARA") prompt that an attribute update by a differently
+signed binary triggers (its data-only update raises none). The old assertion accepted `UPDATED`, so the test passed only because someone
 clicked Allow. A new audit session without UI (`SessionCreate`) would avoid it, but a non-root
 process can't create one.
 
@@ -55,8 +55,8 @@ After the fix (same log stream, filtered for `XARA`, `keychain prompt`, `user ap
 
 The remaining securityd lines are silent `ACL partition mismatch` entries with no prompt.
 
-Not claimed: what macOS does when a differently signed binary modifies our item without a human
-present (it asks the user, so it can't run unattended); the seal is what protects against it, and
+Not claimed: what macOS does when a differently signed binary updates our item's attributes without a
+human present (it asks the user, so it can't run unattended); the seal is what protects against it, and
 that is tested.
 
 ## 3. msd tunnel allowlist (L08 follow-up D2)
