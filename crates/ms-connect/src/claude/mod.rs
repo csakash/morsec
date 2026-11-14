@@ -277,7 +277,7 @@ fn recorded_set(e: &Edits, p: &[&str]) -> Option<Value> {
 }
 
 /// The certificate blocks of a PEM text.
-fn pem_blocks(text: &str) -> Vec<&str> {
+pub(crate) fn pem_blocks(text: &str) -> Vec<&str> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
     let mut out = Vec::new();
@@ -290,7 +290,7 @@ fn pem_blocks(text: &str) -> Vec<&str> {
     out
 }
 
-fn as_str_path(p: &Path) -> Result<String> {
+pub(crate) fn as_str_path(p: &Path) -> Result<String> {
     p.to_str()
         .map(str::to_owned)
         .ok_or_else(|| err(format!("{} is not valid UTF-8", p.display())))

@@ -1,0 +1,3 @@
+model = "o3"
+[tui]
+theme = "dark"

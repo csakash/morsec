@@ -1,0 +1,56 @@
+# Codex config — hand edited, keep my comments.
+model = "o3"   # trailing comment
+shell_environment_policy.inherit = "core"
+shell_environment_policy.set.EDITOR_HINT = 'vim'
+shell_environment_policy.set.SSL_CERT_FILE = "$HOME/.morsec/codex-ca-bundle.pem"
+shell_environment_policy.set.MORSEC_CONNECTED = "codex"
+shell_environment_policy.set.HTTPS_PROXY = "http://127.0.0.1:4401"
+shell_environment_policy.set.HTTP_PROXY = "http://127.0.0.1:4401"
+shell_environment_policy.set.https_proxy = "http://127.0.0.1:4401"
+shell_environment_policy.set.http_proxy = "http://127.0.0.1:4401"
+shell_environment_policy.set.REQUESTS_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
+shell_environment_policy.set.CURL_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
+shell_environment_policy.set.NODE_EXTRA_CA_CERTS = "$HOME/.morsec/codex-ca-bundle.pem"
+shell_environment_policy.set.STRIPE_API_KEY = "ms://stripe/test"
+
+[notice]
+hide_full_access_warning = true
+
+# Servers
+[mcp_servers.linear]
+url = "https://mcp.linear.app/sse"
+bearer_token_env_var = "LINEAR_TOKEN"
+
+[mcp_servers.pg]
+command = "/usr/local/bin/pg-mcp"
+args = [
+  "--readonly",   # important
+  "--db", "app",
+]
+
+[mcp_servers.pg.env]
+PGPASSWORD = "ms://pg/app"
+PGHOST = "localhost"
+HTTPS_PROXY = "http://127.0.0.1:4401"
+HTTP_PROXY = "http://127.0.0.1:4401"
+https_proxy = "http://127.0.0.1:4401"
+http_proxy = "http://127.0.0.1:4401"
+SSL_CERT_FILE = "$HOME/.morsec/codex-ca-bundle.pem"
+REQUESTS_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
+CURL_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
+NODE_EXTRA_CA_CERTS = "$HOME/.morsec/codex-ca-bundle.pem"
+
+[mcp_servers.ms]
+command = "/usr/bin/env"
+args = ["-i", "HOME=$HOME", "PATH=/usr/bin:/bin", "/opt/homebrew/bin/ms", "mcp"]
+
+[profiles.fast]
+model = "gpt-5-mini"
+
+[[skills.config]]
+name = "a"
+enabled = true
+
+[[skills.config]]
+name = "b"
+enabled = false
