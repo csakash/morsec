@@ -739,6 +739,7 @@ fn run_agent_in(argv: &[String], dir: &Path) -> (String, String) {
                 let mut chunk = [0u8; 8192];
                 loop {
                     match r.read(&mut chunk) {
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let mut g = b.lock().unwrap_or_else(|e| e.into_inner());
@@ -1433,7 +1434,7 @@ mod tests {
         let argv: Vec<String> = [
             "/bin/sh",
             "-c",
-            "echo morsec-probe-line; /usr/bin/perl -e 'use POSIX; exit if fork; POSIX::setsid(); sleep 20'",
+            "echo morsec-probe-line; /usr/bin/perl -e 'use POSIX; exit if fork; POSIX::setsid(); sleep 8'",
         ]
         .iter()
         .map(|s| (*s).to_owned())
