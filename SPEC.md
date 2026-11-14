@@ -29,7 +29,7 @@ receipt chain, and output that comes back as redacted, inert data.
   - **Name:** `<key>__<program>`, sanitised to `[a-z0-9_]` (`pg/production` + `psql` →
     `pg_production__psql`); a key with several patterns for the same program gets `_2`, `_3`…
     in pattern order (patterns are sorted on load, so this is stable); any name still
-    colliding, or longer than 64 bytes, is cut and suffixed with 8 hex chars of
+    colliding, or longer than 48 bytes (Claude Code prefixes `mcp__ms__` and caps tool names at 64), is cut and suffixed with 8 hex chars of
     SHA-256(key, pattern). The card's `db_query(sql)` is therefore `pg_production__psql(arg1)`;
     friendly names are a follow-up that needs a rules field (decision for the orchestrator).
   - **Parameters:** each `*` in the pattern is a required string `arg1`, `arg2`… (in order);
@@ -61,7 +61,8 @@ receipt chain, and output that comes back as redacted, inert data.
   `NAME=ms://<key>` for every name in the key's `env`, and hands that to L12's `prepare_run` +
   buffered run. So validation and receipts can't be skipped by a modified `ms mcp`, and a call
   can't name another key: the key comes only from the tool. Refusals before the run (unknown
-  tool, version changed, schema violation) get a receipt too: under the tool's key when the tool
+  tool, version changed, schema violation) get a receipt too (blocked, counting toward LOG-2;
+  except a changed rules version, which is the person's doing: recorded as failed): under the tool's key when the tool
   exists, else under msd's own key; target `mcp:<tool>` (escaped, bounded) and the reason.
 - **D4 — identity from the peer.** msd identifies the `McpCall` connection by its kernel peer
   (L06/L07, the same as `Run`): `ms mcp` is a child of the agent, so its calls are the agent's
@@ -79,8 +80,8 @@ receipt chain, and output that comes back as redacted, inert data.
 - **D7 — protocol.** MCP over stdio, newline-delimited JSON-RPC 2.0. Methods: `initialize`
   (protocol `2025-06-18`, `2025-03-26` or `2024-11-05`, echoing the client's when supported),
   `notifications/initialized`, `ping`, `tools/list`, `tools/call`; anything else
-  `-32601`. Unknown tool: `-32602`. Batches are refused (`-32600`); a line over 1 MiB is a
-  parse error and is discarded. At most 4 tool calls at once. Nothing but protocol goes to
+  `-32601`. Unknown tool: `-32602`. Batches, a missing `"jsonrpc": "2.0"` and an id that is not a string or number are refused (`-32600`); a line over 1 MiB is a
+  parse error and is discarded. At most 4 tool calls run at once and 32 are accepted (more get `-32603`). Nothing but protocol goes to
   stdout; diagnostics go to stderr. The process environment is whatever the connector set
   (`env -i HOME PATH [MORSEC_SOCKET]`, L08/L13 D4).
 - **D8 — the connectors.** L08 (Claude) and L13 (Codex) already write the `ms mcp` entry for

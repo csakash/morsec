@@ -39,17 +39,9 @@ pub(crate) fn call(
         (Catalog::from_rules(&live.rules), live.rules.version)
     };
     let shown = shown(tool);
-    let refuse = |key: &KeyName, why: &str, reply: ResponseBody| {
+    let refuse_as = |key: &KeyName, why: &str, result: ReceiptResult, reply: ResponseBody| {
         let target = format!("mcp:{shown} ({why})");
-        if let Err(e) = d.record(
-            session,
-            key,
-            Mode::Run,
-            &target,
-            version,
-            ReceiptResult::Blocked(Reason::CommandNotAllowed),
-            None,
-        ) {
+        if let Err(e) = d.record(session, key, Mode::Run, &target, version, result, None) {
             tracing::error!(error = %e, "could not record a refused MCP call");
             return reply_err(
                 ErrorCode::Internal,
@@ -57,6 +49,15 @@ pub(crate) fn call(
             );
         }
         reply
+    };
+    // Blocked: counts toward LOG-2 (an agent probing for tools or bad arguments).
+    let refuse = |key: &KeyName, why: &str, reply: ResponseBody| {
+        refuse_as(
+            key,
+            why,
+            ReceiptResult::Blocked(Reason::CommandNotAllowed),
+            reply,
+        )
     };
     let Some(t) = catalog.get(tool) else {
         return refuse(
@@ -71,9 +72,12 @@ pub(crate) fn call(
         );
     };
     if rules_version != version {
-        return refuse(
+        // The person changed the rules, not the agent's doing: recorded, but as a failure that
+        // does not count toward a LOG-2 session stop (review R2).
+        return refuse_as(
             &t.key,
             "rules changed",
+            ReceiptResult::Failed("the rules changed; restart the MCP server".into()),
             reply_err(
                 ErrorCode::Invalid,
                 format!(
@@ -293,6 +297,12 @@ mod tests {
             last.contains("rules changed") && last.contains("svc/test"),
             "{last}"
         );
+        assert!(!last.contains("blocked"), "{last}");
+        // Not the agent's fault: a stale list never gets the session stopped (review R2).
+        for _ in 0..30 {
+            let r = mcp(&rt, &d, &root, "svc_test__env", v - 1, Value::Null);
+            assert_eq!(code(&r), Some(ErrorCode::Invalid), "{r:?}");
+        }
     }
 
     // protects=D5/AUTH-3: a production tool call waits for L11's approver; approved it runs

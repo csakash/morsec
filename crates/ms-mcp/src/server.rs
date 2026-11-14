@@ -20,14 +20,18 @@ use crate::result;
 pub const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Longest request line. Longer lines are discarded with a parse error.
 pub const MAX_LINE: usize = 1 << 20;
-/// Most tool calls in flight at once.
+/// Most tool calls running at once.
 pub const MAX_CALLS: usize = 4;
+/// Most tool calls accepted (running or waiting); more are refused, so a client can't queue
+/// unbounded work (review R3).
+pub const MAX_QUEUED: usize = 32;
 
 /// JSON-RPC error codes.
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+const INTERNAL_ERROR: i64 = -32603;
 
 /// A boxed future, so the trait stays object-safe and `Send`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -70,6 +74,7 @@ where
         }
     });
     let calls = Arc::new(Semaphore::new(MAX_CALLS));
+    let queued = Arc::new(Semaphore::new(MAX_QUEUED));
     let version = server_version.to_owned();
     loop {
         let line = match read_line(&mut input).await? {
@@ -104,7 +109,21 @@ where
                 .await;
             continue;
         };
+        // JSON-RPC 2.0 only; an id is a string or a number (review R6).
         let id = obj.get("id").cloned();
+        let bad_id = id
+            .as_ref()
+            .is_some_and(|i| !(i.is_string() || i.is_number()));
+        if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || bad_id {
+            let _ = tx
+                .send(error(
+                    Value::Null,
+                    INVALID_REQUEST,
+                    "not a JSON-RPC 2.0 request",
+                ))
+                .await;
+            continue;
+        }
         let Some(method) = obj.get("method").and_then(Value::as_str) else {
             // A response or junk; a client never sends us responses (we make no requests).
             if let Some(id) = id {
@@ -154,9 +173,20 @@ where
                 let name = name.to_owned();
                 let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
                 let known = catalog.get(&name).is_some();
+                let Ok(slot) = queued.clone().try_acquire_owned() else {
+                    let _ = tx
+                        .send(error(
+                            id,
+                            INTERNAL_ERROR,
+                            &format!("{MAX_QUEUED} tool calls are already waiting; retry when one finishes"),
+                        ))
+                        .await;
+                    continue;
+                };
                 let (tx, backend, calls) = (tx.clone(), backend.clone(), calls.clone());
                 let rv = catalog.rules_version;
                 tokio::spawn(async move {
+                    let _slot = slot;
                     let Ok(_permit) = calls.acquire_owned().await else {
                         return;
                     };
@@ -172,6 +202,8 @@ where
                             },
                         ),
                         Ok(r) => ok(id, result::tool_result(&r)),
+                        // An unknown tool is -32602 whatever msd said (review R4).
+                        Err(e) if !known => error(id, INVALID_PARAMS, &result::inert(&e)),
                         Err(e) => ok(id, result::refused(&e)),
                     };
                     let _ = tx.send(msg).await;
@@ -344,6 +376,8 @@ mod tests {
             "not json",
             &long,
             r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#,
+            r#"{"id":8,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":{"x":1},"method":"ping"}"#,
         ])
         .await;
         let init = &by_id(&msgs, 1)["result"];
@@ -373,7 +407,17 @@ mod tests {
             .filter(|m| m["id"].is_null())
             .map(|m| m["error"]["code"].as_i64().unwrap())
             .collect();
-        assert_eq!(errs, [INVALID_REQUEST, PARSE_ERROR, PARSE_ERROR]);
+        assert_eq!(
+            errs,
+            [
+                INVALID_REQUEST,
+                PARSE_ERROR,
+                PARSE_ERROR,
+                INVALID_REQUEST,
+                INVALID_REQUEST
+            ]
+        );
+        assert!(!msgs.iter().any(|m| m["id"] == json!(8)));
         let calls = fake.calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "both calls reached msd");
         assert_eq!(calls[0].0, "k__echo");
