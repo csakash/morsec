@@ -126,6 +126,8 @@ pub struct Daemon {
     stops: std::sync::atomic::AtomicU64,
     /// The proxy CA in use (certificate PEM, hosts), when a host is bound.
     ca: Mutex<Option<(String, Vec<String>)>>,
+    /// What `ms doctor --probe` runs reported, and the canaries the proxy saw (L17).
+    probes: Arc<crate::doctor::Probes>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -310,6 +312,7 @@ impl Daemon {
             write: Mutex::new(()),
             flag: Mutex::new(()),
             ca: Mutex::new(None),
+            probes: Arc::default(),
             stops: std::sync::atomic::AtomicU64::new(0),
         }))
     }
@@ -512,6 +515,11 @@ impl Daemon {
         self.read_live().rules.version
     }
 
+    /// The doctor probe store (L17); the proxy's egress observer records canaries in it.
+    pub fn probes(&self) -> Arc<crate::doctor::Probes> {
+        self.probes.clone()
+    }
+
     fn caller(&self, peer: &PeerInfo) -> Option<Caller> {
         (self.identify)(peer)
     }
@@ -643,6 +651,15 @@ impl Daemon {
                 "morsec: ms scan can't run inside an agent session. Run it from your own terminal",
             ),
             RequestBody::Scan => self.scan(&session),
+            RequestBody::DoctorProbe { nonce, report } => self.probes.handle(
+                match &caller {
+                    Some(Caller::Agent(s)) => Some(s.clone()),
+                    _ => None,
+                },
+                nonce.as_deref(),
+                report,
+                now_ms(),
+            ),
             other => reply_err(
                 ErrorCode::NotImplemented,
                 format!(

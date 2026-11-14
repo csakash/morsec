@@ -15,8 +15,8 @@ pub mod server;
 pub use client::Client;
 pub use paths::default_socket_path;
 pub use protocol::{
-    ApprovalScope, ErrorCode, PROTOCOL_VERSION, PendingApproval, RequestBody, ResponseBody,
-    ScanFinding,
+    ApprovalScope, ErrorCode, PROTOCOL_VERSION, PendingApproval, ProbeReport, ProbeSighting,
+    RequestBody, ResponseBody, ScanFinding,
 };
 pub use server::{Handler, PeerCheck, PeerInfo, SameUid, Server, ServerLimits, now_unix_ms};
 
