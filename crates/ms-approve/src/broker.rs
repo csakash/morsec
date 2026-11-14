@@ -75,13 +75,20 @@ struct State {
     grants: Vec<(Binding, ApprovalToken)>,
     /// Bumped by `revoke_all` (`ms stop`): a Touch ID that started before it approves nothing.
     epoch: u64,
+    /// Sessions whose last request was denied or timed out, and until when they may not ask
+    /// again (rate limit, PLAN L11 / L05 S4).
+    cooldown: Vec<(ms_core::SessionId, Instant)>,
 }
+
+/// How long a session waits after a denial or timeout before it may ask again.
+pub const COOLDOWN: Duration = Duration::from_secs(10);
 
 /// The production approver.
 pub struct HumanApprover {
     auth: Arc<dyn Authenticator>,
     tokens: TokenIssuer,
     state: Mutex<State>,
+    cooldown: Mutex<Duration>,
     changed: Condvar,
 }
 
@@ -104,7 +111,13 @@ impl HumanApprover {
             tokens,
             state: Mutex::default(),
             changed: Condvar::new(),
+            cooldown: Mutex::new(COOLDOWN),
         }
+    }
+
+    /// Changes the rate-limit cooldown (tests).
+    pub fn set_cooldown(&self, d: Duration) {
+        *self.cooldown.lock().unwrap_or_else(|e| e.into_inner()) = d;
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -247,6 +260,12 @@ impl Approver for HumanApprover {
         if let Some(t) = self.grant_for(&mut st, &b, now) {
             return ApprovalOutcome::Approved(t);
         }
+        let now_i = Instant::now();
+        st.cooldown.retain(|(_, until)| *until > now_i);
+        if st.cooldown.iter().any(|(s, _)| *s == req.session) {
+            tracing::warn!(key = %req.key, "approval refused: this session was just refused (rate limit)");
+            return ApprovalOutcome::Denied;
+        }
         if st.slot.is_some() {
             tracing::warn!(key = %req.key, "approval refused: another approval is waiting");
             return ApprovalOutcome::Denied;
@@ -286,6 +305,12 @@ impl Approver for HumanApprover {
                 .0;
         };
         st.slot = None;
+        if matches!(answer, ApprovalOutcome::Denied | ApprovalOutcome::TimedOut) {
+            let d = *self.cooldown.lock().unwrap_or_else(|e| e.into_inner());
+            if !d.is_zero() {
+                st.cooldown.push((req.session.clone(), Instant::now() + d));
+            }
+        }
         self.changed.notify_all();
         if let ApprovalOutcome::Approved(t) = &answer
             && Scope::of_id(&t.id) == Some(Scope::Session)
@@ -327,13 +352,35 @@ mod tests {
 
     fn approver(auth: FakeAuthenticator) -> (Arc<HumanApprover>, Arc<FakeAuthenticator>) {
         let auth = Arc::new(auth);
-        (
-            Arc::new(HumanApprover::with_issuer(
-                auth.clone(),
-                TokenIssuer::with_key([1; 32]),
-            )),
-            auth,
-        )
+        let a = HumanApprover::with_issuer(auth.clone(), TokenIssuer::with_key([1; 32]));
+        a.set_cooldown(Duration::ZERO);
+        (Arc::new(a), auth)
+    }
+
+    // protects=rate limit (PLAN L11, L05 S4): after a denial or timeout the same session is
+    // refused at once for the cooldown, without a new prompt; other sessions are not;
+    // fails_when=a refused session can re-prompt immediately; no_claim=cooldown length
+    #[test]
+    fn denied_session_cools_down() {
+        let (a, _) = approver(FakeAuthenticator::approve());
+        a.set_cooldown(Duration::from_secs(30));
+        assert_eq!(
+            a.ask(&req("x"), Duration::from_millis(30)),
+            ApprovalOutcome::TimedOut
+        );
+        let started = Instant::now();
+        assert_eq!(
+            a.ask(&req("y"), Duration::from_secs(5)),
+            ApprovalOutcome::Denied
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!a.busy());
+        let mut other = req("x");
+        other.session.pid = 8;
+        assert_eq!(
+            a.ask(&other, Duration::from_millis(30)),
+            ApprovalOutcome::TimedOut
+        );
     }
 
     /// Runs `ask` on a thread and waits until it is pending.
@@ -371,6 +418,11 @@ mod tests {
         let reasons = auth.reasons();
         assert_eq!(reasons.len(), 1);
         assert!(reasons[0].contains(r#""select 1""#), "{}", reasons[0]);
+        assert!(
+            reasons[0].contains("pg/production (production key)"),
+            "{}",
+            reasons[0]
+        );
         assert!(reasons[0].contains(&render::fingerprint(&req("select 1"))));
         // One argument changed between approval and execution: refused.
         assert_eq!(

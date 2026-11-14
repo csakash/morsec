@@ -381,7 +381,7 @@ impl Daemon {
             ApprovalOutcome::Denied => Err(reply_err(
                 ErrorCode::NeedsApproval,
                 format!(
-                    "morsec: {what} was not approved (denied in ms approve, Touch ID did not confirm, or ms stop ran)"
+                    "morsec: {what} was not approved (denied in ms approve, Touch ID did not confirm, ms stop ran, or this session asked again within 10s of a refusal)"
                 ),
             )),
             ApprovalOutcome::TimedOut => Err(reply_err(
@@ -981,6 +981,7 @@ impl Daemon {
                 "morsec: morsec is stopped (ms stop), so rules can't be loosened. Resume first with: ms start",
             );
         }
+        let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
         let token = match change {
             Change::Same => {
                 return ResponseBody::Ok {
@@ -1023,6 +1024,16 @@ impl Daemon {
                 }
             }
         };
+        // ms stop while the person was approving: the loosening is not applied (security re-check).
+        if token.is_some()
+            && (self.is_stopped()
+                || self.stops.load(std::sync::atomic::Ordering::SeqCst) != stops_seen)
+        {
+            return reply_err(
+                ErrorCode::Denied,
+                "morsec: ms stop ran while this change waited for approval, so it was not applied",
+            );
+        }
         let mode = new_rule
             .as_ref()
             .or(current.as_ref())
@@ -1365,6 +1376,7 @@ mod tests {
         });
         let auth = Arc::new(auth);
         let approvals = Arc::new(HumanApprover::new(auth.clone()).unwrap());
+        approvals.set_cooldown(Duration::ZERO);
         let d = Daemon::open(
             backend.clone(),
             Paths::under(dir.path()),

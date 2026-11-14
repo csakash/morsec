@@ -93,6 +93,28 @@ build.** For the end-to-end tests only, a *debug* build of msd started with the 
 pending slot, caller checks, rendering and token stay real). It is refused with the keychain vault
 and refused at startup in release builds (`cfg!(debug_assertions)`).
 
+**D11 — rate limit (added after the `cli-scope` card rewrite).** After a denial or timeout, the
+same session is refused at once for 10 s (no new prompt), on top of D3's one-at-a-time.
+
+## Against the PLAN card as rewritten by `cli-scope` (merged afb510d)
+
+The card now matches this spec's design (terminal review on `/dev/tty`, Touch ID sheet as the
+trusted surface, agent can't approve, bound token, one prompt at a time, rate limit, at_terminal
+removed). Differences, by decision:
+
+- **Request code.** The card derives the sheet's code from the token HMAC. Here the token is minted
+  only *after* Touch ID, so the code is the **fingerprint**: SHA-256 over the binding (session,
+  key, argv hash, cwd), 12 hex characters, shown in the sheet and in `ms approve`, which tells the
+  user to approve only if they match. The sheet also carries the key, tier and the argv itself
+  (capped, with an explicit "N more characters" marker), so the binary name and arguments are in
+  the sheet. A keyed code would add nothing: whoever can show the user a code (`ms approve`, or a
+  detached process asking `ApprovalPending`) could copy a keyed one too. The card's
+  "reason lacks the code or key → refused" holds by construction: msd builds the reason itself
+  from the pending request (asserted in `broker::approve_then_one_argument_changes`).
+- **"Attached to a terminal."** `ms approve` needs `/dev/tty`, but msd does not check the
+  approving peer's controlling terminal: ms-session (L06) doesn't read it, and any process can
+  get one with `script`, so it would add little. The gate stays Touch ID plus the sheet text.
+
 ## IPC v1 additions (backwards compatible)
 
 - `ApprovalPending` → `Approval { pending: Option<PendingApproval> }`;
