@@ -330,14 +330,22 @@ impl ContextAdapter for PrismaAdapter {
     }
 
     fn needs_approval(&self, call: &RunCall, ctx: &CallContext<'_>) -> Option<String> {
-        match Self::class(call)? {
-            // A read-only key refuses it in `plan` anyway; don't ask a person first (review R7).
-            prisma::Class::Schema(_) if ctx.keys.values().any(|f| f.read_only) => None,
-            prisma::Class::Schema(w) => Some(format!(
-                "{w} can change the database schema or run code morsec can't see, so it always needs an approval"
-            )),
-            _ => None,
+        let class = Self::class(call)?;
+        // A read-only key refuses writes in `plan`, and reading commands run only after the role
+        // check proves the role can't write: no person needed (review R7).
+        if ctx.keys.values().any(|f| f.read_only) {
+            return None;
         }
+        // On a key that can write, every prisma call asks a person (security review S1): even a
+        // "reading" subcommand runs project code the agent can edit (custom generators in
+        // schema.prisma, prisma.config.ts) with the database URL in its environment.
+        Some(match class {
+            prisma::Class::Schema(w) => format!(
+                "{w} can change the database schema or run code morsec can't see, so it always needs an approval"
+            ),
+            prisma::Class::Write(w) => format!("{w} writes to the database, so it needs an approval"),
+            prisma::Class::ReadOnly => "prisma runs project code (generators, prisma.config.ts) with the database URL, so on a key that can write it needs an approval".to_owned(),
+        })
     }
 }
 
@@ -487,8 +495,9 @@ mod tests {
             esc.is_some(),
             "pnpm with a valued option slipped past the prisma adapter"
         );
+        // Security review S1: even `generate` runs project code with the URL, so it asks too.
         let (_, esc) = t.plan(&["prisma", "generate"], &env, false);
-        assert!(esc.is_none());
+        assert!(esc.is_some_and(|w| w.contains("project code")));
 
         let (p, esc) = t.plan(&["prisma", "migrate", "deploy"], &env, true);
         assert!(

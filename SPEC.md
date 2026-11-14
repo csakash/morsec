@@ -74,7 +74,9 @@ which is what `ms import` already stores (L12 SPEC, "DSN userinfo refs").
 - **D4 — Prisma.** Prisma's engines don't read a passfile, so Prisma gets the URL through L12's
   env channel (a whole variable named by the rule, never argv). The adapter classifies the
   subcommand. `migrate deploy|dev|reset|resolve`, `db push|execute` **always need an approval
-  (production tier), whatever the key's tier**: msd asks L11's approver with an `ApprovalRequest`
+  (production tier), whatever the key's tier** — and so, after security review S1, does **every
+  prisma call on a key that can write**, since any subcommand (`generate` with a custom generator,
+  `prisma.config.ts`) runs project code the agent can edit with the URL in its environment: msd asks L11's approver with an `ApprovalRequest`
   built like `decide_run`'s, and the receipt says `approved`. On a read-only key, those plus
   `db seed`, `studio` and any subcommand not known to be read-only are refused, and the allowed
   ones (`migrate status|diff`, `db pull`, `generate`, `validate`, `format`, `version`, `--help`)
