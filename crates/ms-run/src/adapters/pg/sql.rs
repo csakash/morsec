@@ -334,6 +334,8 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
     let mut operators = Vec::new();
     for (n, t) in ftoks.iter().enumerate() {
         match t {
+            // Postgres' lexer turns `!=` into `<>`.
+            Tok::Op(o) if o == "!=" => operators.push("<>".to_owned()),
             Tok::Op(o) => operators.push(o.clone()),
             Tok::Word(w) | Tok::Quoted(w) if ftoks.get(n + 1) == Some(&Tok::Punct('(')) => {
                 if let Tok::Word(w) = t
@@ -400,6 +402,8 @@ mod tests {
         assert_eq!(s.operators, ["="]);
         let s = simple("delete from t where a between 1 and 2 or b ilike 'x'").unwrap();
         assert_eq!(s.operators, ["!~~*", "<=", ">=", "~~*"]);
+        let s = simple("delete from t where a != 1").unwrap();
+        assert_eq!(s.operators, ["<>"]);
         let s = simple("delete from only public.\"Order\" where lower(note) like 'x%' and n >= 2")
             .unwrap();
         assert_eq!(s.table, "public.\"Order\"");

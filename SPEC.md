@@ -87,8 +87,8 @@ which is what `ms import` already stores (L12 SPEC, "DSN userinfo refs").
   rows it would change **without executing the write**: on its own connection it runs `BEGIN READ
   ONLY`, timeouts (`statement_timeout` 5 s, `lock_timeout` 2 s), then a DO block that refuses
   unless the table has no row security, no child or partition that isn't a plain table, and only
-  columns of built-in (`pg_catalog`) or enum types; the database has no implicit or assignment
-  cast that isn't built in, and every operator named in the clause or any comparison or pattern
+  columns of built-in (`pg_catalog`) or enum types; the database has no cast (implicit,
+  assignment or explicit) that isn't built in, and every operator named in the clause or any comparison or pattern
   operator (`=`, `<>`, `<`, …, `~~`, `~`, …, implied by `IN`, `BETWEEN`, `LIKE`, …) is built in
   and not volatile, whatever its argument types; and in the `WHERE` clause every function is a
   built-in, non-volatile one that doesn't run SQL given as text (`*_to_xml*`, `ts_stat`) and

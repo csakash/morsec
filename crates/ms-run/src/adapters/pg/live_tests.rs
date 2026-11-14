@@ -344,7 +344,16 @@ fn preview_never_commits(env: &Env) {
         "delete from orders where table_to_xml('orders', true, true, '') is not null",
     ]);
     assert!(unknown.contains("runs SQL"), "{unknown}");
-    for (db, why) in [("userops", "operator"), ("usercasts", "implicit casts")] {
+    assert_eq!(
+        preview(&[
+            "psql",
+            "ms://pg/w",
+            "-c",
+            "update orders set counter = 1 where status != 'paid'"
+        ]),
+        "2 rows in orders"
+    );
+    for (db, why) in [("userops", "operator"), ("usercasts", "casts")] {
         let k = format!("pg/{db}");
         let kk = key(&k);
         env.vault

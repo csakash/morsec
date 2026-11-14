@@ -171,8 +171,8 @@ impl Cluster {
             "REVOKE CREATE ON SCHEMA public FROM PUBLIC;
              CREATE TABLE t (id int); GRANT INSERT ON t TO split;",
         );
-        // Databases with a non-built-in operator / implicit cast that an untyped literal could
-        // reach: every preview there is unknown.
+        // Databases with a non-built-in operator, or a user cast (here an explicit one), that a
+        // filter could reach: every preview there is unknown.
         for (db, sql) in [
             (
                 "userops",
@@ -183,7 +183,8 @@ impl Cluster {
             (
                 "usercasts",
                 "CREATE TYPE e AS ENUM ('1');
-                 CREATE CAST (int4 AS e) WITH INOUT AS IMPLICIT;",
+                 CREATE FUNCTION g(e) RETURNS int4 LANGUAGE sql VOLATILE AS 'SELECT 1';
+                 CREATE CAST (e AS int4) WITH FUNCTION g(e);",
             ),
         ] {
             c.admin("postgres", &format!("CREATE DATABASE {db}"));

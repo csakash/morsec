@@ -34,12 +34,11 @@ fn is_prisma(a: &str) -> bool {
         })
 }
 
-/// Index in `argv` of the `prisma` word, when this is a Prisma CLI call: `prisma …`, or a
-/// package runner (`npx`, `bunx`, `pnpx`, `npm`, `pnpm`, `yarn`, `bun`) with any argument that is
-/// `prisma` / `prisma@<v>` (or a path to one). Runner options can take values (`pnpm --filter
-/// api exec prisma …`), so morsec doesn't try to parse them: the first such argument counts, and
-/// whatever follows it is classified (an option's value of `prisma` then reads as an unknown
-/// command, which needs an approval: fail closed).
+/// Index in `argv` of the first argument that names prisma, when this is a Prisma call: `prisma …`,
+/// or a package runner (`npx`, `bunx`, `pnpx`, `npm`, `pnpm`, `yarn`, `bun`) with any argument
+/// containing `prisma` (a path, `prisma@npm:…`, `@prisma/cli`, a package script …). This match is
+/// broad on purpose (fail closed): [`class_of`] treats only the exact binary shape as Prisma's own
+/// command and everything else as needing an approval.
 pub fn locate(argv: &[String]) -> Option<usize> {
     let first = base(argv.first()?);
     if first == "prisma" {
@@ -54,7 +53,7 @@ pub fn locate(argv: &[String]) -> Option<usize> {
     argv.iter()
         .enumerate()
         .skip(1)
-        .find(|(_, a)| is_prisma(a))
+        .find(|(_, a)| a.to_ascii_lowercase().contains("prisma"))
         .map(|(i, _)| i)
 }
 
@@ -78,12 +77,15 @@ pub fn class_of(argv: &[String]) -> Option<Class> {
             )
         })
     };
-    let binary = match first {
-        "npx" | "bunx" | "pnpx" => flags_only(&argv[1..at]),
-        _ => {
-            at >= 2 && matches!(argv[1].as_str(), "exec" | "dlx" | "x") && flags_only(&argv[2..at])
-        }
-    };
+    let binary = is_prisma(&argv[at])
+        && match first {
+            "npx" | "bunx" | "pnpx" => flags_only(&argv[1..at]),
+            _ => {
+                at >= 2
+                    && matches!(argv[1].as_str(), "exec" | "dlx" | "x")
+                    && flags_only(&argv[2..at])
+            }
+        };
     if binary {
         return Some(classify(&argv[at + 1..]));
     }
@@ -207,16 +209,29 @@ mod tests {
             Class::Schema(_)
         ));
         assert_eq!(locate(&a(&["npx", "tsc"])), None);
-        // Only prisma itself, at a version or tag, never another package spelled to look like it.
+        // Only prisma itself, at a version or tag, counts as the binary; any other spelling that
+        // names prisma is still matched, and needs an approval.
         assert_eq!(locate(&a(&["npx", "prisma@5.22.0", "generate"])), Some(1));
+        assert_eq!(
+            class_of(&a(&["npx", "prisma@5.22.0", "generate"])),
+            Some(Class::ReadOnly)
+        );
         for other in [
             &["npx", "prisma@npm:evil-pkg", "generate"][..],
             &["npx", "prisma@github:attacker/repo", "generate"],
             &["npx", "prisma@file:../x", "generate"],
             &["pnpm", "dlx", "prisma@https://x/y.tgz", "generate"],
             &["npx", "./evil/prisma", "generate"],
+            &["npx", "./node_modules/.bin/prisma", "migrate", "reset"],
+            &["npx", "prisma@npm:prisma", "migrate", "deploy"],
+            &["npx", "prisma@>=5", "db", "push"],
+            &["pnpm", "dlx", "prisma@5.x", "migrate", "deploy"],
+            &["npx", "@prisma/cli", "generate"],
         ] {
-            assert_eq!(locate(&a(other)), None, "{other:?}");
+            assert!(
+                matches!(class_of(&a(other)), Some(Class::Schema(_))),
+                "{other:?}"
+            );
         }
         assert_eq!(locate(&a(&["psql"])), None);
 

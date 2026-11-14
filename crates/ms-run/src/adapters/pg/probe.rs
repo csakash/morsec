@@ -108,15 +108,15 @@ BEGIN
              WHERE a.attrelid = t AND a.attnum > 0 AND NOT a.attisdropped
                AND n.nspname <> 'pg_catalog' AND y.typtype <> 'e') THEN
     RAISE EXCEPTION 'morsec-why: the table has a column of a type outside pg_catalog'; END IF;
-  -- An untyped literal can resolve to any type, so implicit and assignment casts in the whole
-  -- database must be built in.
+  -- An untyped literal can resolve to any type, and an explicit or function-style cast
+  -- (`m::int4`, `int4(m)`, `to_json(m)`) can pick a user cast: every cast in the database must
+  -- be built in.
   IF EXISTS (SELECT 1 FROM pg_cast c
              LEFT JOIN pg_proc p ON p.oid = c.castfunc
-             WHERE c.castcontext IN ('i', 'a')
-               AND (c.oid >= 16384
+             WHERE (c.oid >= 16384
                     OR (p.oid IS NOT NULL AND (p.pronamespace <> 'pg_catalog'::regnamespace
                                                OR p.provolatile = 'v')))) THEN
-    RAISE EXCEPTION 'morsec-why: the database has implicit casts that are not built in'; END IF;
+    RAISE EXCEPTION 'morsec-why: the database has casts that are not built in'; END IF;
   -- Functions: built-in, not volatile, never one that runs SQL given as text.
   IF EXISTS (SELECT 1 FROM unnest(fns) f WHERE NOT EXISTS (
                SELECT 1 FROM pg_proc p WHERE p.proname = f AND p.pronamespace = 'pg_catalog'::regnamespace)) THEN
