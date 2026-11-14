@@ -39,6 +39,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+ms-run = { workspace = true, features = ["pg-test"] }
 
 # End-to-end test that runs real `ms` commands inside a fake agent. It is its own fake agent:
 # copied as `claude`, it runs a shell command as its child (see the file), so it needs its own
