@@ -688,16 +688,29 @@ pub fn redact_line(line: &str, safe: &dyn Fn(&str) -> bool) -> String {
     };
     let indent = &line[..line.len() - line.trim_start().len()];
     let mut out = Vec::new();
+    let bare = |tl: &dyn toml_edit::TableLike, k: &str| {
+        tl.key(k)
+            .and_then(|key| key.as_repr())
+            .and_then(|r| r.as_raw().as_str())
+            .is_some_and(|raw| !raw.starts_with(['"', '\'']))
+    };
     for (k, item) in d.iter() {
         let mut keys = vec![k.to_owned()];
+        // A quoted key could be a value (a line from inside a multi-line string): shown only
+        // when bare or one morsec wrote (security review N1).
+        let mut keys_ok = bare(d.as_table(), k) || safe(k);
         let mut cur = item;
         // A dotted key parses as nested tables with one entry each.
         while let Some(tl) = cur.as_table().filter(|t| t.is_dotted() || t.is_implicit()) {
             let Some((k2, i2)) = tl.iter().next() else {
                 break;
             };
+            keys_ok &= bare(tl, k2) || safe(k2);
             keys.push(k2.to_owned());
             cur = i2;
+        }
+        if !keys_ok {
+            return "…".to_owned();
         }
         let shown = cur
             .as_value()
@@ -720,7 +733,8 @@ fn all_strings_safe(c: &Canon, safe: &dyn Fn(&str) -> bool) -> bool {
         Canon::Str(s) => safe(s),
         Canon::Array(a) => a.iter().all(|x| all_strings_safe(x, safe)),
         Canon::Table(kv) => kv.iter().all(|(_, x)| all_strings_safe(x, safe)),
-        _ => true,
+        // morsec writes only strings; any other value on a changed line is the user's.
+        _ => false,
     }
 }
 
@@ -753,7 +767,8 @@ mod redact_tests {
             redact_line("mcp_servers.gh.env.T = \"ms://gh/t\"", &safe),
             "mcp_servers.gh.env.T = \"ms://gh/t\""
         );
-        assert_eq!(redact_line("port = 4101", &safe), "port = 4101");
+        assert_eq!(redact_line("port = 4101", &safe), "port = \"…\"");
+        assert_eq!(redact_line("\"ghp_SECRET\" = 1", &safe), "…");
         assert_eq!(redact_line("  \"ghp_SECRET\",", &safe), "…");
         assert_eq!(redact_line("x = \"\"\"ghp_SECRET", &safe), "…");
         assert_eq!(redact_line("# token ghp_SECRET", &safe), "…");

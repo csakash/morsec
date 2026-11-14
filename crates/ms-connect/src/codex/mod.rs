@@ -200,6 +200,89 @@ fn has_userinfo(v: &str) -> bool {
         .is_some_and(|auth| auth.contains('@'))
 }
 
+/// Variables morsec writes with values of its own (not references).
+fn own_var(name: &str) -> bool {
+    name == MARKER
+        || name == "MORSEC_SOCKET"
+        || PROXY_VARS.contains(&name)
+        || CA_VARS.contains(&name)
+}
+
+/// True when `p` is a key path morsec writes: `shell_environment_policy.set.<VAR>`,
+/// `mcp_servers.<id>.env.<VAR>` or `mcp_servers.ms` (security review S1).
+fn own_path(p: &[String]) -> bool {
+    match p {
+        [a, b, _] => a == "shell_environment_policy" && b == "set",
+        [a, _, e, _] => a == "mcp_servers" && e == "env",
+        [a, b] => a == "mcp_servers" && b == MCP_ID,
+        _ => false,
+    }
+}
+
+/// Checks a record read from the state file (security review S1): a same-user process can
+/// edit that file, so a record may only touch morsec's own key shapes, hold the kind of value
+/// morsec writes there, and keep an old value only where morsec keeps one (proxy, CA, marker,
+/// socket), as a plain string: a CA path must be absolute, a proxy URL carries no credentials.
+fn check_record(r: &Record) -> std::result::Result<(), String> {
+    if !own_path(&r.path) {
+        return Err(format!(
+            "record for {} is not one morsec writes",
+            show_path(&r.path)
+        ));
+    }
+    let after = tedit::parse_value(&r.after)?;
+    let var = r.path.last().map(String::as_str).unwrap_or_default();
+    if r.path.len() == 2 {
+        // mcp_servers.ms: a table, never kept when replaced.
+        if !after.is_inline_table() || matches!(r.kind, Kind::Replaced { .. }) {
+            return Err("bad record for mcp_servers.ms".into());
+        }
+        return Ok(());
+    }
+    let Some(a) = after.as_str() else {
+        return Err(format!("record for {} is not a string", show_path(&r.path)));
+    };
+    if !own_var(var) {
+        // A reference morsec wrote for --env / --mcp-env.
+        check_ref_env(var, a)?;
+        if matches!(r.kind, Kind::Replaced { .. }) {
+            return Err(format!(
+                "record for {} keeps an old value",
+                show_path(&r.path)
+            ));
+        }
+        return Ok(());
+    }
+    if let Kind::Replaced { before } = &r.kind {
+        let b = tedit::parse_value(before)?;
+        let b = b.as_str().ok_or("kept value is not a string")?;
+        let ok = if CA_VARS.contains(&var) {
+            b.starts_with('/') && !b.chars().any(char::is_control)
+        } else if PROXY_VARS.contains(&var) {
+            !has_userinfo(b) && !b.chars().any(char::is_control)
+        } else {
+            !b.chars().any(char::is_control)
+        };
+        if !ok {
+            return Err(format!(
+                "kept value for {} is not allowed",
+                show_path(&r.path)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A created table must be a prefix of a path morsec writes.
+fn check_created(c: &[String]) -> bool {
+    match c {
+        [a] => a == "shell_environment_policy" || a == "mcp_servers",
+        [a, b] => (a == "shell_environment_policy" && b == "set") || a == "mcp_servers",
+        [a, _, e] => a == "mcp_servers" && e == "env",
+        _ => false,
+    }
+}
+
 impl CodexConnector {
     /// A connector over `paths`.
     pub fn new(paths: Paths, ms: impl Into<String>) -> Self {
@@ -301,6 +384,14 @@ impl CodexConnector {
         if let Ok(Some(st)) = self.read_state() {
             v.push(Self::proxy_url(st.proxy_port));
             for r in &st.edits.records {
+                // An old value disconnect puts back (a proxy URL without credentials, a CA
+                // path: checked by check_record) is shown, so the user sees what is restored.
+                if let Kind::Replaced { before } = &r.kind
+                    && let Ok(b) = tedit::parse_value(before)
+                    && let Some(b) = b.as_str()
+                {
+                    v.push(b.to_owned());
+                }
                 if let Ok(x) = tedit::parse_value(&r.after)
                     && let Some(s) = x.as_str()
                     && (s.starts_with("ms://") || s == ID)
@@ -366,21 +457,33 @@ impl CodexConnector {
                 },
                 _ => return Err(bad("record kind")),
             };
-            if p.is_empty() {
-                return Err(bad("record path"));
-            }
-            edits.push(Record {
+            let r = Record {
                 path: p,
                 after,
                 kind,
-            });
+            };
+            check_record(&r).map_err(|e| bad(&e))?;
+            edits.push(r);
         }
         for c in v
             .get("created")
             .and_then(json::Value::as_array)
             .ok_or_else(|| bad("no created"))?
         {
-            edits.created.push(strs(c).map_err(|e| bad(&e))?);
+            let c = strs(c).map_err(|e| bad(&e))?;
+            if !check_created(&c) {
+                return Err(bad("created table is not one morsec makes"));
+            }
+            edits.created.push(c);
+        }
+        // The state belongs to one config file (security review S2): a connect or disconnect
+        // with another CODEX_HOME must not apply these records to a different file.
+        let config = s("config").ok_or_else(|| bad("no config path"))?;
+        if Path::new(&config) != self.paths.config {
+            return Err(err(format!(
+                "morsec is connected to the Codex config {config}, not {}. Run ms disconnect codex with the same CODEX_HOME as when you connected (or unset it), then connect again",
+                self.paths.config.display()
+            )));
         }
         let proxy_port = match v.get("proxy_port") {
             Some(json::Value::Number(n)) => n.parse().map_err(|_| bad("proxy_port"))?,
@@ -396,12 +499,16 @@ impl CodexConnector {
         }))
     }
 
-    fn state_text(st: &State) -> String {
+    fn state_text(&self, st: &State) -> String {
         use json::Value as J;
         let strs = |p: &[String]| J::Array(p.iter().map(|k| J::str(k.clone())).collect());
         let mut v = J::object();
         v.set("version", J::int(STATE_VERSION));
         v.set("agent", J::str(ID));
+        v.set(
+            "config",
+            J::str(self.paths.config.to_string_lossy().into_owned()),
+        );
         v.set("proxy_port", J::int(i64::from(st.proxy_port)));
         v.set("with_mcp", J::Bool(st.with_mcp));
         v.set("created_file", J::Bool(st.created_file));
@@ -640,7 +747,7 @@ impl CodexConnector {
                 });
             }
         };
-        push(&self.paths.state, state_now, Self::state_text(&state));
+        push(&self.paths.state, state_now, self.state_text(&state));
         push(&self.paths.bundle, bundle_now, bundle);
         push(&self.paths.config, cur, after);
         Ok(Planned {

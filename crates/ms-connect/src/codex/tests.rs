@@ -845,3 +845,125 @@ fn rerun_after_edit_keeps_created_order() {
         assert_eq!(created(&c.after), created(&st));
     }
 }
+
+// protects=security review S1: a state file edited by a same-user process can't make connect
+// or disconnect write outside morsec's own keys (sandbox_mode, approval_policy, a planted MCP
+// server, deleting a user key) or restore an odd value; such a state is refused as damaged and
+// nothing is written; fails_when=a forged record is applied
+#[test]
+fn forged_state_is_refused() {
+    let t = "sandbox_mode = \"workspace-write\"\n[shell_environment_policy.set]\nMINE = \"x\"\n";
+    let forged: Vec<(&str, String)> = vec![
+        (
+            "sandbox_mode",
+            r#"{"path":["sandbox_mode"],"after":"\"workspace-write\"","kind":"replaced","before":"\"danger-full-access\""}"#.into(),
+        ),
+        (
+            "approval_policy",
+            r#"{"path":["approval_policy"],"after":"\"x\"","kind":"added"}"#.into(),
+        ),
+        (
+            "planted server",
+            r#"{"path":["mcp_servers"],"after":"{ evil = { command = \"sh\" } }","kind":"replaced","before":"{}"}"#.into(),
+        ),
+        (
+            "delete a user key",
+            r#"{"path":["shell_environment_policy","set","MINE"],"after":"\"x\"","kind":"added"}"#.into(),
+        ),
+        (
+            "relative CA",
+            r#"{"path":["shell_environment_policy","set","SSL_CERT_FILE"],"after":"\"/b\"","kind":"replaced","before":"\"evil.pem\""}"#.into(),
+        ),
+        (
+            "proxy with credentials kept",
+            r#"{"path":["shell_environment_policy","set","HTTPS_PROXY"],"after":"\"http://127.0.0.1:1\"","kind":"replaced","before":"\"http://u:p@evil:1\""}"#.into(),
+        ),
+        (
+            "ref keeps a value",
+            r#"{"path":["shell_environment_policy","set","A_KEY"],"after":"\"ms://a/b\"","kind":"replaced","before":"\"x\""}"#.into(),
+        ),
+        (
+            "ms server kept",
+            r#"{"path":["mcp_servers","ms"],"after":"{ command = \"x\" }","kind":"replaced","before":"{ command = \"evil\" }"}"#.into(),
+        ),
+    ];
+    for (name, rec) in forged {
+        let e = env();
+        write_config(&e.c, t);
+        connect(&e.c, &cfg(&[]));
+        let written = config(&e.c).unwrap();
+        let st = std::fs::read_to_string(&e.c.paths.state).unwrap();
+        let st = st.replacen("\"records\": [", &format!("\"records\": [\n    {rec},"), 1);
+        std::fs::write(&e.c.paths.state, &st).unwrap();
+        let msg = e.c.try_plan(&cfg(&[])).unwrap_err().to_string();
+        assert!(msg.contains("damaged"), "{name}: {msg}");
+        assert!(e.c.plan_remove().is_err(), "{name}");
+        assert_eq!(config(&e.c).unwrap(), written, "{name}");
+    }
+    // A created table outside morsec's shapes, too.
+    let e = env();
+    connect(&e.c, &cfg(&[]));
+    let st = std::fs::read_to_string(&e.c.paths.state).unwrap();
+    std::fs::write(
+        &e.c.paths.state,
+        st.replacen(
+            "\"created\": [",
+            "\"created\": [\n    [\"permissions\"],",
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(e.c.plan_remove().is_err());
+}
+
+// protects=security review S2: the state is bound to the config it was made for, so a connect
+// or disconnect run with another CODEX_HOME can't apply its records to a different file (or
+// carry a crafted file's values into the real one); fails_when=either runs against the other
+// config
+#[test]
+fn state_bound_to_its_config() {
+    let e = env();
+    write_config(&e.c, "model = \"o3\"\n");
+    connect(&e.c, &cfg(&[]));
+    let real = config(&e.c).unwrap();
+    let fake_home = e.c.paths.home.join("work/fake");
+    let mut other = e.c.clone();
+    other.paths = Paths {
+        system_roots: e.c.paths.system_roots.clone(),
+        ..Paths::for_home(&e.c.paths.home, Some(&fake_home))
+    };
+    std::fs::create_dir_all(&fake_home).unwrap();
+    std::fs::write(
+        &other.paths.config,
+        "[shell_environment_policy.set]\nSSL_CERT_FILE = \"/tmp/attacker/ca.pem\"\n",
+    )
+    .unwrap();
+    for msg in [
+        other.try_plan(&cfg(&[])).unwrap_err().to_string(),
+        other.plan_remove().unwrap_err().to_string(),
+    ] {
+        assert!(msg.contains("same CODEX_HOME"), "{msg}");
+    }
+    assert_eq!(config(&e.c).unwrap(), real);
+    assert!(!config(&other).unwrap().contains("MORSEC"));
+}
+
+// protects=security review S1 (preview): a kept value disconnect puts back is shown in the
+// preview, so the user sees what is restored; fails_when=it is shown as "…"
+#[test]
+fn restored_values_are_shown() {
+    let mut e = env();
+    write_config(
+        &e.c,
+        "[shell_environment_policy.set]\nHTTPS_PROXY = \"http://corp:8080\"\n",
+    );
+    e.c.opts.force = true;
+    connect(&e.c, &cfg(&[]));
+    let safe = e.c.display_safe(None);
+    assert_eq!(
+        tedit::redact_line("HTTPS_PROXY = \"http://corp:8080\"", &|s| safe
+            .iter()
+            .any(|x| x == s)),
+        "HTTPS_PROXY = \"http://corp:8080\""
+    );
+}
