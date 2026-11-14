@@ -86,6 +86,14 @@ pub(crate) fn run(a: &DoctorArgs) -> ExitCode {
                     "skipped: msd is not running, so nothing can be checked from inside the agents",
                 )],
             );
+        } else if daemon.as_ref().is_some_and(|d| d.stopped) {
+            // While stopped the proxy serves no session, so no canary could ever arrive.
+            report.section(
+                "live",
+                vec![Item::fail(
+                    "skipped: morsec is stopped (ms stop), so agents can't reach it · resume with: ms start",
+                )],
+            );
         } else {
             live(&mut report);
         }
@@ -255,6 +263,7 @@ fn daemon_pid() -> ms_core::Result<u32> {
 
 struct DaemonInfo {
     proxy_port: Option<u16>,
+    stopped: bool,
 }
 
 fn daemon_section(report: &mut Report) -> Option<DaemonInfo> {
@@ -323,7 +332,10 @@ fn daemon_section(report: &mut Report) -> Option<DaemonInfo> {
         items.push(Item::fail(format!("msd alert: {a}")));
     }
     report.section("morsec", items);
-    Some(DaemonInfo { proxy_port })
+    Some(DaemonInfo {
+        proxy_port,
+        stopped: running == Some(false),
+    })
 }
 
 fn signature_item() -> Item {
@@ -379,7 +391,9 @@ fn classify_signature(path: &Path, verified: bool, details: &str) -> Item {
     }
     match (field("TeamIdentifier="), field("Authority=")) {
         (Some(team), _) => Item::pass(format!("msd signed · team {team}")),
-        (None, Some(auth)) => Item::pass(format!("msd signed · {auth}")),
+        (None, Some(auth)) => Item::warn(format!(
+            "msd signed by {auth}, but without a Team ID: not a morsec release"
+        )),
         (None, None) => Item::fail(format!(
             "msd has no signing identity ({p}) · reinstall morsec (brew reinstall morsec)"
         )),
@@ -594,7 +608,10 @@ fn on_path(bin: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .filter(|d| d.is_absolute())
         .map(|d| d.join(bin))
-        .find(|p| p.is_file())
+        .find(|p| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
 }
 
 fn live(report: &mut Report) {
@@ -648,7 +665,17 @@ fn live(report: &mut Report) {
             );
         }
         match held {
-            Err(e) => items.push(Item::fail(format!("could not ask msd what it saw · {e}"))),
+            Err(e) => {
+                items.push(Item::fail(format!("could not ask msd what it saw · {e}")));
+                // msd can't vouch for anything, but an "open" in the agent's output still counts.
+                if output_says_open(&output, &nonce) {
+                    report.direct_open = true;
+                    items.push(Item::fail(format!(
+                        "DIRECT INTERNET IS OPEN in {}'s sandbox (the probe said so in the agent's output)",
+                        t.id
+                    )));
+                }
+            }
             Ok((canary, rep)) => {
                 let v = judge(
                     t.id,
@@ -699,14 +726,23 @@ fn run_agent_in(argv: &[String], dir: &Path) -> (String, String) {
         Ok(c) => c,
         Err(e) => return (format!("not started: {e}"), String::new()),
     };
+    // Keep the first MAX_AGENT_OUTPUT bytes and discard the rest, so a chatty agent never
+    // blocks on a full pipe. The result comes back on a channel, so a grandchild that left the
+    // group holding the pipe can't hold doctor past its timeout.
     let reader = |r: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            if let Some(r) = r {
-                let _ = r.take(MAX_AGENT_OUTPUT as u64).read_to_end(&mut buf);
+            if let Some(mut r) = r {
+                let _ = r
+                    .by_ref()
+                    .take(MAX_AGENT_OUTPUT as u64)
+                    .read_to_end(&mut buf);
+                let _ = std::io::copy(&mut r, &mut std::io::sink());
             }
-            buf
-        })
+            let _ = tx.send(buf);
+        });
+        rx
     };
     let out = reader(
         child
@@ -736,8 +772,10 @@ fn run_agent_in(argv: &[String], dir: &Path) -> (String, String) {
     };
     // Children left holding the pipes would keep the readers open: end the group either way.
     kill_group(child.id());
-    let mut text = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
-    text.push_str(&String::from_utf8_lossy(&err.join().unwrap_or_default()));
+    let collect =
+        |rx: std::sync::mpsc::Receiver<Vec<u8>>| rx.recv_timeout(READ_TIMEOUT).unwrap_or_default();
+    let mut text = String::from_utf8_lossy(&collect(out)).into_owned();
+    text.push_str(&String::from_utf8_lossy(&collect(err)));
     (outcome, text)
 }
 
@@ -748,6 +786,14 @@ fn kill_group(pid: u32) {
     {
         let _ = rustix::process::kill_process_group(p, rustix::process::Signal::KILL);
     }
+}
+
+/// The agent's output carries the probe's machine line for this nonce saying direct egress is
+/// open. Believed on its own: a claim of "open" is never what an attacker wants doctor to see.
+fn output_says_open(output: &str, nonce: &str) -> bool {
+    output
+        .lines()
+        .any(|l| l.contains(&format!("morsec-probe nonce={nonce} ")) && l.contains("direct=OPEN"))
 }
 
 /// The last `n` non-empty lines of an agent's output, each cut to 200 characters.
@@ -799,9 +845,7 @@ fn judge(
             "commands in {id}'s sandbox did not reach morsec's proxy (the canary never arrived) · check: ms doctor, and that the sandbox allows the proxy"
         )),
     });
-    let said_open = agent_output
-        .lines()
-        .any(|l| l.contains(&format!("morsec-probe nonce={nonce} ")) && l.contains("direct=OPEN"));
+    let said_open = output_says_open(agent_output, nonce);
     let direct_open = report.is_some_and(|(r, _)| r.direct_open) || said_open;
     if direct_open {
         items.push(Item::fail(format!(
@@ -1249,6 +1293,10 @@ mod tests {
             classify_signature(p, true, "TeamIdentifier=not set\n").mark,
             Mark::Fail
         );
+        assert_eq!(
+            classify_signature(p, true, "Authority=My Own Cert\nTeamIdentifier=not set\n").mark,
+            Mark::Warn
+        );
     }
 
     #[test]
@@ -1337,6 +1385,25 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    // protects=R1: the agent's own "direct=OPEN" line for this nonce is recognised on its own (used
+    // even when msd can't be asked); fails_when=it is missed or another nonce's line counts;
+    // no_claim=msd's evidence
+    #[test]
+    fn output_open_claim_needs_this_nonce() {
+        assert!(output_says_open(
+            &format!("x\nmorsec-probe nonce={N} proxy=no direct=OPEN\n"),
+            N
+        ));
+        assert!(!output_says_open(
+            &format!("morsec-probe nonce={N} proxy=reached direct=blocked"),
+            N
+        ));
+        assert!(!output_says_open(
+            "morsec-probe nonce=ffffffffffffffffffffffffffffffff proxy=no direct=OPEN",
+            N
+        ));
     }
 
     #[test]
