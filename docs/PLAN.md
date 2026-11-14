@@ -685,7 +685,7 @@ the `security-evals` step of `scripts/check.sh` green; a fresh install to the fi
 - **ARI-42:** AUTH-2, GW-1, LOG-1.
 
 #### L17 `doctor` · M
-- **Depends on:** L08, L13. **Owns:** `ms doctor` CLI module, `tests/e2e/doctor/`.
+- **Depends on:** L08, L13, L29. **Owns:** `ms doctor` CLI module, `tests/e2e/doctor/`.
 - **Build:**
   - Static checks: daemon signed and running, vault reachable, CA trusted, connector blocks
     present and unmodified, MCP tool hashes as expected.
@@ -719,9 +719,10 @@ Follow-up D2 from L08, written up by `cli-scope` (too big for that loop).
     (intersection), like every other rule.
   - msd sets `ProxyConfig.allow` from it, and the proxy rebuilds when the allowlist changes (today
     it rebuilds only when bindings change).
-  - Kill switch: the allow-listed tunnel path doesn't consult policy today, so `ms stop` would
-    not close it. Allow-listed CONNECTs and plain requests must check the stop flag and the
-    session's LOG-2 stop, and `ms stop` closes open tunnels (AUTH-4).
+  - Kill switch: new requests are already refused after `ms stop` or a LOG-2 session stop (msd's
+    session resolver returns no session), but a tunnel that is already open lasts until it goes
+    idle. With a non-empty allowlist that matters more, so `ms stop` must close open allow-listed
+    tunnels (AUTH-4).
   - `ms connect claude-code` writes the same list to `allowedDomains` (plus rule hosts), and warns
     about `allowedDomains` entries the user already had that msd will refuse, with the
     `ms rules` command that would allow them.
@@ -730,7 +731,8 @@ Follow-up D2 from L08, written up by `cli-scope` (too big for that loop).
 - **Verify:** an allow-listed host tunnels and an unlisted one gets `403` plus a block event; a
   wildcard matches subdomains only; a tampered rules file gives an empty allowlist (fail closed);
   adding a host without approval is refused; a project file can't widen it (property test);
-  after `ms stop` an allow-listed CONNECT is refused and an open tunnel is closed; the connector
+  after `ms stop` an allow-listed CONNECT is still refused (regression) and an open tunnel is
+  closed; the connector
   golden includes the list.
 - **ARI-42:** INJ-4, AUTH-4, SDLC-2, SDLC-4.
 

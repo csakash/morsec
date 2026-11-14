@@ -37,11 +37,12 @@ But when it calls `SecItemUpdate` on our item (`update-attr`), securityd checks 
 partition list and **asks the user about the "XARA" partition anyway**, ignoring the flag. The
 test passed only because someone clicked Allow.
 
-Decision D1: the untrusted child never modifies items. The two tamper steps (`update-attr`,
-`update-data`) are done by the byte-identical trusted copy instead: the worst case (as if the user
-had clicked Allow for an attacker), and the seal must still catch it. Assertions get stricter
-(exactly `UPDATED`, then the seal refuses the data). The other-binary checks that prove the ACL
-(`get`, `del`, `put`, `ca`, and `get` after each tamper) stay exactly as they are.
+Decision D1: the untrusted child never updates attributes. That tamper step (`update-attr`) is
+done by the byte-identical trusted copy instead: the worst case (as if the user had clicked Allow
+for an attacker), and the seal must still catch it. A trusted-copy data overwrite is added (exactly
+`UPDATED`, then the seal refuses it). The other binary's own data update raises no dialog and
+stays. The other-binary checks that prove the ACL (`get`, `del`, `put`, `ca`, and `get` after
+each tamper) stay exactly as they are.
 
 Decision D2: every child runs under a timeout (60 s). A child that runs longer is killed (which
 withdraws its dialog) and the test fails with a message naming the likely dialog, so the gate can
@@ -62,9 +63,9 @@ card in PLAN.md. Reasons:
 - Rules have no such section today. Adding one means a model and TOML change, loosening
   classification and approval (adding a host loosens), the tighten-only project merge, an IPC
   path to change it, `ms rules` CLI support, and connector parity.
-- The proxy's allow-listed tunnel path does not consult the kill switch today (only bound keys go
-  through policy), so a non-empty allowlist would survive `ms stop` (AUTH-4) until that is fixed
-  in `ms-proxy`, and the proxy only rebuilds when bindings change.
+- `ms stop` already refuses new requests (msd's session resolver returns no session), but an
+  allow-listed tunnel that is already open lasts until idle, so `ms stop` has to close those
+  (AUTH-4); and the proxy only rebuilds when bindings change.
 
 The card (`L29 egress-allowlist`) specifies the design and its tests; L17 `doctor` depends on it.
 

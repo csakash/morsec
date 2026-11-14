@@ -10,10 +10,11 @@
 //!
 //! No test may raise a keychain dialog, because a dialog blocks the gate until someone clicks it.
 //! Turning interaction off (`quiet`, `SecKeychainSetUserInteractionAllowed(false)`) covers ACL
-//! prompts but not one kind: when a differently signed binary *modifies* our item
+//! prompts but not one kind: when a differently signed binary updates our item's *attributes*
 //! (`SecItemUpdate`), securityd asks the user about the item's partition list (a "XARA" dialog)
-//! whatever the flag says (seen on macOS 26.2, `docs/evidence/cli-scope.md`). So the re-signed
-//! child never modifies items; tampering is done by the trusted copy instead. And every child runs
+//! whatever the flag says (seen on macOS 26.2, `docs/evidence/cli-scope.md`; its data-only
+//! updates raise none). So the re-signed child never updates attributes; that tamper step is done
+//! by the trusted copy instead. And every child runs
 //! under [`CHILD_TIMEOUT`]: one that hangs is killed (which withdraws any dialog) and the test
 //! fails, rather than waiting on a human.
 
@@ -514,7 +515,7 @@ fn run_child(bin: &Path, service: &str, name: &str, op: &str) -> String {
 // CA key, or overwritten data is returned as the value, or a child hangs on a dialog;
 // no_claim=Developer ID binding (acl_developer_id), protection against the user clicking
 // "Always Allow" in a keychain dialog raised by another binary, or what macOS does when another
-// binary SecItemUpdates our item (it asks the user, so the test can't run that unattended)
+// binary updates our item's attributes (it asks the user, so the test can't run that unattended)
 #[test]
 fn acl_other_binary_is_denied() {
     if skip() {
@@ -552,12 +553,12 @@ fn acl_other_binary_is_denied() {
         CANARY.as_bytes()
     );
 
-    // Tampering with SecItemUpdate. When a differently signed binary does it, macOS shows a
-    // partition ("XARA") dialog even with interaction disabled, and if the user clicks Allow the
-    // update goes through (docs/evidence/cli-scope.md). A test can't wait on that dialog, so the
-    // trusted copy tampers instead: the worst case, as if the user had clicked Allow for an
-    // attacker. The seal must still catch it.
-    // Attributes: the comment is only a display copy of the metadata, so nothing we trust changes.
+    // Tampering with SecItemUpdate. Attributes: when a differently signed binary updates them,
+    // macOS shows a partition ("XARA") dialog even with interaction disabled, and if the user
+    // clicks Allow the update goes through (docs/evidence/cli-scope.md). A test can't wait on that
+    // dialog, so the trusted copy rewrites the comment instead: the worst case, as if the user had
+    // clicked Allow for an attacker. The comment is only a display copy of the metadata, so
+    // nothing we trust changes.
     let r = run_child(&same, &t.service, k.as_str(), "update-attr");
     assert_eq!(r, "UPDATED");
     assert_eq!(
@@ -571,8 +572,8 @@ fn acl_other_binary_is_denied() {
     );
     let r = run_child(&other, &t.service, k.as_str(), "get");
     assert!(r.starts_with("DENIED"), "after update-attr: {r}");
-    // Data: the item becomes unusable (refused by the seal), never a value we use, and stays
-    // unreadable by the other binary. Denial of service, not a leak.
+    // Data, worst case first: overwritten through a trusted binary (as if the user had clicked
+    // Allow for an attacker), the item is refused by the seal, never used as a value.
     let r = run_child(&same, &t.service, k.as_str(), "update-data");
     assert_eq!(r, "UPDATED");
     let e = t
@@ -581,6 +582,12 @@ fn acl_other_binary_is_denied() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("seal check failed"), "{e}");
+    // Then the other binary's own data update, which raises no dialog. Whether the keychain
+    // refuses it or lets it through, the item never yields a value we use (denied by the keychain
+    // or refused by the seal): denial of service, not a leak.
+    let r = run_child(&other, &t.service, k.as_str(), "update-data");
+    assert!(r == "UPDATED" || r.starts_with("DENIED"), "{r}");
+    assert!(t.vault.read_with(&k, |b| b.to_vec()).is_err());
     let r = run_child(&other, &t.service, k.as_str(), "get");
     assert!(r.starts_with("DENIED"), "after update-data: {r}");
 }
@@ -609,7 +616,11 @@ fn acl_developer_id() {
     struct WriterCleanup<'a>(&'a Path, &'a str, &'a str);
     impl Drop for WriterCleanup<'_> {
         fn drop(&mut self) {
-            let _ = run_child(self.0, self.1, self.2, "wipe");
+            // A second panic while unwinding (a cleanup child that also hangs) would abort the
+            // whole test binary, so skip cleanup then.
+            if !std::thread::panicking() {
+                let _ = run_child(self.0, self.1, self.2, "wipe");
+            }
         }
     }
     let _cleanup = WriterCleanup(&writer, &t.service, name);
@@ -829,7 +840,10 @@ fn ca_rejects_planted_keys() {
     struct Cleanup<'a>(&'a Path, &'a str);
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
-            let _ = run_child(self.0, self.1, "x", "delca");
+            // See WriterCleanup: never panic again while unwinding.
+            if !std::thread::panicking() {
+                let _ = run_child(self.0, self.1, "x", "delca");
+            }
         }
     }
     let _cleanup = Cleanup(&other, &t.service);

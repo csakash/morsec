@@ -34,10 +34,11 @@ process can't create one.
 
 Fix (`crates/ms-vault/src/macos/tests.rs`):
 
-- The untrusted child never modifies items. The byte-identical trusted copy does the two tamper
-  steps instead, the worst case (as if the user had clicked Allow for an attacker); the seal must
-  still refuse the data (`seal check failed`), and `list` must still report the sealed tier.
-  Assertions are stricter: exactly `UPDATED`, where any result was accepted before.
+- The untrusted child never updates attributes. The byte-identical trusted copy rewrites the
+  comment instead, the worst case (as if the user had clicked Allow for an attacker); `list` must
+  still report the sealed tier. A trusted-copy data overwrite is added, which the seal must refuse
+  (`seal check failed`). The other binary's own data update raises no dialog (checked in the log
+  with it restored) and stays, as do `pin_overwrite_fails_closed`'s.
 - The ACL proof is unchanged: the other binary's `get`, `del`, `put` and `ca` are denied, the
   positive control (same signature) reads, and `get` by the other binary is denied after each
   tamper.
@@ -48,7 +49,7 @@ After the fix (same log stream, filtered for `XARA`, `keychain prompt`, `user ap
 
 | Run | Result | Prompts |
 |---|---|---|
-| the two tests, 5 times | 5 × ok, 1.3–1.6 s each (was 7 s with the dialog) | 0 |
+| the two tests, 5 times (both rounds) | 5 × ok, 1.3–1.6 s each (was 7 s with the dialog) | 0 |
 | full `ms-vault` suite | 19 passed, 3 ignored | 0 |
 | fresh build, 3 full suites in parallel | 3 × 19 passed | 0 |
 
@@ -63,8 +64,8 @@ that is tested.
 Not changed in this loop; written up as card L29 `egress-allowlist` in `docs/PLAN.md`. Reasons:
 msd may only take an egress allowlist from MAC'd rules (Claude Code's `settings.json` and the
 connector state are agent-writable), the rules have no such section yet (model, loosening
-approval, project merge, IPC, CLI), and the proxy's allow-listed tunnel path does not consult the
-kill switch, so a non-empty allowlist would survive `ms stop` until `ms-proxy` checks it.
+approval, project merge, IPC, CLI), and while `ms stop` already refuses new requests, allow-listed
+tunnels that are already open last until idle, so `ms stop` has to close them.
 
 ## ARI-42
 
@@ -72,4 +73,4 @@ kill switch, so a non-empty allowlist would survive `ms stop` until `ms-proxy` c
 |---|---|
 | GW-1 | ACL tests unchanged in what they prove; they can no longer hang on a keychain dialog |
 | INJ-4 | gap recorded: the tunnel allowlist is empty, so unbound hosts are refused (fails closed); L29 |
-| AUTH-3, INJ-3 | plan only: approvals in the terminal as inert text with Touch ID (L11) |
+| AUTH-3, INJ-3 | plan only: approvals in the terminal as inert text with Touch ID, refused from inside an agent session (L11) |
