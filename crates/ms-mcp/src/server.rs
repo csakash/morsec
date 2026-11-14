@@ -551,9 +551,10 @@ mod tests {
     }
 
     // protects=review R11: a client that never reads its answers can't make the server run
-    // unbounded calls: a finished call keeps its run permit and its queue slot until its answer
-    // fits in the channel, so calls stop reaching msd after a handful; fails_when=calls keep
-    // reaching msd while nobody reads; no_claim=-
+    // unbounded calls: a finished call keeps its run permit (MAX_CALLS) until its answer has room
+    // in the 64-message channel, so at most MAX_CALLS + 64 + one answer in the writer reach msd;
+    // fails_when=a permit is freed before the answer has room and calls keep reaching msd while
+    // nobody reads; no_claim=-
     #[tokio::test]
     async fn a_client_that_does_not_read_is_bounded() {
         use tokio::io::AsyncWriteExt;
@@ -579,7 +580,7 @@ mod tests {
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let n = fake.calls.lock().unwrap().len();
-        assert!(n <= MAX_QUEUED + 64 + 2, "{n} calls ran while nobody read");
+        assert!(n <= MAX_CALLS + 64 + 2, "{n} calls ran while nobody read");
         drop(client_w);
         drop(client_r);
         tokio::time::timeout(std::time::Duration::from_secs(20), server)
