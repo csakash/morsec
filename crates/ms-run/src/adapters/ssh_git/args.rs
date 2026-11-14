@@ -50,14 +50,20 @@ pub const GIT_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "ls-remote"];
 
 /// Long options git would read as one of these (git accepts any unambiguous prefix, so
 /// `--recurse=yes` is `--recurse-submodules=yes`; review R1).
-const REFUSED_GIT_LONG: &[&str] = &["--recurse-submodules", "--signed", "--gpg-sign"];
+const REFUSED_GIT_LONG: &[&str] = &[
+    "--recurse-submodules",
+    "--recurse-submodules-default",
+    "--signed",
+    "--gpg-sign",
+];
 
 /// True for `--recurse-submodules`, `--signed`, `--gpg-sign`, any prefix of them git would
 /// accept as an abbreviation (`--rec`, `--gpg`), and `-S` (`--gpg-sign`, also bundled).
 fn refused_git_option(a: &str) -> bool {
     if let Some(long) = a.strip_prefix("--") {
         let name = long.split('=').next().unwrap_or("");
-        return name.len() >= 2
+        // Any non-empty prefix: one git finds ambiguous is refused by git anyway (review R11).
+        return !name.is_empty()
             && REFUSED_GIT_LONG
                 .iter()
                 .any(|r| r.trim_start_matches("--").starts_with(name));
@@ -408,6 +414,8 @@ mod tests {
             &["push", "--rec", "origin"],
             &["fetch", "--recurse-sub"],
             &["pull", "--gpg"],
+            &["pull", "--g"],
+            &["fetch", "--recurse-submodules-default=yes"],
             &["push", "--sign", "origin"],
             &["push", "--recurse-submodules=on-demand"],
             &[],
