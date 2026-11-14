@@ -25,6 +25,7 @@
 //! [`error::adapter_invalid`] so the agent gets the right code. Values an adapter reads from the
 //! vault are redacted from output only if they are among the call's keys.
 
+pub mod adapters;
 pub mod client;
 pub mod cwd;
 pub mod error;
@@ -36,7 +37,7 @@ pub mod runner;
 
 pub use error::{RunError, RunErrorKind};
 pub use input::RunInput;
-pub use runner::{ExecIo, Exit, Prepared, Runner, RunnerConfig};
+pub use runner::{ExecIo, Exit, Prepared, RunGuard, Runner, RunnerConfig};
 
 /// Truncates and escapes agent-supplied text before it goes into a message.
 pub(crate) fn printable(s: &str) -> String {

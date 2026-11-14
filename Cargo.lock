@@ -886,6 +886,7 @@ dependencies = [
 name = "ms-rules"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "hmac",
  "libc",
@@ -912,6 +913,7 @@ dependencies = [
  "ms-scan",
  "ms-vault",
  "proptest",
+ "ring",
  "rustix",
  "tempfile",
  "tokio",

@@ -202,6 +202,15 @@ impl Daemon {
         };
 
         let rules = effective_for(&user, &real_cwd);
+        // L16: `MS_SSH_KEY` / `MS_GIT_CREDENTIAL` are taken out of the call here (their value
+        // never reaches the child) and the ssh/git call is checked against the effective rules.
+        let ssh_git = match self.ssh_git_call(runner(), &mut input, &rules) {
+            Ok(sg) => sg,
+            Err((k, msg)) => {
+                let result = ReceiptResult::Blocked(Reason::CommandNotAllowed);
+                return Err(refuse(&k, result, reply_err(ErrorCode::Denied, msg)));
+            }
+        };
         let call = Runner::call(&input, real_cwd.clone(), session.clone());
         let mut decided = Vec::new();
         for k in &run_keys {
@@ -220,7 +229,10 @@ impl Daemon {
                     ));
                 }
                 Decision::NeedsApproval { mut request } => {
-                    request.effect = runner().preview(&call).map(|p| p.summary);
+                    request.effect = match &ssh_git {
+                        Some(sg) => Some(sg.effect()),
+                        None => runner().preview(&call).map(|p| p.summary),
+                    };
                     // L11: a person approves in `ms approve` with Touch ID; the token is then
                     // checked against this exact request (key, argv hash, cwd, session) before
                     // anything runs, and the plan below is built from that same argv and cwd.
@@ -243,7 +255,23 @@ impl Daemon {
             ));
         }
 
-        let prepared = match runner().plan(&input, &call, &run_keys, &*self.vault) {
+        let planned = match ssh_git {
+            Some(sg) => {
+                let ctx = super::ssh_git::RunContext {
+                    session: session.clone(),
+                    target: target.clone(),
+                    argv_hash: hash,
+                    rule_version: version,
+                    approvals: decided
+                        .iter()
+                        .map(|d| (d.key.clone(), d.approval_id.clone()))
+                        .collect(),
+                };
+                self.plan_ssh_git(runner(), sg, &input, &call, &run_keys, ctx)
+            }
+            None => runner().plan(&input, &call, &run_keys, &*self.vault),
+        };
+        let prepared = match planned {
             Ok(p) => p,
             Err(e) => {
                 for d in &decided {

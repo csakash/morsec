@@ -81,15 +81,29 @@ impl RunnerConfig {
     }
 }
 
+/// Something that must live exactly as long as a run (L16: the per-run SSH agent and
+/// credential sockets). It learns the child's PID (its process-group id) once the child started,
+/// and is dropped when the run ends, however it ends.
+pub trait RunGuard: Send + Sync + std::fmt::Debug {
+    /// The child started with this PID, which is also its process-group id.
+    fn started(&self, pid: u32);
+}
+
 /// A plan ready to run, with the redaction patterns for its values. `Debug` shows no value.
 #[derive(Debug)]
 pub struct Prepared {
     plan: ExecPlan,
     arg0: OsString,
     patterns: Arc<Patterns>,
+    guards: Vec<Box<dyn RunGuard>>,
 }
 
 impl Prepared {
+    /// Keeps `guard` alive for the run and tells it the child's PID when the child starts.
+    pub fn hold(&mut self, guard: Box<dyn RunGuard>) {
+        self.guards.push(guard);
+    }
+
     /// The program that will run.
     pub fn program(&self) -> &Path {
         &self.plan.program
@@ -208,10 +222,20 @@ impl Runner {
         run_keys: &BTreeSet<KeyName>,
         vault: &dyn Vault,
     ) -> Result<Prepared, RunError> {
-        let mut plan = self
-            .adapter(&call.argv)
-            .plan(call, vault)
-            .map_err(|e| from_core(&e))?;
+        self.plan_with(self.adapter(&call.argv), input, call, run_keys, vault)
+    }
+
+    /// Like [`Runner::plan`], with an adapter msd built for this one call (L16) instead of the
+    /// registered ones. The same checks apply to its plan.
+    pub fn plan_with(
+        &self,
+        adapter: &dyn RunAdapter,
+        input: &RunInput,
+        call: &RunCall,
+        run_keys: &BTreeSet<KeyName>,
+        vault: &dyn Vault,
+    ) -> Result<Prepared, RunError> {
+        let mut plan = adapter.plan(call, vault).map_err(|e| from_core(&e))?;
         let program = plan
             .program
             .to_str()
@@ -259,15 +283,18 @@ impl Runner {
             plan,
             arg0: OsString::from(&input.argv[0]),
             patterns: Arc::new(builder.build()),
+            guards: Vec::new(),
         })
     }
 
     /// Runs a prepared plan. Dropping the returned future kills the child's process group.
     pub async fn execute(&self, prepared: Prepared, io: ExecIo) -> Result<Exit, RunError> {
+        // The guards live until this function returns: after the group was killed.
         let Prepared {
             plan,
             arg0,
             patterns,
+            guards,
         } = prepared;
         let mut cmd = tokio::process::Command::new(&plan.program);
         cmd.arg0(&arg0)
@@ -294,6 +321,11 @@ impl Runner {
         let mut child = spawned
             .map_err(|e| RunError::internal(format!("morsec: could not start {shown}: {e}")))?;
         let group = GroupGuard::new(child.id());
+        if let Some(pid) = child.id() {
+            for g in &guards {
+                g.started(pid);
+            }
+        }
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();

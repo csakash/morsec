@@ -65,6 +65,13 @@ pub struct RulesArgs {
     /// Propose removing an environment variable name.
     #[arg(long, value_name = "NAME")]
     remove_env: Vec<String>,
+    /// Propose pinning an SSH host key the run key may sign logins for, as a known_hosts line:
+    /// 'github.com ssh-ed25519 AAAA…' or '[host]:2222 ssh-ed25519 AAAA…'.
+    #[arg(long, value_name = "LINE")]
+    add_ssh_host_key: Vec<String>,
+    /// Propose removing a pinned SSH host key.
+    #[arg(long, value_name = "LINE")]
+    remove_ssh_host_key: Vec<String>,
     /// Propose a tier: test or production.
     #[arg(long, value_name = "TIER")]
     tier: Option<String>,
@@ -92,6 +99,8 @@ impl RulesArgs {
             || !self.remove_root.is_empty()
             || !self.add_env.is_empty()
             || !self.remove_env.is_empty()
+            || !self.add_ssh_host_key.is_empty()
+            || !self.remove_ssh_host_key.is_empty()
             || self.tier.is_some()
             || self.ttl.is_some()
             || self.read_only
@@ -478,6 +487,12 @@ fn show(name: &KeyName, r: &KeyRule) {
                 r.roots.iter().map(|p| p.display().to_string()).collect(),
             );
             list("env", r.env.clone());
+            if !r.ssh_host_keys.is_empty() {
+                list(
+                    "ssh hosts",
+                    r.ssh_host_keys.iter().map(ToString::to_string).collect(),
+                );
+            }
         }
         ms_core::Mode::Mint => list("scopes", r.mint_scopes.clone()),
     }
@@ -553,6 +568,14 @@ fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRu
     }
     for n in &a.remove_env {
         r.env.retain(|x| x != n);
+    }
+    for l in &a.add_ssh_host_key {
+        r.ssh_host_keys
+            .push(ms_rules::SshHostKey::parse(l).map_err(|e| format!("morsec: {e}"))?);
+    }
+    for l in &a.remove_ssh_host_key {
+        let p = ms_rules::SshHostKey::parse(l).map_err(|e| format!("morsec: {e}"))?;
+        r.ssh_host_keys.retain(|x| *x != p);
     }
     if let Some(t) = &a.tier {
         r.tier = match t.as_str() {

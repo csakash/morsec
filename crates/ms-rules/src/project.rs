@@ -125,6 +125,7 @@ impl ProjectRules {
 fn disable(rule: &mut KeyRule) {
     rule.roots.clear();
     rule.env.clear();
+    rule.ssh_host_keys.clear();
     rule.hosts.clear();
     rule.commands.clear();
     rule.mint_scopes.clear();
@@ -383,6 +384,7 @@ hosts = ["*.com"]
                 } else {
                     vec![]
                 },
+                ssh_host_keys: vec![],
             })
     }
 
