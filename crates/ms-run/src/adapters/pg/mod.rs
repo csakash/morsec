@@ -4,8 +4,8 @@
 //!   vault and given to psql without its password; the password goes into a short-lived 0600
 //!   passfile ([`passfile`]) and is redacted on its own. Read-only rules add
 //!   `default_transaction_read_only=on` and first check that the role can't write
-//!   ([`probe::role_check`]). Production writes get a `BEGIN … ROLLBACK` row-count preview
-//!   ([`probe::preview`]).
+//!   ([`probe::role_check`]). Production writes get a row-count preview that never runs the
+//!   write: a read-only `SELECT count(*)` with the statement's `WHERE` clause ([`probe::preview`]).
 //! - [`PrismaAdapter`]: Prisma takes the URL through L12's env channel; schema changes always
 //!   need an approval and read-only keys allow only reading commands.
 //!

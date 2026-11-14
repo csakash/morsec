@@ -53,7 +53,10 @@ SELECT coalesce((SELECT reason FROM (
     WHERE EXISTS (SELECT 1 FROM pg_shdepend s
                   WHERE s.refclassid = 'pg_authid'::regclass AND s.refobjid = r.oid
                     AND s.deptype = 'o'
-                    AND s.dbid IN (0, (SELECT oid FROM pg_database WHERE datname = current_database())))
+                    AND s.dbid IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))
+                    -- Temporary tables another session of this role holds are not a write path.
+                    AND NOT (s.classid = 'pg_class'::regclass AND EXISTS (
+                      SELECT 1 FROM pg_class c WHERE c.oid = s.objid AND c.relpersistence = 't')))
 ) x ORDER BY o LIMIT 1), 'ok') AS morsec_role_check;
 "#;
 
@@ -90,15 +93,38 @@ BEGIN
   IF t IS NULL THEN RAISE EXCEPTION 'morsec-why: the table was not found'; END IF;
   IF (SELECT relkind FROM pg_class WHERE oid = t) NOT IN ('r', 'p') THEN
     RAISE EXCEPTION 'morsec-why: the target is not a table'; END IF;
-  IF EXISTS (SELECT 1 FROM unnest(fns) f WHERE NOT EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = f)) THEN
-    RAISE EXCEPTION 'morsec-why: a function in its WHERE clause is not known'; END IF;
-  IF EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = ANY (fns) AND p.provolatile = 'v') THEN
-    RAISE EXCEPTION 'morsec-why: its WHERE clause calls a volatile function'; END IF;
+  -- Row security policies are evaluated by the count; foreign children would connect out.
+  IF (SELECT relrowsecurity FROM pg_class WHERE oid = t) THEN
+    RAISE EXCEPTION 'morsec-why: the table has row security'; END IF;
+  IF EXISTS (WITH RECURSIVE kids(rel) AS (
+               SELECT inhrelid FROM pg_inherits WHERE inhparent = t
+               UNION SELECT i.inhrelid FROM pg_inherits i JOIN kids ON i.inhparent = kids.rel)
+             SELECT 1 FROM kids JOIN pg_class c ON c.oid = kids.rel WHERE c.relkind NOT IN ('r', 'p')) THEN
+    RAISE EXCEPTION 'morsec-why: the table has a child or partition that is not a plain table'; END IF;
+  -- Column types decide which operators and input functions the filter runs: built-in only.
+  IF EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type y ON y.oid = a.atttypid
+             JOIN pg_namespace n ON n.oid = y.typnamespace
+             WHERE a.attrelid = t AND a.attnum > 0 AND NOT a.attisdropped AND n.nspname <> 'pg_catalog') THEN
+    RAISE EXCEPTION 'morsec-why: the table has a column of a type outside pg_catalog'; END IF;
+  -- Functions: built-in, not volatile, never one that runs SQL given as text.
+  IF EXISTS (SELECT 1 FROM unnest(fns) f WHERE NOT EXISTS (
+               SELECT 1 FROM pg_proc p WHERE p.proname = f AND p.pronamespace = 'pg_catalog'::regnamespace)) THEN
+    RAISE EXCEPTION 'morsec-why: its WHERE clause calls a function that is not built in'; END IF;
+  IF EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = ANY (fns)
+             AND (p.provolatile = 'v' OR p.pronamespace <> 'pg_catalog'::regnamespace
+                  OR p.proname LIKE '%to\_xml%' OR p.proname IN ('ts_stat'))) THEN
+    RAISE EXCEPTION 'morsec-why: its WHERE clause calls a volatile function, one that runs SQL, or one that is not built in'; END IF;
+  -- Operators (written, or implied by IN/BETWEEN/LIKE/…): every one of that name must be built in
+  -- and not volatile, or take a non-built-in type (which the column check already rules out).
   IF EXISTS (SELECT 1 FROM unnest(ops) o WHERE NOT EXISTS (SELECT 1 FROM pg_operator WHERE oprname = o)) THEN
     RAISE EXCEPTION 'morsec-why: an operator in its WHERE clause is not known'; END IF;
   IF EXISTS (SELECT 1 FROM pg_operator o JOIN pg_proc p ON p.oid = o.oprcode
-             WHERE o.oprname = ANY (ops) AND p.provolatile = 'v') THEN
-    RAISE EXCEPTION 'morsec-why: an operator in its WHERE clause calls a volatile function'; END IF;
+             WHERE o.oprname = ANY (ops)
+               AND (p.provolatile = 'v'
+                    OR (p.pronamespace <> 'pg_catalog'::regnamespace
+                        AND (o.oprleft = 0 OR (SELECT typnamespace FROM pg_type WHERE oid = o.oprleft) = 'pg_catalog'::regnamespace)
+                        AND (o.oprright = 0 OR (SELECT typnamespace FROM pg_type WHERE oid = o.oprright) = 'pg_catalog'::regnamespace)))) THEN
+    RAISE EXCEPTION 'morsec-why: an operator in its WHERE clause is volatile or not built in'; END IF;
   IF EXISTS (SELECT 1 FROM unnest(casts) c WHERE to_regtype(c) IS NULL OR NOT EXISTS (
                SELECT 1 FROM pg_type y JOIN pg_namespace n ON n.oid = y.typnamespace
                WHERE y.oid = to_regtype(c) AND n.nspname = 'pg_catalog')) THEN

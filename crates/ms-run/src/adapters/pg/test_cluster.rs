@@ -154,6 +154,8 @@ impl Cluster {
                $$ BEGIN RETURN true; END $$;
              CREATE DOMAIN voldom AS int CHECK (vol_ok(VALUE));
              CREATE TABLE gauges (id int PRIMARY KEY, v voldom);
+             CREATE TABLE secured (id int PRIMARY KEY);
+             ALTER TABLE secured ENABLE ROW LEVEL SECURITY;
              CREATE TABLE tags (id int PRIMARY KEY);
              CREATE SEQUENCE tag_seq;
              CREATE TABLE tagged (id int PRIMARY KEY,

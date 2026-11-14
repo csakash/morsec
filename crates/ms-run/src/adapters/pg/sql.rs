@@ -344,6 +344,21 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
             _ => {}
         }
     }
+    // Keyword forms that call operators implicitly.
+    for t in ftoks {
+        if let Tok::Word(w) = t {
+            let implied: &[&str] = match w.as_str() {
+                "in" | "case" | "nullif" | "distinct" => &["="],
+                "between" => &[">=", "<="],
+                "like" => &["~~", "!~~"],
+                "ilike" => &["~~*", "!~~*"],
+                "similar" => &["~", "!~"],
+                "greatest" | "least" => &["<", ">"],
+                _ => &[],
+            };
+            operators.extend(implied.iter().map(|s| (*s).to_owned()));
+        }
+    }
     functions.sort();
     functions.dedup();
     operators.sort();
@@ -371,13 +386,17 @@ mod tests {
         let s = simple("UPDATE orders SET status = 'paid' WHERE id IN (1, 2, 3);").unwrap();
         assert_eq!(s.table, "orders");
         assert_eq!(s.filter.as_deref(), Some("id IN (1, 2, 3)"));
-        assert!(s.functions.is_empty() && s.operators.is_empty() && !s.only);
+        assert!(s.functions.is_empty() && !s.only);
+        // IN compares with `=`, so `=` is checked even though it isn't written.
+        assert_eq!(s.operators, ["="]);
+        let s = simple("delete from t where a between 1 and 2 or b ilike 'x'").unwrap();
+        assert_eq!(s.operators, ["!~~*", "<=", ">=", "~~*"]);
         let s = simple("delete from only public.\"Order\" where lower(note) like 'x%' and n >= 2")
             .unwrap();
         assert_eq!(s.table, "public.\"Order\"");
         assert!(s.only);
         assert_eq!(s.functions, ["lower"]);
-        assert_eq!(s.operators, [">="]);
+        assert_eq!(s.operators, ["!~~", ">=", "~~"]);
         // The SET list isn't evaluated, so its functions and operators don't matter.
         let s = simple("update t set a = random() + nextval('s'), b = default").unwrap();
         assert!(s.filter.is_none() && s.functions.is_empty() && s.operators.is_empty());

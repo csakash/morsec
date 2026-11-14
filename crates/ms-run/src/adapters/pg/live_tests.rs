@@ -333,10 +333,24 @@ fn preview_never_commits(env: &Env) {
         preview(&["psql", "ms://pg/w", "-c", "delete from tags where id = 1"]),
         "0 rows in tags"
     );
-    assert_eq!(
-        preview(&["psql", "ms://pg/w", "-c", "update gauges set v = 1"]),
-        "0 rows in gauges"
-    );
+    // A column of a domain (or any non-built-in type) could run its input function or CHECK.
+    let unknown = preview(&["psql", "ms://pg/w", "-c", "update gauges set v = 1"]);
+    assert!(unknown.contains("outside pg_catalog"), "{unknown}");
+    // A built-in function that runs SQL given as text, and a table with row security.
+    let unknown = preview(&[
+        "psql",
+        "ms://pg/w",
+        "-c",
+        "delete from orders where query_to_xml('select 1', true, true, '') is not null",
+    ]);
+    assert!(unknown.contains("runs SQL"), "{unknown}");
+    let unknown = preview(&[
+        "psql",
+        "ms://pg/w",
+        "-c",
+        "delete from secured where id = 1",
+    ]);
+    assert!(unknown.contains("row security"), "{unknown}");
     // The SET list is never evaluated; the WHERE clause is checked.
     assert_eq!(
         preview(&[

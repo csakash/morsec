@@ -27,8 +27,10 @@ which is what `ms import` already stores (L12 SPEC, "DSN userinfo refs").
 - `psql ms://pg/prod -c "UPDATE orders SET …"` — the ref is psql's connection argument (the
   positional dbname or the value of `-d` / `--dbname`), as a whole argument.
 - `DATABASE_URL=ms://pg/prod prisma migrate deploy` (also `npx|bunx|pnpx prisma …` and
-  `npm|pnpm|yarn|bun exec|dlx|x prisma …`; `yarn prisma` / `npm run prisma` run a package script,
-  which morsec can't see into, so they always need an approval) — Prisma reads its URL from the environment, through L12's
+  `npm|pnpm|yarn|bun exec|dlx|x prisma …`, with only `--yes`/`-y`/`--no-install`/`--quiet`/`--`
+  between; any other shape that names prisma — a runner option, `yarn prisma` / `npm run prisma`
+  (a package script), `npm install prisma`, `npx -p ./pkg prisma` — runs code morsec can't see
+  into, so it always needs an approval) — Prisma reads its URL from the environment, through L12's
   env channel (the variable must be in the key's `env` rule).
 
 ## Decisions (made in this loop; flagged for the orchestrator)
@@ -84,8 +86,11 @@ which is what `ms import` already stores (L12 SPEC, "DSN userinfo refs").
   CURRENT OF`, `WITH`, subqueries or other relations, dotted names, extra `;`), morsec counts the
   rows it would change **without executing the write**: on its own connection it runs `BEGIN READ
   ONLY`, timeouts (`statement_timeout` 5 s, `lock_timeout` 2 s), then a DO block that refuses
-  unless every function called in the `WHERE` clause exists and none is volatile, no operator
-  there is backed by a volatile function and every cast there is to a `pg_catalog` type, and then
+  unless the table has no row security, no child or partition that isn't a plain table, and only
+  columns of built-in (`pg_catalog`) types, and in the `WHERE` clause every function is a
+  built-in, non-volatile one that doesn't run SQL given as text (`*_to_xml*`, `ts_stat`), every
+  operator (written or implied by `IN`, `BETWEEN`, `LIKE`, …) is built in and not volatile, and
+  every cast is to a `pg_catalog` type, and then
   runs `SELECT count(*) FROM [ONLY] <table> WHERE <the statement's WHERE clause>` — then
   `ROLLBACK`. The `SET` list is never evaluated. Nothing is written, so no trigger, rule, cascade,
   default or constraint runs, and a read-only transaction refuses any write (and `nextval`) even

@@ -51,22 +51,37 @@ pub fn locate(argv: &[String]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// The class of a whole Prisma call. Behind `npm`, `pnpm`, `yarn` or `bun`, `prisma` is the
-/// binary only after `exec`, `dlx` or `x`; otherwise it names a package script (`yarn prisma`,
-/// `npm run prisma`) or a package to install, which run code morsec can't see, so they always
-/// need an approval.
+/// The class of a whole Prisma call. Only exact shapes count as the prisma binary:
+/// `prisma …`; `npx|bunx|pnpx [--yes|-y|--no-install|--quiet|-q|--]… prisma[@v] …`; and
+/// `npm|pnpm|yarn|bun exec|dlx|x [--yes|-y|--]… prisma[@v] …` with the runner word first.
+/// Anything else that names prisma (a runner option before it, which may take a value such as
+/// `yarn --cwd x prisma`; a package script `yarn prisma` / `npm run prisma`; `npm install
+/// prisma`; `npx -p ./pkg prisma`) runs code morsec can't see, so it always needs an approval.
 pub fn class_of(argv: &[String]) -> Option<Class> {
     let at = locate(argv)?;
-    let first = base(&argv[0]);
-    if at == 0 || matches!(first, "npx" | "bunx" | "pnpx") {
-        return Some(classify(&argv[at + 1..]));
+    if at == 0 {
+        return Some(classify(&argv[1..]));
     }
-    let before = argv[1..at].iter().rev().find(|a| a.as_str() != "--");
-    if before.is_some_and(|b| matches!(b.as_str(), "exec" | "dlx" | "x")) {
+    let first = base(&argv[0]);
+    let flags_only = |args: &[String]| {
+        args.iter().all(|a| {
+            matches!(
+                a.as_str(),
+                "--yes" | "-y" | "--no-install" | "--quiet" | "-q" | "--"
+            )
+        })
+    };
+    let binary = match first {
+        "npx" | "bunx" | "pnpx" => flags_only(&argv[1..at]),
+        _ => {
+            at >= 2 && matches!(argv[1].as_str(), "exec" | "dlx" | "x") && flags_only(&argv[2..at])
+        }
+    };
+    if binary {
         return Some(classify(&argv[at + 1..]));
     }
     Some(Class::Schema(format!(
-        "{} {} (a package script or install named prisma; morsec can't see what it runs)",
+        "{} {} (a package script, install or wrapped prisma; morsec can't see what it runs)",
         crate::printable(first),
         argv[1..=at]
             .iter()
@@ -151,7 +166,11 @@ mod tests {
             Some(Class::ReadOnly)
         );
         assert_eq!(
-            cls(&["pnpm", "--filter", "api", "exec", "prisma", "generate"]),
+            cls(&["pnpm", "exec", "prisma", "generate"]),
+            Some(Class::ReadOnly)
+        );
+        assert_eq!(
+            cls(&["npx", "--yes", "prisma@5", "generate"]),
             Some(Class::ReadOnly)
         );
         assert_eq!(cls(&["npx", "prisma", "generate"]), Some(Class::ReadOnly));
@@ -161,6 +180,13 @@ mod tests {
             &["pnpm", "prisma", "generate"],
             &["npm", "install", "prisma"],
             &["bun", "run", "prisma", "generate"],
+            &["pnpm", "--filter", "api", "exec", "prisma", "generate"],
+            &["yarn", "workspace", "x", "prisma", "migrate", "status"],
+            &["yarn", "--cwd", "x", "prisma", "generate"],
+            &["pnpm", "--dir", "x", "prisma", "generate"],
+            &["bun", "--cwd", "x", "prisma", "generate"],
+            &["npx", "-p", "./pkg", "prisma", "generate"],
+            &["npm", "exec", "--package=./pkg", "--", "prisma", "generate"],
         ] {
             assert!(matches!(cls(script), Some(Class::Schema(_))), "{script:?}");
         }
