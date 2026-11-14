@@ -12,6 +12,7 @@ never touched: the suite checks the daemon reports `dev-memory` before it stores
 |---|---|
 | `canary_never_reaches_the_agent` | After `ms import`, a fake agent (`claude`) runs `env`, `cat .env`, `curl` (direct and through the swap proxy) and `psql`. No canary, in any encoding `ms-scan` knows, shows up in its output, the repo, what curl's target or psql got, msd's log or the receipts. A planted leak is caught. |
 | `ms_scan_catches_a_leaky_transcript` | `ms scan` reports planted leaks in Claude Code and Codex transcripts by file:line, key and encoding, exits 3, prints no value; clean tree exits 0; symlinks not followed; refused inside an agent. |
+| `mcp_tools_end_to_end` | (L14) A fake Claude Code starts the real `ms mcp`: `tools/list` matches `ms mcp --catalog` (same SHA-256); calls run with the value redacted; `$( )`, backticks, ESC and U+202E stay literal and come back escaped; an extra `key`, an `ms://` argument and an unknown tool are refused; receipts show each call under `claude_code`; no canary in output, receipts or msd's log. |
 | `real_agent_job_skips_without_opt_in` | `real-agent.sh` does nothing (and spends nothing) without `MORSEC_REAL_AGENT=1`. |
 | `gate_requires_security_evals` | `npm run build` → `scripts/check.sh` → this suite; no real agent in the gate. |
 
@@ -24,7 +25,7 @@ state are unchanged when it ends.
 
 | Test | What it proves |
 |---|---|
-| `healthy_setup_has_no_problems` | Static doctor: msd, vault, CA, both connectors and the port cross-check pass; `ms mcp` is "not installed" (info), exit 0. |
+| `healthy_setup_has_no_problems` | Static doctor: msd, vault, CA, both connectors and the port cross-check pass; the `ms mcp` catalog hash is "not checked yet" (info), exit 0. |
 | `broken_connector_is_reported` | Removing Claude Code's `httpProxyPort` and Codex's `HTTPS_PROXY` is reported with the fix, exit 1. |
 | `daemon_down_is_reported` | No daemon: `msd not running`, connectors still checked, exit 1, no hang. |
 | `probe_open_egress_fails_loudly` | Inside an agent, open direct egress → banner, `direct=OPEN`, exit 1; msd holds the canary from that session and the report; a malformed target is refused. |
