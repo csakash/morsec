@@ -223,7 +223,7 @@ fn own_path(p: &[String]) -> bool {
 /// edit that file, so a record may only touch morsec's own key shapes, hold the kind of value
 /// morsec writes there, and keep an old value only where morsec keeps one (proxy, CA, marker,
 /// socket), as a plain string: a CA path must be absolute, a proxy URL carries no credentials.
-fn check_record(r: &Record) -> std::result::Result<(), String> {
+fn check_record(r: &Record, bundle: &str) -> std::result::Result<(), String> {
     if !own_path(&r.path) {
         return Err(format!(
             "record for {} is not one morsec writes",
@@ -234,7 +234,11 @@ fn check_record(r: &Record) -> std::result::Result<(), String> {
     let var = r.path.last().map(String::as_str).unwrap_or_default();
     if r.path.len() == 2 {
         // mcp_servers.ms: a table, never kept when replaced.
-        if !after.is_inline_table() || matches!(r.kind, Kind::Replaced { .. }) {
+        let cmd = after
+            .as_inline_table()
+            .and_then(|t| t.get("command"))
+            .and_then(Value::as_str);
+        if cmd != Some("/usr/bin/env") || matches!(r.kind, Kind::Replaced { .. }) {
             return Err("bad record for mcp_servers.ms".into());
         }
         return Ok(());
@@ -252,6 +256,24 @@ fn check_record(r: &Record) -> std::result::Result<(), String> {
             ));
         }
         return Ok(());
+    }
+    // The value must be one morsec writes there, so a record can only remove or replace
+    // morsec's own value, never a value of the user's (security re-check N2).
+    let ours = if PROXY_VARS.contains(&var) {
+        a.strip_prefix("http://127.0.0.1:")
+            .is_some_and(|p| p.parse::<u16>().is_ok())
+    } else if CA_VARS.contains(&var) {
+        a == bundle
+    } else if var == MARKER {
+        a == ID
+    } else {
+        a.starts_with('/') && !a.chars().any(char::is_control)
+    };
+    if !ours {
+        return Err(format!(
+            "record for {} is not a value morsec writes",
+            show_path(&r.path)
+        ));
     }
     if let Kind::Replaced { before } = &r.kind {
         let b = tedit::parse_value(before)?;
@@ -462,7 +484,7 @@ impl CodexConnector {
                 after,
                 kind,
             };
-            check_record(&r).map_err(|e| bad(&e))?;
+            check_record(&r, &self.paths.bundle.to_string_lossy()).map_err(|e| bad(&e))?;
             edits.push(r);
         }
         for c in v

@@ -883,6 +883,18 @@ fn forged_state_is_refused() {
             r#"{"path":["shell_environment_policy","set","A_KEY"],"after":"\"ms://a/b\"","kind":"replaced","before":"\"x\""}"#.into(),
         ),
         (
+            "redacted user proxy (N2)",
+            r#"{"path":["shell_environment_policy","set","HTTPS_PROXY"],"after":"\"http://alice:pw@corp:8080\"","kind":"redacted"}"#.into(),
+        ),
+        (
+            "added user CA (N2)",
+            r#"{"path":["shell_environment_policy","set","SSL_CERT_FILE"],"after":"\"/etc/corp.pem\"","kind":"added"}"#.into(),
+        ),
+        (
+            "user ms server (N2)",
+            r#"{"path":["mcp_servers","ms"],"after":"{ command = \"mine\" }","kind":"redacted"}"#.into(),
+        ),
+        (
             "ms server kept",
             r#"{"path":["mcp_servers","ms"],"after":"{ command = \"x\" }","kind":"replaced","before":"{ command = \"evil\" }"}"#.into(),
         ),
