@@ -81,6 +81,8 @@ const NOT_FUNCTIONS: &[&str] = &[
     "and", "or", "not", "in", "exists", "any", "all", "some", "where", "set", "values", "select",
     "from", "using", "on", "as", "is", "between", "like", "ilike", "similar", "when", "then",
     "else", "case", "row", "array", "only", "join", "lateral", "by", "having", "limit", "offset",
+    // SQL syntax, not functions (`CAST(x AS t)` collects `t` as a cast type).
+    "coalesce", "nullif", "greatest", "least", "cast",
 ];
 
 /// Words that make a statement not "simple".
@@ -308,6 +310,13 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
         if let (Tok::Quoted(q), Tok::Literal) = (&w[0], &w[1]) {
             casts.push(q.clone());
         }
+        if w[0] == Tok::Word("as".into()) {
+            match &w[1] {
+                Tok::Word(t) => casts.push(t.clone()),
+                Tok::Quoted(q) => casts.push(q.clone()),
+                _ => return Err("the statement has a cast the preview doesn't handle"),
+            }
+        }
         if w[0] == Tok::Cast {
             match &w[1] {
                 Tok::Word(t) => casts.push(t.clone()),
@@ -415,6 +424,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.casts, ["date", "mydom"]);
+        // SQL syntax that looks like a call: CAST collects its type, COALESCE isn't a function.
+        let s =
+            simple("update t set a = 1 where cast(b as mydom) = 1 and coalesce(c, false)").unwrap();
+        assert_eq!(s.casts, ["mydom"]);
+        assert!(s.functions.is_empty(), "{:?}", s.functions);
 
         for bad in [
             "update t set a = 1; commit",

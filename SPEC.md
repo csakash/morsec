@@ -27,7 +27,7 @@ which is what `ms import` already stores (L12 SPEC, "DSN userinfo refs").
 - `psql ms://pg/prod -c "UPDATE orders SET …"` — the ref is psql's connection argument (the
   positional dbname or the value of `-d` / `--dbname`), as a whole argument.
 - `DATABASE_URL=ms://pg/prod prisma migrate deploy` (also `npx|bunx|pnpx prisma …` and
-  `npm|pnpm|yarn|bun exec|dlx|x prisma …`, with only `--yes`/`-y`/`--no-install`/`--quiet`/`--`
+  `npm|pnpm|yarn|bun exec|dlx|x prisma …` (`prisma` or `prisma@<version or tag>` only), with only `--yes`/`-y`/`--no-install`/`--quiet`/`--`
   between; any other shape that names prisma — a runner option, `yarn prisma` / `npm run prisma`
   (a package script), `npm install prisma`, `npx -p ./pkg prisma` — runs code morsec can't see
   into, so it always needs an approval) — Prisma reads its URL from the environment, through L12's
@@ -87,10 +87,12 @@ which is what `ms import` already stores (L12 SPEC, "DSN userinfo refs").
   rows it would change **without executing the write**: on its own connection it runs `BEGIN READ
   ONLY`, timeouts (`statement_timeout` 5 s, `lock_timeout` 2 s), then a DO block that refuses
   unless the table has no row security, no child or partition that isn't a plain table, and only
-  columns of built-in (`pg_catalog`) types, and in the `WHERE` clause every function is a
-  built-in, non-volatile one that doesn't run SQL given as text (`*_to_xml*`, `ts_stat`), every
-  operator (written or implied by `IN`, `BETWEEN`, `LIKE`, …) is built in and not volatile, and
-  every cast is to a `pg_catalog` type, and then
+  columns of built-in (`pg_catalog`) or enum types; the database has no implicit or assignment
+  cast that isn't built in, and every operator named in the clause or any comparison or pattern
+  operator (`=`, `<>`, `<`, …, `~~`, `~`, …, implied by `IN`, `BETWEEN`, `LIKE`, …) is built in
+  and not volatile, whatever its argument types; and in the `WHERE` clause every function is a
+  built-in, non-volatile one that doesn't run SQL given as text (`*_to_xml*`, `ts_stat`) and
+  every cast (`::t`, `t 'x'`, `CAST(x AS t)`) is to a `pg_catalog` type, and then
   runs `SELECT count(*) FROM [ONLY] <table> WHERE <the statement's WHERE clause>` — then
   `ROLLBACK`. The `SET` list is never evaluated. Nothing is written, so no trigger, rule, cascade,
   default or constraint runs, and a read-only transaction refuses any write (and `nextval`) even

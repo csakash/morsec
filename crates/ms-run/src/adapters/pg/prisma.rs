@@ -23,8 +23,15 @@ fn base(a: &str) -> &str {
         .unwrap_or(a)
 }
 
+/// `prisma`, or `prisma@<version or dist-tag>` (never `prisma@npm:…`, a URL, a path).
 fn is_prisma(a: &str) -> bool {
-    a == "prisma" || a.starts_with("prisma@")
+    a == "prisma"
+        || a.strip_prefix("prisma@").is_some_and(|v| {
+            !v.is_empty()
+                && v.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'^' | b'~')
+                })
+        })
 }
 
 /// Index in `argv` of the `prisma` word, when this is a Prisma CLI call: `prisma …`, or a
@@ -47,7 +54,7 @@ pub fn locate(argv: &[String]) -> Option<usize> {
     argv.iter()
         .enumerate()
         .skip(1)
-        .find(|(_, a)| is_prisma(base(a)))
+        .find(|(_, a)| is_prisma(a))
         .map(|(i, _)| i)
 }
 
@@ -200,6 +207,17 @@ mod tests {
             Class::Schema(_)
         ));
         assert_eq!(locate(&a(&["npx", "tsc"])), None);
+        // Only prisma itself, at a version or tag, never another package spelled to look like it.
+        assert_eq!(locate(&a(&["npx", "prisma@5.22.0", "generate"])), Some(1));
+        for other in [
+            &["npx", "prisma@npm:evil-pkg", "generate"][..],
+            &["npx", "prisma@github:attacker/repo", "generate"],
+            &["npx", "prisma@file:../x", "generate"],
+            &["pnpm", "dlx", "prisma@https://x/y.tgz", "generate"],
+            &["npx", "./evil/prisma", "generate"],
+        ] {
+            assert_eq!(locate(&a(other)), None, "{other:?}");
+        }
         assert_eq!(locate(&a(&["psql"])), None);
 
         let c = |v: &[&str]| classify(&a(v));

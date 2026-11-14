@@ -341,9 +341,33 @@ fn preview_never_commits(env: &Env) {
         "psql",
         "ms://pg/w",
         "-c",
-        "delete from orders where query_to_xml('select 1', true, true, '') is not null",
+        "delete from orders where table_to_xml('orders', true, true, '') is not null",
     ]);
     assert!(unknown.contains("runs SQL"), "{unknown}");
+    for (db, why) in [("userops", "operator"), ("usercasts", "implicit casts")] {
+        let k = format!("pg/{db}");
+        let kk = key(&k);
+        env.vault
+            .put(
+                &kk,
+                SecretBytes::from(env.cluster.url_db("writer", db)),
+                KeyMeta {
+                    name: kk.clone(),
+                    mode: Mode::Run,
+                    tier: Tier::Production,
+                    created_unix_ms: 0,
+                },
+            )
+            .unwrap();
+        let (_, call) = env.call(&[
+            "psql",
+            &format!("ms://{k}"),
+            "-c",
+            "delete from t2 where id like '1'",
+        ]);
+        let u = a.preview(&call, &env.ctx(&k, false)).unwrap().summary;
+        assert!(u.contains("unknown") && u.contains(why), "{db}: {u}");
+    }
     let unknown = preview(&[
         "psql",
         "ms://pg/w",

@@ -171,6 +171,30 @@ impl Cluster {
             "REVOKE CREATE ON SCHEMA public FROM PUBLIC;
              CREATE TABLE t (id int); GRANT INSERT ON t TO split;",
         );
+        // Databases with a non-built-in operator / implicit cast that an untyped literal could
+        // reach: every preview there is unknown.
+        for (db, sql) in [
+            (
+                "userops",
+                "CREATE TYPE e AS ENUM ('1');
+                 CREATE FUNCTION f(int4, e) RETURNS bool LANGUAGE sql STABLE AS 'SELECT true';
+                 CREATE OPERATOR ~~ (leftarg = int4, rightarg = e, function = f);",
+            ),
+            (
+                "usercasts",
+                "CREATE TYPE e AS ENUM ('1');
+                 CREATE CAST (int4 AS e) WITH INOUT AS IMPLICIT;",
+            ),
+        ] {
+            c.admin("postgres", &format!("CREATE DATABASE {db}"));
+            c.admin(
+                db,
+                &format!(
+                    "REVOKE CREATE ON SCHEMA public FROM PUBLIC; {sql}
+                     CREATE TABLE t2 (id int); GRANT SELECT ON t2 TO writer;"
+                ),
+            );
+        }
         Some(c)
     }
 
@@ -182,6 +206,11 @@ impl Cluster {
 
     /// `postgres://role:<password>@127.0.0.1:<port>/shop`, the password %-encoded.
     pub fn url(&self, role: &str) -> String {
+        self.url_db(role, "shop")
+    }
+
+    /// Like [`Cluster::url`] for database `db`.
+    pub fn url_db(&self, role: &str, db: &str) -> String {
         let pw: String = self
             .password(role)
             .bytes()
@@ -193,7 +222,7 @@ impl Cluster {
                 }
             })
             .collect();
-        format!("postgres://{role}:{pw}@127.0.0.1:{}/shop", self.port)
+        format!("postgres://{role}:{pw}@127.0.0.1:{}/{db}", self.port)
     }
 
     /// The directory with `psql` and the server binaries.

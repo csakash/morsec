@@ -101,11 +101,22 @@ BEGIN
                UNION SELECT i.inhrelid FROM pg_inherits i JOIN kids ON i.inhparent = kids.rel)
              SELECT 1 FROM kids JOIN pg_class c ON c.oid = kids.rel WHERE c.relkind NOT IN ('r', 'p')) THEN
     RAISE EXCEPTION 'morsec-why: the table has a child or partition that is not a plain table'; END IF;
-  -- Column types decide which operators and input functions the filter runs: built-in only.
+  -- Column types decide which input functions the filter runs: built-in types, or enums (whose
+  -- input and comparison functions are built in).
   IF EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_type y ON y.oid = a.atttypid
              JOIN pg_namespace n ON n.oid = y.typnamespace
-             WHERE a.attrelid = t AND a.attnum > 0 AND NOT a.attisdropped AND n.nspname <> 'pg_catalog') THEN
+             WHERE a.attrelid = t AND a.attnum > 0 AND NOT a.attisdropped
+               AND n.nspname <> 'pg_catalog' AND y.typtype <> 'e') THEN
     RAISE EXCEPTION 'morsec-why: the table has a column of a type outside pg_catalog'; END IF;
+  -- An untyped literal can resolve to any type, so implicit and assignment casts in the whole
+  -- database must be built in.
+  IF EXISTS (SELECT 1 FROM pg_cast c
+             LEFT JOIN pg_proc p ON p.oid = c.castfunc
+             WHERE c.castcontext IN ('i', 'a')
+               AND (c.oid >= 16384
+                    OR (p.oid IS NOT NULL AND (p.pronamespace <> 'pg_catalog'::regnamespace
+                                               OR p.provolatile = 'v')))) THEN
+    RAISE EXCEPTION 'morsec-why: the database has implicit casts that are not built in'; END IF;
   -- Functions: built-in, not volatile, never one that runs SQL given as text.
   IF EXISTS (SELECT 1 FROM unnest(fns) f WHERE NOT EXISTS (
                SELECT 1 FROM pg_proc p WHERE p.proname = f AND p.pronamespace = 'pg_catalog'::regnamespace)) THEN
@@ -114,17 +125,17 @@ BEGIN
              AND (p.provolatile = 'v' OR p.pronamespace <> 'pg_catalog'::regnamespace
                   OR p.proname LIKE '%to\_xml%' OR p.proname IN ('ts_stat'))) THEN
     RAISE EXCEPTION 'morsec-why: its WHERE clause calls a volatile function, one that runs SQL, or one that is not built in'; END IF;
-  -- Operators (written, or implied by IN/BETWEEN/LIKE/…): every one of that name must be built in
-  -- and not volatile, or take a non-built-in type (which the column check already rules out).
+  -- Operators: the ones written, plus every comparison and pattern operator (implied by IN,
+  -- NOT IN, BETWEEN, LIKE, CASE, …). Every operator with one of those names, whatever its
+  -- argument types, must be built in and not volatile.
   IF EXISTS (SELECT 1 FROM unnest(ops) o WHERE NOT EXISTS (SELECT 1 FROM pg_operator WHERE oprname = o)) THEN
     RAISE EXCEPTION 'morsec-why: an operator in its WHERE clause is not known'; END IF;
   IF EXISTS (SELECT 1 FROM pg_operator o JOIN pg_proc p ON p.oid = o.oprcode
-             WHERE o.oprname = ANY (ops)
-               AND (p.provolatile = 'v'
-                    OR (p.pronamespace <> 'pg_catalog'::regnamespace
-                        AND (o.oprleft = 0 OR (SELECT typnamespace FROM pg_type WHERE oid = o.oprleft) = 'pg_catalog'::regnamespace)
-                        AND (o.oprright = 0 OR (SELECT typnamespace FROM pg_type WHERE oid = o.oprright) = 'pg_catalog'::regnamespace)))) THEN
-    RAISE EXCEPTION 'morsec-why: an operator in its WHERE clause is volatile or not built in'; END IF;
+             WHERE o.oprname = ANY (ops || ARRAY['=', '<>', '<', '>', '<=', '>=', '~~', '~~*',
+                                                  '!~~', '!~~*', '~', '~*', '!~', '!~*'])
+               AND (p.provolatile = 'v' OR p.pronamespace <> 'pg_catalog'::regnamespace
+                    OR o.oprnamespace <> 'pg_catalog'::regnamespace)) THEN
+    RAISE EXCEPTION 'morsec-why: an operator its WHERE clause may use is volatile or not built in'; END IF;
   IF EXISTS (SELECT 1 FROM unnest(casts) c WHERE to_regtype(c) IS NULL OR NOT EXISTS (
                SELECT 1 FROM pg_type y JOIN pg_namespace n ON n.oid = y.typnamespace
                WHERE y.oid = to_regtype(c) AND n.nspname = 'pg_catalog')) THEN
