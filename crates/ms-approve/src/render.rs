@@ -65,7 +65,12 @@ pub fn agent_name(a: &AgentKind) -> String {
         AgentKind::Cursor => "Cursor".into(),
         AgentKind::GeminiCli => "Gemini CLI".into(),
         AgentKind::Other(n) => match n.as_str() {
-            "terminal" => "your terminal (outside any agent)".into(),
+            // msd can't tell the user's terminal from a process an agent started and detached
+            // (security review S1): say only what is known.
+            "terminal" => {
+                "a process outside any agent session (not verified to be you: an agent can start one)"
+                    .into()
+            }
             _ => format!("other: {}", quoted(n)),
         },
     }
@@ -256,6 +261,14 @@ mod tests {
         assert!(text.contains(r#""c1\u{9b}31m\u{85}""#), "{text}");
         assert!(text.contains(r#""back\\slash""#), "{text}");
         assert!(text.contains(r#"other: "evil\e[31mname""#), "{text}");
+        let mut t = r.clone();
+        t.session.agent = AgentKind::Other("terminal".into());
+        let shown = details(&t, "id", 1).join("\n") + &touch_id_reason(&t, Scope::Once);
+        assert!(
+            !shown.contains("your terminal"),
+            "S1: never vouch for the origin"
+        );
+        assert!(shown.contains("not verified to be you"), "{shown}");
         assert!(text.contains(r#""/repo\u{202e}cod.exe""#), "{text}");
         assert!(text.contains(r#""3 rows\nin orders""#), "{text}");
         assert!(text.contains("7 arguments, exactly:"));

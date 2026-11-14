@@ -43,7 +43,9 @@ pub enum DecideError {
     #[error("no approval request {0} is waiting (it was answered or timed out)")]
     NotPending(String),
     /// Someone is already deciding this request (a Touch ID sheet is up).
-    #[error("this request is already being decided")]
+    #[error(
+        "another process already raised the Touch ID sheet for this request. If that was not you, cancel the sheet"
+    )]
     InProgress,
     /// Touch ID / password did not succeed; the request is denied.
     #[error("Touch ID did not confirm ({0}), so the request was denied")]

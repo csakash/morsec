@@ -973,6 +973,14 @@ impl Daemon {
             return self.rules_get(None);
         }
         let change = ms_rules::classify_rule(current.as_ref(), new_rule.as_ref());
+        // While stopped nothing is loosened, and nobody can hold the one approval slot with
+        // loosenings so that ms start keeps getting Busy (security review S4).
+        if change == Change::Loosen && self.is_stopped() {
+            return reply_err(
+                ErrorCode::Denied,
+                "morsec: morsec is stopped (ms stop), so rules can't be loosened. Resume first with: ms start",
+            );
+        }
         let token = match change {
             Change::Same => {
                 return ResponseBody::Ok {
@@ -983,10 +991,14 @@ impl Daemon {
             Change::Loosen => {
                 // The person approves the exact rule text (its hash is the bound argv).
                 let text = rule.unwrap_or("(remove the rule)");
-                let tier = new_rule
-                    .as_ref()
-                    .or(current.as_ref())
-                    .map_or(Tier::Production, |r| r.tier);
+                // The higher of the current and proposed tier, so a downgrade from production
+                // shows as production (security review S2).
+                let tier = [current.as_ref(), new_rule.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|r| r.tier)
+                    .max()
+                    .unwrap_or(Tier::Production);
                 let req = admin_request(
                     session,
                     key.clone(),
@@ -1793,6 +1805,33 @@ mod tests {
         }
         // Removing a rule is tightening.
         assert!(is_ok(&h.as_(agent()).propose("stripe/test", None, false)));
+    }
+
+    // protects=security review S2/S4: while stopped a loosening is refused at once (it can't hold
+    // the approval slot against ms start); the tier shown for a downgrade is the higher one;
+    // fails_when=a loosening waits for approval while stopped, or a production→test downgrade is
+    // shown as test; no_claim=rate limits on prompts before a stop
+    #[test]
+    fn loosening_while_stopped_and_downgrade_tier() {
+        let h = fresh();
+        h.put("stripe/test", Tier::Test);
+        let prod = "mode = \"swap\"\ntier = \"production\"\nhosts = [\"api.stripe.com\"]\n";
+        let r = h.approved(|| h.propose("stripe/test", Some(prod), false));
+        assert!(is_ok(&r), "{r:?}");
+        let down = "mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\"]\n";
+        let r = h.approved(|| h.as_(agent()).propose("stripe/test", Some(down), false));
+        assert!(is_ok(&r), "{r:?}");
+        let last = h.auth.reasons().pop().unwrap();
+        assert!(last.contains("(production key)"), "{last}");
+        h.req(RequestBody::Stop);
+        let wider =
+            "mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\", \"x.example\"]\n";
+        let started = std::time::Instant::now();
+        let r = h.as_(agent()).propose("stripe/test", Some(wider), false);
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        assert!(msg(&r).contains("stopped"), "{r:?}");
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(!h.d.approvals.busy());
     }
 
     // protects=fail closed on tampering: a rules file with a bad MAC loads as tampered (every key
