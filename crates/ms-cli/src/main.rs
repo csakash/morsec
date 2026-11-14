@@ -12,6 +12,7 @@ mod connect;
 mod connect_codex;
 mod import;
 mod log;
+mod mcp;
 mod run;
 mod service;
 mod stats;
@@ -81,8 +82,8 @@ enum Command {
     Status,
     /// Check that every connected agent routes through morsec.
     Doctor(Rest),
-    /// Run the MCP server for an agent.
-    Mcp(Rest),
+    /// Run the MCP server for an agent: your run commands as typed tools.
+    Mcp(mcp::McpArgs),
     /// Scan agent transcripts for leaked secret values.
     Scan(scan::ScanArgs),
     /// Prompts per session, blocks and approvals.
@@ -94,9 +95,9 @@ impl Command {
     fn stub(&self) -> Option<(&'static str, &'static str)> {
         Some(match self {
             Command::Doctor(_) => ("doctor", "L17 doctor"),
-            Command::Mcp(_) => ("mcp", "L14 mcp-server"),
             Command::Status
             | Command::Run(_)
+            | Command::Mcp(_)
             | Command::Init(_)
             | Command::Stop
             | Command::Start
@@ -188,6 +189,7 @@ async fn main() -> ExitCode {
         Command::Disconnect(a) => on_own_thread(move || connect::disconnect(&a)),
         Command::Scan(a) => scan::run(&a).await,
         Command::Run(a) => on_own_thread(move || run::run(&a)),
+        Command::Mcp(a) => mcp::run(&a, VERSION).await,
         Command::Approve(a) => on_own_thread(move || approve::run(&a)),
         _ => unreachable!("every other command is a stub"),
     }

@@ -17,6 +17,7 @@ ms-scan = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 base64 = { workspace = true }
+serde_json = { workspace = true }
 hex = { workspace = true }
 
 # The suite is its own fake agent: copied as `claude`, it runs a shell command as its child, so
