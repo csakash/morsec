@@ -674,3 +674,21 @@ fn userinfo_detection() {
     assert!(!has_userinfo("http://h:1/p@x"));
     assert!(!has_userinfo("http://127.0.0.1:4401"));
 }
+
+// protects=a config with no final newline: disconnect takes connect's newline back off when the
+// file is unchanged (byte-exact), but keeps the newline of text Codex appended since;
+// fails_when=Codex's appended line loses its newline
+#[test]
+fn final_newline_only_removed_when_unchanged() {
+    let e = env();
+    write_config(&e.c, "model = \"o3\"");
+    connect(&e.c, &cfg(&[]));
+    let mut t = config(&e.c).unwrap();
+    t.push_str("\n[projects.\"/w\"]\ntrust_level = \"trusted\"\n");
+    std::fs::write(&e.c.paths.config, &t).unwrap();
+    disconnect(&e.c);
+    assert_eq!(
+        config(&e.c).unwrap(),
+        "model = \"o3\"\n\n[projects.\"/w\"]\ntrust_level = \"trusted\"\n"
+    );
+}

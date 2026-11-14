@@ -524,13 +524,15 @@ impl CodexConnector {
                     .iter()
                     .cloned()
                     .partition(|r| matches!(r.kind, Kind::Redacted { .. }) && still(r));
+                let unchanged = cur.as_deref().map(sha256).as_deref() == Some(p.written.as_str());
+                // Take the final newline back off only when the file is exactly what connect
+                // wrote: after an edit (Codex appends trust entries) the newline may be theirs.
                 let partial = Edits {
                     records: rest,
                     created: p.edits.created.clone(),
-                    no_final_newline: p.edits.no_final_newline,
+                    no_final_newline: p.edits.no_final_newline && unchanged,
                 };
                 let (text, notes) = tedit::undo_text(cur_text, &partial, false).map_err(err)?;
-                let unchanged = cur.as_deref().map(sha256).as_deref() == Some(p.written.as_str());
                 if !unchanged {
                     // A re-plan only undoes in memory; notes about keys the user changed matter.
                     warnings.extend(notes);
@@ -936,9 +938,14 @@ impl CodexConnector {
             return Ok(Some(plan));
         };
         parse_doc(&self.paths.config, &cur)?;
-        let (text, notes) = tedit::undo_text(&cur, &st.edits, false).map_err(err)?;
-        plan.notes.extend(notes);
         let written = sha256(&cur) == st.written;
+        // As in a re-plan: the final newline is morsec's to take off only in the file it wrote.
+        let edits = Edits {
+            no_final_newline: st.edits.no_final_newline && written,
+            ..st.edits.clone()
+        };
+        let (text, notes) = tedit::undo_text(&cur, &edits, false).map_err(err)?;
+        plan.notes.extend(notes);
         if !written && text != cur {
             plan.notes.push(format!(
                 "{} was edited after ms connect (by you or Codex), so morsec removed only its own settings and kept the rest",
