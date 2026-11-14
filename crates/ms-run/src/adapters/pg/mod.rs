@@ -48,7 +48,8 @@ fn utf8_argv(argv: &[OsString]) -> Result<Vec<String>> {
 fn base_is(argv: &[OsString], name: &str) -> bool {
     argv.first()
         .and_then(|a| Path::new(a).file_name())
-        .is_some_and(|n| n == name)
+        // Case-insensitive: macOS file systems resolve `PSQL` to psql.
+        .is_some_and(|n| n.eq_ignore_ascii_case(name))
 }
 
 fn unknown(why: &str) -> EffectPreview {
@@ -333,7 +334,7 @@ impl ContextAdapter for PrismaAdapter {
             // A read-only key refuses it in `plan` anyway; don't ask a person first (review R7).
             prisma::Class::Schema(_) if ctx.keys.values().any(|f| f.read_only) => None,
             prisma::Class::Schema(w) => Some(format!(
-                "{w} changes the database schema, so it always needs an approval"
+                "{w} can change the database schema or run code morsec can't see, so it always needs an approval"
             )),
             _ => None,
         }

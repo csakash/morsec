@@ -184,7 +184,8 @@ impl Cluster {
                 "usercasts",
                 "CREATE TYPE e AS ENUM ('1');
                  CREATE FUNCTION g(e) RETURNS int4 LANGUAGE sql VOLATILE AS 'SELECT 1';
-                 CREATE CAST (e AS int4) WITH FUNCTION g(e);",
+                 CREATE CAST (e AS int4) WITH FUNCTION g(e);
+                 CREATE CAST (int4 AS e) WITH INOUT AS IMPLICIT;",
             ),
         ] {
             c.admin("postgres", &format!("CREATE DATABASE {db}"));

@@ -40,7 +40,9 @@ fn is_prisma(a: &str) -> bool {
 /// broad on purpose (fail closed): [`class_of`] treats only the exact binary shape as Prisma's own
 /// command and everything else as needing an approval.
 pub fn locate(argv: &[String]) -> Option<usize> {
-    let first = base(argv.first()?);
+    // macOS file systems ignore case, so `PRISMA` / `NPX` run the same binaries.
+    let first = base(argv.first()?).to_ascii_lowercase();
+    let first = first.as_str();
     if first == "prisma" {
         return Some(0);
     }
@@ -68,7 +70,8 @@ pub fn class_of(argv: &[String]) -> Option<Class> {
     if at == 0 {
         return Some(classify(&argv[1..]));
     }
-    let first = base(&argv[0]);
+    let first = base(&argv[0]).to_ascii_lowercase();
+    let first = first.as_str();
     let flags_only = |args: &[String]| {
         args.iter().all(|a| {
             matches!(
@@ -234,6 +237,8 @@ mod tests {
             );
         }
         assert_eq!(locate(&a(&["psql"])), None);
+        assert_eq!(locate(&a(&["PRISMA", "migrate", "reset"])), Some(0));
+        assert_eq!(locate(&a(&["NPX", "prisma", "migrate"])), Some(1));
 
         let c = |v: &[&str]| classify(&a(v));
         assert_eq!(c(&["migrate", "status"]), Class::ReadOnly);
