@@ -30,6 +30,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
+use crate::context::{AdapterPlan, CallContext, ContextAdapter, RunGuard};
 use crate::error::{RunError, from_core};
 use crate::generic::GenericAdapter;
 use crate::input::RunInput;
@@ -87,6 +88,8 @@ pub struct Prepared {
     plan: ExecPlan,
     arg0: OsString,
     patterns: Arc<Patterns>,
+    /// A contextual adapter's guard, dropped when the run ends (L15).
+    guard: Option<Box<dyn RunGuard>>,
 }
 
 impl Prepared {
@@ -142,14 +145,22 @@ impl Exit {
 /// See the module docs.
 pub struct Runner {
     cfg: RunnerConfig,
+    contextual: Vec<Box<dyn ContextAdapter>>,
     adapters: Vec<Box<dyn RunAdapter>>,
     generic: GenericAdapter,
+}
+
+/// The adapter chosen for a call.
+enum Chosen<'a> {
+    Contextual(&'a dyn ContextAdapter),
+    Plain(&'a dyn RunAdapter),
 }
 
 impl std::fmt::Debug for Runner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Runner")
             .field("cfg", &self.cfg)
+            .field("contextual", &self.contextual.len())
             .field("adapters", &self.adapters.len())
             .finish()
     }
@@ -161,6 +172,7 @@ impl Runner {
         let generic = GenericAdapter::new(cfg.resolver.clone());
         Self {
             cfg,
+            contextual: Vec::new(),
             adapters: Vec::new(),
             generic,
         }
@@ -170,6 +182,12 @@ impl Runner {
     /// Adapters should resolve programs with [`Runner::resolver`].
     pub fn register(&mut self, adapter: Box<dyn RunAdapter>) {
         self.adapters.push(adapter);
+    }
+
+    /// Adds a context-aware adapter (L15 SPEC D1), consulted before every frozen adapter, in
+    /// the order added.
+    pub fn register_contextual(&mut self, adapter: Box<dyn ContextAdapter>) {
+        self.contextual.push(adapter);
     }
 
     /// The program resolver.
@@ -186,21 +204,48 @@ impl Runner {
         }
     }
 
-    fn adapter(&self, argv: &[OsString]) -> &dyn RunAdapter {
-        self.adapters
-            .iter()
-            .find(|a| a.matches(argv))
-            .map(|a| &**a)
-            .unwrap_or(&self.generic)
+    fn adapter(&self, argv: &[OsString]) -> Chosen<'_> {
+        if let Some(a) = self.contextual.iter().find(|a| a.matches(argv)) {
+            return Chosen::Contextual(&**a);
+        }
+        Chosen::Plain(
+            self.adapters
+                .iter()
+                .find(|a| a.matches(argv))
+                .map(|a| &**a)
+                .unwrap_or(&self.generic),
+        )
     }
 
-    /// The adapter's effect preview, for the approval dialog.
+    /// The adapter's effect preview, for the approval dialog. A contextual adapter gets no
+    /// facts here; use [`Runner::preview_in`].
     pub fn preview(&self, call: &RunCall) -> Option<EffectPreview> {
-        self.adapter(&call.argv).preview(call)
+        match self.adapter(&call.argv) {
+            Chosen::Contextual(_) => None,
+            Chosen::Plain(a) => a.preview(call),
+        }
+    }
+
+    /// The adapter's effect preview with the call's rule facts and vault.
+    pub fn preview_in(&self, call: &RunCall, ctx: &CallContext<'_>) -> Option<EffectPreview> {
+        match self.adapter(&call.argv) {
+            Chosen::Contextual(a) => a.preview(call, ctx),
+            Chosen::Plain(a) => a.preview(call),
+        }
+    }
+
+    /// `Some(why)` when the adapter says this call needs an approval whatever the key's tier
+    /// (L15 SPEC D4). Frozen adapters never do.
+    pub fn needs_approval(&self, call: &RunCall, ctx: &CallContext<'_>) -> Option<String> {
+        match self.adapter(&call.argv) {
+            Chosen::Contextual(a) => a.needs_approval(call, ctx),
+            Chosen::Plain(_) => None,
+        }
     }
 
     /// Builds the exec plan. `run_keys` are the run-mode keys policy allowed for this call; refs
-    /// to other keys are left as they are.
+    /// to other keys are left as they are. A contextual adapter gets an empty context here (and
+    /// refuses); msd uses [`Runner::plan_in`].
     pub fn plan(
         &self,
         input: &RunInput,
@@ -208,10 +253,31 @@ impl Runner {
         run_keys: &BTreeSet<KeyName>,
         vault: &dyn Vault,
     ) -> Result<Prepared, RunError> {
-        let mut plan = self
-            .adapter(&call.argv)
-            .plan(call, vault)
-            .map_err(|e| from_core(&e))?;
+        self.plan_in(input, call, run_keys, &CallContext::empty(vault))
+    }
+
+    /// [`Runner::plan`] with the call's rule facts, for contextual adapters (L15 SPEC D1).
+    pub fn plan_in(
+        &self,
+        input: &RunInput,
+        call: &RunCall,
+        run_keys: &BTreeSet<KeyName>,
+        ctx: &CallContext<'_>,
+    ) -> Result<Prepared, RunError> {
+        let vault = ctx.vault;
+        let AdapterPlan {
+            exec: mut plan,
+            secrets,
+            guard,
+        } = match self.adapter(&call.argv) {
+            Chosen::Contextual(a) => a.plan(call, ctx),
+            Chosen::Plain(a) => a.plan(call, vault).map(|exec| AdapterPlan {
+                exec,
+                secrets: Vec::new(),
+                guard: None,
+            }),
+        }
+        .map_err(|e| from_core(&e))?;
         let program = plan
             .program
             .to_str()
@@ -238,6 +304,9 @@ impl Runner {
         for (k, v) in &values {
             builder.add(k, v);
         }
+        for (k, v) in &secrets {
+            builder.add(k, v);
+        }
 
         let mut names: BTreeSet<OsString> = plan.env.iter().map(|(k, _)| k.clone()).collect();
         let path = (OsString::from("PATH"), self.cfg.resolver.path_var());
@@ -259,6 +328,7 @@ impl Runner {
             plan,
             arg0: OsString::from(&input.argv[0]),
             patterns: Arc::new(builder.build()),
+            guard,
         })
     }
 
@@ -268,7 +338,10 @@ impl Runner {
             plan,
             arg0,
             patterns,
+            guard,
         } = prepared;
+        // Kept until this function returns: the run is over (or was cancelled) by then.
+        let _guard = guard;
         let mut cmd = tokio::process::Command::new(&plan.program);
         cmd.arg0(&arg0)
             .args(&plan.args)

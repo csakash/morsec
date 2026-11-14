@@ -1,0 +1,283 @@
+//! morsec's own psql runs: the read-only role check (SPEC D3) and the effect preview (D5).
+//!
+//! Both are fixed scripts fed on stdin to the trusted psql, with the key's URL (no password) and
+//! a passfile of their own. Values that come from the agent (the statement, its table, function
+//! and operator names) are passed as psql variables and reach the server only as quoted
+//! literals (`:'name'`), never through psql's statement splitter.
+
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use super::passfile::Passfile;
+
+/// Longest a probe may take.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Most output bytes read from a probe.
+const PROBE_OUTPUT: u64 = 64 * 1024;
+
+/// The read-only role check: prints `ok`, or why the login role (or a role it can act as) can
+/// write.
+pub const ROLE_CHECK: &str = r#"\set ON_ERROR_STOP 1
+WITH r AS (
+  SELECT oid, rolname, rolsuper, rolcreaterole, rolcreatedb
+  FROM pg_roles WHERE pg_has_role(current_user, oid, 'MEMBER')
+)
+SELECT coalesce((SELECT reason FROM (
+  SELECT 1 AS o, format('role %I is a superuser', rolname) AS reason FROM r WHERE rolsuper
+  UNION ALL SELECT 2, format('role %I can create roles', rolname) FROM r WHERE rolcreaterole
+  UNION ALL SELECT 3, format('role %I can create databases', rolname) FROM r WHERE rolcreatedb
+  UNION ALL SELECT 4, format('the login role is a member of %I', rolname) FROM r
+    WHERE rolname IN ('pg_write_all_data', 'pg_write_server_files', 'pg_execute_server_program')
+  UNION ALL SELECT 5, format('role %I can create schemas in this database', r.rolname) FROM r
+    WHERE has_database_privilege(r.oid, current_database(), 'CREATE')
+  UNION ALL SELECT 6, format('role %I can create objects in schema %I', r.rolname, n.nspname)
+    FROM r, pg_namespace n
+    WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+      AND has_schema_privilege(r.oid, n.oid, 'CREATE')
+  UNION ALL SELECT 7, format('role %I can write %I.%I', r.rolname, n.nspname, c.relname)
+    FROM r, pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+      AND (has_table_privilege(r.oid, c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')
+           OR has_any_column_privilege(r.oid, c.oid, 'INSERT, UPDATE'))
+  UNION ALL SELECT 8, format('role %I can advance sequence %I.%I', r.rolname, n.nspname, c.relname)
+    FROM r, pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'S' AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+      AND has_sequence_privilege(r.oid, c.oid, 'UPDATE, USAGE')
+) x ORDER BY o LIMIT 1), 'ok') AS morsec_role_check;
+"#;
+
+/// The effect preview: `BEGIN`, safety checks, the statement as a data-modifying CTE that counts
+/// its rows, `ROLLBACK`. Prints `morsec-count=N`; a refusal raises `morsec-why: …`.
+pub const PREVIEW: &str = r#"\set ON_ERROR_STOP 1
+BEGIN;
+SET LOCAL statement_timeout = '5s';
+SET LOCAL lock_timeout = '2s';
+SET LOCAL standard_conforming_strings = on;
+SELECT set_config('morsec.stmt', :'stmt', true), set_config('morsec.tbl', :'tbl', true),
+  set_config('morsec.fns', :'fns', true), set_config('morsec.ops', :'ops', true) \g /dev/null
+DO $morsec$
+DECLARE
+  t oid := to_regclass(current_setting('morsec.tbl'));
+  fns text[] := array_remove(string_to_array(current_setting('morsec.fns'), ','), '');
+  ops text[] := array_remove(string_to_array(current_setting('morsec.ops'), ' '), '');
+  n bigint;
+BEGIN
+  IF t IS NULL THEN RAISE EXCEPTION 'morsec-why: the table was not found'; END IF;
+  IF (SELECT relkind FROM pg_class WHERE oid = t) <> 'r' THEN
+    RAISE EXCEPTION 'morsec-why: the target is not a plain table'; END IF;
+  IF (SELECT relhasrules OR relrowsecurity FROM pg_class WHERE oid = t) THEN
+    RAISE EXCEPTION 'morsec-why: the table has rules or row security'; END IF;
+  IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = t AND NOT tgisinternal) THEN
+    RAISE EXCEPTION 'morsec-why: the table has triggers'; END IF;
+  IF EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
+             WHERE k.contype = 'f' AND k.confrelid = t
+               AND (c.relhasrules OR c.relrowsecurity OR EXISTS (
+                 SELECT 1 FROM pg_trigger g WHERE g.tgrelid = k.conrelid AND NOT g.tgisinternal))) THEN
+    RAISE EXCEPTION 'morsec-why: a table that references it has triggers or rules'; END IF;
+  IF EXISTS (SELECT 1 FROM unnest(fns) f WHERE NOT EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = f)) THEN
+    RAISE EXCEPTION 'morsec-why: a function it calls is not known'; END IF;
+  IF EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = ANY (fns) AND p.provolatile = 'v') THEN
+    RAISE EXCEPTION 'morsec-why: it calls a volatile function'; END IF;
+  IF EXISTS (SELECT 1 FROM unnest(ops) o WHERE NOT EXISTS (SELECT 1 FROM pg_operator WHERE oprname = o)) THEN
+    RAISE EXCEPTION 'morsec-why: an operator it uses is not known'; END IF;
+  IF EXISTS (SELECT 1 FROM pg_operator o JOIN pg_proc p ON p.oid = o.oprcode
+             WHERE o.oprname = ANY (ops) AND p.provolatile = 'v') THEN
+    RAISE EXCEPTION 'morsec-why: an operator it uses calls a volatile function'; END IF;
+  EXECUTE 'WITH morsec_preview AS (' || current_setting('morsec.stmt')
+    || ' RETURNING 1) SELECT count(*) FROM morsec_preview' INTO n;
+  PERFORM set_config('morsec.count', n::text, true);
+END
+$morsec$;
+SELECT 'morsec-count=' || current_setting('morsec.count');
+ROLLBACK;
+"#;
+
+/// What a probe printed.
+#[derive(Debug)]
+pub struct Output {
+    /// Exit status was success.
+    pub ok: bool,
+    /// Stdout.
+    pub stdout: String,
+    /// Stderr.
+    pub stderr: String,
+}
+
+/// A connection for probes: the URL without its password, and the password (if any) to put in
+/// a fresh passfile for each probe.
+pub struct Target<'a> {
+    /// The psql to run.
+    pub psql: &'a Path,
+    /// `PATH` for it.
+    pub path_var: OsString,
+    /// URL without a password.
+    pub url: String,
+    /// Passfile line, when the URL had a password.
+    pub passfile_line: Option<&'a [u8]>,
+}
+
+impl std::fmt::Debug for Target<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("psql", &self.psql)
+            .field("url", &self.url)
+            .field("passfile_line", &self.passfile_line.map(|_| "[hidden]"))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Runs `script` with `vars` against `t`.
+pub fn run(t: &Target<'_>, script: &str, vars: &[(&str, &str)]) -> Result<Output, String> {
+    let passfile = match t.passfile_line {
+        Some(l) => Some(Passfile::create(l)?),
+        None => None,
+    };
+    let mut cmd = Command::new(t.psql);
+    cmd.env_clear()
+        .env("PATH", &t.path_var)
+        .env("PGAPPNAME", "morsec-check")
+        .args([
+            "-X",
+            "-q",
+            "-A",
+            "-t",
+            "--no-readline",
+            "-v",
+            "ON_ERROR_STOP=1",
+        ]);
+    if let Some(h) = std::env::var_os("HOME") {
+        // ~/.postgresql holds the user's TLS roots and client certificates.
+        cmd.env("HOME", h);
+    }
+    if let Some(p) = &passfile {
+        cmd.env("PGPASSFILE", p.path());
+    }
+    for (k, v) in vars {
+        cmd.arg("-v").arg(format!("{k}={v}"));
+    }
+    cmd.arg("-d")
+        .arg(&t.url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start {}: {e}", t.psql.display()))?;
+    let mut stdin = child.stdin.take();
+    let script = script.to_owned();
+    let writer = std::thread::spawn(move || {
+        if let Some(s) = stdin.as_mut() {
+            let _ = s.write_all(script.as_bytes());
+        }
+    });
+    let reader = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(r) = r {
+                let _ = r.take(PROBE_OUTPUT).read_to_end(&mut buf);
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    };
+    let out = reader(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let err = reader(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "psql took longer than {} s",
+                    PROBE_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("waiting for psql failed: {e}")),
+        }
+    };
+    drop(passfile);
+    let _ = writer.join();
+    Ok(Output {
+        ok: status.success(),
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
+}
+
+/// The first `ERROR:` line of psql's stderr, without the prefix.
+pub fn first_error(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .find_map(|l| l.split_once("ERROR:").map(|(_, m)| m.trim()))
+}
+
+/// Runs the role check: `Ok(())` when the role can't write.
+pub fn role_check(t: &Target<'_>) -> Result<(), String> {
+    let o = run(t, ROLE_CHECK, &[])?;
+    let answer = o.stdout.trim();
+    if o.ok && answer == "ok" {
+        return Ok(());
+    }
+    if o.ok && !answer.is_empty() {
+        return Err(format!(
+            "the key's rule is read-only, but {}. Use a role that can only read (for example one granted pg_read_all_data and nothing else)",
+            crate::printable(answer)
+        ));
+    }
+    Err(format!(
+        "the key's rule is read-only and morsec could not check that its role can only read ({})",
+        crate::printable(first_error(&o.stderr).unwrap_or("the check failed"))
+    ))
+}
+
+/// Runs the preview of `s`: the row count, or why it is unknown.
+pub fn preview(t: &Target<'_>, s: &super::sql::Simple) -> Result<u64, String> {
+    let fns = s.functions.join(",");
+    let ops = s.operators.join(" ");
+    let o = run(
+        t,
+        PREVIEW,
+        &[
+            ("stmt", &s.statement),
+            ("tbl", &s.table),
+            ("fns", &fns),
+            ("ops", &ops),
+        ],
+    )?;
+    if let Some(e) = first_error(&o.stderr) {
+        if let Some(why) = e.strip_prefix("morsec-why: ") {
+            return Err(why.to_owned());
+        }
+        return Err(format!(
+            "the statement failed in the preview: {}",
+            crate::printable(e)
+        ));
+    }
+    let counts: Vec<&str> = o
+        .stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("morsec-count="))
+        .collect();
+    match (o.ok, counts.as_slice()) {
+        (true, [n]) => n
+            .parse()
+            .map_err(|_| "the preview printed something unexpected".to_owned()),
+        _ => Err("the preview didn't finish".to_owned()),
+    }
+}

@@ -1,0 +1,131 @@
+//! Recognising a Prisma CLI call and classifying it (SPEC D4).
+//!
+//! Unknown shapes fail closed: a command this module doesn't know is treated as one that changes
+//! the schema (it needs an approval, and a read-only key refuses it).
+
+use std::path::Path;
+
+/// What a Prisma command does to the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Class {
+    /// Reads at most (`migrate status`, `db pull`, `generate`, …).
+    ReadOnly,
+    /// Writes data but is not a schema change (`db seed`, `studio`).
+    Write(String),
+    /// Changes the schema or runs arbitrary SQL, or isn't known: always needs an approval.
+    Schema(String),
+}
+
+fn base(a: &str) -> &str {
+    Path::new(a)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(a)
+}
+
+fn is_prisma(a: &str) -> bool {
+    a == "prisma" || a.starts_with("prisma@")
+}
+
+/// Index in `argv` of the `prisma` word, when this is a Prisma CLI call: `prisma …`,
+/// `npx|bunx|pnpx [opts] prisma[@v] …`, `pnpm|yarn|bun [exec|dlx|x|run] [opts] prisma[@v] …`.
+pub fn locate(argv: &[String]) -> Option<usize> {
+    let first = base(argv.first()?);
+    if first == "prisma" {
+        return Some(0);
+    }
+    let skip_runner = match first {
+        "npx" | "bunx" | "pnpx" => false,
+        "pnpm" | "yarn" | "bun" => true,
+        _ => return None,
+    };
+    let mut words = argv
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, a)| !a.starts_with('-'));
+    let (mut i, mut w) = words.next()?;
+    if skip_runner && matches!(w.as_str(), "exec" | "dlx" | "x" | "run") {
+        (i, w) = words.next()?;
+    }
+    is_prisma(w).then_some(i)
+}
+
+/// Classifies the arguments after the `prisma` word.
+pub fn classify(rest: &[String]) -> Class {
+    let words: Vec<&str> = rest.iter().map(String::as_str).take(2).collect();
+    let shown = || {
+        let mut s = String::from("prisma");
+        for w in &words {
+            s.push(' ');
+            s.push_str(&crate::printable(w));
+        }
+        s
+    };
+    match words.as_slice() {
+        []
+        | [
+            "-v" | "--version" | "version" | "-h" | "--help" | "help",
+            ..,
+        ] => Class::ReadOnly,
+        ["generate" | "validate" | "format" | "init" | "debug", ..] => Class::ReadOnly,
+        ["migrate", "status" | "diff"] | ["db", "pull"] => Class::ReadOnly,
+        ["db", "seed"] | ["studio", ..] => Class::Write(shown()),
+        ["migrate", "deploy" | "dev" | "reset" | "resolve"] | ["db", "push" | "execute"] => {
+            Class::Schema(shown())
+        }
+        _ => Class::Schema(format!(
+            "{} (a prisma command morsec doesn't know)",
+            shown()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // protects=SPEC D4: prisma is recognised behind the usual launchers, schema changes are
+    // classed as needing an approval, and anything unknown fails closed; fails_when=a migrate
+    // call is missed or classed read-only; no_claim=launchers not listed (env, node …) — the
+    // key's command rule decides those
+    #[test]
+    fn locate_and_classify() {
+        assert_eq!(locate(&a(&["prisma", "migrate", "deploy"])), Some(0));
+        assert_eq!(
+            locate(&a(&["/x/node_modules/.bin/prisma", "db", "push"])),
+            Some(0)
+        );
+        assert_eq!(
+            locate(&a(&["npx", "--yes", "prisma@5", "migrate"])),
+            Some(2)
+        );
+        assert_eq!(locate(&a(&["pnpm", "exec", "prisma", "generate"])), Some(2));
+        assert_eq!(locate(&a(&["yarn", "prisma", "generate"])), Some(1));
+        assert_eq!(locate(&a(&["npx", "tsc"])), None);
+        assert_eq!(locate(&a(&["psql"])), None);
+
+        let c = |v: &[&str]| classify(&a(v));
+        assert_eq!(c(&["migrate", "status"]), Class::ReadOnly);
+        assert_eq!(c(&["generate", "--schema", "x"]), Class::ReadOnly);
+        assert_eq!(c(&["db", "pull"]), Class::ReadOnly);
+        assert!(matches!(c(&["db", "seed"]), Class::Write(_)));
+        for schema in [
+            &["migrate", "deploy"][..],
+            &["migrate", "dev", "--name", "x"],
+            &["migrate", "reset", "--force"],
+            &["migrate", "resolve"],
+            &["db", "push"],
+            &["db", "execute", "--file", "x.sql"],
+            &["--schema", "x.prisma", "migrate", "deploy"],
+            &["migrate"],
+            &["frobnicate"],
+        ] {
+            assert!(matches!(c(schema), Class::Schema(_)), "{schema:?}");
+        }
+    }
+}
