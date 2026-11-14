@@ -8,28 +8,27 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
-use ms_approve::{ApprovalOutcome, Approver};
+use ms_approve::{ApprovalOutcome, ApprovalToken, Approver, Binding, HumanApprover, Scope};
 use ms_core::{
     AgentKind, ApprovalRequest, KeyMeta, KeyName, Mode, ReceiptEvent, ReceiptResult, SecretBytes,
     SessionId, Tier,
 };
-use ms_ipc::{ErrorCode, PeerInfo, RequestBody, ResponseBody};
+use ms_ipc::{ApprovalScope, ErrorCode, PeerInfo, PendingApproval, RequestBody, ResponseBody};
 use ms_receipts::{Alert, AlertAction, AlertHandler, ReceiptDetail, ReceiptStore, StoreConfig};
 use ms_rules::{Change, KeyRule, Rules, RulesError, RulesStore, is_reserved};
 use ms_session::Caller;
 use ms_vault::{Vault, VaultExt};
 use tokio::sync::watch;
 
-use crate::approve::PRE_L11;
 use crate::backend::{Backend, DAEMON_STATE_KEY, RULES_HMAC_KEY};
 use crate::paths::Paths;
 
 /// The reserved key daemon events (stop, start, init) are recorded under.
 pub const DAEMON_KEY: &str = "morsec/daemon";
-/// Approval method recorded for the pre-L11 terminal path (SPEC D-A).
-pub const TERMINAL_METHOD: &str = "terminal-pre-l11";
-/// How long an approval may take.
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Approval method recorded for a person's approval (L11): `ms approve` plus Touch ID.
+pub const TOUCH_ID_METHOD: &str = "touch-id";
+/// How long a request waits for a person (L11 SPEC D-4).
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Most alerts kept for `ms status`.
 const MAX_ALERTS: usize = 20;
 
@@ -114,7 +113,9 @@ pub struct Daemon {
     stopped_sessions: Arc<Mutex<HashSet<SessionId>>>,
     alerts: Mutex<Vec<String>>,
     identify: Identify,
-    approver: Arc<dyn Approver>,
+    approvals: Arc<HumanApprover>,
+    /// How long a request waits for a person, in ms ([`APPROVAL_TIMEOUT`]; shorter in tests).
+    approval_timeout_ms: std::sync::atomic::AtomicU64,
     proxy_gen: watch::Sender<u64>,
     proxy_port: u16,
     /// Serializes rules changes (load, classify, save).
@@ -202,7 +203,7 @@ impl Daemon {
         backend: Backend,
         paths: Paths,
         proxy_port: u16,
-        approver: Arc<dyn Approver>,
+        approvals: Arc<HumanApprover>,
         identify: Identify,
     ) -> Result<Arc<Self>, OpenError> {
         backend.ensure_ready().map_err(|e| {
@@ -300,7 +301,10 @@ impl Daemon {
             stopped_sessions,
             alerts: Mutex::new(alerts),
             identify,
-            approver,
+            approvals,
+            approval_timeout_ms: std::sync::atomic::AtomicU64::new(
+                u64::try_from(APPROVAL_TIMEOUT.as_millis()).unwrap_or(120_000),
+            ),
             proxy_gen,
             proxy_port,
             write: Mutex::new(()),
@@ -330,9 +334,103 @@ impl Daemon {
         self.receipts.clone()
     }
 
-    /// The approver (L11 replaces the stub).
+    /// The approver for the swap proxy: asks a person, then checks the token against the exact
+    /// request before the proxy acts on it (L11 SPEC D-6).
     pub fn approver(&self) -> Arc<dyn Approver> {
-        self.approver.clone()
+        Arc::new(VerifyingApprover(self.approvals.clone()))
+    }
+
+    /// Changes how long a request waits for a person (tests; production uses [`APPROVAL_TIMEOUT`]).
+    #[cfg(test)]
+    pub fn set_approval_timeout(&self, t: Duration) {
+        self.approval_timeout_ms.store(
+            u64::try_from(t.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    fn approval_timeout(&self) -> Duration {
+        Duration::from_millis(
+            self.approval_timeout_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// Asks a person to approve exactly `req` (`ms approve` + Touch ID), then checks the token
+    /// against `req` itself before returning it (L11 SPEC D-6). This is the call an executor
+    /// makes right before acting (L15/L16 run mode, admin changes, `ms scan`); the error is the
+    /// reply to send.
+    // The error is the reply itself; it is built once per refused request, so its size is moot.
+    #[allow(clippy::result_large_err)]
+    pub fn approve_exact(&self, req: &ApprovalRequest) -> Result<ApprovalToken, ResponseBody> {
+        let what = render_what(req);
+        match self.approvals.ask(req, self.approval_timeout()) {
+            ApprovalOutcome::Approved(t) => match self.approvals.verify(&t, &Binding::of(req)) {
+                Ok(_) => Ok(t),
+                Err(e) => Err(reply_err(
+                    ErrorCode::Denied,
+                    format!("morsec: {what} was refused at execution: {e}"),
+                )),
+            },
+            ApprovalOutcome::Denied if self.approvals.busy() => Err(reply_err(
+                ErrorCode::Busy,
+                format!(
+                    "morsec: {what} needs an approval, and another approval is already waiting (one at a time). Answer it with ms approve, then retry"
+                ),
+            )),
+            ApprovalOutcome::Denied => Err(reply_err(
+                ErrorCode::NeedsApproval,
+                format!(
+                    "morsec: {what} was not approved (denied in ms approve, Touch ID did not confirm, or ms stop ran)"
+                ),
+            )),
+            ApprovalOutcome::TimedOut => Err(reply_err(
+                ErrorCode::NeedsApproval,
+                format!(
+                    "morsec: nobody approved {what} within {}s, so it was refused. While it waits, run ms approve in your own terminal (not inside an agent)",
+                    self.approval_timeout().as_secs()
+                ),
+            )),
+        }
+    }
+
+    /// `ApprovalPending`: the request waiting for a person.
+    fn pending_approval(&self) -> ResponseBody {
+        ResponseBody::Approval {
+            pending: self.approvals.pending().map(|p| PendingApproval {
+                id: p.id,
+                request: p.request,
+                requested_unix_ms: p.requested_unix_ms,
+                expires_unix_ms: p.expires_unix_ms,
+            }),
+        }
+    }
+
+    /// `ApprovalDecide` from a caller outside every agent tree (checked by `handle`).
+    fn decide_approval(
+        &self,
+        id: &str,
+        approve: bool,
+        scope: Option<ApprovalScope>,
+    ) -> ResponseBody {
+        let scope = match scope {
+            Some(ApprovalScope::Session) => Scope::Session,
+            Some(ApprovalScope::Once) | None => Scope::Once,
+        };
+        match self.approvals.decide(id, approve, scope) {
+            Ok(ApprovalOutcome::Approved(_)) => ResponseBody::Ok {
+                message: match scope {
+                    Scope::Once => "approved with Touch ID: this exact command, once".into(),
+                    Scope::Session => {
+                        "approved with Touch ID: this exact command, for this agent session".into()
+                    }
+                },
+            },
+            Ok(_) => ResponseBody::Ok {
+                message: "denied".into(),
+            },
+            Err(e) => reply_err(ErrorCode::Denied, format!("morsec: {e}")),
+        }
     }
 
     /// The proxy port.
@@ -450,6 +548,39 @@ impl Daemon {
             .map(drop)
     }
 
+    /// Records an approved action with its token id (L11).
+    // Private helper; each argument is one receipt field.
+    #[allow(clippy::too_many_arguments)]
+    fn record_approved(
+        &self,
+        session: &SessionId,
+        key: &KeyName,
+        mode: Mode,
+        target: &str,
+        rule_version: u64,
+        token: &ApprovalToken,
+    ) -> ms_core::Result<()> {
+        self.receipts
+            .append_detailed(
+                ReceiptEvent {
+                    time_unix_ms: now_ms(),
+                    session: session.clone(),
+                    key: key.clone(),
+                    mode,
+                    target: target.to_owned(),
+                    argv_hash: None,
+                    rule_version,
+                    approval_id: Some(token.id.clone()),
+                    result: ReceiptResult::Approved,
+                },
+                ReceiptDetail {
+                    approval_method: Some(TOUCH_ID_METHOD.to_owned()),
+                    ..ReceiptDetail::default()
+                },
+            )
+            .map(drop)
+    }
+
     /// Handles one IPC request. Blocking (vault, receipts, approvals): run it off the reactor.
     pub fn handle(
         &self,
@@ -474,7 +605,6 @@ impl Daemon {
                 "morsec: this agent session was stopped after repeated blocked attempts (LOG-2). Start a new session",
             );
         }
-        let unattributed = matches!(caller, Some(Caller::Unattributed { .. }));
         let in_agent = matches!(caller, Some(Caller::Agent(_)));
         match request {
             RequestBody::Status => self.status(),
@@ -487,13 +617,24 @@ impl Daemon {
                 Err(e) => reply_err(ErrorCode::Internal, e.to_string()),
             },
             RequestBody::RulesGet { key } => self.rules_get(key.as_ref()),
-            RequestBody::RulesProposeLoosen {
-                key,
-                rule,
-                at_terminal,
-            } => self.propose(&session, unattributed, &key, rule.as_deref(), at_terminal),
+            // `at_terminal` (the pre-L11 path) is ignored: every loosening and resume needs a
+            // person's approval with Touch ID (L11 SPEC D-9).
+            RequestBody::RulesProposeLoosen { key, rule, .. } => {
+                self.propose(&session, &key, rule.as_deref())
+            }
             RequestBody::Stop => self.stop(&session),
-            RequestBody::Start { at_terminal } => self.start(&session, unattributed, at_terminal),
+            RequestBody::Start { .. } => self.start(&session),
+            // Only a person outside every agent tree reviews and decides approvals (SPEC D-2).
+            RequestBody::ApprovalPending | RequestBody::ApprovalDecide { .. } if in_agent => {
+                reply_err(
+                    ErrorCode::Denied,
+                    "morsec: approvals can't be seen or given from inside an agent session. Run ms approve in your own terminal",
+                )
+            }
+            RequestBody::ApprovalPending => self.pending_approval(),
+            RequestBody::ApprovalDecide { id, approve, scope } => {
+                self.decide_approval(&id, approve, scope)
+            }
             // A scan answers "is this value in a file I can write?": an oracle for short values,
             // so only the user's own terminal may ask (L09 SPEC D-3).
             RequestBody::Scan if in_agent => reply_err(
@@ -520,6 +661,27 @@ impl Daemon {
             return reply_err(
                 ErrorCode::Denied,
                 "morsec: morsec is stopped (ms stop), so ms scan does not read the vault. Resume first",
+            );
+        }
+        // A scan reads every value: a person approves it first (L11, closes L09's INJ-5
+        // residual: a detached process could otherwise use it as a guessing oracle).
+        let req = admin_request(session, daemon_key(), Tier::Production, &["ms", "scan"]);
+        if let Err(resp) = self.approve_exact(&req) {
+            let _ = self.record(
+                session,
+                &daemon_key(),
+                Mode::Run,
+                "ms scan",
+                self.rules_version(),
+                ReceiptResult::Denied,
+                None,
+            );
+            return resp;
+        }
+        if self.is_stopped() {
+            return reply_err(
+                ErrorCode::Denied,
+                "morsec: morsec was stopped (ms stop) while the scan waited for approval",
             );
         }
         let keys = match self.list_keys() {
@@ -783,55 +945,7 @@ impl Daemon {
         Ok((self.rules_version(), change))
     }
 
-    /// Pre-L11 approval for an administrative change (SPEC D-A): the stub approver first, then
-    /// the terminal path for an unattributed caller that confirmed at its terminal.
-    // The error is the reply itself; it is built once per refused request, so its size is moot.
-    #[allow(clippy::result_large_err)]
-    fn admin_approval(
-        &self,
-        session: &SessionId,
-        unattributed: bool,
-        at_terminal: bool,
-        key: &KeyName,
-        argv: Vec<String>,
-    ) -> Result<Option<&'static str>, ResponseBody> {
-        if at_terminal {
-            if unattributed {
-                return Ok(Some(TERMINAL_METHOD));
-            }
-            return Err(reply_err(
-                ErrorCode::Denied,
-                "morsec: --at-terminal only works from your own terminal, outside any agent session. Run it there",
-            ));
-        }
-        let req = ApprovalRequest {
-            session: session.clone(),
-            key: key.clone(),
-            tier: Tier::Production,
-            argv_hash: ms_rules::argv_hash(&argv),
-            argv_display: argv,
-            cwd: std::path::PathBuf::new(),
-            effect: None,
-        };
-        match self.approver.ask(&req, APPROVAL_TIMEOUT) {
-            ApprovalOutcome::Approved(_) => Ok(None),
-            ApprovalOutcome::Denied | ApprovalOutcome::TimedOut => Err(reply_err(
-                ErrorCode::NeedsApproval,
-                format!(
-                    "morsec: this needs an approval, and {PRE_L11}. Until then, run the same command from your own terminal (not inside an agent) with --at-terminal"
-                ),
-            )),
-        }
-    }
-
-    fn propose(
-        &self,
-        session: &SessionId,
-        unattributed: bool,
-        key: &KeyName,
-        rule: Option<&str>,
-        at_terminal: bool,
-    ) -> ResponseBody {
+    fn propose(&self, session: &SessionId, key: &KeyName, rule: Option<&str>) -> ResponseBody {
         if is_reserved(key) {
             return reply_err(
                 ErrorCode::Invalid,
@@ -859,7 +973,7 @@ impl Daemon {
             return self.rules_get(None);
         }
         let change = ms_rules::classify_rule(current.as_ref(), new_rule.as_ref());
-        let method = match change {
+        let token = match change {
             Change::Same => {
                 return ResponseBody::Ok {
                     message: format!("no change to {key}"),
@@ -867,9 +981,20 @@ impl Daemon {
             }
             Change::Tighten => None,
             Change::Loosen => {
-                let argv = vec!["ms".into(), "rules".into(), key.to_string()];
-                match self.admin_approval(session, unattributed, at_terminal, key, argv) {
-                    Ok(m) => m.or(Some("approver")),
+                // The person approves the exact rule text (its hash is the bound argv).
+                let text = rule.unwrap_or("(remove the rule)");
+                let tier = new_rule
+                    .as_ref()
+                    .or(current.as_ref())
+                    .map_or(Tier::Production, |r| r.tier);
+                let req = admin_request(
+                    session,
+                    key.clone(),
+                    tier,
+                    &["ms", "rules", key.as_str(), text],
+                );
+                match self.approve_exact(&req) {
+                    Ok(t) => Some(t),
                     Err(resp) => {
                         let v = self.rules_version();
                         let _ = self.record(
@@ -890,26 +1015,28 @@ impl Daemon {
             .as_ref()
             .or(current.as_ref())
             .map_or(Mode::Swap, |r| r.mode);
-        match self.change_rule(key, new_rule, change == Change::Loosen && method.is_some()) {
+        match self.change_rule(key, new_rule, token.is_some()) {
             Ok((version, _)) => {
-                let result = if change == Change::Loosen {
-                    ReceiptResult::Approved
-                } else {
-                    ReceiptResult::Allowed
+                let recorded = match &token {
+                    Some(t) => self.record_approved(
+                        session,
+                        key,
+                        mode,
+                        "rules change (loosen)",
+                        version,
+                        t,
+                    ),
+                    None => self.record(
+                        session,
+                        key,
+                        mode,
+                        "rules change (tighten)",
+                        version,
+                        ReceiptResult::Allowed,
+                        None,
+                    ),
                 };
-                if let Err(e) = self.record(
-                    session,
-                    key,
-                    mode,
-                    if change == Change::Loosen {
-                        "rules change (loosen)"
-                    } else {
-                        "rules change (tighten)"
-                    },
-                    version,
-                    result,
-                    method.filter(|m| *m != "approver"),
-                ) {
+                if let Err(e) = recorded {
                     tracing::error!(error = %e, "could not record a rules change");
                 }
                 ResponseBody::Ok {
@@ -943,9 +1070,14 @@ impl Daemon {
             l.rules.stopped = true;
             l.rules.version
         };
+        // Every approval token and session grant ends now; a request waiting for a person is
+        // denied (L11).
+        if let Err(e) = self.approvals.revoke_all() {
+            tracing::error!(error = %e, "could not revoke approvals");
+        }
         // No proxy rebuild: the proxy's session resolver returns no session while stopped, so
         // the next request is refused without the listener going away.
-        let mut message = "morsec stopped: every agent request is now refused. Resume from your own terminal with: ms init --resume (ms start once Touch ID arrives in L11)".to_owned();
+        let mut message = "morsec stopped: every agent request is now refused. Resume from your own terminal with: ms start (needs Touch ID)".to_owned();
         if let Err(e) = self.persist_state(true) {
             tracing::error!(error = %e, "could not persist the stop flag");
             self.alert(format!(
@@ -969,7 +1101,7 @@ impl Daemon {
         ResponseBody::Ok { message }
     }
 
-    fn start(&self, session: &SessionId, unattributed: bool, at_terminal: bool) -> ResponseBody {
+    fn start(&self, session: &SessionId) -> ResponseBody {
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
         if !self.is_stopped() {
             return ResponseBody::Ok {
@@ -977,14 +1109,13 @@ impl Daemon {
             };
         }
         let key = daemon_key();
-        let method = match self.admin_approval(
+        let token = match self.approve_exact(&admin_request(
             session,
-            unattributed,
-            at_terminal,
-            &key,
-            vec!["ms".into(), "start".into()],
-        ) {
-            Ok(m) => m,
+            key.clone(),
+            Tier::Production,
+            &["ms", "start"],
+        )) {
+            Ok(t) => t,
             Err(resp) => {
                 let v = self.rules_version();
                 let _ = self.record(
@@ -996,18 +1127,7 @@ impl Daemon {
                     ReceiptResult::Denied,
                     None,
                 );
-                return match resp {
-                    ResponseBody::Error {
-                        code: ErrorCode::NeedsApproval,
-                        ..
-                    } => reply_err(
-                        ErrorCode::NeedsApproval,
-                        format!(
-                            "morsec: ms start needs Touch ID, and {PRE_L11}. Until then, resume from your own terminal (not inside an agent): ms init --resume"
-                        ),
-                    ),
-                    other => other,
-                };
+                return resp;
             }
         };
         // The approval happens outside the lock (a Touch ID prompt must not hold up ms stop);
@@ -1037,19 +1157,63 @@ impl Daemon {
             l.rules.version
         };
         lock(&self.stopped_sessions).clear();
-        if let Err(e) = self.record(
-            session,
-            &key,
-            Mode::Run,
-            "ms start",
-            version,
-            ReceiptResult::Approved,
-            method,
-        ) {
+        if let Err(e) = self.record_approved(session, &key, Mode::Run, "ms start", version, &token)
+        {
             tracing::error!(error = %e, "could not record ms start");
         }
         ResponseBody::Ok {
             message: "morsec on".into(),
+        }
+    }
+}
+
+/// An approval request for one of morsec's own actions (`ms start`, loosening a rule, `ms scan`):
+/// the key's tier (production for morsec's own), no cwd, `argv` hashed the way run mode hashes commands.
+fn admin_request(session: &SessionId, key: KeyName, tier: Tier, argv: &[&str]) -> ApprovalRequest {
+    let argv: Vec<String> = argv.iter().map(|a| (*a).to_owned()).collect();
+    ApprovalRequest {
+        session: session.clone(),
+        key,
+        tier,
+        argv_hash: ms_rules::argv_hash(&argv),
+        argv_display: argv,
+        cwd: std::path::PathBuf::new(),
+        effect: None,
+    }
+}
+
+/// "ms start", "pg/production for psql …": how a refusal names the request (inert).
+fn render_what(req: &ApprovalRequest) -> String {
+    let cmd = req
+        .argv_display
+        .iter()
+        .take(3)
+        .map(|a| ms_approve::render::inert(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let more = if req.argv_display.len() > 3 {
+        " …"
+    } else {
+        ""
+    };
+    format!("{} ({cmd}{more})", req.key)
+}
+
+/// The swap proxy's approver: a person's approval, checked against the exact request before the
+/// proxy uses it (SPEC D-6).
+struct VerifyingApprover(Arc<HumanApprover>);
+
+impl Approver for VerifyingApprover {
+    fn ask(&self, req: &ApprovalRequest, timeout: Duration) -> ApprovalOutcome {
+        match self.0.ask(req, timeout) {
+            ApprovalOutcome::Approved(t) => match self.0.verify(&t, &Binding::of(req)) {
+                Ok(_) => ApprovalOutcome::Approved(t),
+                Err(e) => {
+                    tracing::warn!(key = %req.key, error = %e, "approval refused at use");
+                    ApprovalOutcome::Denied
+                }
+            },
+            other => other,
         }
     }
 }
@@ -1118,7 +1282,7 @@ impl ms_ipc::Handler for IpcHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approve::DenyApprover;
+    use ms_approve::auth::fake::FakeAuthenticator;
     use ms_core::{Decision, Reason, Request};
     use ms_vault::memory::MemoryVault;
 
@@ -1126,6 +1290,7 @@ mod tests {
 
     struct H {
         d: Arc<Daemon>,
+        auth: Arc<FakeAuthenticator>,
         backend: Backend,
         dir: tempfile::TempDir,
         who: Arc<Mutex<Option<Caller>>>,
@@ -1155,19 +1320,51 @@ mod tests {
         }
     }
 
+    /// The PID of the person's `ms approve` (always outside any agent), and of an agent's
+    /// process trying to approve.
+    const APPROVER_PID: i32 = 99;
+    const AGENT_APPROVER_PID: i32 = 98;
+
+    fn peer_pid(pid: i32) -> PeerInfo {
+        PeerInfo {
+            pid: Some(pid),
+            ..peer()
+        }
+    }
+
     fn open_with(backend: Backend, dir: tempfile::TempDir, who: Arc<Mutex<Option<Caller>>>) -> H {
+        open_auth(backend, dir, who, FakeAuthenticator::approve())
+    }
+
+    fn open_auth(
+        backend: Backend,
+        dir: tempfile::TempDir,
+        who: Arc<Mutex<Option<Caller>>>,
+        auth: FakeAuthenticator,
+    ) -> H {
         let w = who.clone();
-        let identify: Identify = Arc::new(move |_| lock(&w).clone());
+        let identify: Identify = Arc::new(move |p: &PeerInfo| match p.pid {
+            Some(APPROVER_PID) => Some(Caller::Unattributed {
+                pid: 99,
+                started_unix_ms: 1,
+            }),
+            Some(AGENT_APPROVER_PID) => Some(agent()),
+            _ => lock(&w).clone(),
+        });
+        let auth = Arc::new(auth);
+        let approvals = Arc::new(HumanApprover::new(auth.clone()).unwrap());
         let d = Daemon::open(
             backend.clone(),
             Paths::under(dir.path()),
             0,
-            Arc::new(DenyApprover),
+            approvals,
             identify,
         )
         .unwrap();
+        d.set_approval_timeout(Duration::from_millis(300));
         H {
             d,
+            auth,
             backend,
             dir,
             who,
@@ -1190,6 +1387,7 @@ mod tests {
             backend,
             dir,
             who,
+            ..
         } = h;
         drop(d);
         open_with(backend, dir, who)
@@ -1225,6 +1423,55 @@ mod tests {
                 rule: rule.map(|r| format!("version = 1\n[keys.\"{key}\"]\n{r}")),
                 at_terminal,
             })
+        }
+        /// Runs `f` (which waits for an approval) while a person at `approver_pid` answers the
+        /// pending request with `approve` / `scope`. Returns `f`'s reply and the decision's.
+        fn answered(
+            &self,
+            approver_pid: i32,
+            approve: bool,
+            scope: Option<ApprovalScope>,
+            f: impl FnOnce() -> ResponseBody + Send,
+        ) -> (ResponseBody, ResponseBody) {
+            std::thread::scope(|sc| {
+                let decider = sc.spawn(|| {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let r = self.d.handle(
+                            &peer_pid(approver_pid),
+                            RequestBody::ApprovalPending,
+                            None,
+                        );
+                        match r {
+                            ResponseBody::Approval { pending: Some(p) } => {
+                                return self.d.handle(
+                                    &peer_pid(approver_pid),
+                                    RequestBody::ApprovalDecide {
+                                        id: p.id,
+                                        approve,
+                                        scope,
+                                    },
+                                    None,
+                                );
+                            }
+                            ResponseBody::Approval { pending: None } => {}
+                            other => return other,
+                        }
+                        if std::time::Instant::now() > deadline {
+                            return ResponseBody::error(ErrorCode::Internal, "nothing pending");
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                });
+                let out = f();
+                (out, decider.join().unwrap())
+            })
+        }
+        /// `f`, approved by the person with Touch ID (once).
+        fn approved(&self, f: impl FnOnce() -> ResponseBody + Send) -> ResponseBody {
+            let (out, decision) = self.answered(APPROVER_PID, true, None, f);
+            assert!(is_ok(&decision), "{decision:?}");
+            out
         }
         fn swap(&self, key: &str, host: &str) -> Decision {
             let s = match agent() {
@@ -1327,11 +1574,13 @@ mod tests {
     fn stop_is_immediate_and_survives_restart() {
         let h = fresh();
         h.put("stripe/test", Tier::Test);
-        let r = h.propose(
-            "stripe/test",
-            Some("mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\"]\n"),
-            true,
-        );
+        let r = h.approved(|| {
+            h.propose(
+                "stripe/test",
+                Some("mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\"]\n"),
+                false,
+            )
+        });
         assert!(is_ok(&r), "{r:?}");
         assert_eq!(h.swap("stripe/test", "api.stripe.com"), Decision::Allow);
         assert!(
@@ -1359,35 +1608,141 @@ mod tests {
         assert!(h.receipts_text().contains("ms stop"));
     }
 
-    // protects=ms start needs an approval: the pre-L11 stub denies it with the --resume hint, the
-    // terminal path is refused for an agent caller, and works for an unattributed caller (recorded
-    // as terminal-pre-l11), persisting across a restart; fails_when=an agent resumes morsec or a
-    // plain ms start succeeds before L11; no_claim=that an unattributed caller is a person (SPEC D-A
-    // residual)
+    // protects=AUTH-3/SPEC D-9: ms start needs a person's approval with Touch ID: unanswered it
+    // times out, denied or failed Touch ID it stays stopped, at_terminal no longer bypasses
+    // anything, an agent can't approve its own resume, and an approved resume persists across a
+    // restart and is recorded with the token id and method touch-id; fails_when=morsec resumes
+    // without a Touch ID approval from outside every agent tree; no_claim=the real LAContext sheet
     #[test]
-    fn start_needs_approval_or_terminal() {
+    fn start_needs_touch_id_approval() {
         let h = fresh();
         h.req(RequestBody::Stop);
-        let r = h.req(RequestBody::Start { at_terminal: false });
-        assert_eq!(code(&r), Some(ErrorCode::NeedsApproval));
-        assert!(msg(&r).contains("ms init --resume"), "{r:?}");
-        let r = h.as_(agent()).req(RequestBody::Start { at_terminal: true });
-        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        let r = h.req(RequestBody::Start { at_terminal: true });
+        assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
+        assert!(msg(&r).contains("ms approve"), "{r:?}");
         assert!(h.d.is_stopped());
-        let r = h
-            .as_(terminal())
-            .req(RequestBody::Start { at_terminal: true });
+        // An agent's process tries to approve: refused, and the request times out.
+        let (r, d) = h.answered(AGENT_APPROVER_PID, true, None, || {
+            h.as_(agent()).req(RequestBody::Start { at_terminal: true })
+        });
+        assert_eq!(code(&d), Some(ErrorCode::Denied), "{d:?}");
+        assert!(msg(&d).contains("inside an agent session"), "{d:?}");
+        assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
+        assert!(h.d.is_stopped());
+        // The person denies.
+        let (r, _) = h.answered(APPROVER_PID, false, None, || {
+            h.as_(terminal())
+                .req(RequestBody::Start { at_terminal: false })
+        });
+        assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
+        assert!(h.d.is_stopped());
+        assert!(h.auth.reasons().is_empty(), "deny needs no Touch ID");
+        // The person approves with Touch ID.
+        let r = h.approved(|| {
+            h.as_(terminal())
+                .req(RequestBody::Start { at_terminal: false })
+        });
         assert!(is_ok(&r), "{r:?}");
         assert!(!h.d.is_stopped());
-        assert!(h.receipts_text().contains(TERMINAL_METHOD));
+        let reasons = h.auth.reasons();
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains(r#""ms" "start""#), "{}", reasons[0]);
+        let text = h.receipts_text();
+        assert!(
+            text.contains(TOUCH_ID_METHOD) && text.contains("once-"),
+            "{text}"
+        );
         let h = restart(h);
         assert!(!h.d.is_stopped());
     }
 
-    // protects=rules over IPC (open from L03): tightening is saved without approval; loosening is
-    // refused (NeedsApproval) without one, refused on the terminal path for an agent, saved on the
-    // terminal path from a terminal; reserved keys and multi-key payloads are refused; RulesGet
-    // returns the saved rules; fails_when=an agent loosens a rule; no_claim=Touch ID (L11)
+    // protects=SPEC D-4: a failed or cancelled Touch ID denies the request and nothing changes;
+    // fails_when=morsec resumes after a failed Touch ID; no_claim=lockout handling of the sheet
+    #[test]
+    fn failed_touch_id_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = open_auth(
+            Backend::Memory(Arc::new(MemoryVault::new())),
+            dir,
+            Arc::new(Mutex::new(Some(terminal()))),
+            FakeAuthenticator::deny("cancelled"),
+        );
+        h.req(RequestBody::Stop);
+        let (r, d) = h.answered(APPROVER_PID, true, None, || {
+            h.req(RequestBody::Start { at_terminal: false })
+        });
+        assert_eq!(code(&d), Some(ErrorCode::Denied), "{d:?}");
+        assert!(msg(&d).contains("Touch ID did not confirm"), "{d:?}");
+        assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
+        assert!(h.d.is_stopped());
+    }
+
+    // protects=SPEC D-2/D-3 over IPC: an agent can neither list nor decide approvals; only one
+    // request waits at a time and a second is refused at once with Busy; ms stop denies the
+    // waiting one; fails_when=an agent sees or answers a request, or a second request is parked;
+    // no_claim=the real process-tree walk (agent_e2e)
+    #[test]
+    fn approvals_ipc_rules() {
+        let h = fresh();
+        let r = h.d.handle(
+            &peer_pid(AGENT_APPROVER_PID),
+            RequestBody::ApprovalPending,
+            None,
+        );
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        assert!(matches!(
+            h.d.handle(&peer_pid(APPROVER_PID), RequestBody::ApprovalPending, None),
+            ResponseBody::Approval { pending: None }
+        ));
+        h.d.set_approval_timeout(Duration::from_secs(5));
+        h.req(RequestBody::Stop);
+        std::thread::scope(|sc| {
+            let first = sc.spawn(|| h.req(RequestBody::Start { at_terminal: false }));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let p = loop {
+                if let ResponseBody::Approval { pending: Some(p) } =
+                    h.d.handle(&peer_pid(APPROVER_PID), RequestBody::ApprovalPending, None)
+                {
+                    break p;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(p.request.argv_display, vec!["ms", "start"]);
+            let started = std::time::Instant::now();
+            let second = h.d.handle(&peer(), RequestBody::Scan, None);
+            assert_eq!(
+                code(&second),
+                Some(ErrorCode::Denied),
+                "stopped: {second:?}"
+            );
+            let second = h.req(RequestBody::Start { at_terminal: false });
+            assert_eq!(code(&second), Some(ErrorCode::Busy), "{second:?}");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            let r = h.d.handle(
+                &peer_pid(AGENT_APPROVER_PID),
+                RequestBody::ApprovalDecide {
+                    id: p.id.clone(),
+                    approve: true,
+                    scope: None,
+                },
+                None,
+            );
+            assert_eq!(code(&r), Some(ErrorCode::Denied));
+            // ms stop denies the waiting request.
+            assert!(is_ok(&h.as_(agent()).req(RequestBody::Stop)));
+            let first = first.join().unwrap();
+            assert_eq!(code(&first), Some(ErrorCode::NeedsApproval), "{first:?}");
+        });
+        assert!(h.d.is_stopped());
+        assert!(h.auth.reasons().is_empty());
+    }
+
+    // protects=rules over IPC (open from L03, L11): tightening is saved without approval;
+    // loosening times out without one (at_terminal no longer bypasses it) and is saved after a
+    // person approves with Touch ID, the sheet naming the exact rule; reserved keys and multi-key
+    // payloads are refused; RulesGet returns the saved rules; fails_when=a loosening is saved
+    // without Touch ID; no_claim=the real LAContext sheet
     #[test]
     fn rules_changes() {
         let h = fresh();
@@ -1395,10 +1750,15 @@ mod tests {
         let loose = "mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\", \"files.stripe.com\"]\n";
         let r = h.as_(agent()).propose("stripe/test", Some(loose), false);
         assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
-        let r = h.as_(agent()).propose("stripe/test", Some(loose), true);
-        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
         let r = h.as_(terminal()).propose("stripe/test", Some(loose), true);
+        assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
+        let r = h.approved(|| h.as_(agent()).propose("stripe/test", Some(loose), false));
         assert!(is_ok(&r), "{r:?}");
+        assert!(
+            h.auth.reasons()[0].contains("files.stripe.com"),
+            "{:?}",
+            h.auth.reasons()
+        );
         let tight = "mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\"]\n";
         let r = h.as_(agent()).propose("stripe/test", Some(tight), false);
         assert!(is_ok(&r), "agents may tighten: {r:?}");
@@ -1446,11 +1806,13 @@ mod tests {
         let rules = h.dir.path().join("rules.toml");
         let mac = ms_rules::store::mac_path(&rules);
         let old = (std::fs::read(&rules).unwrap(), std::fs::read(&mac).unwrap());
-        let r = h.propose(
-            "stripe/test",
-            Some("mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\"]\n"),
-            true,
-        );
+        let r = h.approved(|| {
+            h.propose(
+                "stripe/test",
+                Some("mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\"]\n"),
+                false,
+            )
+        });
         assert!(is_ok(&r));
         h.propose("stripe/test", None, false);
         // Replay the older, validly MAC'd file.
@@ -1539,6 +1901,13 @@ mod tests {
         assert!(msg(&r).contains("your own terminal"), "{r:?}");
         *lock(&h.who) = None;
         assert_eq!(code(&h.req(RequestBody::Scan)), Some(ErrorCode::Denied));
+        // L11 (INJ-5): from a terminal, nothing is read until a person approves; unanswered it
+        // times out, and a denial is recorded.
+        let r = h.as_(terminal()).req(RequestBody::Scan);
+        assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
+        let (r, _) = h.answered(APPROVER_PID, false, None, || h.req(RequestBody::Scan));
+        assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
+        assert!(h.receipts_text().contains("ms scan"));
         // The kill switch: a stopped morsec reads no value, even for the user's terminal.
         let h = fresh();
         assert!(is_ok(&h.put("stripe/test", Tier::Test)));
@@ -1563,12 +1932,12 @@ mod tests {
         );
         assert_eq!(code(&h.put("new/key", Tier::Test)), Some(ErrorCode::Denied));
         assert_eq!(
-            code(&h.req(RequestBody::Start { at_terminal: true })),
+            code(&h.req(RequestBody::Start { at_terminal: false })),
             Some(ErrorCode::Denied)
         );
         assert!(is_ok(&h.req(RequestBody::Stop)));
         assert_eq!(
-            code(&h.req(RequestBody::Start { at_terminal: true })),
+            code(&h.req(RequestBody::Start { at_terminal: false })),
             Some(ErrorCode::Denied)
         );
         assert!(h.d.is_stopped());
@@ -1583,11 +1952,34 @@ mod tests {
     #[test]
     fn stop_and_start_are_serialized() {
         let h = Arc::new(fresh());
+        // A person who approves whatever is waiting, for the whole test.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let person = {
+            let (h, done) = (h.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let ResponseBody::Approval { pending: Some(p) } =
+                        h.d.handle(&peer_pid(APPROVER_PID), RequestBody::ApprovalPending, None)
+                    {
+                        let _ = h.d.handle(
+                            &peer_pid(APPROVER_PID),
+                            RequestBody::ApprovalDecide {
+                                id: p.id,
+                                approve: true,
+                                scope: None,
+                            },
+                            None,
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
         for _ in 0..50 {
             let (a, b) = (h.clone(), h.clone());
             let t1 = std::thread::spawn(move || {
                 a.as_(terminal())
-                    .req(RequestBody::Start { at_terminal: true })
+                    .req(RequestBody::Start { at_terminal: false })
             });
             let t2 = std::thread::spawn(move || b.d.handle(&peer(), RequestBody::Stop, None));
             let _ = t1.join().unwrap();
@@ -1604,6 +1996,9 @@ mod tests {
                 "memory and vault disagree"
             );
         }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        person.join().unwrap();
+        assert!(!h.auth.reasons().is_empty(), "no start was ever approved");
     }
 
     // protects=the state item format round-trips and anything else is rejected (fail closed);
@@ -1633,10 +2028,10 @@ mod tests {
         let h = restart(h);
         assert!(h.d.is_stopped() && h.d.rules().tampered);
         assert!(is_ok(&h.req(RequestBody::Stop)));
-        assert!(is_ok(
-            &h.as_(terminal())
-                .req(RequestBody::Start { at_terminal: true })
-        ));
+        assert!(is_ok(&h.approved(|| {
+            h.as_(terminal())
+                .req(RequestBody::Start { at_terminal: false })
+        })));
         let saved = h.backend.vault().read_with(&state, <[u8]>::to_vec).unwrap();
         let (_, floor) = parse_state(&saved).unwrap();
         assert!(floor < 100, "sentinel floor persisted: {floor}");

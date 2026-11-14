@@ -97,6 +97,45 @@ pub enum RequestBody {
     /// Search the agent transcripts msd knows about for vault values (`ms scan`, L09). No
     /// fields: msd picks the directories itself, so a client can't point it at a file.
     Scan,
+    /// The approval waiting for a person, if any (`ms approve`, L11). Refused inside an agent
+    /// session.
+    ApprovalPending,
+    /// A person's answer to the waiting approval (L11). Refused inside an agent session. Before
+    /// approving anything msd itself asks for Touch ID, with a reason it builds from the request.
+    ApprovalDecide {
+        /// The pending request's id (from `ApprovalPending`).
+        id: String,
+        /// Approve (Touch ID follows) or deny (no Touch ID).
+        approve: bool,
+        /// What an approval covers; absent = this exact command, once.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<ApprovalScope>,
+    },
+}
+
+/// What an approval covers (L11, PRD §7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalScope {
+    /// This exact command, once (the default).
+    Once,
+    /// This exact command, for this agent session.
+    Session,
+}
+
+/// The approval waiting for a person (`ApprovalPending`, L11). Every string in `request` is
+/// agent-influenced: render it with `ms_approve::render`, never raw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingApproval {
+    /// Id a decision must name.
+    pub id: String,
+    /// The exact request, as msd will carry it out.
+    pub request: ms_core::ApprovalRequest,
+    /// When it was asked, Unix ms.
+    pub requested_unix_ms: u64,
+    /// When it times out, Unix ms.
+    pub expires_unix_ms: u64,
 }
 
 impl RequestBody {
@@ -123,6 +162,9 @@ impl RequestBody {
             RequestBody::LogQuery { .. } => "L02 receipts",
             RequestBody::DoctorProbe => "L17 doctor",
             RequestBody::Scan => "L09 e2e-canary",
+            RequestBody::ApprovalPending | RequestBody::ApprovalDecide { .. } => {
+                "L11 approvals-macos"
+            }
         }
     }
 }
@@ -241,6 +283,11 @@ pub enum ResponseBody {
         notes: Vec<String>,
         /// False when the scan stopped early (time budget, file cap, unreadable files).
         complete: bool,
+    },
+    /// The approval waiting for a person, if any (`ApprovalPending`, L11).
+    Approval {
+        /// The request, or none.
+        pending: Option<PendingApproval>,
     },
     /// An error; `message` is shown to people as is.
     Error {

@@ -30,12 +30,12 @@ fn main() -> ExitCode {
     }
     // `cargo test -- --list` and filters: this file has one test.
     if args.iter().any(|a| a == "--list") {
-        println!("kill_switch_and_terminal_path_end_to_end: test");
+        println!("kill_switch_and_approvals_end_to_end: test");
         return ExitCode::SUCCESS;
     }
     println!("running 1 test");
-    kill_switch_and_terminal_path_end_to_end();
-    println!("test kill_switch_and_terminal_path_end_to_end ... ok");
+    kill_switch_and_approvals_end_to_end();
+    println!("test kill_switch_and_approvals_end_to_end ... ok");
     ExitCode::SUCCESS
 }
 
@@ -88,6 +88,9 @@ fn start_msd(socket: &Path, proxy_port: u16) -> Daemon {
         .arg("--state-dir")
         .arg(&state)
         .args(["--proxy-port", &proxy_port.to_string()])
+        // L11: the approval flow (pending slot, caller checks, ms approve, token) is real; only
+        // the Touch ID sheet is stood in for (debug build, memory vault only).
+        .args(["--test-touch-id", "allow"])
         .env("MORSEC_LOG", "warn")
         .env_remove("SSL_CERT_FILE")
         .env_remove("SSL_CERT_DIR")
@@ -141,16 +144,20 @@ fn in_agent(dir: &Path, socket: &Path, command: &str) -> (i32, String) {
     )
 }
 
-/// Runs `command` detached from this test's process tree, with `yes` typed into a pseudo-terminal
-/// (`script`) for `/dev/tty` confirmations. Returns (exit code, output).
-fn detached_terminal(dir: &Path, socket: &Path, command: &str) -> (i32, String) {
-    let run = dir.join("terminal.sh");
-    let out = dir.join("terminal.out");
-    let rc = dir.join("terminal.rc");
+static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Runs `command` detached from this test's process tree (the user's own terminal), with
+/// `typed` typed into its pseudo-terminal (`script`) after a second, for `/dev/tty` answers.
+/// Returns (exit code, output).
+fn detached_terminal(dir: &Path, socket: &Path, typed: &str, command: &str) -> (i32, String) {
+    let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let run = dir.join(format!("terminal{n}.sh"));
+    let out = dir.join(format!("terminal{n}.out"));
+    let rc = dir.join(format!("terminal{n}.rc"));
     std::fs::write(
         &run,
         format!(
-            "export MORSEC_SOCKET='{}'\n(sleep 1; printf 'yes\\n'; sleep 3) | script -q /dev/null {command}\n",
+            "export MORSEC_SOCKET='{}'\n(sleep 1; printf '{typed}\\n'; sleep 4) | script -q /dev/null {command}\n",
             socket.display()
         ),
     )
@@ -188,18 +195,22 @@ fn receipts_text(socket: &Path) -> String {
     s
 }
 
-// protects=AUTH-4 and SPEC D-A end to end with the real binaries and the swap proxy:
-// - loosening a rule from inside an agent session is refused, even with --at-terminal; from a
-//   terminal outside any agent session it is applied (pre-L11 path) and recorded;
+// protects=AUTH-4 and L11 (AUTH-3, SPEC D-1/D-2) end to end with the real binaries and the swap
+// proxy:
+// - an agent's loosening waits for a person; the agent can't see or answer it with ms approve
+//   (refused inside its process tree), and the person's denial in ms approve refuses it;
+// - from the user's own terminal, ms rules shows the request inline, `o` + Touch ID (stood in)
+//   applies it, and the receipt records touch-id;
 // - the mockup's exfiltration case (a placeholder sent to an unbound host) is blocked with 403 and
 //   recorded as a receipt;
 // - after `ms stop` (which an agent may run) the very next proxy request is refused, status says
-//   stopped, and `ms start` from the agent is refused;
+//   stopped, and the agent's `ms start` is refused when the person denies it;
 // - with msd down the proxy port refuses connections and `ms status` fails closed.
 // fails_when=an agent loosens a rule or resumes morsec, a request goes through after ms stop, or
-// the proxy answers with msd down; no_claim=Touch ID (L11), a real upstream swap (L05 itests),
+// the proxy answers with msd down; no_claim=the real Touch ID sheet (PROOF.md, needs a human), a
+// real upstream swap (L05 itests),
 // restart persistence of the stop flag (daemon unit test; the memory vault is ephemeral)
-fn kill_switch_and_terminal_path_end_to_end() {
+fn kill_switch_and_approvals_end_to_end() {
     let d = tempfile::Builder::new()
         .prefix("mse2e")
         .tempdir_in("/tmp")
@@ -215,33 +226,52 @@ fn kill_switch_and_terminal_path_end_to_end() {
     );
     assert_eq!(code, 0, "{out}{err}");
 
-    // From inside an agent: refused, nothing changes.
-    let (code, text) = in_agent(
-        d.path(),
-        &sock,
-        &format!(
-            "(sleep 1; printf 'yes\\n'; sleep 3) | script -q /dev/null {ms} rules stripe/test --add-host api.stripe.com --at-terminal"
-        ),
-    );
-    assert!(text.contains("outside any agent session"), "{code} {text}");
-    let (code, text) = in_agent(
-        d.path(),
-        &sock,
-        &format!("{ms} rules stripe/test --add-host api.stripe.com"),
-    );
-    assert_ne!(code, 0, "{text}");
-    assert!(text.contains("needs an approval"), "{text}");
+    // From inside an agent: the loosening waits for a person. The agent can't see or answer it,
+    // even typing into its own pseudo-terminal; the person denies it in ms approve.
+    std::thread::scope(|sc| {
+        let waiting = sc.spawn(|| {
+            in_agent(
+                d.path(),
+                &sock,
+                &format!("{ms} rules stripe/test --add-host api.stripe.com --at-terminal"),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        let (code, text) = in_agent(
+            d.path(),
+            &sock,
+            &format!("(sleep 1; printf 'o\\n'; sleep 2) | script -q /dev/null {ms} approve"),
+        );
+        assert_ne!(code, 0, "{text}");
+        assert!(text.contains("inside an agent session"), "{text}");
+        let (code, text) = detached_terminal(d.path(), &sock, "d", &format!("{ms} approve"));
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(r#"hosts = [\"api.stripe.com\"]"#),
+            "the person sees the rule: {text}"
+        );
+        assert!(text.contains("denied"), "{text}");
+        let (code, text) = waiting.join().unwrap();
+        assert_ne!(code, 0, "{text}");
+        assert!(text.contains("was not approved"), "{text}");
+    });
     assert!(!receipts_text(&sock).contains("rules change (loosen)"));
 
-    // From a terminal outside any agent: applied.
+    // From the user's own terminal: reviewed inline, approved with `o` and Touch ID, applied.
     let (code, text) = detached_terminal(
         d.path(),
         &sock,
-        &format!("{ms} rules stripe/test --add-host api.stripe.com --at-terminal"),
+        "o",
+        &format!("{ms} rules stripe/test --add-host api.stripe.com"),
     );
     assert_eq!(code, 0, "{text}");
+    assert!(text.contains("needs your approval"), "{text}");
     assert!(text.contains("saved: rules version"), "{text}");
-    assert!(receipts_text(&sock).contains("terminal-pre-l11"));
+    let r = receipts_text(&sock);
+    assert!(
+        r.contains("rules change (loosen)") && r.contains("touch-id"),
+        "{r}"
+    );
 
     // The exfiltration attempt from inside the agent: blocked and recorded. The proxy rebuilds
     // after the rules change, so retry briefly.
@@ -276,9 +306,18 @@ fn kill_switch_and_terminal_path_end_to_end() {
         out.starts_with("morsec stopped · 1 secret protected"),
         "{out}"
     );
-    let (code, text) = in_agent(d.path(), &sock, &format!("{ms} start"));
-    assert_ne!(code, 0, "{text}");
-    assert!(text.contains("ms init --resume"), "{text}");
+    std::thread::scope(|sc| {
+        let waiting = sc.spawn(|| in_agent(d.path(), &sock, &format!("{ms} start")));
+        std::thread::sleep(Duration::from_millis(1500));
+        let (code, text) = detached_terminal(d.path(), &sock, "d", &format!("{ms} approve"));
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("[1] \"start\""), "{text}");
+        let (code, text) = waiting.join().unwrap();
+        assert_ne!(code, 0, "{text}");
+        assert!(text.contains("was not approved"), "{text}");
+    });
+    let (_, out, _) = run(&["status"], &sock, b"");
+    assert!(out.starts_with("morsec stopped"), "{out}");
 
     // S2: an agent can't run the signed msd's setup to reset keys or the stop flag. Refused before
     // the vault is touched.

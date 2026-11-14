@@ -742,6 +742,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "libc",
+ "ms-approve",
  "ms-connect",
  "ms-core",
  "ms-import",

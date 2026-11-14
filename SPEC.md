@@ -98,7 +98,7 @@ and absent from release builds.
 - `ApprovalPending` → `Approval { pending: Option<PendingApproval> }`;
   `PendingApproval { id, request: ApprovalRequest, requested_unix_ms, expires_unix_ms }`.
 - `ApprovalDecide { id, approve, scope? }` (`scope`: `once` | `session`) → `Ok` or an error.
-- `Status` gains optional `approvals_pending`.
+- `ms status` asks `ApprovalPending` too and shows "1 approval waiting · run ms approve" (no new `Status` field, to keep other loops' code untouched).
 - Responses to requests that wait for approval can take up to the timeout; the CLI waits longer
   than that.
 

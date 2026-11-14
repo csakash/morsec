@@ -190,6 +190,9 @@ impl World {
             .arg("--state-dir")
             .arg(dir.path().join("state"))
             .args(["--proxy-port", &proxy_port.to_string()])
+            // L11: ms scan needs a person's approval. The review in ms (on a pseudo-terminal)
+            // is real; only the Touch ID sheet is stood in for (debug build, memory vault only).
+            .args(["--test-touch-id", "allow"])
             .stdout(Stdio::null())
             .stderr(log);
         base_env(&mut cmd, dir.path(), &home, &sock);
@@ -324,6 +327,13 @@ impl World {
 
     /// Runs `command` (in the repo) detached from this process tree, as the user's own terminal
     /// would. Returns (exit code, stdout + stderr).
+    /// `ms scan` from the user's terminal, approved by typing `o` at its inline review (L11).
+    fn scan_approved(&self) -> (i32, String) {
+        let (code, out) =
+            self.outside("(sleep 2; printf 'o\\n'; sleep 8) | script -q /dev/null ms scan");
+        (code, out.replace("\r\n", "\n"))
+    }
+
     fn outside(&self, command: &str) -> (i32, String) {
         let n = RUNS.fetch_add(1, Ordering::Relaxed);
         let d = self.dir.path();
@@ -558,7 +568,7 @@ fn ms_scan_catches_a_leaky_transcript() {
     .unwrap();
     std::fs::write(sessions.join("rollout-clean.jsonl"), "{\"cmd\":\"ls\"}\n").unwrap();
 
-    let (code, out) = w.outside("ms scan");
+    let (code, out) = w.scan_approved();
     assert_eq!(code, 0, "{out}");
     assert!(
         out.contains("no vault value found in 2 transcript files (3 keys checked)"),
@@ -608,7 +618,7 @@ fn ms_scan_catches_a_leaky_transcript() {
     std::fs::write(&outside, format!("{}\n", stripe.value)).unwrap();
     std::os::unix::fs::symlink(&outside, projects.join("link.jsonl")).unwrap();
 
-    let (code, out) = w.outside("ms scan");
+    let (code, out) = w.scan_approved();
     assert_eq!(code, 3, "{out}");
     // msd resolves its transcript roots (/tmp is a link on macOS).
     let leaky = std::fs::canonicalize(&leaky).unwrap();
