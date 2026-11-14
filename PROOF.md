@@ -11,7 +11,7 @@ See `SPEC.md` for the design decisions (D1–D10).
 
 ## Testing
 
-- **Gate:** `npm run build` (`scripts/check.sh`: fmt, build, clippy `-D warnings`, all tests including the keychain ACL tests, cargo-deny, cargo-audit, supply-chain check, shellcheck, ARI-42 scan, canary security-evals). It passed at 750c552 and again after the review fixes; see `proof/build-morsec.txt`. No keychain dialog blocked it.
+- **Gate:** `npm run build` (`scripts/check.sh`: fmt, build, clippy `-D warnings`, all tests including the keychain ACL tests, cargo-deny, cargo-audit, supply-chain check, shellcheck, ARI-42 scan, canary security-evals). It passed at 6a60e0d, after merging origin/main (afb510d, the cli-scope card rewrite), and earlier at 750c552; see `proof/build-morsec-final.txt` and `proof/build-morsec.txt`. No keychain dialog blocked it.
 - **Changing one argument after approval makes the executor refuse:**
   - `ms-approve` `token::any_change_after_approval_is_refused` covers argv, cwd, key, session pid, session start and agent, plus forged expiry, scope, MAC and another daemon's key.
   - `broker::approve_then_one_argument_changes` covers the person approving and then `verify` with one argument changed.
@@ -30,6 +30,7 @@ See `SPEC.md` for the design decisions (D1–D10).
 - **One prompt at a time:**
   - `broker::one_prompt_at_a_time`: a second request is refused at once.
   - `approvals_ipc_rules`: `Busy` over IPC.
+- **Rate limit (card; L05 S4):** `broker::denied_session_cools_down`: a session refused or timed out waits 10 s. In `agent_e2e` the same agent session asks again right after a denial and is refused at once, with no prompt.
 - **Scopes:**
   - `broker::session_scope_covers_only_the_same_request`.
   - `token::expiry_reuse_and_revocation`: once tokens are single-use, and `ms stop` revokes.
@@ -52,7 +53,14 @@ See `SPEC.md` for the design decisions (D1–D10).
 
 ## Risk
 
-- **Sensitive paths (need a human reviewer):**
+- **Reviews (fresh context, converged):**
+  - Code review, 2 cycles. R1 (important): `ms stop` during an in-flight Touch ID could be overwritten by a late approval. Fixed in 4fa1a6a with a test. R2, R4, R5 and R6 fixed. R3 accepted (message only).
+  - Security review, 2 cycles. S1 (important): `ms approve` and the sheet labelled any request from outside an agent tree as "your terminal", which a detached agent child also is. Fixed in 0984423. S2–S4 fixed.
+  - A last diff-only pass over the merge, the rate limit and the stop re-check found nothing important. F2–F4 fixed. F1 accepted: the stop re-check in `propose` has no test, and a stop landing between that re-check and the save still applies a change a person approved.
+- **Differences from the PLAN card as rewritten by cli-scope** (SPEC.md, "Against the PLAN card"):
+  - The request code is an unkeyed fingerprint of the binding, not derived from the token HMAC, because the token is minted only after Touch ID.
+  - msd doesn't check that the approving `ms` has a controlling terminal. `ms approve` requires `/dev/tty` on the client side.
+- **`gloop risk` lists 22 sensitive paths (need a human reviewer):**
   - `crates/ms-approve/**`: the approver, token, Touch ID and `unsafe` FFI to LocalAuthentication, each block with a SAFETY comment.
   - `crates/msd/src/daemon.rs` and `approve.rs`: approval wiring, stop/start, scan.
   - `crates/ms-ipc/src/protocol.rs`: two new messages, which are additive.
