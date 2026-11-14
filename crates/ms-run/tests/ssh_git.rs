@@ -201,3 +201,70 @@ fn repository_cant_make_the_run_start_a_program() {
     assert!(!marker.exists(), "{out}");
     assert!(out.contains("transport 'ext' not allowed"), "{out}");
 }
+
+// protects=security review S1: a run's child leads its own session, so a process outside it
+// (here a sibling of the run, as a process left behind by another run would be) can't join the
+// run's process group and pass the agent socket's peer check; fails_when=`setpgid` into the
+// run's group succeeds; no_claim=root or a debugger attaching to the child
+#[test]
+fn outsiders_cant_join_a_runs_group() {
+    if !Path::new("/usr/bin/perl").exists() {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let resolver = Resolver::new(vec!["/usr/bin".into(), "/bin".into()], vec![]);
+    let runner = Runner::new(RunnerConfig {
+        resolver,
+        base_env: vec![],
+        max_runtime: Duration::from_secs(30),
+    });
+    let d = tempfile::tempdir().unwrap();
+    let input = RunInput::new(
+        vec!["sh".into(), "-c".into(), "echo $$; sleep 5".into()],
+        d.path().to_path_buf(),
+        vec![],
+    )
+    .unwrap();
+    let call = RunCall {
+        argv: input.argv.iter().map(Into::into).collect(),
+        cwd: d.path().to_path_buf(),
+        session: SessionId {
+            agent: AgentKind::ClaudeCode,
+            pid: 1,
+            started_unix_ms: 1,
+        },
+    };
+    let v = MemoryVault::new();
+    let prepared = runner.plan(&input, &call, &BTreeSet::new(), &v).unwrap();
+    let joined = rt.block_on(async {
+        let (_in_tx, in_rx) = tokio::sync::mpsc::channel(1);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(16);
+        let run = runner.execute(
+            prepared,
+            ms_run::ExecIo {
+                stdin: in_rx,
+                output: out_tx,
+            },
+        );
+        let probe = async {
+            let (_, first) = out_rx.recv().await.unwrap();
+            let pid: i32 = String::from_utf8(first).unwrap().trim().parse().unwrap();
+            let st = Command::new("/usr/bin/perl")
+                .args(["-e", &format!("exit(setpgrp(0, {pid}) ? 0 : 1)")])
+                .status()
+                .unwrap();
+            st.success()
+        };
+        tokio::select! {
+            j = probe => j,
+            _ = run => panic!("the run ended first"),
+        }
+    });
+    assert!(
+        !joined,
+        "a process outside the run joined its process group"
+    );
+}

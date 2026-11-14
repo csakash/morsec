@@ -181,7 +181,10 @@ impl Shared {
         let Some(pid) = cred.pid().and_then(rustix::process::Pid::from_raw) else {
             return false;
         };
+        // The run's child leads its own session (security review S1), so the peer must be in
+        // that session as well as in its group: a process from elsewhere can't join either.
         rustix::process::getpgid(Some(pid)).is_ok_and(|g| g.as_raw_nonzero().get() == pgid)
+            && rustix::process::getsid(Some(pid)).is_ok_and(|s| s.as_raw_nonzero().get() == pgid)
     }
 
     /// Takes a connection on, or refuses it when too many came or the session closed.

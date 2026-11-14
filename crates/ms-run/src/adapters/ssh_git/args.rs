@@ -32,7 +32,9 @@ const SSH_WITH_ARG: &[u8] = b"BbcDEeFIiJLlmOoPpQRSWw";
 const SSH_PLAIN: &[u8] = b"1246AaCfGgKkMNnqsTtVvXxYy";
 /// Flags the caller may not pass: agent forwarding, another config file, a jump host, a control
 /// socket or master, a PKCS#11 provider.
-const SSH_REFUSED: &[u8] = b"AFJSMI";
+/// Also refused (security review S2): going to the background (`-f`) and port, stdio and tunnel
+/// forwarding (`-L -R -D -W -w`), which would outlive the run; another identity file (`-i`).
+const SSH_REFUSED: &[u8] = b"AFJSMIfLRDWwi";
 
 /// Checks the caller's arguments (after `argv[0]`) for `tool`. For ssh, the destination must be
 /// one of `pins` (host and port).
@@ -142,7 +144,7 @@ fn check_ssh(args: &[String], pins: &[HostPin]) -> Result<(), RunError> {
             let f = flags[j];
             if SSH_REFUSED.contains(&f) {
                 return Err(RunError::denied(format!(
-                    "morsec: ssh -{} is refused with a morsec key (agent forwarding, another config file, jump hosts, control sockets and PKCS#11 are off)",
+                    "morsec: ssh -{} is refused with a morsec key (agent forwarding, backgrounding, port forwarding, another config or identity file, jump hosts, control sockets and PKCS#11 are off)",
                     f as char
                 )));
             }
@@ -286,6 +288,9 @@ pub(crate) fn forced_ssh_options(agent: &Path, public: &Path, known_hosts: &Path
         "BatchMode=yes".to_owned(),
         "PasswordAuthentication=no".to_owned(),
         "KbdInteractiveAuthentication=no".to_owned(),
+        "ClearAllForwardings=yes".to_owned(),
+        "ForkAfterAuthentication=no".to_owned(),
+        "EscapeChar=none".to_owned(),
     ] {
         v.push("-o".to_owned());
         v.push(o);
@@ -361,6 +366,13 @@ mod tests {
             &["-S", "/tmp/s", "github.com"],
             &["-I", "/lib.so", "github.com"],
             &["-M", "github.com"],
+            &["-f", "-N", "github.com"],
+            &["-D", "1080", "github.com"],
+            &["-L1:h:2", "github.com"],
+            &["-R", "1:h:2", "github.com"],
+            &["-W", "h:22", "github.com"],
+            &["-w", "0", "github.com"],
+            &["-i", "/Users/me/.ssh/id_ed25519", "github.com"],
             &["-Z", "github.com"],
             &["-o", "HostName=evil.example", "github.com"],
             &["-oPort=2222", "github.com"],

@@ -304,8 +304,10 @@ impl Runner {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
+            .kill_on_drop(true);
+        // Its own session (and process group, id = its PID): nothing outside can join the
+        // group (security review S1, L16).
+        crate::sys::new_session(&mut cmd);
         for (k, v) in &plan.env {
             match v {
                 EnvValue::Plain(s) => cmd.env(k, s),

@@ -48,7 +48,8 @@ destination check.
   (`-----BEGIN OPENSSH PRIVATE KEY-----`). Other formats are refused with a message.
 - For the run, msd serves an SSH agent on a Unix socket in a new 0700 directory under `$TMPDIR`.
   It accepts a connection only from the same user and only from a process in the run's process
-  group (the child and what it starts), waiting up to 1 s for the group to be known. It stops,
+  group and session (the child and what it starts; every run's child starts in a session of its
+  own, so no outside process can join its group), waiting up to 1 s for the group to be known. It stops,
   and the directory is removed, when the run ends (exit, timeout, `ms stop`, client gone).
 - The key is read from the vault for every identities request and every sign request, parsed in
   wiped buffers and dropped right after. It is never written to disk, never put in the child's
@@ -70,9 +71,10 @@ destination check.
   `GlobalKnownHostsFile=/dev/null`, `StrictHostKeyChecking=yes`, `UpdateHostKeys=no`,
   `ForwardAgent=no`, `ProxyCommand=none`, `ProxyJump=none`, `ControlMaster=no`,
   `ControlPath=none`, `PermitLocalCommand=no`, `BatchMode=yes`, `PasswordAuthentication=no`,
-  `KbdInteractiveAuthentication=no`. The public key and pinned-keys files are public data in the
+  `KbdInteractiveAuthentication=no`, `ClearAllForwardings=yes`, `ForkAfterAuthentication=no`,
+  `EscapeChar=none`. The public key and pinned-keys files are public data in the
   run's 0700 directory.
-- Direct `ssh`: the flags `-A -F -J -S -M -I` are refused; `-o` takes only `ServerAliveInterval`,
+- Direct `ssh`: the flags `-A -F -J -S -M -I -f -L -R -D -W -w -i` are refused; `-o` takes only `ServerAliveInterval`,
   `ServerAliveCountMax`, `ConnectTimeout`, `ConnectionAttempts`, `LogLevel`, `RequestTTY`,
   `Compression`, `TCPKeepAlive`, `User`; the destination (with `-p` or `ssh://…:PORT`) must
   match a pinned host. Otherwise refused before anything runs.

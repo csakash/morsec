@@ -34,6 +34,7 @@ pub mod input;
 pub mod redact;
 pub mod resolve;
 pub mod runner;
+mod sys;
 
 pub use error::{RunError, RunErrorKind};
 pub use input::RunInput;
