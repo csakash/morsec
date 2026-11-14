@@ -94,7 +94,8 @@ pending slot, caller checks, rendering and token stay real). It is refused with 
 and refused at startup in release builds (`cfg!(debug_assertions)`).
 
 **D11 — rate limit (added after the `cli-scope` card rewrite).** After a denial or timeout, the
-same session is refused at once for 10 s (no new prompt), on top of D3's one-at-a-time.
+same session is refused at once for 10 s (no new prompt), on top of D3's one-at-a-time. Residual: a
+detached process is its own session (fresh PID), so it gets a fresh cooldown; D3 still holds.
 
 ## Against the PLAN card as rewritten by `cli-scope` (merged afb510d)
 

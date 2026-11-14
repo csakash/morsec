@@ -230,10 +230,14 @@ fn kill_switch_and_approvals_end_to_end() {
     // even typing into its own pseudo-terminal; the person denies it in ms approve.
     std::thread::scope(|sc| {
         let waiting = sc.spawn(|| {
+            // The second ask, from the same agent session right after the refusal, tests the
+            // rate limit (SPEC D11): refused at once, without a prompt.
             in_agent(
                 d.path(),
                 &sock,
-                &format!("{ms} rules stripe/test --add-host api.stripe.com --at-terminal"),
+                &format!(
+                    "{ms} rules stripe/test --add-host api.stripe.com --at-terminal; s=$(date +%s); {ms} rules stripe/test --add-host api.stripe.com; echo \"rc=$? took=$(( $(date +%s) - s ))\""
+                ),
             )
         });
         std::thread::sleep(Duration::from_millis(1500));
@@ -251,10 +255,17 @@ fn kill_switch_and_approvals_end_to_end() {
             "the person sees the rule: {text}"
         );
         assert!(text.contains("denied"), "{text}");
-        let (code, text) = waiting.join().unwrap();
-        assert_ne!(code, 0, "{text}");
+        let (_, text) = waiting.join().unwrap();
         assert!(text.contains("was not approved"), "{text}");
+        assert!(text.contains("within 10s of a refusal"), "{text}");
+        assert!(
+            text.contains("rc=1 took=0") || text.contains("rc=1 took=1"),
+            "{text}"
+        );
     });
+    // When these tests run inside an agent, every fake-agent call shares that session, so let its
+    // cooldown run out before the agent asks again below.
+    let denied_at = Instant::now();
     assert!(!receipts_text(&sock).contains("rules change (loosen)"));
 
     // From the user's own terminal: reviewed inline, approved with `o` and Touch ID, applied.
@@ -306,6 +317,8 @@ fn kill_switch_and_approvals_end_to_end() {
         out.starts_with("morsec stopped · 1 secret protected"),
         "{out}"
     );
+    // Let the agent session's cooldown (from the refusals above) run out.
+    std::thread::sleep(Duration::from_secs(11).saturating_sub(denied_at.elapsed()));
     std::thread::scope(|sc| {
         let waiting = sc.spawn(|| in_agent(d.path(), &sock, &format!("{ms} start")));
         std::thread::sleep(Duration::from_millis(1500));

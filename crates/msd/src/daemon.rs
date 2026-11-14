@@ -381,7 +381,8 @@ impl Daemon {
             ApprovalOutcome::Denied => Err(reply_err(
                 ErrorCode::NeedsApproval,
                 format!(
-                    "morsec: {what} was not approved (denied in ms approve, Touch ID did not confirm, ms stop ran, or this session asked again within 10s of a refusal)"
+                    "morsec: {what} was not approved (denied in ms approve, Touch ID did not confirm, ms stop ran, or this session asked again within {}s of a refusal)",
+                    ms_approve::broker::COOLDOWN.as_secs()
                 ),
             )),
             ApprovalOutcome::TimedOut => Err(reply_err(
