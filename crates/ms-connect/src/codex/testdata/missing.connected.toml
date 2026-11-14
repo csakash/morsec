@@ -1,0 +1,15 @@
+[shell_environment_policy.set]
+MORSEC_CONNECTED = "codex"
+HTTPS_PROXY = "http://127.0.0.1:4401"
+HTTP_PROXY = "http://127.0.0.1:4401"
+https_proxy = "http://127.0.0.1:4401"
+http_proxy = "http://127.0.0.1:4401"
+SSL_CERT_FILE = "$HOME/.morsec/codex-ca-bundle.pem"
+REQUESTS_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
+CURL_CA_BUNDLE = "$HOME/.morsec/codex-ca-bundle.pem"
+NODE_EXTRA_CA_CERTS = "$HOME/.morsec/codex-ca-bundle.pem"
+STRIPE_API_KEY = "ms://stripe/test"
+
+[mcp_servers.ms]
+command = "/usr/bin/env"
+args = ["-i", "HOME=$HOME", "PATH=/usr/bin:/bin", "/opt/homebrew/bin/ms", "mcp"]

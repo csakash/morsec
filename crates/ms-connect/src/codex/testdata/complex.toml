@@ -1,0 +1,34 @@
+# Codex config — hand edited, keep my comments.
+model = "o3"   # trailing comment
+shell_environment_policy.inherit = "core"
+shell_environment_policy.set.EDITOR_HINT = 'vim'
+shell_environment_policy.set.SSL_CERT_FILE = "/etc/corp/ca.pem"
+
+[notice]
+hide_full_access_warning = true
+
+# Servers
+[mcp_servers.linear]
+url = "https://mcp.linear.app/sse"
+bearer_token_env_var = "LINEAR_TOKEN"
+
+[mcp_servers.pg]
+command = "/usr/local/bin/pg-mcp"
+args = [
+  "--readonly",   # important
+  "--db", "app",
+]
+
+[mcp_servers.pg.env]
+PGPASSWORD = "CANARY-pg-password"
+PGHOST = "localhost"
+
+[profiles.fast]
+model = "gpt-5-mini"
+
+[[skills.config]]
+name = "a"
+enabled = true
+
+[[skills.config]]
+name = "b"

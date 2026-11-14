@@ -76,6 +76,7 @@ pub trait Connector: Send + Sync {
 }
 
 pub mod claude;
+pub mod codex;
 
 /// Fake connector for tests.
 pub mod fake {
