@@ -128,6 +128,7 @@ fn disable(rule: &mut KeyRule) {
     rule.hosts.clear();
     rule.commands.clear();
     rule.mint_scopes.clear();
+    rule.git_hosts.clear();
 }
 
 /// Applies project restrictions to the user rules. Never widens: a request the result allows,
@@ -162,6 +163,12 @@ pub fn merge(user: &Rules, project: &ProjectRules) -> Rules {
         }
         if let Some(h) = &limit.hosts {
             rule.hosts = intersect_sets(&rule.hosts, h, HostPattern::intersect);
+            let hosts = &rule.hosts;
+            rule.git_hosts.retain(|g| {
+                hosts
+                    .iter()
+                    .any(|p| matches!(p, HostPattern::Exact(e) if e == g))
+            });
         }
         if let Some(c) = &limit.commands {
             rule.commands = intersect_sets(&rule.commands, c, CommandPattern::intersect);
@@ -336,6 +343,43 @@ hosts = ["*.com"]
         assert_eq!(m, user);
     }
 
+    // protects=L30 D1 a project can't add git hosts, narrowing hosts drops them and disabling
+    // clears them; fails_when=a project file with git_hosts parses, or a git host survives without
+    // its host; no_claim=the proxy bindings (msd)
+    #[test]
+    fn projects_cant_widen_git_hosts() {
+        let user = Rules::from_toml(
+            "version = 1\n[keys.\"gh/t\"]\nmode = \"swap\"\ntier = \"test\"\nhosts = [\"api.github.com\", \"github.com\", \"git.example.com\"]\ngit_hosts = [\"github.com\", \"git.example.com\"]",
+            "rules.toml",
+        )
+        .unwrap();
+        let (m, err) = effective(
+            &user,
+            Some("[keys.\"gh/t\"]\ngit_hosts = [\"evil.net\"]"),
+            ".morsec.toml",
+        );
+        assert!(err.is_some());
+        assert!(
+            m.keys
+                .values()
+                .all(|r| r.allows_nothing() && r.git_hosts.is_empty())
+        );
+        let (m, err) = effective(
+            &user,
+            Some("[keys.\"gh/t\"]\nhosts = [\"api.github.com\", \"*.example.com\"]"),
+            ".morsec.toml",
+        );
+        assert!(err.is_none());
+        let r = &m.keys[&k("gh/t")];
+        assert_eq!(r.git_hosts, ["git.example.com"]);
+        let (m, _) = effective(
+            &user,
+            Some("[keys.\"gh/t\"]\ndisabled = true"),
+            ".morsec.toml",
+        );
+        assert!(m.keys[&k("gh/t")].git_hosts.is_empty());
+    }
+
     fn arb_mode() -> impl Strategy<Value = Mode> {
         prop::sample::select(vec![Mode::Swap, Mode::Run, Mode::Mint])
     }
@@ -373,6 +417,7 @@ hosts = ["*.com"]
                 mint_scopes: if mode == Mode::Mint { scopes } else { vec![] },
                 session_ttl_secs: ttl,
                 read_only: ro,
+                git_hosts: vec![],
                 roots: if mode == Mode::Run {
                     vec!["/r/app".into()]
                 } else {

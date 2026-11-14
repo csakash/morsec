@@ -18,11 +18,15 @@ mod idle;
 mod rewrite;
 mod server;
 pub mod ssrf;
+#[cfg(any(test, debug_assertions))]
+pub mod test_upstreams;
 mod tls;
 mod upstream;
 
 #[cfg(test)]
 mod itests;
+#[cfg(test)]
+mod itests_git;
 
 pub use ca::Ca;
 pub use config::{BasicField, Binding, Limits, Location, ProxyConfig, UpstreamRoots};

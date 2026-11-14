@@ -46,6 +46,13 @@ pub struct RulesArgs {
     /// Propose removing a host.
     #[arg(long, value_name = "HOST")]
     remove_host: Vec<String>,
+    /// Propose sending a swap key to a git host over HTTPS (github.com): adds the host, and on it
+    /// the key goes in the Basic-auth password, where git sends a token.
+    #[arg(long, value_name = "HOST")]
+    add_git_host: Vec<String>,
+    /// Stop treating a host as a git host (the host itself stays; see --remove-host).
+    #[arg(long, value_name = "HOST")]
+    remove_git_host: Vec<String>,
     /// Propose adding a command, as a JSON array: '["psql", "-c", "*"]'.
     #[arg(long, value_name = "JSON")]
     add_command: Vec<String>,
@@ -86,6 +93,8 @@ impl RulesArgs {
     fn has_changes(&self) -> bool {
         !self.add_host.is_empty()
             || !self.remove_host.is_empty()
+            || !self.add_git_host.is_empty()
+            || !self.remove_git_host.is_empty()
             || !self.add_command.is_empty()
             || !self.remove_command.is_empty()
             || !self.add_root.is_empty()
@@ -379,9 +388,39 @@ pub fn run(a: RulesArgs) -> ExitCode {
             );
             return ExitCode::from(EXIT_USAGE);
         }
-        return propose(&name, &user, proposed, a.at_terminal);
+        let new_git: Vec<String> = proposed
+            .git_hosts
+            .iter()
+            .filter(|g| !current.git_hosts.contains(g))
+            .cloned()
+            .collect();
+        let code = propose(&name, &user, proposed, a.at_terminal);
+        if code == ExitCode::SUCCESS {
+            for h in &new_git {
+                for line in git_recipe(&name, h) {
+                    out(&line);
+                }
+            }
+        }
+        return code;
     }
     ExitCode::SUCCESS
+}
+
+/// How to make git send the placeholder to a git host (SPEC D4). The helper prints only
+/// `ms://<key>`; the empty entry first stops a global helper (the keychain) from sending, and
+/// after a 401 erasing, the person's own credentials.
+fn git_recipe(name: &KeyName, host: &str) -> Vec<String> {
+    vec![
+        String::new(),
+        format!("to use {name} with git over https://{host}, in the repository:"),
+        format!("  git config credential.https://{host}.helper ''"),
+        format!(
+            "  git config --add credential.https://{host}.helper '!f() {{ echo username=x-access-token; echo password=ms://{name}; }}; f'"
+        ),
+        "git then sends only the placeholder; morsec's proxy puts the token in on the way out."
+            .into(),
+    ]
 }
 
 fn check(file: &Path) -> ExitCode {
@@ -484,6 +523,9 @@ fn show(name: &KeyName, r: &KeyRule) {
     if r.mode == ms_core::Mode::Swap || !r.hosts.is_empty() {
         list("hosts", r.hosts.iter().map(ToString::to_string).collect());
     }
+    if !r.git_hosts.is_empty() {
+        list("git hosts", r.git_hosts.clone());
+    }
     out(&format!("  ttl        {} s", r.session_ttl_secs));
     out(&format!(
         "  read-only  {}",
@@ -527,6 +569,34 @@ fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRu
     for h in &a.remove_host {
         let p = HostPattern::parse(h).map_err(|e| format!("morsec: {e}"))?;
         r.hosts.retain(|x| *x != p);
+        r.git_hosts.retain(|g| HostPattern::Exact(g.clone()) != p);
+    }
+    let removed: Vec<HostPattern> = a
+        .remove_host
+        .iter()
+        .chain(&a.remove_git_host)
+        .filter_map(|h| HostPattern::parse(h).ok())
+        .collect();
+    for h in &a.add_git_host {
+        let p = HostPattern::parse(h).map_err(|e| format!("morsec: {e}"))?;
+        let HostPattern::Exact(name) = &p else {
+            return Err(format!(
+                "morsec: a git host is one exact name such as github.com, not {h:?}"
+            ));
+        };
+        if removed.contains(&p) {
+            return Err(format!(
+                "morsec: {name} is both added and removed; say one or the other"
+            ));
+        }
+        if !r.hosts.contains(&p) {
+            r.hosts.push(p.clone());
+        }
+        r.git_hosts.push(name.clone());
+    }
+    for h in &a.remove_git_host {
+        let p = HostPattern::parse(h).map_err(|e| format!("morsec: {e}"))?;
+        r.git_hosts.retain(|g| HostPattern::Exact(g.clone()) != p);
     }
     for c in &a.add_command {
         r.commands.push(parse_command(c)?);
@@ -598,5 +668,57 @@ mod tests {
         std::fs::create_dir(&loose).unwrap();
         std::fs::write(loose.join(PROJECT_FILE), "").unwrap();
         assert_eq!(find_project_file(&loose), None);
+    }
+
+    fn edit(current: &KeyRule, args: &[&str]) -> Result<KeyRule, String> {
+        #[derive(clap::Parser)]
+        struct W {
+            #[command(flatten)]
+            a: RulesArgs,
+        }
+        let mut argv = vec!["ms", "gh/t"];
+        argv.extend_from_slice(args);
+        let w = <W as clap::Parser>::try_parse_from(argv).map_err(|e| e.to_string())?;
+        apply_edits(&KeyName::new("gh/t").unwrap(), current, &w.a)
+    }
+
+    // protects=L30 D1 CLI edits (review findings 3 and 4): --add-git-host adds the parsed
+    // host to both lists, --remove-host drops it from both, --remove-git-host keeps the host,
+    // and adding and removing one host at once is refused; fails_when=the raw spelling is stored,
+    // a removal is ignored, or a conflicting pair is applied in either order; no_claim=msd's
+    // approval of the change (msd tests)
+    #[test]
+    fn git_host_edits() {
+        let base = KeyRule::new(ms_core::Mode::Swap, Tier::Test);
+        // Same parser as --add-host: other spellings are refused, never stored raw.
+        for odd in ["GitHub.com", "github.com.", "*.github.com", "10.0.0.1"] {
+            assert!(edit(&base, &["--add-git-host", odd]).is_err(), "{odd}");
+        }
+        let r = edit(&base, &["--add-git-host", "github.com"]).unwrap();
+        assert_eq!(r.git_hosts, ["github.com"]);
+        assert_eq!(r.hosts, [HostPattern::parse("github.com").unwrap()]);
+        let gone = edit(&r, &["--remove-host", "github.com"]).unwrap();
+        assert!(gone.hosts.is_empty() && gone.git_hosts.is_empty());
+        let plain = edit(&r, &["--remove-git-host", "github.com"]).unwrap();
+        assert!(plain.git_hosts.is_empty());
+        assert_eq!(plain.hosts, r.hosts);
+        for conflict in [
+            &[
+                "--add-git-host",
+                "github.com",
+                "--remove-host",
+                "github.com",
+            ][..],
+            &[
+                "--add-git-host",
+                "github.com",
+                "--remove-git-host",
+                "github.com",
+            ][..],
+        ] {
+            assert!(edit(&base, conflict).is_err(), "{conflict:?}");
+        }
+        let run = KeyRule::new(ms_core::Mode::Run, Tier::Test);
+        assert!(edit(&run, &["--add-git-host", "github.com"]).is_err());
     }
 }
