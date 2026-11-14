@@ -26,6 +26,7 @@ ms-approve = { workspace = true, features = ["touch-id"] }
 ms-import = { workspace = true }
 ms-scan = { workspace = true }
 ms-run = { workspace = true }
+ms-mcp = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

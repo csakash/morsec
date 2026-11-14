@@ -634,11 +634,12 @@ fn shim_check(
     items
 }
 
-/// `ms mcp` tool hashes (MCP-2). L14 (`ms mcp`) is not built yet, so there is nothing to hash;
-/// this is the hook L14 fills in: compare each tool description's hash with the one shipped.
+/// `ms mcp` tool hashes (MCP-2). `ms mcp` (L14) is built, but doctor does not compare a running
+/// server's catalog hash (`tools/list` `_meta["dev.morsec/catalog"]`) with
+/// `ms_mcp::Catalog::from_rules` on the live rules yet; until it does, say so as info.
 fn mcp_checks() -> Vec<Item> {
     vec![Item::info(
-        "ms mcp not installed (tool hashes are checked once it ships, L14)",
+        "ms mcp tool catalog hash not checked yet (MCP-2; `ms mcp --catalog` prints it)",
     )]
 }
 
@@ -1523,14 +1524,16 @@ mod tests {
         assert_eq!(items[0].mark, Mark::Info);
     }
 
-    // protects=MCP hook: until L14 ships, ms mcp is reported as not installed, as info that never
-    // fails doctor; fails_when=it is a problem or a pass; no_claim=tool hashes (L14)
+    // protects=MCP hook: until doctor compares the catalog hash, ms mcp is reported as not
+    // checked, as info that never fails doctor; fails_when=it is a problem or a pass, or claims
+    // ms mcp is not installed; no_claim=the hash comparison (MCP-2)
     #[test]
-    fn mcp_not_installed_is_info() {
+    fn mcp_hash_not_checked_is_info() {
         let m = mcp_checks();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].mark, Mark::Info);
-        assert!(m[0].text.contains("not installed"));
+        assert!(m[0].text.contains("not checked yet"));
+        assert!(!m[0].text.contains("not installed"));
     }
 
     #[test]

@@ -82,6 +82,7 @@ impl Daemon {
         argv: Vec<String>,
         cwd: PathBuf,
         env: Vec<RunEnv>,
+        via: Option<&str>,
     ) -> Result<(Prepared, SessionId), ResponseBody> {
         let caller = self.caller(peer).ok_or_else(|| {
             reply_err(
@@ -129,11 +130,15 @@ impl Daemon {
             .filter(|(_, v)| carries_run_ref(v))
             .map(|(n, _)| n.as_str())
             .collect();
-        let target = if env_names.is_empty() {
+        let mut target = if env_names.is_empty() {
             target_of(&input.argv)
         } else {
             format!("{} [env {}]", target_of(&input.argv), env_names.join(","))
         };
+        // Where the call came from (`mcp:<tool>`, L14); built by msd, never agent text.
+        if let Some(v) = via {
+            target = format!("{v} {target}");
+        }
         let hash = ms_rules::argv_hash(&input.argv);
         let refuse = |key: &KeyName, result: ReceiptResult, reply: ResponseBody| {
             if let Err(e) = self.record_run(&session, key, &target, hash, version, result, None) {
@@ -392,11 +397,12 @@ pub(crate) fn run_buffered(
     argv: Vec<String>,
     cwd: PathBuf,
     env: Vec<RunEnv>,
+    via: Option<&str>,
 ) -> ResponseBody {
     let Ok(_permit) = RUNS.try_acquire() else {
         return busy();
     };
-    let (prepared, session) = match d.prepare_run(peer, argv, cwd, env) {
+    let (prepared, session) = match d.prepare_run(peer, argv, cwd, env, via) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -436,18 +442,21 @@ pub(crate) async fn run_stream(
         return busy();
     };
     let d2 = d.clone();
-    let (prepared, session) =
-        match tokio::task::spawn_blocking(move || d2.prepare_run(&peer, argv, cwd, env)).await {
-            Ok(Ok(p)) => p,
-            Ok(Err(r)) => return r,
-            Err(e) => {
-                tracing::error!(error = %e, "run handler failed");
-                return reply_err(
-                    ErrorCode::Internal,
-                    "morsec: the daemon failed handling this run",
-                );
-            }
-        };
+    let (prepared, session) = match tokio::task::spawn_blocking(move || {
+        d2.prepare_run(&peer, argv, cwd, env, None)
+    })
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(r)) => return r,
+        Err(e) => {
+            tracing::error!(error = %e, "run handler failed");
+            return reply_err(
+                ErrorCode::Internal,
+                "morsec: the daemon failed handling this run",
+            );
+        }
+    };
     let StreamIo { input, output } = io;
     // Only now may the client read its stdin: a refusal above leaves it untouched.
     if output.send(ResponseBody::RunStarted).await.is_err() {
@@ -579,7 +588,7 @@ fn read_project(p: &Path) -> std::io::Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     // protects=a project file can't widen and an unreadable one fails closed; the walk stops at
@@ -626,11 +635,11 @@ mod tests {
     use ms_vault::memory::MemoryVault;
     use std::sync::Mutex;
 
-    const VALUE: &str = "pk_live_RUNMSD_canary_93a1";
+    pub(crate) const VALUE: &str = "pk_live_RUNMSD_canary_93a1";
     /// The PID the person answering approvals connects from (outside every agent tree).
     const PERSON_PID: i32 = 7001;
 
-    fn peer() -> PeerInfo {
+    pub(crate) fn peer() -> PeerInfo {
         PeerInfo {
             uid: 501,
             gid: 20,
@@ -647,7 +656,7 @@ mod tests {
     }
 
     /// Answers the next pending approval as the person (`ms approve`), approving or denying.
-    fn answer(
+    pub(crate) fn answer(
         d: &Arc<Daemon>,
         approve: bool,
         expect_argv: Option<&'static [&'static str]>,
@@ -740,13 +749,13 @@ mod tests {
 
     /// A daemon with one test-tier run key `svc/test` (value VALUE) under `rule_body`, roots =
     /// `<tmp>/proj`; the caller is an agent session.
-    fn test_daemon(rule_body: &str) -> (Arc<Daemon>, tempfile::TempDir, PathBuf) {
+    pub(crate) fn test_daemon(rule_body: &str) -> (Arc<Daemon>, tempfile::TempDir, PathBuf) {
         test_daemon_with(Tier::Test, rule_body, FakeAuthenticator::approve())
     }
 
     /// Like [`test_daemon`], with the key's tier and the Touch ID stand-in chosen. The person
     /// answering approvals connects from PERSON_PID.
-    fn test_daemon_with(
+    pub(crate) fn test_daemon_with(
         tier: Tier,
         rule_body: &str,
         auth: FakeAuthenticator,
@@ -864,7 +873,7 @@ mod tests {
         })
     }
 
-    fn rt() -> tokio::runtime::Runtime {
+    pub(crate) fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

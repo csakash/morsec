@@ -1,6 +1,6 @@
 [package]
 name = "ms-mcp"
-description = "MCP server exposing run capabilities as tools (built in L14)."
+description = "MCP server exposing run capabilities as typed tools generated from the rules (L14)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,4 +11,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+ms-core = { workspace = true }
+ms-ipc = { workspace = true }
+ms-rules = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+# Already in the lockfile (tracing-subscriber's env-filter); used for the schema `pattern` keyword.
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 
+[dev-dependencies]
+tokio = { workspace = true }
