@@ -498,9 +498,10 @@ mod tests {
         );
     }
 
-    // protects=review R1: ms stop while Touch ID is up wins: the waiting request is denied, the
-    // late Touch ID approves nothing and leaves no session grant; fails_when=a token or grant is
-    // issued after revoke_all; no_claim=-
+    // protects=review R1 (epoch path): ms stop while Touch ID is up wins: the waiting request is
+    // denied, the late Touch ID reports Ended, approves nothing and leaves no session grant;
+    // fails_when=a token or grant is issued after revoke_all; no_claim=the narrower interleaving
+    // where the asker has not yet woken (also refused by the epoch check, not reproduced here)
     #[test]
     fn stop_during_touch_id_approves_nothing() {
         let (a, _) = approver(FakeAuthenticator::approve().after(Duration::from_millis(300)));
