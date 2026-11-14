@@ -691,9 +691,16 @@ async fn serve_stream<H: Handler>(
                     ready = rd.ready(tokio::io::Interest::READABLE) => {
                         match ready {
                             Ok(r) if !r.is_read_closed() => {
-                                // More frames are waiting behind this one; check again shortly.
-                                tokio::time::sleep(STDIN_POLL).await;
-                                event = Some(e);
+                                // More frames wait behind this one. Hand it over the moment a
+                                // slot frees; otherwise look for a hang-up again shortly.
+                                tokio::select! {
+                                    permit = in_tx.reserve() => {
+                                        if let Ok(p) = permit {
+                                            p.send(e);
+                                        }
+                                    }
+                                    () = tokio::time::sleep(STDIN_POLL) => event = Some(e),
+                                }
                             }
                             _ => return,
                         }

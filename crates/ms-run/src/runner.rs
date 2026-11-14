@@ -39,7 +39,8 @@ use crate::{EffectPreview, EnvValue, ExecPlan, RunAdapter, RunCall};
 
 /// Longest a run may take by default; the IPC connection lifetime (10 min) is the outer bound.
 pub const DEFAULT_MAX_RUNTIME: Duration = Duration::from_secs(590);
-/// How long output may still drain after the child exited and its group was killed.
+/// How long a read of the child's output may wait once the child exited and its group was killed
+/// (time spent sending output to a slow client is not counted).
 pub const EXIT_GRACE: Duration = Duration::from_secs(2);
 /// Bytes read from the child's output per step.
 pub const OUTPUT_CHUNK: usize = 32 * 1024;
@@ -314,37 +315,33 @@ impl Runner {
             drop(w);
             std::future::pending::<()>().await
         };
-        let out = pump(stdout, OutStream::Stdout, patterns.clone(), output.clone());
-        let err = pump(stderr, OutStream::Stderr, patterns, output.clone());
+        // Set once the child exited and its group was killed. From then on a pump waits at most
+        // EXIT_GRACE for each read: a descendant that left the group (setsid) may hold the pipes
+        // open. Time a pump spends handing output to a slow client doesn't count.
+        let (exited_tx, exited_rx) = tokio::sync::watch::channel(false);
+        let out = pump(
+            stdout,
+            OutStream::Stdout,
+            patterns.clone(),
+            output.clone(),
+            exited_rx.clone(),
+        );
+        let err = pump(
+            stderr,
+            OutStream::Stderr,
+            patterns,
+            output.clone(),
+            exited_rx,
+        );
         let waited = async {
             let status = child.wait().await;
             // Background processes the command left behind would keep its environment (and
             // the value) alive, and keep the output pipes open.
             group.kill();
+            let _ = exited_tx.send(true);
             status
         };
-        let all = async {
-            let pumps = async { tokio::join!(out, err) };
-            tokio::pin!(pumps);
-            tokio::pin!(waited);
-            let mut status = None;
-            loop {
-                tokio::select! {
-                    s = &mut waited, if status.is_none() => status = Some(s),
-                    _ = &mut pumps => break,
-                }
-                if status.is_some() {
-                    // The child is gone and its group killed. A descendant that left the group
-                    // (setsid) may still hold the pipes: don't wait for it past a short grace.
-                    let _ = tokio::time::timeout(EXIT_GRACE, &mut pumps).await;
-                    break;
-                }
-            }
-            match status {
-                Some(s) => s,
-                None => waited.await,
-            }
-        };
+        let all = async { tokio::join!(waited, out, err).0 };
         let finished = tokio::time::timeout(self.cfg.max_runtime, async {
             tokio::select! {
                 r = all => r,
@@ -442,19 +439,37 @@ fn substitute(raw: &str, values: &BTreeMap<KeyName, Zeroizing<Vec<u8>>>) -> EnvV
     EnvValue::Secret(SecretBytes::new(std::mem::take(&mut *out)))
 }
 
-/// Reads one output stream through a redactor into `tx`. Stops when the stream ends or the
-/// receiver is gone.
+/// Reads one output stream through a redactor into `tx`. Stops when the stream ends, the
+/// receiver is gone, or (after the child exited) no byte arrives within [`EXIT_GRACE`]; in that
+/// last case a note on stderr says the output was cut.
 async fn pump<R: AsyncRead + Unpin>(
     reader: Option<R>,
     stream: OutStream,
     patterns: Arc<Patterns>,
     tx: mpsc::Sender<(OutStream, Vec<u8>)>,
+    mut exited: tokio::sync::watch::Receiver<bool>,
 ) {
     let Some(mut reader) = reader else { return };
     let mut red = StreamRedactor::new(patterns);
     let mut buf = Zeroizing::new(vec![0u8; OUTPUT_CHUNK]);
+    let mut cut = false;
     loop {
-        let n = match reader.read(&mut buf[..]).await {
+        let read = if *exited.borrow() {
+            match tokio::time::timeout(EXIT_GRACE, reader.read(&mut buf[..])).await {
+                Ok(r) => r,
+                Err(_) => {
+                    cut = true;
+                    break;
+                }
+            }
+        } else {
+            // `read` is cancel-safe: if the child exits first, nothing read is lost.
+            tokio::select! {
+                r = reader.read(&mut buf[..]) => r,
+                _ = exited.changed() => continue,
+            }
+        };
+        let n = match read {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
@@ -464,8 +479,12 @@ async fn pump<R: AsyncRead + Unpin>(
         }
     }
     let out = red.finish();
-    if !out.is_empty() {
-        let _ = tx.send((stream, out)).await;
+    if !out.is_empty() && tx.send((stream, out)).await.is_err() {
+        return;
+    }
+    if cut {
+        let note = "\nmorsec: output cut: the command exited but a process it started kept its output open\n";
+        let _ = tx.send((OutStream::Stderr, note.as_bytes().to_vec())).await;
     }
 }
 

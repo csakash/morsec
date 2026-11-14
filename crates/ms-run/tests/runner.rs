@@ -402,3 +402,44 @@ async fn escaped_descendant_does_not_stall() {
         started.elapsed()
     );
 }
+
+// protects=R3 round 2: a slow client (output not read for longer than the exit grace) still gets
+// every byte after the command exited; fails_when=output is cut or the note appears;
+// no_claim=-
+#[tokio::test]
+async fn slow_reader_gets_all_output() {
+    let r = runner(Duration::from_secs(60));
+    let cwd = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    let inp = input(
+        &["sh", "-c", "head -c 50000 /dev/zero | tr '\\0' x; exit 4"],
+        &[],
+        &cwd,
+    );
+    let call = Runner::call(&inp, cwd, session());
+    let prepared = r.plan(&inp, &call, &BTreeSet::new(), &vault()).unwrap();
+    let (_in_tx, in_rx) = mpsc::channel(1);
+    let (out_tx, mut out_rx) = mpsc::channel::<(OutStream, Vec<u8>)>(1);
+    let collect = async move {
+        tokio::time::sleep(ms_run::runner::EXIT_GRACE + Duration::from_secs(1)).await;
+        let (mut o, mut e) = (0usize, Vec::new());
+        while let Some((s, b)) = out_rx.recv().await {
+            if s == OutStream::Stdout {
+                o += b.iter().filter(|c| **c == b'x').count();
+            } else {
+                e.extend(b);
+            }
+        }
+        (o, e)
+    };
+    let exec = r.execute(
+        prepared,
+        ExecIo {
+            stdin: in_rx,
+            output: out_tx,
+        },
+    );
+    let (exit, (o, e)) = tokio::join!(exec, collect);
+    assert_eq!(exit.unwrap().code, Some(4));
+    assert_eq!(o, 50_000);
+    assert!(!String::from_utf8_lossy(&e).contains("output cut"));
+}

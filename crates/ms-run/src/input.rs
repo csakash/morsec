@@ -46,7 +46,15 @@ const DENIED_ENV: &[&str] = &[
     "JDK_JAVA_OPTIONS",
     "GCONV_PATH",
     "TMPDIR",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "BROWSER",
+    "LESSOPEN",
+    "LESSCLOSE",
 ];
+/// Suffixes of variables tools run as commands (`PSQL_PAGER`, `SSH_ASKPASS`, `GIT_EDITOR`…).
+const DENIED_ENV_SUFFIXES: &[&str] = &["_PAGER", "_EDITOR", "_ASKPASS", "_BROWSER"];
 const DENIED_ENV_PREFIXES: &[&str] = &[
     "LD_",
     "DYLD_",
@@ -168,6 +176,7 @@ pub fn env_name_allowed(name: &str) -> bool {
         && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
         && !DENIED_ENV.contains(&name)
         && !DENIED_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+        && !DENIED_ENV_SUFFIXES.iter().any(|x| name.ends_with(x))
 }
 
 fn check_env(env: &[(String, String)]) -> Result<(), RunError> {
@@ -266,6 +275,14 @@ mod tests {
             "RUBYOPT",
             "GIT_SSH_COMMAND",
             "JAVA_TOOL_OPTIONS",
+            "VISUAL",
+            "EDITOR",
+            "PAGER",
+            "PSQL_PAGER",
+            "SSH_ASKPASS",
+            "SUDO_ASKPASS",
+            "LESSOPEN",
+            "BROWSER",
             "1X",
             "A-B",
             "",

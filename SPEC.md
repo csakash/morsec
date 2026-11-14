@@ -6,7 +6,7 @@ Card: `docs/PLAN.md` § "L12 `run-core`". Depends on L07 (merged). Owns `crates/
 
 | File | Change |
 |---|---|
-| `crates/ms-ipc/src/protocol.rs` | optional `env` on `Run`; new `RunStream`, `RunInput`, `RunInputEnd` requests; `RunOutput`, `RunExit`, `RunResult` replies; error code `not_run` |
+| `crates/ms-ipc/src/protocol.rs` | optional `env` on `Run`; new `RunStream`, `RunInput`, `RunInputEnd` requests; `RunStarted`, `RunOutput`, `RunExit`, `RunResult` replies; error code `not_run` |
 | `crates/ms-ipc/src/server.rs` | `Handler::handle_stream` (default: not implemented) and the stream pump for `RunStream` |
 | `crates/ms-ipc/src/client.rs` | `Client::run_stream` |
 | `crates/ms-rules/src/{model,change}.rs` | per-key `roots` (run keys only); adding a root is loosening |
@@ -38,7 +38,9 @@ encoding of the value redacted. Without a ref, nothing about the command changes
 ## Decisions (made in this loop; flagged for the orchestrator)
 
 - **D1 — streaming over the socket.** `RunStream {argv, cwd, env}` opens a stream on its own
-  connection: the client sends `RunInput {data}` frames (stdin) and `RunInputEnd`; msd sends
+  connection. msd answers either one `Error` (refused, `not_run`, busy…) or `RunStarted`; only
+  after `RunStarted` does the client send `RunInput {data}` frames (stdin) and `RunInputEnd`, so
+  a refusal never consumes the caller's stdin (amended in build, review R1). msd then sends
   `RunOutput {stream, data}` frames and ends with one `RunExit {code, signal}` (or an `Error`),
   then closes the connection. Bytes travel base64 in the JSON body (frames stay JSON; chunks
   ≤ 32 KiB). A client that disconnects cancels the run: msd kills the child's process group.
