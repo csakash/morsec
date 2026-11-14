@@ -71,3 +71,23 @@ otherwise disconnect removes morsec's own keys by content and keeps everything e
 `codex mcp list [--json]`, `codex mcp get <id> [--json]`, `codex features list`,
 `codex sandbox -- <cmd>`, all with `-c key=value`. **Note:** `codex mcp list --json` prints MCP
 `env` values in clear (the table output masks them), so tests never log it with real values.
+
+## Live check of what `ms connect codex` writes (codex-cli 0.162.1)
+
+`MORSEC_LIVE_CODEX=1 cargo test -p ms-connect --test live_codex` (opt-in; no sign-in, no model
+call; throwaway HOME and CODEX_HOME). For the missing, typical, complex and no-final-newline
+inputs, after connect:
+
+- `codex --strict-config` loads the file without "unknown configuration field" (the flag is
+  only accepted by the bare `codex` command; with no terminal it then stops with "stdin is not a
+  terminal", which is the pass case). Negative control: an unknown key is reported.
+- `codex mcp get ms --json` reads the `ms` server as `/usr/bin/env -i …`, and the server given
+  `--mcp-env` shows the reference and the proxy variable.
+- `codex sandbox -c sandbox_mode="workspace-write" -- /usr/bin/env` shows
+  `MORSEC_CONNECTED=codex`, the four proxy variables, the CA variables and the `--env` reference.
+- After disconnect the file loads strictly again.
+
+CLI QA against a dev msd (proof folder `qa.md`): with `network_access = true`, a command Codex
+runs reaches msd through `HTTPS_PROXY` (msd logs and refuses the unbound host with 403, like the
+host control); with network off it can't connect to msd at all, which `ms connect codex` warns
+about.
