@@ -277,25 +277,54 @@ pub fn undo(root: &mut Value, edits: &Edits) -> Vec<String> {
                             .and_then(|a| a.first())
                             == Some(&Value::str("run"))
                 };
-                let done = match (root.at_mut(path), at) {
-                    // Only the hook at the recorded place: another of the same shape may have
-                    // been wrapped differently (review F1).
-                    (Some(Value::Array(groups)), Some((g, h))) => groups
-                        .get_mut(*g)
-                        .and_then(|g| match g.get_mut("hooks") {
-                            Some(Value::Array(hs)) => hs.get_mut(*h),
-                            _ => None,
-                        })
-                        .filter(|h| hit(h))
-                        .is_some_and(|h| unwrap_command(h, *shell, *had_args)),
-                    (Some(o @ Value::Object(_)), None) if hit(o) => {
-                        unwrap_command(o, *shell, *had_args)
+                // The wrap's argv has the form this record unwraps (shell: `/bin/sh -c CMD`).
+                let fits = |o: &Value| {
+                    hit(o)
+                        && (!*shell
+                            || o.get("args").and_then(Value::as_array).is_some_and(|a| {
+                                a.len() == 5
+                                    && a[2] == Value::str("/bin/sh")
+                                    && a[3] == Value::str("-c")
+                            }))
+                };
+                let done = match root.at_mut(path) {
+                    Some(Value::Array(groups)) => {
+                        // The hook at the recorded place first (review F1). If the user moved it
+                        // (or the record has no place), the one wrapped hook of this shape in the
+                        // event, but only when exactly one fits: two alike could be swapped
+                        // (review G1, G2).
+                        let mut hooks: Vec<(usize, usize, &mut Value)> = Vec::new();
+                        for (gi, g) in groups.iter_mut().enumerate() {
+                            if let Some(Value::Array(hs)) = g.get_mut("hooks") {
+                                for (hi, h) in hs.iter_mut().enumerate() {
+                                    hooks.push((gi, hi, h));
+                                }
+                            }
+                        }
+                        let placed = at.and_then(|(g, h)| {
+                            hooks
+                                .iter()
+                                .position(|(gi, hi, o)| (*gi, *hi) == (g, h) && fits(o))
+                        });
+                        let pick = placed.or_else(|| {
+                            let mut alike = hooks
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, (_, _, o))| fits(o))
+                                .map(|(i, _)| i);
+                            match (alike.next(), alike.next()) {
+                                (Some(i), None) => Some(i),
+                                _ => None,
+                            }
+                        });
+                        pick.is_some_and(|i| unwrap_command(hooks[i].2, *shell, *had_args))
                     }
+                    Some(o @ Value::Object(_)) if fits(o) => unwrap_command(o, *shell, *had_args),
                     _ => false,
                 };
                 if !done {
                     notes.push(format!(
-                        "a command morsec wrapped in {} was edited after ms connect; left as it is now",
+                        "a command morsec wrapped in {} was edited or moved after ms connect, so morsec can't tell it apart; it is left as it is now (still run through `ms run --`). Edit it back by hand if you need to",
                         dotted(path)
                     ));
                 }

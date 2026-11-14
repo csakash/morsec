@@ -1228,3 +1228,110 @@ fn changed_ref_updates_the_redacted_record() {
         "{after}"
     );
 }
+
+/// PreToolUse groups of `settings` (test helper).
+fn pre_tool_use(h: &Home) -> Vec<Value> {
+    let v = json::parse(&h.read(&h.settings()).unwrap()).unwrap();
+    v.at(&["hooks".into(), "PreToolUse".into()])
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Puts a new group in front of PreToolUse, the way a user editing the file might.
+fn prepend_group(h: &Home) {
+    let t = h.read(&h.settings()).unwrap();
+    let t = t.replacen(
+        "\"PreToolUse\": [",
+        "\"PreToolUse\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"echo new\"}]},",
+        1,
+    );
+    std::fs::write(h.settings(), t).unwrap();
+}
+
+// protects=review G1: a wrapped hook the user moved (a group added in front of it) is still
+// unwrapped on disconnect and on a re-run, because it is the only wrapped hook of its shape;
+// two moved hooks that look alike are left wrapped with a note, never swapped;
+// fails_when=a moved hook stays `ms run --` with no record, or alike hooks are swapped
+#[test]
+fn moved_wrapped_hook_still_unwraps() {
+    let one = "{\"hooks\": {\"PreToolUse\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"echo hi\"}]}]}}";
+    let opts = Options {
+        wrap: true,
+        ..Options::default()
+    };
+    let unwrapped = |h: &Home| {
+        let g = pre_tool_use(h);
+        assert_eq!(g.len(), 2, "{g:?}");
+        let hook = &g[1].get("hooks").unwrap().as_array().unwrap()[0];
+        assert_eq!(
+            hook.get("command"),
+            Some(&Value::str("echo hi")),
+            "{hook:?}"
+        );
+        assert!(hook.get("args").is_none(), "{hook:?}");
+    };
+
+    // (a) disconnect after the move.
+    let h = Home::new();
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    std::fs::write(h.settings(), one).unwrap();
+    connect(&h, opts);
+    prepend_group(&h);
+    let c = h.connector(opts);
+    let plan = c.plan_remove().unwrap().unwrap();
+    assert!(
+        !plan.notes.iter().any(|n| n.contains("ms run --")),
+        "{:?}",
+        plan.notes
+    );
+    c.apply_remove(&plan).unwrap();
+    unwrapped(&h);
+    assert!(!h.read(&h.settings()).unwrap().contains("\"run\""));
+
+    // (b) re-run after the move, then disconnect.
+    let h = Home::new();
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    std::fs::write(h.settings(), one).unwrap();
+    connect(&h, opts);
+    prepend_group(&h);
+    let warnings = connect(&h, opts);
+    assert!(
+        !warnings.iter().any(|w| w.contains("ms run --")),
+        "{warnings:?}"
+    );
+    let c = h.connector(opts);
+    let plan = c.plan_remove().unwrap().unwrap();
+    c.apply_remove(&plan).unwrap();
+    unwrapped(&h);
+    assert!(!h.read(&h.settings()).unwrap().contains("\"run\""));
+
+    // (c) two alike hooks, both moved: neither is guessed.
+    let h = Home::new();
+    std::fs::create_dir_all(h.home().join(".claude")).unwrap();
+    std::fs::write(
+        h.settings(),
+        "{\"hooks\": {\"PreToolUse\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"echo hi\"}, {\"type\": \"command\", \"command\": \"/bin/sh\", \"args\": [\"-c\", \"x\"]}]}]}}",
+    )
+    .unwrap();
+    connect(&h, opts);
+    prepend_group(&h);
+    let c = h.connector(opts);
+    let plan = c.plan_remove().unwrap().unwrap();
+    assert_eq!(
+        plan.notes
+            .iter()
+            .filter(|n| n.contains("ms run --"))
+            .count(),
+        2,
+        "{:?}",
+        plan.notes
+    );
+    c.apply_remove(&plan).unwrap();
+    let g = pre_tool_use(&h);
+    let hs = g[1].get("hooks").unwrap().as_array().unwrap();
+    assert!(
+        hs.iter().all(|x| x.get("command") == Some(&Value::str(MS))),
+        "{hs:?}"
+    );
+}
