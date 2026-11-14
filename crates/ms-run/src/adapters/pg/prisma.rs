@@ -51,6 +51,31 @@ pub fn locate(argv: &[String]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// The class of a whole Prisma call. Behind `npm`, `pnpm`, `yarn` or `bun`, `prisma` is the
+/// binary only after `exec`, `dlx` or `x`; otherwise it names a package script (`yarn prisma`,
+/// `npm run prisma`) or a package to install, which run code morsec can't see, so they always
+/// need an approval.
+pub fn class_of(argv: &[String]) -> Option<Class> {
+    let at = locate(argv)?;
+    let first = base(&argv[0]);
+    if at == 0 || matches!(first, "npx" | "bunx" | "pnpx") {
+        return Some(classify(&argv[at + 1..]));
+    }
+    let before = argv[1..at].iter().rev().find(|a| a.as_str() != "--");
+    if before.is_some_and(|b| matches!(b.as_str(), "exec" | "dlx" | "x")) {
+        return Some(classify(&argv[at + 1..]));
+    }
+    Some(Class::Schema(format!(
+        "{} {} (a package script or install named prisma; morsec can't see what it runs)",
+        crate::printable(first),
+        argv[1..=at]
+            .iter()
+            .map(|a| crate::printable(a))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )))
+}
+
 /// Classifies the arguments after the `prisma` word.
 pub fn classify(rest: &[String]) -> Class {
     let words: Vec<&str> = rest.iter().map(String::as_str).take(2).collect();
@@ -120,6 +145,26 @@ mod tests {
             locate(&a(&["npm", "exec", "--", "prisma", "migrate"])),
             Some(3)
         );
+        let cls = |v: &[&str]| class_of(&a(v));
+        assert_eq!(
+            cls(&["npm", "exec", "--", "prisma", "migrate", "status"]),
+            Some(Class::ReadOnly)
+        );
+        assert_eq!(
+            cls(&["pnpm", "--filter", "api", "exec", "prisma", "generate"]),
+            Some(Class::ReadOnly)
+        );
+        assert_eq!(cls(&["npx", "prisma", "generate"]), Some(Class::ReadOnly));
+        for script in [
+            &["npm", "run", "prisma"][..],
+            &["yarn", "prisma"],
+            &["pnpm", "prisma", "generate"],
+            &["npm", "install", "prisma"],
+            &["bun", "run", "prisma", "generate"],
+        ] {
+            assert!(matches!(cls(script), Some(Class::Schema(_))), "{script:?}");
+        }
+        assert_eq!(cls(&["npm", "test"]), None);
         assert_eq!(
             locate(&a(&["npx", "-p", "prisma", "prisma", "migrate"])),
             Some(2)

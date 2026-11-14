@@ -47,15 +47,13 @@ SELECT coalesce((SELECT reason FROM (
     FROM r, pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind = 'S' AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
       AND has_sequence_privilege(r.oid, c.oid, 'UPDATE, USAGE')
-  UNION ALL SELECT 9, format('role %I owns this database', r.rolname) FROM r, pg_database b
-    WHERE b.datname = current_database() AND b.datdba = r.oid
-  UNION ALL SELECT 10, format('role %I owns objects in schema %I (it could alter or drop them)', r.rolname, n.nspname)
-    FROM r, pg_namespace n
-    WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema' AND (
-      n.nspowner = r.oid
-      OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = n.oid AND c.relowner = r.oid)
-      OR EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = n.oid AND p.proowner = r.oid)
-      OR EXISTS (SELECT 1 FROM pg_type y WHERE y.typnamespace = n.oid AND y.typowner = r.oid))
+  -- Every owned object, of any kind (pg_shdepend 'o'): in this database, and shared ones
+  -- (databases, tablespaces). An owner can alter or drop what it owns, CASCADE included.
+  UNION ALL SELECT 9, format('role %I owns objects (it could alter or drop them)', r.rolname) FROM r
+    WHERE EXISTS (SELECT 1 FROM pg_shdepend s
+                  WHERE s.refclassid = 'pg_authid'::regclass AND s.refobjid = r.oid
+                    AND s.deptype = 'o'
+                    AND s.dbid IN (0, (SELECT oid FROM pg_database WHERE datname = current_database())))
 ) x ORDER BY o LIMIT 1), 'ok') AS morsec_role_check;
 "#;
 
@@ -68,77 +66,48 @@ WHERE datallowconn AND has_database_privilege(datname, 'CONNECT') ORDER BY datna
 /// Most databases the read-only check visits.
 pub const MAX_DATABASES: usize = 64;
 
-/// The effect preview: `BEGIN`, safety checks, the statement as a data-modifying CTE that counts
-/// its rows, `ROLLBACK`. Prints `morsec-count=N`; a refusal raises `morsec-why: …`.
+/// The effect preview: counts the rows the statement's `WHERE` clause matches, in a read-only
+/// transaction that is rolled back. The statement itself never runs. Prints `morsec-count=N`; a
+/// refusal raises `morsec-why: …`.
 pub const PREVIEW: &str = r#"\set ON_ERROR_STOP 1
-BEGIN;
+BEGIN READ ONLY;
 SET LOCAL statement_timeout = '5s';
 SET LOCAL lock_timeout = '2s';
 SET LOCAL standard_conforming_strings = on;
-SELECT set_config('morsec.stmt', :'stmt', true), set_config('morsec.tbl', :'tbl', true),
-  set_config('morsec.fns', :'fns', true), set_config('morsec.ops', :'ops', true),
-  set_config('morsec.casts', :'casts', true) \g /dev/null
+SELECT set_config('morsec.filter', :'filter', true), set_config('morsec.tbl', :'tbl', true),
+  set_config('morsec.only', :'only', true), set_config('morsec.fns', :'fns', true),
+  set_config('morsec.ops', :'ops', true), set_config('morsec.casts', :'casts', true) \g /dev/null
 DO $morsec$
 DECLARE
   t oid := to_regclass(current_setting('morsec.tbl'));
+  filter text := current_setting('morsec.filter');
   fns text[] := array_remove(string_to_array(current_setting('morsec.fns'), ','), '');
   ops text[] := array_remove(string_to_array(current_setting('morsec.ops'), ' '), '');
   casts text[] := array_remove(string_to_array(current_setting('morsec.casts'), ','), '');
-  rels oid[];
+  q text;
   n bigint;
 BEGIN
   IF t IS NULL THEN RAISE EXCEPTION 'morsec-why: the table was not found'; END IF;
-  IF (SELECT relkind FROM pg_class WHERE oid = t) <> 'r' THEN
-    RAISE EXCEPTION 'morsec-why: the target is not a plain table'; END IF;
-  IF (SELECT relhasrules OR relrowsecurity FROM pg_class WHERE oid = t) THEN
-    RAISE EXCEPTION 'morsec-why: the table has rules or row security'; END IF;
-  IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = t AND NOT tgisinternal) THEN
-    RAISE EXCEPTION 'morsec-why: the table has triggers'; END IF;
-  -- The table and every table a cascade can reach from it, at any depth.
-  rels := ARRAY(WITH RECURSIVE reach(rel) AS (
-                  SELECT t
-                  UNION
-                  SELECT k.conrelid FROM pg_constraint k JOIN reach ON k.confrelid = reach.rel
-                  WHERE k.contype = 'f')
-                SELECT rel FROM reach);
-  IF EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = ANY (rels) AND c.oid <> t
-             AND (c.relhasrules OR c.relrowsecurity OR EXISTS (
-               SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid AND NOT g.tgisinternal))) THEN
-    RAISE EXCEPTION 'morsec-why: a table that references it (at any depth) has triggers or rules'; END IF;
-  -- ON DELETE/UPDATE SET DEFAULT evaluates a column default (nextval …).
-  IF EXISTS (SELECT 1 FROM pg_constraint k WHERE k.contype = 'f' AND k.confrelid = ANY (rels)
-             AND (k.confdeltype = 'd' OR k.confupdtype = 'd')) THEN
-    RAISE EXCEPTION 'morsec-why: a foreign key on it (at any depth) is ON ... SET DEFAULT'; END IF;
-  -- CHECK constraints of those tables and of the domains their columns use (nested domains
-  -- too) must not call volatile functions.
-  IF EXISTS (WITH RECURSIVE doms(typ) AS (
-               SELECT a.atttypid FROM pg_attribute a
-               WHERE a.attrelid = ANY (rels) AND a.attnum > 0 AND NOT a.attisdropped
-               UNION
-               SELECT y.typbasetype FROM pg_type y JOIN doms ON y.oid = doms.typ
-               WHERE y.typtype = 'd')
-             SELECT 1 FROM pg_constraint k
-             JOIN pg_depend d ON d.classid = 'pg_constraint'::regclass AND d.objid = k.oid
-                              AND d.refclassid = 'pg_proc'::regclass
-             JOIN pg_proc p ON p.oid = d.refobjid
-             WHERE p.provolatile = 'v'
-               AND (k.conrelid = ANY (rels) OR k.contypid IN (SELECT typ FROM doms))) THEN
-    RAISE EXCEPTION 'morsec-why: a CHECK or domain constraint it touches calls a volatile function'; END IF;
+  IF (SELECT relkind FROM pg_class WHERE oid = t) NOT IN ('r', 'p') THEN
+    RAISE EXCEPTION 'morsec-why: the target is not a table'; END IF;
+  IF EXISTS (SELECT 1 FROM unnest(fns) f WHERE NOT EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = f)) THEN
+    RAISE EXCEPTION 'morsec-why: a function in its WHERE clause is not known'; END IF;
+  IF EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = ANY (fns) AND p.provolatile = 'v') THEN
+    RAISE EXCEPTION 'morsec-why: its WHERE clause calls a volatile function'; END IF;
+  IF EXISTS (SELECT 1 FROM unnest(ops) o WHERE NOT EXISTS (SELECT 1 FROM pg_operator WHERE oprname = o)) THEN
+    RAISE EXCEPTION 'morsec-why: an operator in its WHERE clause is not known'; END IF;
+  IF EXISTS (SELECT 1 FROM pg_operator o JOIN pg_proc p ON p.oid = o.oprcode
+             WHERE o.oprname = ANY (ops) AND p.provolatile = 'v') THEN
+    RAISE EXCEPTION 'morsec-why: an operator in its WHERE clause calls a volatile function'; END IF;
   IF EXISTS (SELECT 1 FROM unnest(casts) c WHERE to_regtype(c) IS NULL OR NOT EXISTS (
                SELECT 1 FROM pg_type y JOIN pg_namespace n ON n.oid = y.typnamespace
                WHERE y.oid = to_regtype(c) AND n.nspname = 'pg_catalog')) THEN
-    RAISE EXCEPTION 'morsec-why: it casts to a type outside pg_catalog'; END IF;
-  IF EXISTS (SELECT 1 FROM unnest(fns) f WHERE NOT EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = f)) THEN
-    RAISE EXCEPTION 'morsec-why: a function it calls is not known'; END IF;
-  IF EXISTS (SELECT 1 FROM pg_proc p WHERE p.proname = ANY (fns) AND p.provolatile = 'v') THEN
-    RAISE EXCEPTION 'morsec-why: it calls a volatile function'; END IF;
-  IF EXISTS (SELECT 1 FROM unnest(ops) o WHERE NOT EXISTS (SELECT 1 FROM pg_operator WHERE oprname = o)) THEN
-    RAISE EXCEPTION 'morsec-why: an operator it uses is not known'; END IF;
-  IF EXISTS (SELECT 1 FROM pg_operator o JOIN pg_proc p ON p.oid = o.oprcode
-             WHERE o.oprname = ANY (ops) AND p.provolatile = 'v') THEN
-    RAISE EXCEPTION 'morsec-why: an operator it uses calls a volatile function'; END IF;
-  EXECUTE 'WITH morsec_preview AS (' || current_setting('morsec.stmt')
-    || ' RETURNING 1) SELECT count(*) FROM morsec_preview' INTO n;
+    RAISE EXCEPTION 'morsec-why: its WHERE clause casts to a type outside pg_catalog'; END IF;
+  q := 'SELECT count(*) FROM '
+    || CASE WHEN current_setting('morsec.only') = 'on' THEN 'ONLY ' ELSE '' END
+    || t::regclass::text;
+  IF filter <> '' THEN q := q || ' WHERE ' || filter; END IF;
+  EXECUTE q INTO n;
   PERFORM set_config('morsec.count', n::text, true);
 END
 $morsec$;
@@ -334,8 +303,9 @@ pub fn preview(t: &Target<'_>, s: &super::sql::Simple) -> Result<u64, String> {
         t,
         PREVIEW,
         &[
-            ("stmt", &s.statement),
+            ("filter", s.filter.as_deref().unwrap_or("")),
             ("tbl", &s.table),
+            ("only", if s.only { "on" } else { "" }),
             ("fns", &fns),
             ("ops", &ops),
             ("casts", &casts),

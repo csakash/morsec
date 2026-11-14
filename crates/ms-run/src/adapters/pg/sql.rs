@@ -1,8 +1,9 @@
 //! The statement check for effect previews (SPEC D5).
 //!
-//! A preview executes the statement (inside `BEGIN … ROLLBACK`), so only statements this strict
+//! A preview counts the rows a statement would change without running it: `SELECT count(*) FROM
+//! <table> WHERE <its WHERE clause>` in a read-only transaction. Only statements this strict
 //! check fully understands are previewed: one `UPDATE` or `DELETE`, written with a small
-//! alphabet. Anything else is "unknown". The check is a lexer for a subset of SQL that refuses
+//! alphabet, reading no other relation. Anything else is "unknown". The check is a lexer for a subset of SQL that refuses
 //! every construct where Postgres' lexer could read the text differently (comments, dollar
 //! quotes, prefixed strings, backslashes, psql variables, non-ASCII outside quotes), so the
 //! function and operator names it collects are all the ones Postgres will see.
@@ -30,15 +31,18 @@ enum Tok {
 /// A statement that can be previewed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Simple {
-    /// The statement without its trailing `;`.
-    pub statement: String,
     /// The target table as written (`orders`, `public."Order"`), for `to_regclass`.
     pub table: String,
-    /// Function names called (lowercased unless quoted, quotes removed).
+    /// `UPDATE ONLY` / `DELETE FROM ONLY`.
+    pub only: bool,
+    /// The text of the `WHERE` clause, when there is one (else every row matches).
+    pub filter: Option<String>,
+    /// Function names called in the filter (lowercased unless quoted, quotes removed).
     pub functions: Vec<String>,
-    /// Operators used.
+    /// Operators used in the filter.
     pub operators: Vec<String>,
-    /// Type names after `::` (each must be a `pg_catalog` type for a preview).
+    /// Type names cast to in the filter (`::t`, `t 'literal'`); each must be a `pg_catalog`
+    /// type for a preview.
     pub casts: Vec<String>,
 }
 
@@ -46,6 +50,10 @@ const OP_CHARS: &str = "+-*/<>=~!@#%^&|";
 
 /// Keywords a literal may follow without being a typed literal (`type 'text'`).
 const LITERAL_KEYWORDS: &[&str] = &[
+    "zone",
+    "precision",
+    "varying",
+    "case",
     "and",
     "or",
     "not",
@@ -78,14 +86,9 @@ const NOT_FUNCTIONS: &[&str] = &[
 /// Words that make a statement not "simple".
 const REFUSED_WORDS: &[(&str, Why)] = &[
     ("returning", "the statement already has RETURNING"),
-    (
-        "default",
-        "the statement uses DEFAULT, which can call functions with side effects",
-    ),
     ("current", "WHERE CURRENT OF needs a cursor"),
     ("with", "the statement has a WITH clause"),
     ("into", "the statement isn't a simple UPDATE or DELETE"),
-    ("nextval", "the statement advances a sequence"),
     // Another relation (a view, a subquery) could call functions the check can't see.
     (
         "select",
@@ -96,11 +99,18 @@ const REFUSED_WORDS: &[(&str, Why)] = &[
     ("join", "the statement reads another relation (JOIN)"),
 ];
 
-fn lex(sql: &str) -> Result<Vec<Tok>, Why> {
+/// Tokens and the byte offset where each starts.
+fn lex(sql: &str) -> Result<(Vec<Tok>, Vec<usize>), Why> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
+    let mut starts = Vec::new();
     let mut i = 0;
     while i < b.len() {
+        if starts.len() < out.len() {
+            starts.push(starts.last().copied().unwrap_or(0));
+        }
+        let tok_start = i;
+        let before = out.len();
         let c = b[i];
         match c {
             b' ' | b'\t' | b'\n' | b'\r' => i += 1,
@@ -187,8 +197,11 @@ fn lex(sql: &str) -> Result<Vec<Tok>, Why> {
             b'\\' => return Err("the statement has a backslash"),
             _ => return Err("the statement has a character the preview doesn't handle"),
         }
+        if out.len() > before {
+            starts.push(tok_start);
+        }
     }
-    Ok(out)
+    Ok((out, starts))
 }
 
 /// `name`, `schema.name` or `db.schema.name` starting at `i`: its text and the next index.
@@ -214,12 +227,9 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
     if sql.len() > 64 * 1024 {
         return Err("the statement is too long to preview");
     }
-    let mut toks = lex(sql)?;
-    let mut statement = sql.trim_end().to_owned();
+    let (mut toks, starts) = lex(sql)?;
     if toks.last() == Some(&Tok::Punct(';')) {
         toks.pop();
-        statement.pop();
-        statement = statement.trim_end().to_owned();
     }
     if toks.contains(&Tok::Punct(';')) {
         return Err("the command has more than one statement");
@@ -240,7 +250,8 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
         }
         _ => return Err("only a single UPDATE or DELETE is previewed"),
     };
-    if toks.get(i) == Some(&Tok::Word("only".into())) {
+    let only = toks.get(i) == Some(&Tok::Word("only".into()));
+    if only {
         i += 1;
     }
     let Some(after_table) = qualified(&toks, i, &mut table) else {
@@ -258,8 +269,36 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
     if toks[after_table..].contains(&Tok::Punct('.')) {
         return Err("the statement uses a dotted name (a qualified column or attribute notation)");
     }
+    // The WHERE clause at paren depth 0: the only part the preview evaluates.
+    let mut depth = 0i32;
+    let mut where_at = None;
+    for (n, t) in toks.iter().enumerate().skip(after_table) {
+        match t {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => depth -= 1,
+            Tok::Word(w) if w == "where" && depth == 0 => {
+                where_at = Some(n);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let (filter, ftoks) = match where_at {
+        Some(n) => {
+            let Some(&from) = starts.get(n + 1) else {
+                return Err("the statement's WHERE clause is empty");
+            };
+            let end = if toks.len() < starts.len() {
+                starts[toks.len()]
+            } else {
+                sql.len()
+            };
+            (Some(sql[from..end].trim().to_owned()), &toks[n + 1..])
+        }
+        None => (None, &toks[toks.len()..]),
+    };
     let mut casts = Vec::new();
-    for w in toks.windows(2) {
+    for w in ftoks.windows(2) {
         // `type 'literal'` is a cast too (`date '2024-01-01'`, `mydomain '1'`).
         if let (Tok::Word(t), Tok::Literal) = (&w[0], &w[1])
             && !LITERAL_KEYWORDS.contains(&t.as_str())
@@ -284,10 +323,10 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
     }
     let mut functions = Vec::new();
     let mut operators = Vec::new();
-    for (n, t) in toks.iter().enumerate() {
+    for (n, t) in ftoks.iter().enumerate() {
         match t {
             Tok::Op(o) => operators.push(o.clone()),
-            Tok::Word(w) | Tok::Quoted(w) if toks.get(n + 1) == Some(&Tok::Punct('(')) => {
+            Tok::Word(w) | Tok::Quoted(w) if ftoks.get(n + 1) == Some(&Tok::Punct('(')) => {
                 if let Tok::Word(w) = t
                     && NOT_FUNCTIONS.contains(&w.as_str())
                 {
@@ -310,8 +349,9 @@ pub fn simple(sql: &str) -> Result<Simple, Why> {
     operators.sort();
     operators.dedup();
     Ok(Simple {
-        statement,
         table,
+        only,
+        filter,
         functions,
         operators,
         casts,
@@ -330,22 +370,31 @@ mod tests {
     fn only_simple_dml() {
         let s = simple("UPDATE orders SET status = 'paid' WHERE id IN (1, 2, 3);").unwrap();
         assert_eq!(s.table, "orders");
-        assert_eq!(
-            s.statement,
-            "UPDATE orders SET status = 'paid' WHERE id IN (1, 2, 3)"
-        );
-        assert!(s.functions.is_empty());
-        assert_eq!(s.operators, ["="]);
+        assert_eq!(s.filter.as_deref(), Some("id IN (1, 2, 3)"));
+        assert!(s.functions.is_empty() && s.operators.is_empty() && !s.only);
         let s = simple("delete from only public.\"Order\" where lower(note) like 'x%' and n >= 2")
             .unwrap();
         assert_eq!(s.table, "public.\"Order\"");
+        assert!(s.only);
         assert_eq!(s.functions, ["lower"]);
         assert_eq!(s.operators, [">="]);
-        let s = simple("update t set a = \"My Fn\"(b)::int, c = 'it''s; fine'").unwrap();
+        // The SET list isn't evaluated, so its functions and operators don't matter.
+        let s = simple("update t set a = random() + nextval('s'), b = default").unwrap();
+        assert!(s.filter.is_none() && s.functions.is_empty() && s.operators.is_empty());
+        let s = simple("update t set a = 1 where created at time zone 'UTC' < now() ;").unwrap();
+        assert_eq!(
+            s.filter.as_deref(),
+            Some("created at time zone 'UTC' < now()")
+        );
+        assert!(s.casts.is_empty());
+        assert_eq!(s.functions, ["now"]);
+        let s = simple("update t set c = 'it''s; fine' where a = \"My Fn\"(b)::int").unwrap();
         assert_eq!(s.functions, ["My Fn"]);
         assert_eq!(s.casts, ["int"]);
-        let s =
-            simple("update t set a = mydom '1', b = date '2024-01-01' where c like 'x%'").unwrap();
+        let s = simple(
+            "update t set a = 1 where a = mydom '1' or b = date '2024-01-01' or c like 'x%'",
+        )
+        .unwrap();
         assert_eq!(s.casts, ["date", "mydom"]);
 
         for bad in [
@@ -359,12 +408,11 @@ mod tests {
             "update t set a = 'x\\'",
             "update t set a = :v",
             "update t set a = 1 returning *",
-            "update t set a = default",
             "with x as (select 1) update t set a = 1",
             "insert into t values (1)",
             "select 1",
             "delete t",
-            "update t set a = nextval('s')",
+            "update t set a = 1 where",
             "update t set a = é",
             "update t set a = U&'d!0061t' uescape '!'",
             "update t set a = 1 where current of c",

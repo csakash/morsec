@@ -260,9 +260,7 @@ impl PrismaAdapter {
     }
 
     fn class(call: &RunCall) -> Option<prisma::Class> {
-        let argv = utf8_argv(&call.argv).ok()?;
-        let at = prisma::locate(&argv)?;
-        Some(prisma::classify(&argv[at + 1..]))
+        prisma::class_of(&utf8_argv(&call.argv).ok()?)
     }
 }
 
@@ -285,10 +283,9 @@ impl ContextAdapter for PrismaAdapter {
                 "no rule facts were given for this prisma call, so the Postgres adapter refuses (fail closed)",
             ));
         }
-        let Some(at) = prisma::locate(&argv) else {
+        let Some(class) = prisma::class_of(&argv) else {
             return Err(adapter_invalid("this isn't a prisma command"));
         };
-        let class = prisma::classify(&argv[at + 1..]);
         for (key, f) in &ctx.keys {
             if !f.read_only {
                 continue;

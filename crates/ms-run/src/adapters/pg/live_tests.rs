@@ -319,16 +319,39 @@ fn preview_never_commits(env: &Env) {
         ]),
         "1 row in orders"
     );
-    let unknown = preview(&["psql", "ms://pg/w", "-c", "update audited set n = n + 1"]);
-    assert!(
-        unknown.contains("unknown") && unknown.contains("trigger"),
-        "{unknown}"
+    // Nothing is written, so triggers, cascades, defaults and constraints never run: tables
+    // that have them preview like any other.
+    assert_eq!(
+        preview(&["psql", "ms://pg/w", "-c", "update audited set n = n + 1"]),
+        "1 row in audited"
+    );
+    assert_eq!(
+        preview(&["psql", "ms://pg/w", "-c", "delete from parent where id = 1"]),
+        "1 row in parent"
+    );
+    assert_eq!(
+        preview(&["psql", "ms://pg/w", "-c", "delete from tags where id = 1"]),
+        "0 rows in tags"
+    );
+    assert_eq!(
+        preview(&["psql", "ms://pg/w", "-c", "update gauges set v = 1"]),
+        "0 rows in gauges"
+    );
+    // The SET list is never evaluated; the WHERE clause is checked.
+    assert_eq!(
+        preview(&[
+            "psql",
+            "ms://pg/w",
+            "-c",
+            "update orders set status = random()::text where id = 2"
+        ]),
+        "1 row in orders"
     );
     let unknown = preview(&[
         "psql",
         "ms://pg/w",
         "-c",
-        "update orders set status = random()::text",
+        "update orders set counter = 1 where random() < 2",
     ]);
     assert!(
         unknown.contains("unknown") && unknown.contains("volatile"),
@@ -338,38 +361,32 @@ fn preview_never_commits(env: &Env) {
         "psql",
         "ms://pg/w",
         "-c",
-        "update orders set counter = 1; commit",
-    ]);
-    assert!(unknown.contains("unknown"), "{unknown}");
-    let unknown = preview(&["psql", "ms://pg/w", "-c", "delete from parent where id = 1"]);
-    assert!(unknown.contains("any depth"), "{unknown}");
-    let unknown = preview(&[
-        "psql",
-        "ms://pg/w",
-        "-c",
-        "update orders set counter = 1::posint",
+        "update orders set counter = 1 where counter = 1::posint",
     ]);
     assert!(unknown.contains("pg_catalog"), "{unknown}");
     let unknown = preview(&[
         "psql",
         "ms://pg/w",
         "-c",
-        "update orders set counter = posint '1'",
+        "update orders set counter = 1 where counter = posint '1'",
     ]);
     assert!(unknown.contains("pg_catalog"), "{unknown}");
-    let unknown = preview(&["psql", "ms://pg/w", "-c", "update gauges set v = 1"]);
-    assert!(unknown.contains("volatile"), "{unknown}");
-    let unknown = preview(&["psql", "ms://pg/w", "-c", "delete from tags where id = 1"]);
-    assert!(unknown.contains("SET DEFAULT"), "{unknown}");
     assert_eq!(
         preview(&[
             "psql",
             "ms://pg/w",
             "-c",
-            "update orders set counter = '4'::int4 where id = 1"
+            "update orders set counter = '4'::int4 where id = '1'::int4"
         ]),
         "1 row in orders"
     );
+    let unknown = preview(&[
+        "psql",
+        "ms://pg/w",
+        "-c",
+        "update orders set counter = 1; commit",
+    ]);
+    assert!(unknown.contains("unknown"), "{unknown}");
     let unknown = preview(&["psql", "ms://pg/w"]);
     assert!(unknown.contains("unknown"), "{unknown}");
     let ro = a
@@ -392,17 +409,30 @@ fn preview_never_commits(env: &Env) {
         url: url.rewritten(false),
         passfile_line: line.as_deref().map(|l| l.as_slice()),
     };
-    let smuggled = sql::Simple {
-        statement: "UPDATE orders SET counter = 100 RETURNING 1) SELECT 1; COMMIT; \
-                    WITH morsec_preview AS (UPDATE orders SET counter = 7"
-            .into(),
-        table: "orders".into(),
-        functions: Vec::new(),
-        operators: vec!["=".into()],
-        casts: Vec::new(),
-    };
-    let r = probe::preview(&t, &smuggled);
-    assert!(r.is_err(), "{r:?}");
-    eprintln!("smuggled statement: {r:?}");
+    // Even if the lexer were fooled, the server side can't write: the filter runs as text inside
+    // a DO block in a READ ONLY transaction, where COMMIT and writes are errors.
+    for filter in [
+        "true; COMMIT; DELETE FROM orders",
+        "true; UPDATE orders SET counter = 100",
+        "id IN (SELECT id FROM (DELETE FROM orders RETURNING id) d)",
+        "nextval('tag_seq') > 0",
+    ] {
+        let smuggled = sql::Simple {
+            table: "orders".into(),
+            only: false,
+            filter: Some(filter.into()),
+            functions: Vec::new(),
+            operators: Vec::new(),
+            casts: Vec::new(),
+        };
+        let r = probe::preview(&t, &smuggled);
+        assert!(r.is_err(), "{filter}: {r:?}");
+        eprintln!("smuggled filter {filter:?}: {r:?}");
+    }
+    assert_eq!(
+        env.cluster.admin("shop", "SELECT is_called FROM tag_seq"),
+        "f",
+        "a preview advanced a sequence"
+    );
     assert_eq!(env.counters(), before, "a preview committed");
 }

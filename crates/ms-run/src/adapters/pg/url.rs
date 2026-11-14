@@ -131,7 +131,7 @@ impl PgUrl {
         };
         // A password with an unencoded '/' or a second '@' leaves part of it in the host or
         // database, which would go into argv: refuse rather than follow libpq there.
-        if hosts_raw.contains('@') || path_raw.contains('@') || !ports_numeric(hosts_raw) {
+        if hosts_raw.contains('@') || after_host.contains('@') || !ports_numeric(hosts_raw) {
             return Err("the key's URL has an unencoded '@', '/' or ':' in its user or password (or a port that isn't a number); %-encode them".into());
         }
         let mut user_raw = None;
@@ -351,7 +351,10 @@ mod tests {
         let u = PgUrl::parse(b"postgres://h?application_name=a@b").unwrap();
         assert_eq!(u.user(), Some("h?application_name=a"));
         assert_eq!(u.passfile_host(), "b");
-        let u = PgUrl::parse(b"postgres://h/db?application_name=a@b").unwrap();
+        // An '@' after the first '/' must be %-encoded (review F3: a password with '/' would
+        // otherwise spill into the query and argv).
+        assert!(PgUrl::parse(b"postgres://h/db?application_name=a@b").is_err());
+        let u = PgUrl::parse(b"postgres://h/db?application_name=a%40b").unwrap();
         assert_eq!(u.user(), None);
         assert_eq!(u.passfile_host(), "h");
         let u = PgUrl::parse(b"postgres://u@%2Ftmp%2Fsock/db").unwrap();
@@ -377,6 +380,7 @@ mod tests {
             b"postgres://app:pa/ss@db/shop",
             b"postgres://app:p@ss@db/shop",
             b"postgres://h:5x/db",
+            b"postgres://app:2024/secret?x@db/shop",
             b"\xff",
         ] {
             assert!(
