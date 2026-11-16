@@ -20,6 +20,14 @@ libc = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 
+# macOS: msd's code signature is checked through Security.framework (T-03). The few raw calls
+# (LOCAL_PEERTOKEN, SecCodeCopySigningInformation) live in one audited module,
+# src/peer_verify/macos.rs. Same versions as ms-vault, so no new crates enter the lockfile.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+security-framework-sys = "2.17"
+core-foundation = "0.10"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 ms-fuzz = { workspace = true }

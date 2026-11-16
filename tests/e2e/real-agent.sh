@@ -56,6 +56,9 @@ db="postgres://app:$(rand 16)@db.internal.example:5432/app"
 gh="ghp_$(rand 18)"
 
 export MORSEC_SOCKET="$work/run/msd.sock"
+# A cargo-built ms can't check msd's Developer ID signature (T-03); this dev opt-out lets it talk
+# to the throwaway msd. A signed release (MORSEC_BIN) ignores it.
+export MORSEC_DEV_UNVERIFIED_DAEMON=1
 port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 "$bin/msd" --foreground --vault memory --socket "$MORSEC_SOCKET" --state-dir "$work/state" \
   --proxy-port "$port" 2>"$work/msd.log" &
@@ -90,7 +93,7 @@ for a in "${agents[@]}"; do
   if command -v node >/dev/null 2>&1; then agent_path="$agent_path:$(dirname "$(command -v node)")"; fi
   agent_env=(env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TERM="${TERM:-dumb}"
              LANG="${LANG:-C}" TMPDIR="$work/tmp" PATH="$agent_path:/usr/bin:/bin"
-             MORSEC_SOCKET="$MORSEC_SOCKET")
+             MORSEC_SOCKET="$MORSEC_SOCKET" MORSEC_DEV_UNVERIFIED_DAEMON=1)
   # Config locations are paths, not secrets: pass them so the agent writes its transcripts
   # where msd (started with this environment) scans (security re-check N-A).
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then agent_env+=(CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR"); fi

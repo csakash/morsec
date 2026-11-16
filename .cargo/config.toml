@@ -1,0 +1,7 @@
+# Dev and test runs only (cargo run / cargo test in this repo). Builds from `cargo build` are
+# unsigned, so `ms` can't check msd's Developer ID signature (T-03) and refuses to talk to it
+# unless this opt-out is set; with it, every client prints a "DEV BUILD" warning once.
+# A release `ms` is signed with a Team ID and ignores this variable (ms-ipc peer_verify::policy).
+# Tests that prove the refusal remove it from their child's environment.
+[env]
+MORSEC_DEV_UNVERIFIED_DAEMON = "1"

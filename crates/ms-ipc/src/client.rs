@@ -7,6 +7,7 @@ use ms_core::{Error, KeyMeta, KeyName, Result, SecretBytes};
 use tokio::net::UnixStream;
 
 use crate::frame::{read_frame, write_frame};
+use crate::peer_verify::PeerIdentity;
 use crate::protocol::{OutStream, RequestBody, ResponseBody, decode, encode};
 use tokio::io::AsyncReadExt;
 
@@ -20,6 +21,7 @@ pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Client {
     stream: UnixStream,
     next_id: u64,
+    identity: PeerIdentity,
 }
 
 impl Client {
@@ -43,7 +45,21 @@ impl Client {
             })?
             .uid();
         check_server_uid(server_uid, own_uid()?, path)?;
-        Ok(Self { stream, next_id: 1 })
+        // T-03: the uid says nothing about *which* same-user process answers. Before the first
+        // frame, check the connected peer's code signature (see `peer_verify`).
+        let identity = verify_server(&stream)
+            .await
+            .map_err(|detail| Error::DaemonNotVerified { detail })?;
+        Ok(Self {
+            stream,
+            next_id: 1,
+            identity,
+        })
+    }
+
+    /// What was established about the daemon when this connection was made (`ms doctor`).
+    pub fn peer_identity(&self) -> &PeerIdentity {
+        &self.identity
     }
 
     /// Sends a request and waits for its response. Use [`Client::put_key`] for `PutKey`.
@@ -192,6 +208,31 @@ impl Client {
         }
         Ok(env.body)
     }
+}
+
+/// Applies the peer-verification policy to a fresh connection. The signature check can poll for
+/// up to 2 s, so it runs off the async workers (a long-lived `ms mcp` connects per tool call),
+/// on its own descriptor for the same socket. The dev opt-out and refusals decide at once.
+///
+/// If the caller drops the connect future, the blocking check still runs to its end (at most
+/// 2 s) holding that descriptor, so msd counts the connection toward its per-process limit
+/// until then. Nothing is ever sent on it (review R10, accepted).
+async fn verify_server(stream: &UnixStream) -> std::result::Result<PeerIdentity, String> {
+    use crate::peer_verify::{Trust, apply, current_trust, verify_peer};
+    let trust = current_trust();
+    if !matches!(trust, Trust::Verify { .. }) {
+        return apply(trust, |_| Err("no signature check in this mode".into()));
+    }
+    let fd = {
+        use std::os::fd::AsFd;
+        stream
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| format!("can't duplicate the connection for the check: {e}"))?
+    };
+    tokio::task::spawn_blocking(move || apply(trust, |req| verify_peer(&fd, req)))
+        .await
+        .map_err(|e| format!("the check did not finish: {e}"))?
 }
 
 /// Stdin bytes per `RunInput` frame.

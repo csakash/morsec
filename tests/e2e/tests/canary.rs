@@ -346,7 +346,7 @@ impl World {
         std::fs::write(
             &script,
             format!(
-                "export PATH='{}' HOME='{}' MORSEC_SOCKET='{}' TMPDIR='{}/tmp' LANG=C\nunset CLAUDE_CONFIG_DIR CODEX_HOME\ncd '{}'\n{command}\n",
+                "export PATH='{}' HOME='{}' MORSEC_SOCKET='{}' TMPDIR='{}/tmp' LANG=C MORSEC_DEV_UNVERIFIED_DAEMON=1\nunset CLAUDE_CONFIG_DIR CODEX_HOME\ncd '{}'\n{command}\n",
                 self.path_var(),
                 self.home.display(),
                 self.sock.display(),
@@ -374,7 +374,7 @@ impl World {
         loop {
             if let Ok(code) = std::fs::read_to_string(&rc) {
                 let text = std::fs::read_to_string(&out).unwrap_or_default();
-                return (code.trim().parse().unwrap_or(-1), text);
+                return (code.trim().parse().unwrap_or(-1), drop_dev_warning(&text));
             }
             assert!(Instant::now() < deadline, "detached command never finished");
             std::thread::sleep(Duration::from_millis(50));
@@ -410,7 +410,10 @@ fn base_env(cmd: &mut Command, dir: &Path, home: &Path, sock: &Path) {
         .env("HOME", home)
         .env("TMPDIR", dir.join("tmp"))
         .env("LANG", "C")
-        .env("MORSEC_SOCKET", sock);
+        .env("MORSEC_SOCKET", sock)
+        // The cargo-built ms can't check msd's Developer ID signature (T-03); this explicit dev
+        // opt-out is the only way it talks to the test msd. A signed release ignores it.
+        .env("MORSEC_DEV_UNVERIFIED_DAEMON", "1");
 }
 
 fn chmod_x(p: &Path) {
@@ -1171,4 +1174,13 @@ fn gate_runs_fuzz_step() {
     ] {
         assert!(body.contains(needle), "fuzz step lost `{needle}`");
     }
+}
+
+/// Drops the cargo-built ms's one-line "DEV BUILD" notice (T-03 dev opt-out) from merged
+/// stdout+stderr, so commands whose stdout is parsed (`ms mcp --catalog`) still parse.
+fn drop_dev_warning(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.starts_with("morsec: DEV BUILD:"))
+        .map(|l| format!("{l}\n"))
+        .collect()
 }

@@ -15,6 +15,17 @@ pub enum Error {
         detail: String,
     },
 
+    /// Something answers on the daemon socket, but it is not a verified msd (T-03). Nothing was
+    /// sent to it. Distinct from [`Error::DaemonUnavailable`], so "daemon down" fallbacks (local
+    /// rules file, launchd kickstart) never run when an impostor answers.
+    #[error(
+        "morsec: the process serving the msd socket is not a verified msd ({detail}). Nothing was sent to it. Run: ms doctor"
+    )]
+    DaemonNotVerified {
+        /// Why verification failed.
+        detail: String,
+    },
+
     /// A key name failed validation.
     #[error(
         "morsec: invalid key name \"{name}\": {why}. Use lowercase a-z, 0-9 and '-', with '/' between parts, e.g. stripe/test"
@@ -100,6 +111,13 @@ mod tests {
                 }
                 .to_string(),
                 "ms start",
+            ),
+            (
+                Error::DaemonNotVerified {
+                    detail: "impostor".into(),
+                }
+                .to_string(),
+                "ms doctor",
             ),
             (
                 Error::InvalidKeyName {
