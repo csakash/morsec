@@ -1,0 +1,1 @@
+{"v": 1, "id": 4, "body": {"type": "run", "argv": ["/usr/bin/git", "push"], "cwd": "/tmp/p", "env": [{"name": "TOKEN", "value": "ms://gh/token"}]}}

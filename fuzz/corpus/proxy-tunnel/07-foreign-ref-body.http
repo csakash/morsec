@@ -1,0 +1,5 @@
+POST /v1 HTTP/1.1
+Host: api.stripe.com
+Content-Length: 30
+
+{"other":"ms://maps/test"}    

@@ -41,6 +41,7 @@ const TESTS: &[Test] = &[
         real_agent_job_skips_without_opt_in,
     ),
     ("gate_requires_security_evals", gate_requires_security_evals),
+    ("gate_runs_fuzz_step", gate_runs_fuzz_step),
     ("run_mode_through_shims", run_mode_through_shims),
     ("mcp_tools_end_to_end", mcp_tools_end_to_end),
 ];
@@ -1129,4 +1130,45 @@ fn mcp_tools_end_to_end() {
         "msd's log",
         &std::fs::read(w.dir.path().join("msd.log")).unwrap(),
     );
+}
+
+// protects=EVAL-1 (hardening loop): the gate runs the fuzz_* targets of all three parsers under
+// a ceiling and checks the threat model's test names; fails_when=the fuzz step, a crate, the
+// ceiling or the name check is dropped from scripts/check.sh; no_claim=what the targets find
+// (they run in the step itself)
+fn gate_runs_fuzz_step() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let check = std::fs::read_to_string(root.join("scripts/check.sh")).unwrap();
+    let live: Vec<&str> = check
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect();
+    let step = live
+        .iter()
+        .position(|l| l.starts_with("step \"7c fuzz"))
+        .expect("no fuzz step in scripts/check.sh");
+    let body = live[step + 1..]
+        .iter()
+        .take_while(|l| !l.starts_with("step "))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "-p ms-import",
+        "-p ms-ipc",
+        "-p ms-proxy",
+        "set -euo pipefail",
+        "fuzz_dotenv",
+        "fuzz_frame",
+        "fuzz_head",
+        "fuzz_rewriter",
+        "fuzz_decode",
+        "fuzz_listener",
+        "fuzz_tunnel",
+        "fuzz_server",
+        "with_ceiling 90 bash -c fuzz_step",
+        "python3 -I scripts/threat_model_check.py",
+    ] {
+        assert!(body.contains(needle), "fuzz step lost `{needle}`");
+    }
 }

@@ -22,3 +22,5 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+ms-fuzz = { workspace = true }
+proptest = { workspace = true }

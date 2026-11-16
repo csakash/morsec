@@ -10,6 +10,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes `ms_proxy::fuzzing` for the nightly cargo-fuzz harness in `fuzz/` (L24). Never enabled
+# by msd or ms.
+fuzzing = []
+
 [dependencies]
 
 ms-core = { workspace = true }
@@ -35,6 +40,7 @@ time = "0.3.55"
 
 [dev-dependencies]
 proptest = { workspace = true }
+ms-fuzz = { workspace = true }
 tempfile = { workspace = true }
 ms-vault = { workspace = true }
 http-body-util = { version = "0.1.5", features = ["channel"] }

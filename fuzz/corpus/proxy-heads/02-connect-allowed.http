@@ -1,0 +1,3 @@
+CONNECT allowed.example.com:443 HTTP/1.1
+Host: allowed.example.com:443
+

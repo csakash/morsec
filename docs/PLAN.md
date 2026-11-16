@@ -851,6 +851,16 @@ review package) stays in L24.
 - **Depends on:** all of wave 4a. **Owns:** `docs/threat-model.md`, `fuzz/`, fixes routed as small follow-up loops.
   The threat model and the dotenv, request-head and IPC fuzz targets are started earlier, by the
   pre-release hardening pass (see "First public CLI release"); L24 extends them.
+- **Done early (loop `hardening`, the pre-release pass, 2026-11-16):** the STRIDE threat model
+  `docs/threat-model.md` (assets, actors, the five trust boundaries, 60 threats each with control,
+  proving test, status and ARI-42 ids; its test names are checked by the gate); `fuzz/` with the
+  shared seed corpus and nightly cargo-fuzz harnesses `dotenv`, `proxy_head`, `ipc_frame`,
+  `ipc_decode`; stable proptest `fuzz_*` targets for the same three parsers (plus the proxy inside
+  a terminated tunnel and a live IPC server) in the gate under a ceiling, and a long local run of
+  each. **Still L24:** continuous coverage-guided runs of the `fuzz/` harnesses (none has run on
+  nightly yet), fuzzing ms-rules, the ms-mcp schema validator and the run-mode adapters, Miri and
+  sanitizers, the review of every `ARI42.md` row, the external review package, and the open rows
+  of the threat model (T-03 socket impersonation first).
 - **Build:** a STRIDE threat model for every process boundary; continuous fuzzing of the dotenv
   parser, the proxy request head and the IPC framing; a pass with Miri and sanitizers over
   `unsafe`; a review of every `ARI42.md` row; an external review package (architecture, threat
