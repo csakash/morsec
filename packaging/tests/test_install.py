@@ -155,7 +155,10 @@ class InstalledShimTests(unittest.TestCase):
 
     @classmethod
     def env(cls) -> dict[str, str]:
-        return {"PATH": "/usr/bin:/bin", "HOME": cls.home, "TMPDIR": os.path.join(cls.dir, "tmp"), "LANG": "C"}
+        # The binaries under test are cargo builds with no Developer ID, so ms only talks to msd
+        # with the explicit dev opt-out (T-03, ms-ipc peer_verify). A signed release ignores it.
+        return {"PATH": "/usr/bin:/bin", "HOME": cls.home, "TMPDIR": os.path.join(cls.dir, "tmp"), "LANG": "C",
+                "MORSEC_DEV_UNVERIFIED_DAEMON": "1"}
 
     @classmethod
     def start_msd(cls):
@@ -185,7 +188,7 @@ class InstalledShimTests(unittest.TestCase):
         with open(script, "w", encoding="utf-8") as f:
             f.write(
                 f"export PATH='{prefix}/bin:{env['PATH']}' HOME='{cls.home}' MORSEC_SOCKET='{cls.sock}' "
-                f"TMPDIR='{env['TMPDIR']}' LANG=C\nunset CLAUDE_CONFIG_DIR CODEX_HOME\ncd '{cls.home}'\n{command}\n")
+                f"TMPDIR='{env['TMPDIR']}' LANG=C MORSEC_DEV_UNVERIFIED_DAEMON=1\nunset CLAUDE_CONFIG_DIR CODEX_HOME\ncd '{cls.home}'\n{command}\n")
         # Its own session and process group (setsid), so teardown can kill whatever is left.
         p = subprocess.Popen(
             ["/bin/sh", "-c",
