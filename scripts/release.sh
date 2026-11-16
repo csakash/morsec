@@ -164,7 +164,8 @@ build_release() {
   case "$work$cargo_home" in *[[:space:]]*) die "the build and cargo paths must not contain spaces" ;; esac
 
   local commit
-  commit="$(git -C "$root" rev-parse HEAD)"
+  # verify-repro pins one commit for both builds, so a commit made meanwhile can't split them.
+  commit="${pinned_commit:-$(git -C "$root" rev-parse HEAD)}"
   if [ -n "$(git -C "$root" status --porcelain)" ]; then
     [ "$mode" = build ] || die "the working tree is not clean"
     printf 'release.sh: warning: uncommitted changes are NOT in this build (it builds %s)\n' "${commit:0:12}" >&2
@@ -364,9 +365,11 @@ cmd_build() { # cmd_build <mode> [--out DIR]
   build_release "$work" "$out" "$id" "$mode"
 }
 
+pinned_commit=""
 cmd_verify_repro() {
   [ $# -eq 0 ] || usage
   check_host
+  pinned_commit="$(git -C "$root" rev-parse HEAD)"
   work="$(new_work morsec-repro)"
   trap cleanup EXIT
   # Build 2 differs from build 1 in every host path a binary could pick up: the build dir (a
