@@ -324,12 +324,16 @@ fn attack(mode: &str) -> (Result<(), String>, usize) {
         .spawn()
         .unwrap();
     let _attacker = Daemon(child);
+    // The path exists after bind() but before listen(): retry until the attacker accepts
+    // connections (review S1).
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !path.exists() {
-        assert!(Instant::now() < deadline, "attacker did not listen");
+    let conn = loop {
+        match UnixStream::connect(&path) {
+            Ok(c) => break c,
+            Err(e) => assert!(Instant::now() < deadline, "attacker did not listen: {e}"),
+        }
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let conn = UnixStream::connect(&path).unwrap();
+    };
     while UnixStream::connect(&other).is_err() {
         assert!(Instant::now() < deadline, "the exec'd msd is not up");
         std::thread::sleep(Duration::from_millis(20));

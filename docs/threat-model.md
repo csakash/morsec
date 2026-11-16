@@ -161,7 +161,7 @@ the loop hand-over notes; "unowned" means nobody has it yet.
 
 | ID | Status | What is missing | Owner |
 |---|---|---|---|
-| T-03 | partial | A genuine signed msd started by the agent with its own socket, state directory or memory vault passes the signature check; Linux has no peer check (L21 needs `SO_PEERCRED` plus a pidfd, and msd as its own user (L23) or a root-owned install path for `/proc/<pid>/exe`) | unowned (follow-up: release msd refuses a non-default socket, state directory and memory vault, or `ms` checks that msd is the launchd job; L21 for Linux) |
+| T-03 | partial | A genuine signed msd started by the agent with its own socket, state directory or memory vault passes the signature check, and so does any older release of msd from the same team (downgrade; a version floor belongs to the same follow-up); Linux has no peer check (L21 needs `SO_PEERCRED` plus a pidfd, and msd as its own user (L23) or a root-owned install path for `/proc/<pid>/exe`) | unowned (follow-up: release msd refuses a non-default socket, state directory and memory vault, or `ms` checks that msd is the launchd job; L21 for Linux) |
 | T-04 | partial | A detached same-user process can decide an approval; the gate is the Touch ID sheet and the person | unowned |
 | T-06 | partial | Cooldown keyed on session; a detached process starts fresh | unowned |
 | T-07 | partial | Homoglyphs; same-user writes to the `ms approve` terminal; manual LAContext check | unowned (manual check: "Needs a human" in `ARI42.md`) |

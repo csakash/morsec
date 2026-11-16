@@ -73,7 +73,8 @@ const ACCEPT_WAIT: Duration = Duration::from_secs(2);
 const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
 /// `PROX_FDTYPE_SOCKET`.
 const PROX_FDTYPE_SOCKET: u32 = 2;
-/// Most descriptors read from one process.
+/// Most descriptors read from one process. msd caps its connections far below this; past it the
+/// check fails closed (a false "did not accept", never a pass) (review S2).
 const MAX_FDS: usize = 16_384;
 
 /// Offsets into `struct socket_fdinfo` (LP64 macOS), from `clang` `offsetof` (the same layout
