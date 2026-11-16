@@ -9,6 +9,7 @@
 pub mod client;
 pub mod frame;
 pub mod paths;
+pub mod peer_verify;
 pub mod protocol;
 pub mod server;
 

@@ -7,6 +7,7 @@ use ms_core::{Error, KeyMeta, KeyName, Result, SecretBytes};
 use tokio::net::UnixStream;
 
 use crate::frame::{read_frame, write_frame};
+use crate::peer_verify::PeerIdentity;
 use crate::protocol::{OutStream, RequestBody, ResponseBody, decode, encode};
 use tokio::io::AsyncReadExt;
 
@@ -20,6 +21,7 @@ pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Client {
     stream: UnixStream,
     next_id: u64,
+    identity: PeerIdentity,
 }
 
 impl Client {
@@ -43,7 +45,20 @@ impl Client {
             })?
             .uid();
         check_server_uid(server_uid, own_uid()?, path)?;
-        Ok(Self { stream, next_id: 1 })
+        // T-03: the uid says nothing about *which* same-user process answers. Before the first
+        // frame, check the connected peer's code signature (see `peer_verify`).
+        let identity = crate::peer_verify::check_connected(&stream)
+            .map_err(|detail| Error::DaemonNotVerified { detail })?;
+        Ok(Self {
+            stream,
+            next_id: 1,
+            identity,
+        })
+    }
+
+    /// What was established about the daemon when this connection was made (`ms doctor`).
+    pub fn peer_identity(&self) -> &PeerIdentity {
+        &self.identity
     }
 
     /// Sends a request and waits for its response. Use [`Client::put_key`] for `PutKey`.

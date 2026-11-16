@@ -819,8 +819,11 @@ name = "ms-ipc"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "core-foundation",
  "libc",
  "ms-core",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "tempfile",
