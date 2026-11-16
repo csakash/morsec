@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -16,6 +16,7 @@ use clap::Args;
 use ms_ipc::{Client, RequestBody, ResponseBody};
 use ms_run::client::{self, EXIT_USAGE, Outcome};
 
+use crate::brew::{self, Entry};
 use crate::terminal_safe;
 
 #[derive(Debug, Args)]
@@ -150,11 +151,10 @@ fn link_shims() -> ExitCode {
         eprintln!("morsec: HOME is not set, so ~/.morsec/shims can't be found");
         return ExitCode::FAILURE;
     };
-    let shim = match std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map(|p| p.with_file_name("ms-shim"))
+    let shim = match brew::sibling("ms-shim")
+        .and_then(|(real, _)| brew::Shim::open(&real, brew::stable_path(&real)))
     {
-        Ok(p) if p.is_file() => p,
+        Ok(s) if s.real.is_file() => s,
         _ => {
             eprintln!("morsec: ms-shim is not installed next to ms; reinstall morsec");
             return ExitCode::FAILURE;
@@ -197,51 +197,50 @@ pub(crate) fn fetch_rules() -> Result<ms_rules::Rules, String> {
     }
 }
 
-/// Makes `dir` hold exactly one shim per name in `want` (hard links of `shim`, or copies when a
-/// link can't cross file systems). Files that are not shims are left alone and reported.
-fn sync_shims(dir: &Path, shim: &Path, want: &BTreeSet<String>) -> Result<Vec<String>, String> {
+/// Makes `dir` hold exactly one shim per name in `want`: symlinks to the stable
+/// `opt/morsec/bin/ms-shim` in a Homebrew install (they follow `brew upgrade`), else hard links of
+/// `ms-shim`, or copies when a link can't cross file systems. Shims left by an older version are
+/// replaced. Files that are not shims are left alone and reported.
+fn sync_shims(
+    dir: &Path,
+    shim: &brew::Shim,
+    want: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
         .map_err(|e| format!("morsec: can't create {}: {e}", dir.display()))?;
-    let shim_meta =
-        std::fs::metadata(shim).map_err(|e| format!("morsec: {}: {e}", shim.display()))?;
-    let shim_bytes = std::fs::read(shim).map_err(|e| format!("morsec: {}: {e}", shim.display()))?;
-    // A shim is a hard link of ms-shim, or a byte-identical copy (cross-device fallback).
-    let same_at = |p: &Path, m: &std::fs::Metadata| {
-        (m.dev(), m.ino()) == (shim_meta.dev(), shim_meta.ino())
-            || (m.file_type().is_file()
-                && m.len() == shim_meta.len()
-                && std::fs::read(p).is_ok_and(|b| b == shim_bytes))
-    };
     let mut lines = Vec::new();
     for e in std::fs::read_dir(dir).map_err(|e| format!("morsec: {}: {e}", dir.display()))? {
         let e = e.map_err(|e| format!("morsec: {}: {e}", dir.display()))?;
         let name = e.file_name().to_string_lossy().into_owned();
-        let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+        if want.contains(&name) {
             continue;
-        };
-        if !want.contains(&name) && same_at(&e.path(), &m) {
+        }
+        if matches!(
+            shim.classify(&e.path()),
+            Entry::Linked | Entry::Pinned | Entry::Stale
+        ) {
             std::fs::remove_file(e.path()).map_err(|err| format!("morsec: {name}: {err}"))?;
             lines.push(format!("removed {name}"));
         }
     }
     for name in want {
         let p = dir.join(name);
-        match std::fs::symlink_metadata(&p) {
-            Ok(m) if (m.dev(), m.ino()) == (shim_meta.dev(), shim_meta.ino()) => {}
-            Ok(m) if same_at(&p, &m) => {
+        match shim.classify(&p) {
+            Entry::Linked => {}
+            Entry::Pinned | Entry::Stale => {
                 std::fs::remove_file(&p).map_err(|e| format!("morsec: {name}: {e}"))?;
-                place(shim, &p)?;
+                shim.place(&p)?;
                 lines.push(format!("updated {name}"));
             }
-            Ok(_) => lines.push(format!(
+            Entry::Foreign => lines.push(format!(
                 "skipped {name}: {} exists and is not a morsec shim",
                 p.display()
             )),
-            Err(_) => {
-                place(shim, &p)?;
+            Entry::Missing => {
+                shim.place(&p)?;
                 lines.push(format!("linked {name}"));
             }
         }
@@ -253,15 +252,6 @@ fn sync_shims(dir: &Path, shim: &Path, want: &BTreeSet<String>) -> Result<Vec<St
         dir.display()
     ));
     Ok(lines)
-}
-
-fn place(shim: &Path, at: &Path) -> Result<(), String> {
-    if std::fs::hard_link(shim, at).is_ok() {
-        return Ok(());
-    }
-    std::fs::copy(shim, at)
-        .map(drop)
-        .map_err(|e| format!("morsec: can't create {}: {e}", at.display()))
 }
 
 #[cfg(test)]
@@ -298,18 +288,27 @@ mod tests {
     #[test]
     fn sync() {
         let d = tempfile::tempdir().unwrap();
-        let shim = d.path().join("ms-shim");
-        std::fs::write(&shim, "shim-binary").unwrap();
+        let shim_path = d.path().join("ms-shim");
+        std::fs::write(&shim_path, crate::brew::tests::shim_bytes("dev")).unwrap();
+        let shim = brew::Shim::open(&shim_path, None).unwrap();
         let dir = d.path().join("shims");
         let want: BTreeSet<String> = ["psql".into(), "stripe".into()].into();
         sync_shims(&dir, &shim, &want).unwrap();
         assert!(dir.join("psql").exists() && dir.join("stripe").exists());
+        assert!(
+            !std::fs::symlink_metadata(dir.join("psql"))
+                .unwrap()
+                .is_symlink()
+        );
         std::fs::write(dir.join("mine"), "user file, different size").unwrap();
-        // Same size as the shim but different bytes: not a shim, never removed.
-        std::fs::write(dir.join("lookalike"), "shim-BINARY").unwrap();
+        // Same size as the shim but different bytes and no marker: not a shim, never removed.
+        let mut look = crate::brew::tests::shim_bytes("dev");
+        look[0] = b'#';
+        std::fs::write(dir.join("lookalike"), &look).unwrap();
         let want2: BTreeSet<String> = ["psql".into(), "mine".into()].into();
         let lines = sync_shims(&dir, &shim, &want2).unwrap();
         assert!(!dir.join("stripe").exists());
+        assert!(dir.join("lookalike").exists());
         assert_eq!(
             std::fs::read_to_string(dir.join("mine")).unwrap(),
             "user file, different size"
@@ -318,5 +317,88 @@ mod tests {
             lines.iter().any(|l| l.starts_with("skipped mine")),
             "{lines:?}"
         );
+        assert_eq!(shim.classify(&dir.join("psql")), Entry::Linked);
+    }
+
+    // protects=in a Homebrew install shims are symlinks to opt/morsec/bin/ms-shim, so after
+    // `brew upgrade` (new keg, opt moved, old keg deleted) they run the new ms-shim with no
+    // relink; hard links left by an older version are migrated; fails_when=a shim points into a
+    // versioned keg or an old hard link is skipped as foreign; no_claim=brew itself (never run)
+    #[test]
+    fn sync_follows_brew_upgrade() {
+        use crate::brew::tests::{FakeBrew, shim_bytes};
+        let b = FakeBrew::new();
+        let v1 = b.install("1.0.0", &shim_bytes("1"));
+        b.point_opt("1.0.0");
+        let shims = b.prefix.join("home/.morsec/shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        // What an older ms left: a hard link of the 1.0.0 keg's ms-shim, and a stale extra one.
+        std::fs::hard_link(v1.join("ms-shim"), shims.join("psql")).unwrap();
+        std::fs::hard_link(v1.join("ms-shim"), shims.join("gone")).unwrap();
+        std::fs::write(shims.join("mine"), "user file").unwrap();
+
+        let real = v1.join("ms-shim");
+        let shim = brew::Shim::open(&real, brew::stable_path(&real)).unwrap();
+        assert_eq!(shim.stable.as_deref(), Some(b.opt_bin("ms-shim").as_path()));
+        assert_eq!(shim.classify(&shims.join("psql")), Entry::Pinned);
+        let want: BTreeSet<String> = ["psql".into(), "stripe".into()].into();
+        let lines = sync_shims(&shims, &shim, &want).unwrap();
+        assert!(lines.contains(&"updated psql".to_owned()), "{lines:?}");
+        assert!(lines.contains(&"linked stripe".to_owned()), "{lines:?}");
+        assert!(lines.contains(&"removed gone".to_owned()), "{lines:?}");
+        for n in ["psql", "stripe"] {
+            assert_eq!(
+                std::fs::read_link(shims.join(n)).unwrap(),
+                b.opt_bin("ms-shim")
+            );
+            assert_eq!(shim.classify(&shims.join(n)), Entry::Linked);
+        }
+        assert!(shims.join("mine").exists());
+
+        // brew upgrade: 1.1.0 installed, opt moved, 1.0.0 deleted.
+        let v2 = b.install("1.1.0", &shim_bytes("2"));
+        b.point_opt("1.1.0");
+        b.uninstall("1.0.0");
+        for n in ["psql", "stripe"] {
+            assert_eq!(
+                std::fs::read(shims.join(n)).unwrap(),
+                shim_bytes("2"),
+                "{n} runs the new ms-shim"
+            );
+        }
+        // The new ms sees them as linked: nothing to do.
+        let real2 = v2.join("ms-shim");
+        let shim2 = brew::Shim::open(&real2, brew::stable_path(&real2)).unwrap();
+        let lines = sync_shims(&shims, &shim2, &want).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    // protects=a dev build's copies of an older ms-shim are recognised by the marker and
+    // replaced, and a dangling symlink to an ms-shim counts as stale; fails_when=they are
+    // skipped as foreign files; no_claim=-
+    #[test]
+    fn sync_migrates_old_dev_shims() {
+        use crate::brew::tests::shim_bytes;
+        let d = tempfile::tempdir().unwrap();
+        let shim_path = d.path().join("ms-shim");
+        std::fs::write(&shim_path, shim_bytes("new")).unwrap();
+        let shim = brew::Shim::open(&shim_path, None).unwrap();
+        let dir = d.path().join("shims");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("psql"), shim_bytes("old build")).unwrap();
+        std::os::unix::fs::symlink(d.path().join("deleted/ms-shim"), dir.join("stripe")).unwrap();
+        std::os::unix::fs::symlink(d.path().join("deleted/other"), dir.join("aws")).unwrap();
+        assert_eq!(shim.classify(&dir.join("psql")), Entry::Stale);
+        assert_eq!(shim.classify(&dir.join("stripe")), Entry::Stale);
+        assert_eq!(shim.classify(&dir.join("aws")), Entry::Foreign);
+        let want: BTreeSet<String> = ["psql".into(), "stripe".into(), "aws".into()].into();
+        let lines = sync_shims(&dir, &shim, &want).unwrap();
+        assert!(lines.contains(&"updated psql".to_owned()), "{lines:?}");
+        assert!(lines.contains(&"updated stripe".to_owned()), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with("skipped aws")),
+            "{lines:?}"
+        );
+        assert_eq!(std::fs::read(dir.join("psql")).unwrap(), shim_bytes("new"));
     }
 }

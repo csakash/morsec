@@ -10,3 +10,7 @@ entries. Move the entries from Unreleased into it when you bump the version.
   `csakash/tap`. Swap mode (proxy), run mode (`ms run`, shims), `ms mcp`, `ms doctor`, and
   connectors for Claude Code and Codex.
 - `ms stop` now leaves a receipt for every run it kills.
+- `brew upgrade morsec` is enough to upgrade: `ms init` points msd's LaunchAgent, and
+  `ms run --link-shims` points the run shims, at Homebrew's stable `opt/morsec` path instead of
+  the versioned Cellar path. `ms doctor` flags a LaunchAgent whose version is gone, or one or
+  shims still pinned to a version. Dev and manual installs keep their paths.

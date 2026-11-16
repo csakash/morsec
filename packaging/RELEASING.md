@@ -69,7 +69,10 @@ steps are yours, below.
 8. On a clean macOS VM (Apple silicon, no Rust, no morsec):
    `brew install csakash/tap/morsec && ms --version && mors --version && brew test morsec`
    (`brew test` also checks `ms-shim`), then `ms init` and `ms doctor`: the "run shims" section
-   must not say ms-shim is missing. Time it from `brew install` to the first protected session
+   must not say ms-shim is missing, and the "launchagent" section must name
+   `$(brew --prefix)/opt/morsec/bin/msd`, not a `Cellar/morsec/<version>` path. From the second
+   release on, also check `brew upgrade morsec` alone keeps msd starting (`ms doctor` after a
+   logout or `launchctl kickstart -k gui/$(id -u)/cc.morsec.msd`). Time it from `brew install` to the first protected session
    (L28's target is under 5 minutes). Then follow `packaging/VERIFY.md` once from the
    downloaded files.
 

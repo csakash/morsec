@@ -24,9 +24,9 @@ class Morsec < Formula
     <<~EOS
       Set morsec up (creates the vault and starts msd as a LaunchAgent):
         ms init
-      morsec has no auto-update. Upgrade with:
-        brew upgrade morsec && ms init && ms run --link-shims
-      (ms init points msd's LaunchAgent at the new version; --link-shims refreshes the run shims.)
+      morsec has no auto-update. Upgrade with brew upgrade morsec, then restart msd
+      (or log out and back in), with your user id (id -u) as UID:
+        launchctl kickstart -k gui/UID/cc.morsec.msd
     EOS
   end
 

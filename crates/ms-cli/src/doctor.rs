@@ -73,6 +73,9 @@ pub(crate) fn run(a: &DoctorArgs) -> ExitCode {
     }
     let mut report = Report::default();
     let daemon = daemon_section(&mut report);
+    // Shown even when msd is down: a LaunchAgent left pointing at a deleted version is a
+    // common reason it is.
+    report.section("launchagent", launch_agent_items());
     let port = daemon.as_ref().and_then(|d| d.proxy_port);
     if daemon.is_some() {
         report.section("run shims", shim_items());
@@ -607,8 +610,84 @@ fn agent_items(
     items
 }
 
+/// msd's LaunchAgent (launchagent-opt-path): does the program it starts still exist, and will it
+/// survive `brew upgrade`?
+fn launch_agent_items() -> Vec<Item> {
+    match crate::service::plist_path() {
+        Ok(p) => vec![launch_agent_check(&p)],
+        Err(e) => vec![Item::fail(format!("LaunchAgent not checked · {e}"))],
+    }
+}
+
+fn launch_agent_check(plist: &Path) -> Item {
+    let text = match std::fs::read_to_string(plist) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Item::info(format!(
+                "no LaunchAgent at {} (ms init installs it; skip this if you start msd yourself)",
+                plist.display()
+            ));
+        }
+        Err(e) => {
+            return Item::fail(format!(
+                "LaunchAgent unreadable ({}) · {e} · run: ms init",
+                plist.display()
+            ));
+        }
+    };
+    let Some(program) = crate::service::plist_program(&text).map(PathBuf::from) else {
+        return Item::fail(format!(
+            "LaunchAgent {} names no program in the form ms init writes, so it may start nothing · run: ms init",
+            plist.display()
+        ));
+    };
+    let p = program.display();
+    let keg = crate::brew::keg_of(&program).map(|(prefix, v)| (prefix.to_path_buf(), v.to_owned()));
+    if !std::fs::metadata(&program).is_ok_and(|m| m.is_file()) {
+        return Item::fail(match keg {
+            Some((_, v)) => format!(
+                "LaunchAgent starts msd from morsec {v}, which is no longer installed (brew upgrade removes old versions), so msd can't start ({p}) · run: ms init"
+            ),
+            None => format!("LaunchAgent starts {p}, which does not exist · run: ms init"),
+        });
+    }
+    if program.file_name().is_none_or(|n| n != "msd") {
+        return Item::warn(format!(
+            "LaunchAgent {} starts {p}, which is not msd · run: ms init",
+            plist.display()
+        ));
+    }
+    if let Some((prefix, v)) = keg {
+        let opt = prefix.join("opt/morsec/bin/msd");
+        let real = std::fs::canonicalize(&program).ok();
+        if let Ok(opt_real) = std::fs::canonicalize(&opt) {
+            if real.as_ref() != Some(&opt_real) {
+                let now = crate::brew::keg_of(&opt_real).map_or_else(
+                    || "another version".to_owned(),
+                    |(_, w)| format!("morsec {w}"),
+                );
+                return Item::warn(format!(
+                    "LaunchAgent is pinned to morsec {v} ({p}), but {now} is installed: msd runs the old version and stops starting when brew cleans it up · run: ms init"
+                ));
+            }
+            if real.as_deref().and_then(crate::brew::stable_path).is_some() {
+                return Item::warn(format!(
+                    "LaunchAgent is pinned to morsec {v} ({p}); the next brew upgrade will stop msd from starting · run: ms init"
+                ));
+            }
+            return Item::warn(format!(
+                "LaunchAgent is pinned to morsec {v} ({p}): ms init can't use {} because it or {}/opt is not owned by you or root, or is writable by others; the next brew upgrade will stop msd from starting",
+                opt.display(),
+                prefix.display()
+            ));
+        }
+    }
+    Item::pass(format!("LaunchAgent starts {p}"))
+}
+
 /// Run-mode shims (L12): when a run key allows programs, `ms-shim` must sit next to `ms` and
-/// `~/.morsec/shims/<program>` must be it (a hard link, or a byte-identical copy).
+/// `~/.morsec/shims/<program>` must be it: a symlink to the stable `opt` path in a Homebrew
+/// install, else a hard link (or a byte-identical copy).
 fn shim_items() -> Vec<Item> {
     let rules = match crate::run::fetch_rules() {
         Ok(r) => r,
@@ -620,9 +699,9 @@ fn shim_items() -> Vec<Item> {
             "no run-mode key allows a program, so no shims are needed",
         )];
     }
-    let shim = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map(|p| p.with_file_name("ms-shim"));
+    let shim = crate::brew::sibling("ms-shim")
+        .and_then(|(real, _)| crate::brew::Shim::open(&real, crate::brew::stable_path(&real)))
+        .ok();
     let Some(home) = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|h| h.is_absolute())
@@ -634,35 +713,30 @@ fn shim_items() -> Vec<Item> {
     let dir = home.join(".morsec/shims");
     let on_path =
         std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == dir));
-    shim_check(shim.ok().as_deref(), &dir, &want, on_path)
+    shim_check(shim.as_ref(), &dir, &want, on_path)
 }
 
 fn shim_check(
-    shim: Option<&Path>,
+    shim: Option<&crate::brew::Shim>,
     dir: &Path,
     want: &std::collections::BTreeSet<String>,
     on_path: bool,
 ) -> Vec<Item> {
-    use std::os::unix::fs::MetadataExt;
-    let Some((shim, meta)) = shim.and_then(|s| std::fs::metadata(s).ok().map(|m| (s, m))) else {
+    use crate::brew::Entry;
+    let Some(shim) = shim else {
         return vec![Item::fail(
             "ms-shim is not installed next to ms · reinstall morsec (brew reinstall morsec)",
         )];
     };
-    let bytes = std::fs::read(shim).unwrap_or_default();
-    let is_shim = |p: &Path| {
-        std::fs::symlink_metadata(p).is_ok_and(|m| {
-            (m.dev(), m.ino()) == (meta.dev(), meta.ino())
-                || (m.file_type().is_file()
-                    && m.len() == meta.len()
-                    && std::fs::read(p).is_ok_and(|b| b == bytes))
-        })
-    };
-    let bad: Vec<&str> = want
-        .iter()
-        .filter(|n| !is_shim(&dir.join(n)))
-        .map(String::as_str)
-        .collect();
+    let mut bad = Vec::new();
+    let mut pinned = Vec::new();
+    for n in want {
+        match shim.classify(&dir.join(n)) {
+            Entry::Linked => {}
+            Entry::Pinned => pinned.push(n.as_str()),
+            Entry::Stale | Entry::Foreign | Entry::Missing => bad.push(n.as_str()),
+        }
+    }
     let mut items = vec![if bad.is_empty() {
         Item::pass(format!(
             "{} shim{} linked in {}",
@@ -676,6 +750,19 @@ fn shim_check(
             bad.join(", ")
         ))
     }];
+    if !pinned.is_empty() {
+        items.push(Item::warn(if shim.stable.is_some() {
+            format!(
+                "shims pinned to this morsec version: {} · the next brew upgrade leaves them stale · run: ms run --link-shims",
+                pinned.join(", ")
+            )
+        } else {
+            format!(
+                "shims linked another way than ms run --link-shims makes them: {} · run: ms run --link-shims",
+                pinned.join(", ")
+            )
+        }));
+    }
     if !on_path {
         items.push(Item::warn(format!(
             "{} is not on this terminal's PATH (agents get it from their connector); add it to run these programs through morsec here too",
@@ -1769,11 +1856,12 @@ mod tests {
     #[test]
     fn shim_check_verdicts() {
         let d = tempfile::tempdir().unwrap();
-        let shim = d.path().join("ms-shim");
-        std::fs::write(&shim, b"shim-bytes").unwrap();
+        let shim_path = d.path().join("ms-shim");
+        std::fs::write(&shim_path, b"shim-bytes").unwrap();
+        let shim = crate::brew::Shim::open(&shim_path, None).unwrap();
         let dir = d.path().join("shims");
         std::fs::create_dir(&dir).unwrap();
-        std::fs::hard_link(&shim, dir.join("psql")).unwrap();
+        std::fs::hard_link(&shim_path, dir.join("psql")).unwrap();
         std::fs::write(dir.join("deploy"), b"something else").unwrap();
         let want = |n: &[&str]| n.iter().map(|s| (*s).to_owned()).collect();
         let items = shim_check(Some(&shim), &dir, &want(&["psql"]), true);
@@ -1786,8 +1874,127 @@ mod tests {
         assert!(items[0].text.contains("deploy, git"), "{}", items[0].text);
         assert!(items[0].text.contains("ms run --link-shims"));
         assert_eq!(items[1].mark, Mark::Warn);
-        let items = shim_check(Some(&d.path().join("nope")), &dir, &want(&["psql"]), true);
+        let items = shim_check(None, &dir, &want(&["psql"]), true);
         assert_eq!(items[0].mark, Mark::Fail);
+    }
+
+    // protects=in a Homebrew install, opt symlinks pass and hard links into the keg warn (they
+    // go stale on upgrade); fails_when=a keg-pinned shim passes silently; no_claim=-
+    #[test]
+    fn shim_check_brew() {
+        use crate::brew::tests::{FakeBrew, shim_bytes};
+        let b = FakeBrew::new();
+        let v1 = b.install("1.0.0", &shim_bytes("1"));
+        b.point_opt("1.0.0");
+        let real = v1.join("ms-shim");
+        let shim = crate::brew::Shim::open(&real, crate::brew::stable_path(&real)).unwrap();
+        let dir = b.prefix.join("shims");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(b.opt_bin("ms-shim"), dir.join("psql")).unwrap();
+        std::fs::hard_link(&real, dir.join("stripe")).unwrap();
+        let want = |n: &[&str]| n.iter().map(|s| (*s).to_owned()).collect();
+        let items = shim_check(Some(&shim), &dir, &want(&["psql"]), true);
+        assert_eq!(
+            items.iter().map(|i| i.mark).collect::<Vec<_>>(),
+            [Mark::Pass]
+        );
+        let items = shim_check(Some(&shim), &dir, &want(&["psql", "stripe"]), true);
+        assert_eq!(
+            items.iter().map(|i| i.mark).collect::<Vec<_>>(),
+            [Mark::Pass, Mark::Warn]
+        );
+        assert!(items[1].text.contains("stripe") && items[1].text.contains("brew upgrade"));
+    }
+
+    // protects=doctor flags a LaunchAgent whose program is in a deleted Cellar version (fail,
+    // names the version), warns on a keg-pinned one, passes the opt path, treats a missing plist
+    // as info; fails_when=a LaunchAgent into a removed keg passes; no_claim=launchctl's state
+    #[test]
+    fn launch_agent_verdicts() {
+        use crate::brew::tests::{FakeBrew, shim_bytes};
+        let b = FakeBrew::new();
+        let v1 = b.install("1.0.0", &shim_bytes("1"));
+        b.point_opt("1.0.0");
+        let plist = b.prefix.join("LaunchAgents/cc.morsec.msd.plist");
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        let write = |msd: &Path| {
+            std::fs::write(
+                &plist,
+                crate::service::render_plist(msd, Path::new("/tmp/msd.log")),
+            )
+            .unwrap();
+        };
+        assert_eq!(launch_agent_check(&plist).mark, Mark::Info);
+
+        write(&b.opt_bin("msd"));
+        let it = launch_agent_check(&plist);
+        assert_eq!(it.mark, Mark::Pass, "{}", it.text);
+
+        write(&v1.join("msd"));
+        let it = launch_agent_check(&plist);
+        assert_eq!(it.mark, Mark::Warn, "{}", it.text);
+        assert!(
+            it.text.contains("1.0.0") && it.text.contains("ms init"),
+            "{}",
+            it.text
+        );
+
+        // brew upgrade with cleanup deferred: 1.1.0 is current, 1.0.0 still on disk.
+        b.install("1.1.0", &shim_bytes("2"));
+        b.point_opt("1.1.0");
+        let it = launch_agent_check(&plist);
+        assert_eq!(it.mark, Mark::Warn, "{}", it.text);
+        assert!(
+            it.text.contains("pinned to morsec 1.0.0")
+                && it.text.contains("morsec 1.1.0 is installed"),
+            "{}",
+            it.text
+        );
+
+        // A group-writable opt: ms init can't use it, and doctor says why.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let opt = b.prefix.join("opt");
+            write(&b.keg_bin("1.1.0").join("msd"));
+            std::fs::set_permissions(&opt, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let it = launch_agent_check(&plist);
+            assert_eq!(it.mark, Mark::Warn, "{}", it.text);
+            assert!(it.text.contains("not owned by you or root"), "{}", it.text);
+            std::fs::set_permissions(&opt, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write(&v1.join("msd"));
+        }
+
+        // brew cleanup: 1.0.0 is gone.
+        b.uninstall("1.0.0");
+        let it = launch_agent_check(&plist);
+        assert_eq!(it.mark, Mark::Fail, "{}", it.text);
+        assert!(
+            it.text.contains("morsec 1.0.0") && it.text.contains("no longer installed"),
+            "{}",
+            it.text
+        );
+        assert!(it.text.contains("run: ms init"));
+        // ...while one written with the opt path keeps working.
+        write(&b.opt_bin("msd"));
+        assert_eq!(launch_agent_check(&plist).mark, Mark::Pass);
+
+        // A program that is not msd.
+        write(Path::new("/bin/sh"));
+        let it = launch_agent_check(&plist);
+        assert_eq!(it.mark, Mark::Warn, "{}", it.text);
+        assert!(it.text.contains("not msd"), "{}", it.text);
+
+        // A non-Homebrew program that is gone, and one that exists.
+        write(&b.prefix.join("dev/msd"));
+        let it = launch_agent_check(&plist);
+        assert_eq!(it.mark, Mark::Fail);
+        assert!(it.text.contains("does not exist"), "{}", it.text);
+        std::fs::create_dir_all(b.prefix.join("dev")).unwrap();
+        std::fs::write(b.prefix.join("dev/msd"), "dev").unwrap();
+        assert_eq!(launch_agent_check(&plist).mark, Mark::Pass);
+
+        std::fs::write(&plist, "<plist><dict></dict></plist>").unwrap();
+        assert_eq!(launch_agent_check(&plist).mark, Mark::Fail);
     }
 
     #[test]

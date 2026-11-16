@@ -121,7 +121,8 @@ pub(crate) fn home() -> Result<PathBuf, String> {
 }
 
 /// The `ms` path to write into settings: the first `ms` on PATH that is this binary (a stable
-/// Homebrew link survives upgrades), else this binary (SPEC D12). A PATH entry counts only in a
+/// Homebrew link survives upgrades), else the Homebrew `opt` path when there is one
+/// ([`crate::brew::stable_path`]), else this binary (SPEC D12). A PATH entry counts only in a
 /// directory outside HOME and the current directory that no other user can write (security
 /// review S4): the link is run outside the sandbox at every session start, so it must not live
 /// where a repo checkout or a temp dir could repoint it.
@@ -150,7 +151,8 @@ pub(crate) fn ms_path() -> Result<String, String> {
             .map(|d| d.join("ms"))
             .find(|c| std::fs::canonicalize(c).is_ok_and(|r| r == real))
     });
-    let p = on_path.unwrap_or(real);
+    // Not on PATH: the stable Homebrew opt path if there is one (launchagent-opt-path).
+    let p = on_path.unwrap_or_else(|| crate::brew::preferred(&real));
     p.to_str()
         .map(str::to_owned)
         .ok_or_else(|| format!("morsec: the path of ms ({}) is not UTF-8", p.display()))

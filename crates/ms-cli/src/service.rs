@@ -125,7 +125,8 @@ fn home() -> Result<PathBuf, String> {
         .ok_or_else(|| "morsec: HOME is not set".to_owned())
 }
 
-fn plist_path() -> Result<PathBuf, String> {
+/// `~/Library/LaunchAgents/cc.morsec.msd.plist`.
+pub(crate) fn plist_path() -> Result<PathBuf, String> {
     Ok(home()?.join(format!("Library/LaunchAgents/{LABEL}.plist")))
 }
 
@@ -224,31 +225,70 @@ pub(crate) fn render_plist(msd: &Path, log: &Path) -> String {
         .replace("@LOG@", &xml_escape(&log.display().to_string()))
 }
 
-/// `msd`, installed next to `ms`.
+/// `msd`, installed next to `ms`, as the LaunchAgent should name it: the stable
+/// `<prefix>/opt/morsec/bin/msd` in a Homebrew install (it survives `brew upgrade`), else msd's
+/// own path (a dev build or a manual install).
 fn msd_path() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("morsec: finding ms itself: {e}"))?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    let msd = exe.with_file_name("msd");
-    if !msd.is_file() {
+    let (real, preferred) =
+        crate::brew::sibling("msd").map_err(|e| format!("morsec: finding ms itself: {e}"))?;
+    if !real.is_file() {
         return Err(format!(
             "morsec: msd is not installed next to ms ({}). Reinstall morsec",
-            msd.display()
+            real.display()
         ));
     }
-    Ok(msd)
+    Ok(preferred)
+}
+
+/// Where msd's LaunchAgent sends its stderr.
+fn log_path(home: &Path) -> PathBuf {
+    home.join("Library/Logs/morsec/msd.log")
+}
+
+/// The program a LaunchAgent plist runs: the first `ProgramArguments` string, as `ms init`
+/// writes it (XML). `None` when the plist has no such entry.
+pub(crate) fn plist_program(plist: &str) -> Option<String> {
+    // Comments out of the way first (the template carries one), refusing an unclosed one.
+    let mut text = String::with_capacity(plist.len());
+    let mut rest = plist;
+    while let Some(i) = rest.find("<!--") {
+        text.push_str(&rest[..i]);
+        rest = &rest[i + 4..][rest[i + 4..].find("-->")? + 3..];
+    }
+    text.push_str(rest);
+    // Exactly one ProgramArguments key, followed (after whitespace only) by <array>, then
+    // (after whitespace only) by the first <string>. Anything else is not the form `ms init`
+    // writes, and is reported as such rather than guessed at (security review S2).
+    const KEY: &str = "<key>ProgramArguments</key>";
+    if text.matches(KEY).count() != 1 {
+        return None;
+    }
+    let after = text[text.find(KEY)? + KEY.len()..].trim_start();
+    let after = after.strip_prefix("<array>")?.trim_start();
+    let after = after.strip_prefix("<string>")?;
+    let end = after.find("</string>")?;
+    Some(
+        after[..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    )
 }
 
 fn install_launch_agent(msd: &Path) -> Result<(), String> {
     let home = home()?;
-    let log_dir = home.join("Library/Logs/morsec");
-    std::fs::create_dir_all(&log_dir)
+    let log = log_path(&home);
+    let log_dir = log.parent().unwrap_or(&home);
+    std::fs::create_dir_all(log_dir)
         .map_err(|e| format!("morsec: creating {}: {e}", log_dir.display()))?;
     let plist = plist_path()?;
     if let Some(dir) = plist.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("morsec: creating {}: {e}", dir.display()))?;
     }
-    std::fs::write(&plist, render_plist(msd, &log_dir.join("msd.log")))
+    std::fs::write(&plist, render_plist(msd, &log))
         .map_err(|e| format!("morsec: writing {}: {e}", plist.display()))?;
     let domain = format!("gui/{}", uid());
     // Unload an older copy first; it is fine if none is loaded.
@@ -416,5 +456,54 @@ mod tests {
         assert!(p.contains("<string>--foreground</string>"));
         assert!(!p.contains("@MSD@") && !p.contains("@LOG@"));
         assert!(!p.contains("<key>EnvironmentVariables</key>"));
+        assert_eq!(plist_program(&p).as_deref(), Some("/opt/m&s/msd"));
+    }
+
+    // protects=ms init names msd by the stable opt path in a Homebrew install and by its own
+    // path otherwise; the plist it renders reads back to that path; fails_when=a Cellar
+    // (versioned) path lands in the LaunchAgent while opt points at the same keg;
+    // no_claim=launchctl loading it
+    #[test]
+    fn launch_agent_uses_opt_path() {
+        use crate::brew::tests::{FakeBrew, shim_bytes};
+        let b = FakeBrew::new();
+        let v1 = b.install("1.0.0", &shim_bytes("1"));
+        b.point_opt("1.0.0");
+        let chosen = crate::brew::preferred(&v1.join("msd"));
+        assert_eq!(chosen, b.opt_bin("msd"));
+        let plist = render_plist(&chosen, &log_path(Path::new("/Users/x")));
+        assert_eq!(
+            plist_program(&plist).map(PathBuf::from),
+            Some(b.opt_bin("msd"))
+        );
+        assert!(!plist.contains("/Cellar/"), "{plist}");
+        assert!(plist.contains("/Users/x/Library/Logs/morsec/msd.log"));
+        // Not a keg: unchanged.
+        let dev = Path::new("/Users/x/code/morsec/target/release/msd");
+        assert_eq!(crate::brew::preferred(dev), dev);
+    }
+
+    // protects=the program is read only from ProgramArguments[0]; fails_when=another string is
+    // taken for it; no_claim=binary plists (doctor warns that it can't read them)
+    #[test]
+    fn plist_program_parsing() {
+        assert_eq!(plist_program("<dict></dict>"), None);
+        let other = "<key>Label</key><string>x</string><key>ProgramArguments</key>\n<array>\n  <string>/a&lt;b</string><string>--foreground</string></array>";
+        assert_eq!(plist_program(other).as_deref(), Some("/a<b"));
+        let not_first =
+            "<key>ProgramArguments</key><array><integer>1</integer><string>/x</string></array>";
+        assert_eq!(plist_program(not_first), None);
+        // An empty array followed by another key's array: not taken for the program.
+        let elsewhere = "<key>ProgramArguments</key><array/><key>Other</key><array><string>/msd</string></array>";
+        assert_eq!(plist_program(elsewhere), None);
+        let twice = "<key>ProgramArguments</key><array><string>/a</string></array><key>ProgramArguments</key><array><string>/b</string></array>";
+        assert_eq!(plist_program(twice), None);
+        // A commented-out entry is ignored; the real one is read.
+        let commented = "<!-- <key>ProgramArguments</key><array><string>/fake</string></array> --><key>ProgramArguments</key><array><string>/x</string></array>";
+        assert_eq!(plist_program(commented).as_deref(), Some("/x"));
+        assert_eq!(
+            plist_program("<!-- unclosed <key>ProgramArguments</key>"),
+            None
+        );
     }
 }
