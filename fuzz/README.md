@@ -33,5 +33,9 @@ libFuzzer writes what it finds there and the committed seeds stay as they are:
 cd fuzz && cargo +nightly fuzz run dotenv runs/dotenv corpus/dotenv
 ```
 
+`fuzz/Cargo.lock` is committed, so a nightly run builds the dependency versions reviewed here.
+The gate's cargo-deny and cargo-audit do not cover this crate; run them in `fuzz/` before a long
+session (`cargo deny check`, `cargo audit`).
+
 Add a crash input that reproduces a bug to `corpus/<target>/` together with the fix and a
 regression test in the crate.
