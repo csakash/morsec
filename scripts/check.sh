@@ -20,6 +20,7 @@ need cargo-deny "cargo install --locked cargo-deny"
 need cargo-audit "cargo install --locked cargo-audit"
 need python3 "your OS package manager"
 need shellcheck "brew install shellcheck"
+need perl "your OS package manager (macOS ships it)"
 
 step() { printf '\n== %s\n' "$*"; }
 
@@ -49,6 +50,38 @@ cargo metadata --format-version 1 --locked | python3 -I scripts/supply_chain_che
 step "7b release tooling: packaging tests and shellcheck (L10)"
 python3 -I -m unittest discover -s packaging/tests
 shellcheck scripts/release.sh
+
+step "7c fuzz: fuzz_* property targets with more cases, 90 s ceiling (hardening loop)"
+# proptest on stable (SPEC D1-D4, docs/THREAT_MODEL.md): the dotenv parser, the proxy's request
+# handling and IPC framing/decoding/server. Step 4 ran them at their small default counts; this
+# runs them deeper. Pure parsers get many cases; the targets that drive a live proxy or socket
+# per case get fewer. The whole step runs under one hard ceiling: past it, every process of the
+# step is killed and the gate fails (macOS has no timeout(1)).
+# A longer local session: MORSEC_FUZZ_CASES=100000 cargo test -p <crate> -- fuzz_<name>
+with_ceiling() {
+  perl -e '
+    my $t = shift;
+    my $pid = fork() // die "fork: $!";
+    if ($pid == 0) { setpgrp(0, 0); exec(@ARGV) or die "exec: $!"; }
+    $SIG{ALRM} = sub { kill("KILL", -$pid); print STDERR "check.sh: fuzz step passed its ${t}s ceiling\n"; exit 1; };
+    alarm($t);
+    waitpid($pid, 0);
+    my $s = $?;
+    exit(($s & 127) ? 1 : ($s >> 8));
+  ' "$@"
+}
+fuzz_step() {
+  MORSEC_FUZZ_CASES="${MORSEC_FUZZ_CASES:-2500}" cargo test --locked -q \
+    -p ms-fuzz -p ms-import -p ms-ipc -p ms-proxy -- \
+    fuzz_dotenv fuzz_frame fuzz_decode fuzz_head fuzz_rewriter
+  MORSEC_FUZZ_CASES="${MORSEC_FUZZ_LIVE_CASES:-200}" cargo test --locked -q \
+    -p ms-ipc -p ms-proxy -- fuzz_listener fuzz_tunnel fuzz_server
+}
+fuzz_start=$SECONDS
+export -f fuzz_step
+with_ceiling 90 bash -c fuzz_step
+echo "fuzz step: $((SECONDS - fuzz_start)) s"
+python3 -I scripts/threat_model_check.py
 
 step "8/8 ARI-42 scan"
 python3 .claude/skills/ari42/scripts/ari42_scan.py check . --fail-on high
