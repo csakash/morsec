@@ -800,11 +800,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-fuzz"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "ms-import"
 version = "0.0.0"
 dependencies = [
  "libc",
  "ms-core",
+ "ms-fuzz",
  "ms-vault",
  "proptest",
  "serde",

@@ -1,6 +1,7 @@
 # cargo-fuzz harness for the dotenv parser (L04). Not a workspace member: it needs nightly and
-# libfuzzer. Run with: cd crates/ms-import/fuzz && cargo +nightly fuzz run dotenv
-# The same properties run on stable in `cargo test` (ms-import dotenv proptests).
+# libfuzzer. Run with: cd crates/ms-import/fuzz && cargo +nightly fuzz run dotenv ../fuzz-corpus/dotenv
+# The same properties, and more, run on stable as the `fuzz_dotenv_*` proptests (hardening loop,
+# SPEC D1), which read the same seed corpus and run in the gate.
 [package]
 name = "ms-import-fuzz"
 version = "0.0.0"

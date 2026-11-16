@@ -635,51 +635,213 @@ mod tests {
         })
     }
 
+    /// The parse-and-rewrite invariants every fuzz target checks on input it got from anywhere.
+    fn check_invariants(s: &str) -> Result<(), TestCaseError> {
+        let Ok(entries) = parse(s) else {
+            return Ok(());
+        };
+        for e in &entries {
+            prop_assert!(e.value_span.start <= e.value_span.end);
+            prop_assert!(e.value_span.end <= s.len());
+            prop_assert!(s.is_char_boundary(e.value_span.start));
+            prop_assert!(s.is_char_boundary(e.value_span.end));
+        }
+        let same = rewrite(s, &[]);
+        prop_assert_eq!(same.as_str(), s);
+        // Rewriting every entry gives a file whose entries are exactly the refs.
+        // (Empty values are never imported, so they are left out here.)
+        let reps: Vec<_> = entries
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| (e, "ms://x".to_owned()))
+            .collect();
+        let out = rewrite(s, &reps);
+        let again = parse(&out);
+        prop_assert!(
+            again.is_ok(),
+            "a rewritten file must parse: {:?}",
+            again.err()
+        );
+        let again = again.unwrap();
+        prop_assert_eq!(again.len(), entries.len());
+        for (old, new) in entries.iter().zip(&again) {
+            prop_assert_eq!(&old.name, &new.name);
+            let want: &[u8] = if old.value().is_empty() {
+                b""
+            } else {
+                b"ms://x"
+            };
+            prop_assert_eq!(new.value(), want);
+        }
+        Ok(())
+    }
+
+    fn corpus() -> Vec<Vec<u8>> {
+        ms_fuzz::corpus(concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz-corpus/dotenv"))
+    }
+
+    /// Tokens worth inserting whole into a mutated `.env`.
+    const DICT: &[&[u8]] = &[
+        b"=",
+        b": ",
+        b"export ",
+        b"#",
+        b" #",
+        b"'",
+        b"\"",
+        b"`",
+        b"\\",
+        b"\\\"",
+        b"${",
+        b"}",
+        b"$X",
+        b"\n",
+        b"\r\n",
+        b"\r",
+        b"\t",
+        b"\xef\xbb\xbf",
+        b"\xc3\xa9",
+        b"\xe2\x80\xae",
+        b"\0",
+    ];
+
+    /// A secret-looking token, unique per index: `TOK<i>x<6 alphanumerics>`.
+    fn token(i: usize) -> impl Strategy<Value = String> {
+        "[A-Za-z0-9]{6}".prop_map(move |t| format!("TOK{i}x{t}"))
+    }
+
+    /// Text that may sit around a token inside a value without changing how it parses.
+    fn noise(quote: Quote) -> BoxedStrategy<String> {
+        match quote {
+            Quote::None => "[a-z0-9_./+-]{0,6}".boxed(),
+            Quote::Single => "[a-z0-9 #\"`$\\\n]{0,8}".boxed(),
+            Quote::Double => "[a-z0-9 #'`\n]{0,8}".boxed(),
+            Quote::Backtick => "[a-z0-9 #'\"$\\\n]{0,8}".boxed(),
+        }
+    }
+
+    /// One entry line holding `tok` as (part of) its value, in one of the syntaxes loaders read.
+    fn entry_line(tok: String) -> impl Strategy<Value = String> {
+        let quote = prop_oneof![
+            Just(Quote::None),
+            Just(Quote::Single),
+            Just(Quote::Double),
+            Just(Quote::Backtick),
+        ];
+        (
+            quote,
+            "[a-z_][a-z0-9_.-]{0,8}",
+            prop::bool::ANY,
+            prop_oneof![Just("="), Just(" = "), Just("\t=\t"), Just(": ")],
+            "[ \t]{0,2}",
+            prop_oneof![Just(String::new()), "[ \t]{1,2}#[ -~&&[^A-Z]]{0,10}"],
+        )
+            .prop_flat_map(move |(q, name, export, sep, lead, comment)| {
+                let tok = tok.clone();
+                (noise(q), noise(q)).prop_map(move |(a, b)| {
+                    let v = match q.char() {
+                        None => format!("{a}{tok}{b}"),
+                        Some(c) => format!("{c}{a}{tok}{b}{c}"),
+                    };
+                    let export = if export { "export " } else { "" };
+                    // A YAML-style name may not contain '-' or '.' for every loader; keep it
+                    // simple and still valid for this parser.
+                    format!("{lead}{export}{name}{sep}{v}{comment}")
+                })
+            })
+    }
+
+    /// A `.env` file made of entries that each hold one unique token, plus comments and blanks.
+    fn env_with_tokens() -> impl Strategy<Value = (String, usize)> {
+        (1usize..8).prop_flat_map(|n| {
+            let entries: Vec<_> = (0..n).map(|i| token(i).prop_flat_map(entry_line)).collect();
+            (
+                entries,
+                prop::collection::vec(
+                    prop_oneof![
+                        Just(String::new()),
+                        "#[ -~&&[^A-Z]]{0,20}",
+                        "[ \t]{1,3}",
+                        "export [a-z]{1,4}"
+                    ],
+                    n,
+                ),
+                prop_oneof![Just("\n"), Just("\r\n")],
+                prop::bool::ANY,
+            )
+                .prop_map(move |(entries, fillers, eol, bom)| {
+                    let mut s = String::from(if bom { BOM } else { "" });
+                    for (e, f) in entries.iter().zip(&fillers) {
+                        s.push_str(f);
+                        s.push_str(eol);
+                        s.push_str(e);
+                        s.push_str(eol);
+                    }
+                    (s, n)
+                })
+        })
+    }
+
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(2000))]
+        #![proptest_config(ms_fuzz::config(2000))]
 
         // protects=parse never panics on arbitrary input, control characters and line breaks
-        // included (stable stand-in for the fuzz target); fails_when=any input panics;
-        // no_claim=coverage-guided depth (see fuzz/)
+        // included; fails_when=any input panics; no_claim=coverage-guided depth (see fuzz/)
         #[test]
-        fn never_panics(s in any::<String>()) {
-            let _ = parse(&s);
+        fn fuzz_dotenv_never_panics(s in any::<String>()) {
+            check_invariants(&s)?;
         }
 
         // protects=as above, on ASCII-heavy input where dotenv syntax is likely; fails_when=any
-        // input panics
+        // input panics or breaks an invariant
         #[test]
-        fn never_panics_ascii(s in "[\\x00-\\x7f]{0,200}") {
-            let _ = parse(&s);
+        fn fuzz_dotenv_never_panics_ascii(s in "[\\x00-\\x7f]{0,200}") {
+            check_invariants(&s)?;
         }
 
-        // protects=parse never panics on dotenv-shaped input, and an untouched rewrite is the
-        // identity; fails_when=a byte changes with no replacements, or spans fall outside src;
-        // no_claim=semantic equivalence with other loaders
+        // protects=parse never panics on dotenv-shaped input, spans are in bounds on char
+        // boundaries, an untouched rewrite is the identity and a full rewrite re-parses to the
+        // same names with only refs; fails_when=any of those breaks; no_claim=semantic
+        // equivalence with other loaders
         #[test]
-        fn untouched_rewrite_is_identity(s in arb_env()) {
-            if let Ok(entries) = parse(&s) {
-                for e in &entries {
-                    prop_assert!(e.value_span.end <= s.len());
-                    prop_assert!(s.is_char_boundary(e.value_span.start));
-                    prop_assert!(s.is_char_boundary(e.value_span.end));
-                }
-                let same = rewrite(&s, &[]);
-                prop_assert_eq!(same.as_str(), s.as_str());
-                // Rewriting every entry gives a file whose entries are exactly the refs.
-                // (Empty values are never imported, so they are left out here.)
-                let reps: Vec<_> = entries
+        fn fuzz_dotenv_rewrite_roundtrip(s in arb_env()) {
+            check_invariants(&s)?;
+        }
+
+        // protects=the same invariants on byte-mutated seeds from the committed corpus
+        // (fuzz-corpus/dotenv); fails_when=a mutated real-world file panics or breaks an
+        // invariant; no_claim=coverage guidance (proptest, SPEC D1)
+        #[test]
+        fn fuzz_dotenv_corpus(s in ms_fuzz::mutated_str(corpus(), DICT)) {
+            check_invariants(&s)?;
+        }
+
+        // protects=fail closed on import: every secret in a value position is either refused
+        // with a parse error or found as an entry, and a full ref rewrite leaves none of them in
+        // the file; fails_when=a token survives the rewrite or is skipped (left in plaintext);
+        // no_claim=interpolated values (left alone by design, see plan.rs)
+        #[test]
+        fn fuzz_dotenv_no_value_left((s, n) in env_with_tokens()) {
+            let entries = parse(&s);
+            prop_assert!(entries.is_ok(), "generated file must parse: {:?}\n{s:?}", entries.err());
+            let entries = entries.unwrap();
+            for i in 0..n {
+                let needle = format!("TOK{i}x");
+                let holders = entries
                     .iter()
-                    .filter(|e| !e.value().is_empty())
-                    .map(|e| (e, "ms://x".to_owned()))
-                    .collect();
-                let out = rewrite(&s, &reps);
-                let again = parse(&out).unwrap();
-                prop_assert_eq!(again.len(), entries.len());
-                for (old, new) in entries.iter().zip(&again) {
-                    let want: &[u8] = if old.value().is_empty() { b"" } else { b"ms://x" };
-                    prop_assert_eq!(new.value(), want);
-                }
+                    .filter(|e| e.value().windows(needle.len()).any(|w| w == needle.as_bytes()))
+                    .count();
+                prop_assert_eq!(holders, 1, "token {} found in {} entries\n{:?}", i, holders, s);
+            }
+            let reps: Vec<_> = entries
+                .iter()
+                .filter(|e| !e.value().is_empty())
+                .map(|e| (e, format!("ms://env/{}", e.name)))
+                .collect();
+            let out = rewrite(&s, &reps);
+            for i in 0..n {
+                let needle = format!("TOK{i}x");
+                prop_assert!(!out.contains(&needle), "a value survived the rewrite:\n{:?}", out.as_str());
             }
         }
     }

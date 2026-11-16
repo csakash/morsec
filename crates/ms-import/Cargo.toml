@@ -21,4 +21,5 @@ tempfile = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+ms-fuzz = { workspace = true }
 proptest = { workspace = true }
