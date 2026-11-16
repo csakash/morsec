@@ -24,6 +24,42 @@ class FormulaError(Exception):
     pass
 
 
+BIN_INSTALL = re.compile(r'^\s*bin\.install\s+(.+?)\s*$', re.M)
+BIN_ARG = re.compile(r'"bin/([A-Za-z0-9._-]+)"')
+
+
+def installed_bins(template: str) -> list[str]:
+    """The bin/ tools the formula installs: the names in its single `bin.install "bin/…", …`
+    line, in order. Refuses anything it can't read exactly, so a check built on it fails closed."""
+    lines = BIN_INSTALL.findall(template)
+    if len(lines) != 1:
+        raise FormulaError(f"the formula must have exactly one bin.install line, found {len(lines)}")
+    args = [a.strip() for a in lines[0].split(",")]
+    names = []
+    for a in args:
+        m = BIN_ARG.fullmatch(a)
+        if not m:
+            raise FormulaError(f"bin.install argument {a!r} is not a \"bin/<name>\" string")
+        names.append(m.group(1))
+    if len(set(names)) != len(names):
+        raise FormulaError("bin.install names a binary twice")
+    return names
+
+
+def sign_targets(text: str) -> list[tuple[str, str]]:
+    """Rows of packaging/macos/sign-targets: (bin name, signing identifier)."""
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            raise FormulaError(f"sign-targets line {line!r} is not '<name> <identifier>'")
+        rows.append((parts[0], parts[1]))
+    return rows
+
+
 def render(template: str, version: str, sha256: str, url: str) -> str:
     if not VERSION.fullmatch(version):
         raise FormulaError(f"version {version!r} is not MAJOR.MINOR.PATCH[-pre]")

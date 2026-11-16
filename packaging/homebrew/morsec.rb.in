@@ -13,7 +13,9 @@ class Morsec < Formula
   depends_on macos: :ventura # built with MACOSX_DEPLOYMENT_TARGET=13.0
 
   def install
-    bin.install "bin/ms", "bin/msd"
+    # ms-shim (run mode) must sit next to ms: ms run --link-shims and ms doctor look for it
+    # beside ms's real path, which is this Cellar bin/. The list matches packaging/macos/sign-targets.
+    bin.install "bin/ms", "bin/msd", "bin/ms-shim"
     bin.install_symlink "ms" => "mors"
     (share/"morsec").install "share/morsec/BUILDINFO", "share/morsec/morsec.cdx.json"
   end
@@ -29,5 +31,7 @@ class Morsec < Formula
   test do
     assert_match "morsec #{version}", shell_output("#{bin}/ms --version")
     assert_match "morsec #{version}", shell_output("#{bin}/mors --version")
+    # Under its own name ms-shim refuses (exit 64) and says how to link it.
+    assert_match "ms run --link-shims", shell_output("#{bin}/ms-shim 2>&1", 64)
   end
 end

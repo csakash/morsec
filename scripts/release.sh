@@ -60,6 +60,20 @@ workspace_version() {
 
 sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
+# shipped_bins <packaging dir>: the bin/ tools a release ships, one per line, in the order of
+# <packaging dir>/macos/sign-targets. That file is the one list: everything shipped is signed.
+shipped_bins() {
+  local name ident rest n=0
+  while read -r name ident rest; do
+    case "$name" in '' | '#'*) continue ;; esac
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ && -n "$ident" && -z "$rest" ]] ||
+      die "malformed line in $1/macos/sign-targets: $name $ident $rest"
+    printf '%s\n' "$name"
+    n=$((n + 1))
+  done <"$1/macos/sign-targets"
+  [ "$n" -gt 0 ] || die "$1/macos/sign-targets lists no binaries"
+}
+
 dev_id_re='^Developer ID Application: .+ \(([A-Z0-9]{10})\)$'
 
 # The Developer ID team every release is signed by. The keychain trusts msd by identifier plus
@@ -182,12 +196,17 @@ build_release() {
     "CARGO_ENCODED_RUSTFLAGS=--remap-path-prefix=$src=/morsec${sep}--remap-path-prefix=$cargo_home=/cargo${sep}-Clink-arg=-Wl,-oso_prefix,$work/${sep}-Clink-arg=-Wl,-S"
     "CFLAGS=-ffile-prefix-map=$src=/morsec -ffile-prefix-map=$cargo_home=/cargo"
   )
-  (cd "$src" && "${benv[@]}" cargo build --release --locked -p ms-cli -p msd --target "$TARGET")
+  # ms-cli: ms; msd: msd; ms-run: ms-shim (run mode, L12).
+  (cd "$src" && "${benv[@]}" cargo build --release --locked -p ms-cli -p msd -p ms-run --target "$TARGET")
 
   local rel="$work/target/$TARGET/release" stage="$work/stage" unsigned="$work/unsigned"
   mkdir -p "$stage/bin" "$stage/share/morsec" "$unsigned"
-  local b
-  for b in ms msd; do
+  local b bins_list
+  local -a bins=()
+  bins_list="$(shipped_bins "$bpk")" || exit 1
+  while read -r b; do bins+=("$b"); done <<<"$bins_list"
+  for b in "${bins[@]}"; do
+    [ -f "$rel/$b" ] || die "sign-targets names $b, which the build did not produce"
     cp "$rel/$b" "$unsigned/$b"
     cp "$rel/$b" "$stage/bin/$b"
   done
@@ -195,7 +214,7 @@ build_release() {
   say "SBOM (CycloneDX 1.5) and auto-update check"
   (cd "$src" && "${benv[@]}" cargo metadata --format-version 1 --locked --filter-platform "$TARGET") |
     py "$bpk/lib/sbom.py" --lock "$src/Cargo.lock" --version "$version" --commit "$commit" \
-      --epoch "$epoch" --root ms-cli --root msd --out "$stage/share/morsec/morsec.cdx.json"
+      --epoch "$epoch" --root ms-cli --root msd --root ms-run --out "$stage/share/morsec/morsec.cdx.json"
 
   local signing=none
   if [ -n "$id" ]; then
@@ -219,7 +238,7 @@ build_release() {
   clang_v="$("${benv[@]}" clang --version | head -1)"
   local -a hashes=()
   local u c
-  for b in ms msd; do
+  for b in "${bins[@]}"; do
     u="$(sha256 "$unsigned/$b")"
     c="$(py "$bpk/lib/machocmp.py" "$unsigned/$b")"
     c="${c%% *}"
@@ -243,8 +262,10 @@ build_release() {
 
   local tarball="morsec-$version-$TARGET.tar.gz"
   mkdir -p "$out"
+  local -a entries=()
+  for b in "${bins[@]}"; do entries+=("$stage/bin/$b=bin/$b:0755"); done
   py "$bpk/lib/archive.py" --out "$out/$tarball" --prefix "morsec-$version" --epoch "$epoch" \
-    "$stage/bin/ms=bin/ms:0755" "$stage/bin/msd=bin/msd:0755" \
+    "${entries[@]}" \
     "$stage/share/morsec/BUILDINFO=share/morsec/BUILDINFO:0644" \
     "$stage/share/morsec/morsec.cdx.json=share/morsec/morsec.cdx.json:0644"
   cp "$stage/share/morsec/BUILDINFO" "$out/BUILDINFO"
@@ -367,8 +388,12 @@ cmd_verify_repro() {
     MORSEC_MINISIGN_KEY="" build_release "$b" "$b/out" "" build )
   say "build 1"; cat "$a/out/SHA256SUMS"; grep -E '^(unsigned|code)_sha256' "$a/out/BUILDINFO"
   say "build 2"; cat "$b/out/SHA256SUMS"; grep -E '^(unsigned|code)_sha256' "$b/out/BUILDINFO"
-  if cmp -s "$a/out/SHA256SUMS" "$b/out/SHA256SUMS" && cmp -s "$a/out/BUILDINFO" "$b/out/BUILDINFO" &&
-    cmp -s "$a/unsigned/ms" "$b/unsigned/ms" && cmp -s "$a/unsigned/msd" "$b/unsigned/msd"; then
+  local same=1 bin bins_list
+  bins_list="$(shipped_bins "$pk")" || exit 1
+  cmp -s "$a/out/SHA256SUMS" "$b/out/SHA256SUMS" || same=0
+  cmp -s "$a/out/BUILDINFO" "$b/out/BUILDINFO" || same=0
+  while read -r bin; do cmp -s "$a/unsigned/$bin" "$b/unsigned/$bin" || same=0; done <<<"$bins_list"
+  if [ "$same" = 1 ]; then
     say "reproducible: both builds are identical"
   else
     diff "$a/out/BUILDINFO" "$b/out/BUILDINFO" >&2 || true

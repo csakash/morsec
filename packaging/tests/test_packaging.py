@@ -226,7 +226,8 @@ class FormulaTests(unittest.TestCase):
         self.assertIn(f'url "{self.URL}"', out)
         self.assertIn('sha256 "' + "a" * 64 + '"', out)
         self.assertIn('bin.install_symlink "ms" => "mors"', out)
-        self.assertIn('bin.install "bin/ms", "bin/msd"', out)
+        self.assertIn('bin.install "bin/ms", "bin/msd", "bin/ms-shim"', out)
+        self.assertIn('shell_output("#{bin}/ms-shim 2>&1", 64)', out)
         self.assertIn("depends_on arch: :arm64", out)
         self.assertIn("depends_on macos: :ventura", out)
         self.assertIn('shell_output("#{bin}/mors --version")', out)
@@ -262,11 +263,48 @@ class FormulaTests(unittest.TestCase):
             formula.render(self.template + "\n# @OTHER@\n", "0.1.0", "a" * 64, self.URL)
 
 
+class InstalledBinsTests(unittest.TestCase):
+    def test_reads_the_bin_install_line(self):
+        t = 'x\n    bin.install "bin/a", "bin/b-c"\n    bin.install_symlink "a" => "z"\n'
+        self.assertEqual(formula.installed_bins(t), ["a", "b-c"])
+
+    def test_refuses_what_it_cannot_read_exactly(self):
+        for t in ("", 'bin.install "bin/a"\nbin.install "bin/b"\n', 'bin.install "bin/a", libexec/"x"\n',
+                  'bin.install "bin/a", "bin/a"\n', 'bin.install "bin/#{x}"\n', 'bin.install Dir["bin/*"]\n'):
+            with self.assertRaises(formula.FormulaError, msg=t):
+                formula.installed_bins(t)
+
+    def test_sign_targets_rows(self):
+        self.assertEqual(formula.sign_targets("# c\n\nms cc.x\n"), [("ms", "cc.x")])
+        with self.assertRaises(formula.FormulaError):
+            formula.sign_targets("ms\n")
+
+
 class FrozenConfigTests(unittest.TestCase):
     def test_signing_identifiers_are_frozen(self):
         with open(os.path.join(PKG, "macos", "sign-targets"), encoding="utf-8") as f:
             rows = [l.split() for l in f if l.strip() and not l.startswith("#")]
-        self.assertEqual(rows, [["ms", "cc.morsec.ms"], ["msd", "cc.morsec.msd"]])
+        self.assertEqual(rows, [["ms", "cc.morsec.ms"], ["msd", "cc.morsec.msd"],
+                                ["ms-shim", "cc.morsec.ms-shim"]])
+
+    # protects=L28: what the formula installs is exactly what release.sh builds and signs
+    # (sign-targets), so ms-shim can't be dropped from one and not the other; fails_when=the two
+    # lists differ; no_claim=the built binaries themselves (scripts/release-check.sh)
+    def test_formula_installs_exactly_the_signed_binaries(self):
+        with open(os.path.join(PKG, "macos", "sign-targets"), encoding="utf-8") as f:
+            signed = [n for n, _ in formula.sign_targets(f.read())]
+        with open(os.path.join(PKG, "homebrew", "morsec.rb.in"), encoding="utf-8") as f:
+            self.assertEqual(formula.installed_bins(f.read()), signed)
+        self.assertIn("ms-shim", signed)
+
+    # protects=release.sh ships what sign-targets lists, not a hard-coded pair; fails_when=a
+    # loop over a fixed `ms msd` list comes back; no_claim=-
+    def test_release_script_has_no_fixed_binary_list(self):
+        with open(RELEASE, encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotRegex(text, r"for b in ms msd")
+        self.assertIn("-p ms-run", text)
+        self.assertIn("--root ms-run", text)
 
     def test_msd_identifier_matches_launch_agent_label(self):
         with open(os.path.join(ROOT, "crates", "ms-cli", "src", "service.rs"), encoding="utf-8") as f:

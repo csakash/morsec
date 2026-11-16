@@ -45,6 +45,10 @@ const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 /// What a run killed by `ms stop` answers.
 const STOPPED_MID_RUN: &str =
     "morsec: morsec was stopped (ms stop or a stopped session), so the command was killed";
+/// The `Failed` reason in the receipt of a run killed by `ms stop`.
+const KILLED_BY_STOP: &str = "killed: morsec was stopped (ms stop)";
+/// The `Failed` reason in the receipt of a run killed by a LOG-2 session stop.
+const KILLED_BY_SESSION_STOP: &str = "killed: this agent session was stopped (LOG-2)";
 /// Most output bytes in one `RunOutput` frame.
 const FRAME_DATA: usize = 32 * 1024;
 /// Longest argv shown in a receipt's target.
@@ -72,6 +76,16 @@ struct Decided {
     approval_id: Option<String>,
 }
 
+/// A run whose start receipts are written: what a kill receipt repeats (L12 review N3).
+pub(crate) struct Started {
+    session: SessionId,
+    target: String,
+    argv_hash: [u8; 32],
+    rule_version: u64,
+    /// Each run-mode key the run uses, with its approval id.
+    keys: Vec<(KeyName, Option<String>)>,
+}
+
 impl Daemon {
     /// Steps 1–4: everything up to an exec plan. Blocking (vault, approvals, receipts).
     // The error is the reply itself.
@@ -83,7 +97,7 @@ impl Daemon {
         cwd: PathBuf,
         env: Vec<RunEnv>,
         via: Option<&str>,
-    ) -> Result<(Prepared, SessionId), ResponseBody> {
+    ) -> Result<(Prepared, Started), ResponseBody> {
         let caller = self.caller(peer).ok_or_else(|| {
             reply_err(
                 ErrorCode::Denied,
@@ -349,7 +363,9 @@ impl Daemon {
                 return Err(e.reply());
             }
         };
+        let mut keys = Vec::with_capacity(decided.len());
         for d in decided {
+            keys.push((d.key.clone(), d.approval_id.clone()));
             if let Err(e) = self.record_run(
                 &session,
                 &d.key,
@@ -367,7 +383,40 @@ impl Daemon {
                 ));
             }
         }
-        Ok((prepared, session))
+        Ok((
+            prepared,
+            Started {
+                session,
+                target,
+                argv_hash: hash,
+                rule_version: version,
+                keys,
+            },
+        ))
+    }
+
+    /// A run in progress was killed because morsec or its session was stopped: one receipt per
+    /// key, with the start receipt's target, argv hash, rule version and approval id. `Failed`,
+    /// not `Blocked`, so a kill never counts toward a LOG-2 alert. Blocking (receipt store).
+    fn record_kill(&self, run: &Started) {
+        let why = if self.is_stopped() {
+            KILLED_BY_STOP
+        } else {
+            KILLED_BY_SESSION_STOP
+        };
+        for (key, approval_id) in &run.keys {
+            if let Err(e) = self.record_run(
+                &run.session,
+                key,
+                &run.target,
+                run.argv_hash,
+                run.rule_version,
+                ReceiptResult::Failed(why.to_owned()),
+                approval_id.clone(),
+            ) {
+                tracing::error!(error = %e, key = %key, "could not record a run killed by a stop");
+            }
+        }
     }
 
     /// Resolves once `ms stop` is in effect or a LOG-2 alert stopped `session`, so a run in
@@ -430,7 +479,7 @@ pub(crate) fn run_buffered(
     let Ok(_permit) = RUNS.try_acquire() else {
         return busy();
     };
-    let (prepared, session) = match d.prepare_run(peer, argv, cwd, env, via) {
+    let (prepared, started) = match d.prepare_run(peer, argv, cwd, env, via) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -438,10 +487,11 @@ pub(crate) fn run_buffered(
     let result = handle.block_on(async {
         tokio::select! {
             r = runner().execute_buffered(prepared, BUFFERED_CAP) => Some(r),
-            () = d.stop_signal(&session) => None,
+            () = d.stop_signal(&started.session) => None,
         }
     });
     let Some(result) = result else {
+        d.record_kill(&started);
         return reply_err(ErrorCode::Denied, STOPPED_MID_RUN);
     };
     match result {
@@ -470,7 +520,7 @@ pub(crate) async fn run_stream(
         return busy();
     };
     let d2 = d.clone();
-    let (prepared, session) = match tokio::task::spawn_blocking(move || {
+    let (prepared, started) = match tokio::task::spawn_blocking(move || {
         d2.prepare_run(&peer, argv, cwd, env, None)
     })
     .await
@@ -517,7 +567,14 @@ pub(crate) async fn run_stream(
     let exit = tokio::select! {
         e = both => e,
         // Dropping the run kills the child's process group.
-        () = d.stop_signal(&session) => return reply_err(ErrorCode::Denied, STOPPED_MID_RUN),
+        () = d.stop_signal(&started.session) => {
+            // The receipt store is blocking I/O.
+            let d2 = d.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || d2.record_kill(&started)).await {
+                tracing::error!(error = %e, "could not record a run killed by a stop");
+            }
+            return reply_err(ErrorCode::Denied, STOPPED_MID_RUN);
+        }
     };
     match exit {
         Ok(e) => ResponseBody::RunExit {
@@ -951,12 +1008,65 @@ pub(super) mod tests {
         }
     }
 
+    /// Every receipt file under the test state dir, concatenated.
+    fn receipts_in(dir: &tempfile::TempDir) -> String {
+        std::fs::read_dir(dir.path().join("receipts"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect()
+    }
+
+    // protects=L12 review N3: a run killed by `ms stop` leaves a receipt saying so (Failed, with
+    // the start receipt's argv hash), on the streamed path too; fails_when=the kill is not
+    // recorded, or recorded as Blocked; no_claim=a client that hangs up (no stop) is not a kill
+    #[test]
+    fn stop_kill_is_recorded_when_streaming() {
+        let rt = rt();
+        let (d, dir, root) = test_daemon("commands = [[\"sleep\", \"30\"]]\nenv = [\"TOKEN\"]");
+        let d2 = d.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            d2.handle(&peer(), RequestBody::Stop, None)
+        });
+        let (_in_tx, in_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let r = rt.block_on(async {
+            let drain = tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
+            let r = run_stream(
+                d.clone(),
+                peer(),
+                vec!["sleep".into(), "30".into()],
+                root.clone(),
+                vec![RunEnv {
+                    name: "TOKEN".into(),
+                    value: "ms://svc/test".into(),
+                }],
+                StreamIo {
+                    input: in_rx,
+                    output: out_tx,
+                },
+            )
+            .await;
+            drain.abort();
+            r
+        });
+        assert!(matches!(stopper.join().unwrap(), ResponseBody::Ok { .. }));
+        assert!(
+            matches!(&r, ResponseBody::Error { code: ErrorCode::Denied, message } if message.contains("killed")),
+            "{r:?}"
+        );
+        let receipts = receipts_in(&dir);
+        assert_eq!(receipts.matches(KILLED_BY_STOP).count(), 1, "{receipts}");
+        assert!(!receipts.contains(VALUE));
+    }
+
     // protects=security review S3: `ms stop` kills a run in progress (and a later run is
-    // refused); fails_when=the command runs to completion after the stop; no_claim=-
+    // refused), and the kill is recorded (L12 review N3); fails_when=the command runs to
+    // completion after the stop, or no Failed receipt names the kill; no_claim=-
     #[test]
     fn stop_kills_a_running_command() {
         let rt = rt();
-        let (d, _dir, root) = test_daemon("commands = [[\"sleep\", \"30\"]]\nenv = [\"TOKEN\"]");
+        let (d, dir, root) = test_daemon("commands = [[\"sleep\", \"30\"]]\nenv = [\"TOKEN\"]");
         let d2 = d.clone();
         let started = std::time::Instant::now();
         let stopper = std::thread::spawn(move || {
@@ -976,6 +1086,28 @@ pub(super) mod tests {
             "{r:?}"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // One start receipt and one kill receipt for svc/test, the kill as Failed with the
+        // same argv hash as the start.
+        let receipts = receipts_in(&dir);
+        let lines: Vec<&str> = receipts
+            .lines()
+            .filter(|l| l.contains("svc/test"))
+            .collect();
+        let kill: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains(KILLED_BY_STOP))
+            .collect();
+        assert_eq!(kill.len(), 1, "{receipts}");
+        assert!(
+            kill[0].contains(&format!("{{\"failed\":\"{KILLED_BY_STOP}\"}}")),
+            "{}",
+            kill[0]
+        );
+        let hash = hex::encode(ms_rules::argv_hash(&["sleep".to_owned(), "30".to_owned()]));
+        assert!(
+            lines.iter().filter(|l| l.contains(&hash)).count() >= 2,
+            "start and kill receipts must carry the argv hash: {receipts}"
+        );
     }
 
     // protects=receipt targets are escaped and bounded, so an agent's argv can't inject lines or

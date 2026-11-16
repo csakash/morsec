@@ -903,6 +903,19 @@ security review): L18–L24 merged. **Human:** the external review is booked and
   release of `ms` and `msd`. No app and no cask (CLI-only decision).
 - **Verify:** a clean-machine install-to-protected-session run under 5 minutes; release artifacts
   verified.
+- **Done in loop `release-cli` (prep, no human steps):** the release ships `ms-shim` with `ms`
+  and `msd` (`packaging/macos/sign-targets` is the one list release.sh builds, signs and
+  archives; the formula installs the same list, pinned by tests; identifier `cc.morsec.ms-shim`);
+  an install test puts the formula's binaries in a temp prefix and shows `ms doctor` finds
+  `ms-shim` (and fails without it); `ms stop` writes a receipt for every run it kills (L12 N3);
+  `scripts/release-check.sh` checks version, CHANGELOG, `cargo build --release --locked`,
+  packaging tests and formula-vs-build, and signs, tags and publishes nothing; `CHANGELOG.md`.
+- **Left for the human (packaging/RELEASING.md):** Developer ID certificate, notary profile,
+  `team-id` and `minisign.pub`; the version bump and CHANGELOG section (through a loop); the tag;
+  `release.sh release`; the GitHub release; the `csakash/homebrew-tap` repo; the clean-VM
+  install and its timing. Still open from the card: onboarding docs, migration notes, the
+  measured time to first protected session, and the Homebrew `msd_path()` follow-up (L10 notes:
+  the LaunchAgent should point at `$(brew --prefix)/opt/morsec/bin/msd`, not the Cellar).
 
 **v1.0 gate** (PRD: 1Password/Bitwarden import, ARI-42 export; the PRD's menu-bar app is deferred
 by the CLI-only decision): **Human:** 3 startups use the export in a real customer security review.

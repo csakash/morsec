@@ -38,7 +38,7 @@ cargo run -q -p msd -- --foreground --socket /tmp/morsec-dev/msd.sock
 MORSEC_SOCKET=/tmp/morsec-dev/msd.sock cargo run -q -p ms-cli -- status
 ```
 
-Install dev builds of `ms`, `mors` and `msd` into `~/.local/bin` (links, refuses to overwrite
+Install dev builds of `ms`, `mors` and `msd` into `~/.local/bin` (it also builds `ms-shim`, which `ms` finds beside its real path in `target/release`) (links, refuses to overwrite
 anything else):
 
 ```bash
