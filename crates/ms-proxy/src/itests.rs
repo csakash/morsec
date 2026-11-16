@@ -1609,7 +1609,9 @@ fn tunnel_harness(which: &'static str) -> &'static H {
 
 /// CONNECTs to `host`, completes TLS trusting only the morsec CA, writes `bytes` inside the
 /// tunnel, then a final `Connection: close` request (which also completes a cut-off head), and
-/// reads until the proxy closes (at most 3 s). The write side stays open: hyper drops an
+/// reads until the proxy closes (at most 1 s; a request it is still waiting on is simply not
+/// answered, and the per-request markers keep a late arrival from being checked against the
+/// wrong case). The write side stays open: hyper drops an
 /// in-flight request when its client half-closes, as a real client never does.
 async fn tunnel_exchange(h: &H, host: &str, bytes: &[u8]) {
     let (code, head, tcp) = connect(h.proxy, &format!("{host}:{}", h.up.port), "").await;
@@ -1631,7 +1633,31 @@ async fn tunnel_exchange(h: &H, host: &str, bytes: &[u8]) {
     let _ = tls.write_all(close.as_bytes()).await;
     let _ = tls.flush().await;
     let mut out = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut out)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), tls.read_to_end(&mut out)).await;
+}
+
+/// The `Authorization` pieces that are the binding's own placeholder, in its location.
+fn own_placeholders(host: &str) -> &'static [&'static [u8]] {
+    if host == STRIPE {
+        &[
+            b"Authorization: Bearer ms://stripe/test\r\n",
+            b"authorization: bearer ms://stripe/test\r\n",
+            b"Authorization: Bearer sk_test_ms_0000placeholder\r\n",
+        ]
+    } else {
+        // base64("x-access-token:ms://git/test")
+        &[b"Authorization: Basic eC1hY2Nlc3MtdG9rZW46bXM6Ly9naXQvdGVzdA==\r\n"]
+    }
+}
+
+/// Header that ties a request the upstream saw to the request the agent sent.
+const MARKER: &str = "x-fuzz-req";
+
+/// One request of a fuzz case: its marker, and whether it carried the binding's placeholder.
+#[derive(Debug, Clone)]
+struct ReqMeta {
+    marker: String,
+    placeholder: bool,
 }
 
 /// Pieces that go into a header block inside the tunnel.
@@ -1666,7 +1692,9 @@ fn tunnel_headers(host: &'static str) -> Vec<&'static [u8]> {
 
 /// One well-formed request inside the tunnel: line, Host, header pieces, and a body framed by
 /// Content-Length or by chunks (with an optional trailer).
-fn tunnel_request(host: &'static str) -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+fn tunnel_request(
+    host: &'static str,
+) -> impl proptest::strategy::Strategy<Value = (Vec<u8>, ReqMeta)> {
     use proptest::prelude::*;
     let lines: Vec<&'static [u8]> = if host == STRIPE {
         vec![
@@ -1697,12 +1725,15 @@ fn tunnel_request(host: &'static str) -> impl proptest::strategy::Strategy<Value
         0u8..4,
         prop::collection::vec(1usize..8, 1..4),
         any::<bool>(),
+        any::<u64>(),
     )
-        .prop_map(move |(line, hs, body, framing, cuts, own)| {
+        .prop_map(move |(line, hs, body, framing, cuts, own, marker)| {
+            let marker = format!("{marker:016x}");
+            let placeholder = own || hs.iter().any(|h| own_placeholders(host).contains(h));
             let mut r = line.to_vec();
             r.extend_from_slice(b" HTTP/1.1\r\nHost: ");
             r.extend_from_slice(host.as_bytes());
-            r.extend_from_slice(b"\r\n");
+            r.extend_from_slice(format!("\r\n{MARKER}: {marker}\r\n").as_bytes());
             // Half the requests carry the binding's own placeholder, so swaps happen often.
             if own {
                 r.extend_from_slice(if host == STRIPE {
@@ -1741,22 +1772,35 @@ fn tunnel_request(host: &'static str) -> impl proptest::strategy::Strategy<Value
                     r.extend_from_slice(b"\r\n");
                 }
             }
-            r
+            (
+                r,
+                ReqMeta {
+                    marker,
+                    placeholder,
+                },
+            )
         })
 }
 
-fn tunnel_input(host: &'static str) -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+/// A case: the bytes sent in the tunnel, and what each well-formed request in it carried. Mutated
+/// cases carry no metadata (an edit can move a placeholder), so only the location rules apply
+/// to them.
+fn tunnel_input(
+    host: &'static str,
+) -> impl proptest::strategy::Strategy<Value = (Vec<u8>, Vec<ReqMeta>)> {
     use proptest::prelude::*;
     let lines: Vec<&'static [u8]> = vec![b"GET /", b"POST /x", b"GET https://api.stripe.com/"];
-    let pipelined = prop::collection::vec(tunnel_request(host), 1..4).prop_map(|v| v.concat());
+    let pipelined = prop::collection::vec(tunnel_request(host), 1..4)
+        .prop_map(|v| v.into_iter().unzip::<_, _, Vec<_>, Vec<_>>())
+        .prop_map(|(bytes, metas)| (bytes.concat(), metas));
     let pipelined_dyn = prop::collection::vec(tunnel_request(host), 1..4)
-        .prop_map(|v| v.concat())
+        .prop_map(|v| v.into_iter().map(|(b, _)| b).collect::<Vec<_>>().concat())
         .prop_flat_map(|seed| ms_fuzz::mutated(vec![seed], &[]));
     prop_oneof![
         4 => pipelined,
-        2 => pipelined_dyn,
-        2 => ms_fuzz::mutated(proxy_corpus("tunnel"), &[]),
-        1 => assembled(lines),
+        2 => pipelined_dyn.prop_map(|b| (b, Vec::new())),
+        2 => ms_fuzz::mutated(proxy_corpus("tunnel"), &[]).prop_map(|b| (b, Vec::new())),
+        1 => assembled(lines).prop_map(|b| (b, Vec::new())),
     ]
 }
 
@@ -1764,7 +1808,7 @@ fn tunnel_input(host: &'static str) -> impl proptest::strategy::Strategy<Value =
 /// the agent supplied.
 fn check_upstream(
     h: &H,
-    input: &[u8],
+    metas: &[ReqMeta],
     host: &str,
 ) -> Result<(), proptest::test_runner::TestCaseError> {
     use proptest::{prop_assert, prop_assert_eq};
@@ -1772,39 +1816,59 @@ fn check_upstream(
     for r in &seen {
         prop_assert!(!r.uri.contains("CANARY"), "value in the target: {}", r.uri);
         prop_assert!(!has(&r.body, b"CANARY"), "value in the body");
+        // The request the agent sent, when this case built it (a late arrival from an earlier
+        // case, or a mutated request, has none).
+        let sent = r
+            .headers
+            .iter()
+            .find(|(k, _)| k == MARKER)
+            .and_then(|(_, v)| metas.iter().find(|m| m.marker.as_bytes() == v.as_slice()));
+        let mut swapped = false;
         for (k, v) in &r.headers {
+            let text = String::from_utf8_lossy(v);
+            // Basic credentials, decoded, for the checks below.
+            let basic = text
+                .strip_prefix("Basic ")
+                .and_then(|b64| B64.decode(b64.trim()).ok())
+                .map(|d| String::from_utf8_lossy(&d).into_owned());
             if STRIPPED.contains(&k.as_str()) {
                 prop_assert!(
-                    !has(v, b"AGENTSECRET"),
+                    !text.contains("AGENTSECRET"),
                     "agent credential {} reached upstream",
                     k
                 );
+                if let Some(d) = &basic {
+                    prop_assert!(
+                        !d.contains("AGENTSECRET"),
+                        "agent Basic credential in {}",
+                        k
+                    );
+                }
             }
-            let text = String::from_utf8_lossy(v);
             if host == STRIPE {
                 prop_assert!(!text.contains(BASIC_CANARY));
                 if text.contains("CANARY") {
                     prop_assert_eq!(k.as_str(), "authorization");
                     prop_assert_eq!(text.as_ref(), format!("Bearer {CANARY}"));
-                    prop_assert!(
-                        has(input, b"ms://stripe/test")
-                            || has(input, b"sk_test_ms_0000placeholder"),
-                        "value sent without a placeholder"
-                    );
+                    swapped = true;
                 }
             } else {
                 prop_assert!(!text.contains("CANARY"), "raw value in {}: {}", k, text);
-                if k == "authorization"
-                    && let Some(b64) = text.strip_prefix("Basic ")
-                    && let Ok(d) = B64.decode(b64)
+                if let Some(d) = &basic
+                    && d.contains("CANARY")
                 {
-                    let d = String::from_utf8_lossy(&d);
-                    if d.contains("CANARY") {
-                        prop_assert!(d.ends_with(&format!(":{BASIC_CANARY}")), "{}", d);
-                        prop_assert!(!d[..d.len() - BASIC_CANARY.len() - 1].contains(':'));
-                    }
+                    prop_assert_eq!(k.as_str(), "authorization");
+                    prop_assert_eq!(d.as_str(), format!("x-access-token:{BASIC_CANARY}"));
+                    swapped = true;
                 }
             }
+        }
+        if let Some(m) = sent {
+            prop_assert!(
+                !swapped || m.placeholder,
+                "value sent for request {} that carried no placeholder",
+                m.marker
+            );
         }
     }
     Ok(())
@@ -1819,22 +1883,24 @@ proptest::proptest! {
     // the value, and the proxy keeps serving; fails_when=any of those breaks; no_claim=h2 inside
     // the tunnel (swap_over_http2)
     #[test]
-    fn fuzz_tunnel_bearer(input in tunnel_input(STRIPE)) {
+    fn fuzz_tunnel_bearer((input, metas) in tunnel_input(STRIPE)) {
         let h = tunnel_harness(STRIPE);
         rt().block_on(tunnel_exchange(h, STRIPE, &input));
-        check_upstream(h, &input, STRIPE)?;
+        check_upstream(h, &metas, STRIPE)?;
         no_value_recorded(h)?;
         still_alive(h)?;
     }
 
     // protects=as above for a Basic binding (token in the password): the raw value never
-    // reaches the upstream, and decoded Basic credentials hold it only as `<user>:<value>`;
-    // fails_when=the value appears anywhere else; no_claim=real git (itests_git)
+    // reaches the upstream, decoded Basic credentials hold it only as the agent's user joined
+    // with the value, only for a request that carried the placeholder, and the agent's own
+    // Basic credentials never reach it; fails_when=any of those breaks; no_claim=real git
+    // (itests_git)
     #[test]
-    fn fuzz_tunnel_basic(input in tunnel_input(BASIC)) {
+    fn fuzz_tunnel_basic((input, metas) in tunnel_input(BASIC)) {
         let h = tunnel_harness(BASIC);
         rt().block_on(tunnel_exchange(h, BASIC, &input));
-        check_upstream(h, &input, BASIC)?;
+        check_upstream(h, &metas, BASIC)?;
         no_value_recorded(h)?;
         still_alive(h)?;
     }

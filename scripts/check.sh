@@ -64,6 +64,8 @@ with_ceiling() {
     my $pid = fork() // die "fork: $!";
     if ($pid == 0) { setpgrp(0, 0); exec(@ARGV) or die "exec: $!"; }
     $SIG{ALRM} = sub { kill("KILL", -$pid); print STDERR "check.sh: fuzz step passed its ${t}s ceiling\n"; exit 1; };
+    # The step runs in its own process group, so Ctrl-C reaches only perl: pass it on.
+    $SIG{INT} = $SIG{TERM} = sub { kill("KILL", -$pid); exit 130; };
     alarm($t);
     waitpid($pid, 0);
     my $s = $?;
@@ -71,6 +73,9 @@ with_ceiling() {
   ' "$@"
 }
 fuzz_step() {
+  # Runs in a fresh `bash -c`, which does not inherit set -e: without it a failing first pass
+  # would be hidden by a passing second one.
+  set -euo pipefail
   MORSEC_FUZZ_CASES="${MORSEC_FUZZ_CASES:-2500}" cargo test --locked -q \
     -p ms-fuzz -p ms-import -p ms-ipc -p ms-proxy -- \
     fuzz_dotenv fuzz_frame fuzz_decode fuzz_head fuzz_rewriter

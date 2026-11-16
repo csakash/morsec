@@ -1071,9 +1071,24 @@ mod fuzz_tests {
                 let mut req = Request::new(());
                 req.headers_mut().insert(http::header::PROXY_AUTHORIZATION, v);
                 let (parts, ()) = req.into_parts();
-                if let Some(u) = proxy_user(&parts) {
-                    prop_assert!(!u.contains(':'));
-                }
+                let got = proxy_user(&parts);
+                // The session tag is the user half of `Basic user:pass`, whatever the case of
+                // the scheme; anything else is no tag.
+                let want = std::str::from_utf8(&value)
+                    .ok()
+                    .and_then(|v| v.get(..6).filter(|p| p.eq_ignore_ascii_case("basic ")).map(|_| &v[6..]))
+                    .and_then(|b| B64.decode(b.trim()).ok())
+                    .and_then(|d| String::from_utf8(d).ok())
+                    .map(|d| d.split_once(':').map_or(d.clone(), |(u, _)| u.to_owned()));
+                prop_assert_eq!(got, want);
+            }
+            // A well-formed tag always comes back as its user.
+            if !user.contains(':') {
+                let v = http::HeaderValue::from_str(&format!("Basic {}", B64.encode(format!("{user}:pw"))))
+                    .unwrap();
+                let mut req = Request::new(());
+                req.headers_mut().insert(http::header::PROXY_AUTHORIZATION, v);
+                prop_assert_eq!(proxy_user(&req.into_parts().0), Some(user.clone()));
             }
         }
     }

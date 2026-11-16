@@ -624,7 +624,11 @@ mod tests {
         // query swap uses, and never panics on arbitrary text; fails_when=a round trip changes
         // the text or a stray '%' panics; no_claim=double encoding (decoded once by design)
         #[test]
-        fn fuzz_head_helpers(text in any::<String>(), junk in "[%0-9a-fA-FzZ]{0,12}") {
+        fn fuzz_head_helpers(
+            text in any::<String>(),
+            junk in "[%0-9a-fA-FzZ]{0,12}",
+            seed in ms_fuzz::mutated_str(ms_fuzz::seeds("proxy-heads"), &[b"%", b"%2", b"%3A"]),
+        ) {
             let mut enc = Vec::new();
             pct_encode_into(&mut enc, text.as_bytes());
             let enc = String::from_utf8(enc).unwrap();
@@ -632,6 +636,8 @@ mod tests {
             prop_assert_eq!(dec.as_ref(), text.as_str());
             let _ = pct_decode(&junk);
             let _ = pct_decode(&format!("{text}{junk}"));
+            // Real heads from the corpus, mutated: decoding never panics and never grows.
+            prop_assert!(pct_decode(&seed).len() <= seed.len() * 3);
         }
 
         // protects=a Basic swap writes exactly one Authorization header that decodes to the
@@ -678,8 +684,10 @@ mod tests {
                     }
                     prop_assert!(!p.uri.to_string().contains("CANARY"));
                 }
-                // An extra header with a foreign ref, or a second Basic placeholder, refuses.
-                Plan::Block(_) | Plan::Ambiguous => {}
+                // Only an extra header can refuse (a foreign ref in it, or a second credential).
+                Plan::Block(_) | Plan::Ambiguous => {
+                    prop_assert!(!extra.is_empty(), "a lone Basic placeholder was refused");
+                }
                 Plan::Forward(None) => prop_assert!(false, "the Basic placeholder was not seen"),
             }
         }
