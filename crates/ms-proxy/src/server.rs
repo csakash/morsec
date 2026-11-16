@@ -109,12 +109,14 @@ fn text(status: StatusCode, msg: impl Into<String>) -> Response<Body> {
     r
 }
 
-/// `host` lowercased without a trailing dot or IPv6 brackets, and the port.
+/// `host` lowercased without a trailing dot or IPv6 brackets, and the port. The dot comes off
+/// before the brackets do, so `[::1].` gives `::1`, not `::1]` (hardening loop finding).
 fn split_authority(a: &http::uri::Authority, default_port: u16) -> (String, u16) {
-    let host = a
-        .host()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
+    let host = a.host().trim_end_matches('.');
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
         .trim_end_matches('.')
         .to_ascii_lowercase();
     (host, a.port_u16().unwrap_or(default_port))
@@ -1032,6 +1034,30 @@ mod fuzz_tests {
     use super::*;
     use proptest::prelude::*;
 
+    // protects=authority normalisation found by fuzz_head_helpers_authority: a trailing dot
+    // after IPv6 brackets no longer leaves a ']' in the host, userinfo never reaches the host,
+    // and the ordinary forms are unchanged; fails_when=`[::1].` gives `::1]` (the old order:
+    // brackets, then the dot) or a normal host changes; no_claim=SSRF handling of the result
+    // (ssrf.rs; a host like `]` fails to resolve and is refused)
+    #[test]
+    fn split_authority_dot_after_brackets() {
+        let split = |s: &str| split_authority(&s.parse().unwrap(), 443);
+        assert_eq!(split("[::1].:8443"), ("::1".to_owned(), 8443));
+        assert_eq!(split("[::1]."), ("::1".to_owned(), 443));
+        // `[` is userinfo here; the host is what follows the '@'.
+        assert_eq!(split("[@]."), ("]".to_owned(), 443));
+        assert_eq!(
+            split("user@api.stripe.com:443"),
+            ("api.stripe.com".to_owned(), 443)
+        );
+        assert_eq!(split("[::1]:80"), ("::1".to_owned(), 80));
+        assert_eq!(
+            split("API.Stripe.COM.:443"),
+            ("api.stripe.com".to_owned(), 443)
+        );
+        assert_eq!(split("api.stripe.com"), ("api.stripe.com".to_owned(), 443));
+    }
+
     fn authority() -> impl Strategy<Value = String> {
         prop_oneof![
             "[a-zA-Z0-9.\\-\\[\\]:@%_]{1,40}",
@@ -1059,7 +1085,11 @@ mod fuzz_tests {
                 let (host, port) = split_authority(&auth, default_port);
                 prop_assert_eq!(&host, &host.to_ascii_lowercase());
                 prop_assert!(!host.ends_with('.'));
-                prop_assert!(!host.starts_with('[') && !host.ends_with(']'));
+                // A bracketed host (IPv6) loses its brackets, with or without a trailing dot.
+                let raw = auth.host().trim_end_matches('.');
+                if raw.starts_with('[') && raw.ends_with(']') {
+                    prop_assert!(!host.starts_with('[') && !host.ends_with(']'), "{} -> {}", a, host);
+                }
                 prop_assert_eq!(port, auth.port_u16().unwrap_or(default_port));
             }
             for value in [

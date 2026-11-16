@@ -45,6 +45,18 @@ pub fn config(default: u32) -> Config {
     }
 }
 
+/// [`config`] for a test in a crate's `tests/` directory, where proptest's default persistence
+/// can't find `lib.rs`: failures are saved next to the test file
+/// (`tests/<name>.proptest-regressions`) and committed like the others.
+pub fn config_tests_dir(default: u32) -> Config {
+    Config {
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        ..config(default)
+    }
+}
+
 /// Reads every regular file in `dir` (sorted by name) as one seed.
 ///
 /// # Panics

@@ -185,7 +185,7 @@ fn chunk_sizes() -> impl Strategy<Value = Vec<usize>> {
 }
 
 proptest! {
-    #![proptest_config(ms_fuzz::config(256))]
+    #![proptest_config(ms_fuzz::config_tests_dir(256))]
 
     // protects=read_frame agrees with the framing rules on any byte stream delivered in any
     // chunking (no panic, no frame invented, none lost, limits and truncation refused);
@@ -245,7 +245,9 @@ proptest! {
 // ---------- message decoding ----------
 
 fn key_name() -> impl Strategy<Value = KeyName> {
-    "[a-z][a-z0-9_-]{0,10}(/[a-z0-9_.-]{1,10}){0,2}"
+    // Valid by construction (ms-core: a segment starts with a-z or 0-9, then a-z, 0-9, '-'), so a
+    // long session never runs out of proptest's reject budget.
+    "[a-z0-9][a-z0-9-]{0,10}(/[a-z0-9][a-z0-9-]{0,9}){0,2}"
         .prop_filter_map("valid key name", |s| KeyName::new(&s).ok())
 }
 
@@ -392,7 +394,7 @@ where
 }
 
 proptest! {
-    #![proptest_config(ms_fuzz::config(1024))]
+    #![proptest_config(ms_fuzz::config_tests_dir(1024))]
 
     // protects=decode never panics on arbitrary or mutated messages, answers a wrong version with
     // UnsupportedVersion and the sender's id, anything else bad with Protocol, and whatever it
@@ -518,7 +520,7 @@ fn session_bytes() -> impl Strategy<Value = Vec<u8>> {
 }
 
 proptest! {
-    #![proptest_config(ms_fuzz::config(64))]
+    #![proptest_config(ms_fuzz::config_tests_dir(64))]
 
     // protects=a live server survives any frame sequence (value frames, streams, stdin outside a
     // stream, damage): it answers only well-formed responses, never echoes a value frame, ends
