@@ -294,6 +294,18 @@ fn daemon_section(report: &mut Report) -> Option<DaemonInfo> {
             report.section("morsec", items);
             return None;
         }
+        Err(Error::DaemonNotVerified { detail }) => {
+            // T-03: something answers on the socket, but it is not the signed msd. Nothing was
+            // sent to it; say so instead of "not running".
+            items.push(Item::fail(format!(
+                "msd identity not verified · {detail} · nothing was sent to it; check what serves {}, then restart msd: launchctl kickstart -k gui/$UID/{}",
+                ms_ipc::default_socket_path()
+                    .map_or_else(|_| "the socket".to_owned(), |p| p.display().to_string()),
+                crate::service::LABEL
+            )));
+            report.section("morsec", items);
+            return None;
+        }
         Err(e) => {
             items.push(Item::fail(format!(
                 "msd not running · {e} · start it with: ms init (or launchctl kickstart gui/$UID/{})",
@@ -316,6 +328,7 @@ fn daemon_section(report: &mut Report) -> Option<DaemonInfo> {
             "this is a dev daemon with a memory vault: keys are gone when it stops",
         ));
     }
+    items.push(identity_item());
     items.push(signature_item());
     items.push(match ask(RequestBody::ListKeys) {
         Ok(ResponseBody::Keys { keys }) => Item::pass(format!(
@@ -338,6 +351,34 @@ fn daemon_section(report: &mut Report) -> Option<DaemonInfo> {
         proxy_port,
         stopped: running == Some(false),
     })
+}
+
+/// T-03: what `Client::connect` established about the process serving the socket.
+fn identity_item() -> Item {
+    let identity = block_on(async {
+        let path = ms_ipc::default_socket_path()?;
+        Ok(Client::connect(&path).await?.peer_identity().clone())
+    });
+    identity_verdict(identity.map_err(|e| match e {
+        Error::DaemonNotVerified { detail } => detail,
+        other => other.to_string(),
+    }))
+}
+
+/// The doctor line for a peer identity, or for the reason it wasn't verified.
+fn identity_verdict(
+    identity: std::result::Result<ms_ipc::peer_verify::PeerIdentity, String>,
+) -> Item {
+    use ms_ipc::peer_verify::{DEV_OPT_OUT_ENV, MSD_IDENTIFIER, PeerIdentity};
+    match identity {
+        Ok(PeerIdentity::Verified { team }) => Item::pass(format!(
+            "msd identity verified · {MSD_IDENTIFIER} · team {team}"
+        )),
+        Ok(PeerIdentity::DevUnverified) => Item::warn(format!(
+            "msd identity NOT verified · dev opt-out {DEV_OPT_OUT_ENV}=1 with an unsigned ms (never use with real secrets)"
+        )),
+        Err(e) => Item::fail(format!("msd identity not verified · {e}")),
+    }
 }
 
 fn signature_item() -> Item {
@@ -1534,6 +1575,26 @@ mod tests {
         assert_eq!(m[0].mark, Mark::Info);
         assert!(m[0].text.contains("not checked yet"));
         assert!(!m[0].text.contains("not installed"));
+    }
+
+    // protects=T-03 ms doctor reports the peer verdict: verified is a pass naming the team, the
+    // dev opt-out is a loud warning, a failed check is a failure carrying the reason;
+    // fails_when=an unverified or impostor peer shows as a pass; no_claim=the live connect (the
+    // ms-cli peer_verify test drives that)
+    #[test]
+    fn identity_verdicts() {
+        use ms_ipc::peer_verify::PeerIdentity;
+        let v = identity_verdict(Ok(PeerIdentity::Verified {
+            team: "ABCDE12345".into(),
+        }));
+        assert_eq!(v.mark, Mark::Pass);
+        assert!(v.text.contains("cc.morsec.msd") && v.text.contains("ABCDE12345"));
+        let d = identity_verdict(Ok(PeerIdentity::DevUnverified));
+        assert_eq!(d.mark, Mark::Warn);
+        assert!(d.text.contains("NOT verified") && d.text.contains("MORSEC_DEV_UNVERIFIED_DAEMON"));
+        let f = identity_verdict(Err("it does not carry msd's signature".into()));
+        assert_eq!(f.mark, Mark::Fail);
+        assert!(f.text.contains("does not carry msd's signature"));
     }
 
     #[test]
