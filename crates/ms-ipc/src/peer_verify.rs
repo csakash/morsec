@@ -165,7 +165,7 @@ pub fn apply(
     match trust {
         Trust::Verify { team, requirement } => {
             verify(&requirement).map_err(|e| {
-                format!("it does not carry msd's signature ({MSD_IDENTIFIER}, team {team}): {e}")
+                format!("can't confirm it is msd ({MSD_IDENTIFIER}, team {team}): {e}")
             })?;
             Ok(PeerIdentity::Verified { team })
         }

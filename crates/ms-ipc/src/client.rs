@@ -213,6 +213,10 @@ impl Client {
 /// Applies the peer-verification policy to a fresh connection. The signature check can poll for
 /// up to 2 s, so it runs off the async workers (a long-lived `ms mcp` connects per tool call),
 /// on its own descriptor for the same socket. The dev opt-out and refusals decide at once.
+///
+/// If the caller drops the connect future, the blocking check still runs to its end (at most
+/// 2 s) holding that descriptor, so msd counts the connection toward its per-process limit
+/// until then. Nothing is ever sent on it (review R10, accepted).
 async fn verify_server(stream: &UnixStream) -> std::result::Result<PeerIdentity, String> {
     use crate::peer_verify::{Trust, apply, current_trust, verify_peer};
     let trust = current_trust();
