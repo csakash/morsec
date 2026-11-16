@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -37,6 +39,9 @@ use crate::*;
 const CANARY: &str = "sk_test_CANARY_7f3a9c";
 const STRIPE: &str = "api.stripe.com";
 const MAPS: &str = "maps.example.com";
+/// A host with a Basic-auth binding (`git/test` in the password, as for HTTPS git tokens).
+const BASIC: &str = "git.example.com";
+const BASIC_CANARY: &str = "ghp_BASIC_CANARY_1a2b3c";
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type TestBody = BoxBody<Bytes, BoxError>;
@@ -112,6 +117,16 @@ impl Resolve for TableResolver {
 struct Echo {
     hits: AtomicUsize,
     gate: Notify,
+    /// Every request the echo path answered, as it arrived upstream.
+    seen: Mutex<Vec<SeenReq>>,
+}
+
+/// One request as the upstream received it.
+#[derive(Debug, Clone)]
+struct SeenReq {
+    uri: String,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
 }
 
 struct Upstream {
@@ -188,7 +203,23 @@ async fn echo_handler(
             String::from_utf8_lossy(v.as_bytes())
         ));
     }
-    let body = req.into_body().collect().await.unwrap().to_bytes();
+    let uri = req.uri().to_string();
+    let headers: Vec<(String, Vec<u8>)> = req
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
+        .collect();
+    let Ok(body) = req.into_body().collect().await.map(|b| b.to_bytes()) else {
+        // The proxy cut the body off (a fuzzed request): nothing to echo.
+        return Ok(Response::new(
+            Full::new(Bytes::new()).map_err(|n| match n {}).boxed(),
+        ));
+    };
+    st.seen.lock().unwrap().push(SeenReq {
+        uri,
+        headers,
+        body: body.to_vec(),
+    });
     out.push('\n');
     out.push_str(&String::from_utf8_lossy(&body));
     Ok(Response::new(
@@ -197,7 +228,7 @@ async fn echo_handler(
 }
 
 async fn start_upstream(h1_only: bool) -> Upstream {
-    let (root, chain, key) = upstream_pki(&[STRIPE, MAPS]);
+    let (root, chain, key) = upstream_pki(&[STRIPE, MAPS, BASIC]);
     let mut cfg = rustls::ServerConfig::builder_with_provider(crate::tls::provider())
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -299,13 +330,27 @@ fn bindings(port: u16) -> Vec<Binding> {
             },
             shaped_placeholder: None,
         },
+        Binding {
+            key: KeyName::new("git/test").unwrap(),
+            provider: "git".into(),
+            hosts: vec![BASIC.into()],
+            port,
+            location: Location::Basic {
+                field: BasicField::Password,
+            },
+            shaped_placeholder: None,
+        },
     ]
 }
 
 async fn harness(o: Opts) -> H {
     let up = start_upstream(o.upstream_h1_only).await;
     let vault = Arc::new(MemoryVault::new());
-    for (k, v) in [("stripe/test", CANARY), ("maps/test", "AIza-MAPS-CANARY")] {
+    for (k, v) in [
+        ("stripe/test", CANARY),
+        ("maps/test", "AIza-MAPS-CANARY"),
+        ("git/test", BASIC_CANARY),
+    ] {
         let name = KeyName::new(k).unwrap();
         vault
             .put(
@@ -320,10 +365,11 @@ async fn harness(o: Opts) -> H {
             )
             .unwrap();
     }
-    let ca = Arc::new(Ca::generate([STRIPE, MAPS]).unwrap());
+    let ca = Arc::new(Ca::generate([STRIPE, MAPS, BASIC]).unwrap());
     let mut names: HashMap<String, IpAddr> = [
         (STRIPE.to_owned(), "127.0.0.1".parse().unwrap()),
         (MAPS.to_owned(), "127.0.0.1".parse().unwrap()),
+        (BASIC.to_owned(), "127.0.0.1".parse().unwrap()),
         (
             "allowed.example.com".to_owned(),
             "127.0.0.1".parse().unwrap(),
@@ -1403,31 +1449,123 @@ fn fuzz_harness() -> &'static H {
     H_.get_or_init(|| rt().block_on(harness(Opts::default())))
 }
 
+fn proxy_corpus(name: &str) -> Vec<Vec<u8>> {
+    ms_fuzz::corpus(format!("{}/fuzz-corpus/{name}", env!("CARGO_MANIFEST_DIR")))
+}
+
+/// Header pieces shared by the listener and tunnel targets: placeholders, agent credentials,
+/// framing headers and bodies, including chunked ones.
+fn head_pieces() -> Vec<&'static [u8]> {
+    vec![
+        b" HTTP/1.1\r\n",
+        b"HTTP/1.0\r\n",
+        b"Host: api.stripe.com\r\n",
+        b"Host: git.example.com\r\n",
+        b"Host: maps.example.com\r\n",
+        b"Host: paste.example.net\r\n",
+        b"Authorization: Bearer ms://stripe/test\r\n",
+        b"authorization: bearer ms://stripe/test\r\n",
+        b"Authorization: Bearer sk_test_ms_0000placeholder\r\n",
+        // base64("x-access-token:ms://git/test")
+        b"Authorization: Basic eC1hY2Nlc3MtdG9rZW46bXM6Ly9naXQvdGVzdA==\r\n",
+        // base64("ms://stripe/test:")
+        b"Authorization: Basic bXM6Ly9zdHJpcGUvdGVzdDo=\r\n",
+        b"Proxy-Authorization: Basic bXMtc2Vzc2lvbjp4\r\n",
+        b"X-Api-Key: AGENTSECRET\r\n",
+        b"Cookie: s=AGENTSECRET\r\n",
+        b"Authorization: Bearer AGENTSECRET\r\n",
+        b"X-Auth-Token: AGENTSECRET\r\n",
+        b"Connection: X-Api-Key, close\r\n",
+        b"Content-Length: 5\r\n",
+        b"Content-Length: 0\r\n",
+        b"Content-Length: 99999999999\r\n",
+        b"Transfer-Encoding: chunked\r\n",
+        b"Transfer-Encoding: gzip, chunked\r\n",
+        b"Expect: 100-continue\r\n",
+        b"\r\n",
+        b"hello",
+        b"5\r\nhello\r\n0\r\n\r\n",
+        b"3;ext=1\r\nabc\r\n0\r\nX-Trailer: ms://stripe/test\r\n\r\n",
+        b"ffffffffffffffffff\r\n",
+        b"0\r\n\r\n",
+        b"ms://stripe/test",
+        b"ms://maps/test",
+        b"ms%3A%2F%2Fgit%2Ftest",
+    ]
+}
+
+/// A request head assembled from pieces: one request line, then any pieces, then raw bytes.
+fn assembled(lines: Vec<&'static [u8]>) -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+    use proptest::prelude::*;
+    let mut pieces: Vec<BoxedStrategy<Vec<u8>>> = head_pieces()
+        .into_iter()
+        .map(|p| Just(p.to_vec()).boxed())
+        .collect();
+    pieces.push(prop::collection::vec(any::<u8>(), 0..24).boxed());
+    let line = prop::sample::select(lines).prop_map(<[u8]>::to_vec);
+    (
+        line,
+        prop::collection::vec(proptest::strategy::Union::new(pieces), 0..12),
+    )
+        .prop_map(|(l, rest)| [l, rest.concat()].concat())
+}
+
 fn mutated_head() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
     use proptest::prelude::*;
-    let pieces = prop_oneof![
-        Just(b"CONNECT ".to_vec()),
-        Just(b"GET ".to_vec()),
-        Just(b"POST http://paste.example.net/ ".to_vec()),
-        Just(b"api.stripe.com:443".to_vec()),
-        Just(b"/p/stripe/x".to_vec()),
-        Just(b" HTTP/1.1\r\n".to_vec()),
-        Just(b"Host: api.stripe.com\r\n".to_vec()),
-        Just(b"Authorization: Bearer ms://stripe/test\r\n".to_vec()),
-        Just(b"Content-Length: 5\r\n".to_vec()),
-        Just(b"Transfer-Encoding: chunked\r\n".to_vec()),
-        Just(b"\r\n".to_vec()),
-        prop::collection::vec(any::<u8>(), 0..24),
+    let lines: Vec<&'static [u8]> = vec![
+        b"CONNECT api.stripe.com:443",
+        b"CONNECT git.example.com:443",
+        b"CONNECT [::1]:443",
+        b"CONNECT api.stripe.com:0",
+        b"CONNECT api.stripe.com:99999",
+        b"CONNECT user@api.stripe.com:443",
+        b"CONNECT API.STRIPE.COM.:443",
+        b"CONNECT 169.254.169.254:80",
+        b"CONNECT allowed.example.com:443",
+        b"CONNECT ",
+        b"GET ",
+        b"GET /p/stripe/x",
+        b"GET /p/git/x",
+        b"POST http://paste.example.net/ ",
+        b"POST http://api.stripe.com/v1 ",
+        b"GET http://169.254.169.254/latest ",
     ];
-    prop::collection::vec(pieces, 0..12).prop_map(|v| v.concat())
+    prop_oneof![
+        3 => assembled(lines),
+        2 => ms_fuzz::mutated(proxy_corpus("heads"), &[]),
+        1 => prop::collection::vec(any::<u8>(), 0..64),
+    ]
+}
+
+/// True when the agent's input names `needle`.
+fn has(input: &[u8], needle: &[u8]) -> bool {
+    input.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Asserts that the vault values never reached receipts or block events.
+fn no_value_recorded(h: &H) -> Result<(), proptest::test_runner::TestCaseError> {
+    let all = format!("{:?} {:?}", h.receipts.events(), h.egress.0.lock().unwrap());
+    proptest::prop_assert!(!all.contains("CANARY"), "value recorded: {}", all);
+    Ok(())
+}
+
+/// Asserts that the proxy still answers a plain request.
+fn still_alive(h: &H) -> Result<(), proptest::test_runner::TestCaseError> {
+    let alive = rt().block_on(raw(
+        h.proxy,
+        b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    ));
+    proptest::prop_assert!(alive.starts_with("HTTP/1.1 400"), "{}", alive);
+    Ok(())
 }
 
 proptest::proptest! {
-    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(96))]
-    // protects=AC13: arbitrary bytes and mutated request heads never crash the listener and
-    // never draw the canary into a response; fails_when=a response contains the value or the
-    // proxy stops answering; no_claim=coverage-guided fuzzing (cargo-fuzz needs nightly; this
-    // is a property test over the same entry point)
+    #![proptest_config(ms_fuzz::config(96))]
+    // protects=AC13: arbitrary bytes, mutated corpus heads, CONNECT authorities, absolute-form,
+    // Proxy-Authorization and chunked/length bodies never crash the listener and never draw a
+    // vault value into a response or a record; fails_when=a response contains the value (other
+    // than the echo of a real base-URL swap), a value is recorded, or the proxy stops answering;
+    // no_claim=coverage-guided fuzzing (proptest on stable, SPEC D1)
     #[test]
     fn fuzz_listener(input in mutated_head()) {
         let h = fuzz_harness();
@@ -1442,10 +1580,262 @@ proptest::proptest! {
         // The one legitimate way to see the value is the echo upstream reflecting a real
         // base-URL swap; anything else carrying it is a leak.
         let text = String::from_utf8_lossy(&resp);
-        let has = |needle: &[u8]| input.windows(needle.len()).any(|w| w == needle);
-        let legit = has(b"/p/stripe/") && has(b"Authorization: Bearer ms://stripe/test\r\n");
+        let legit = has(&input, b"/p/stripe/") && has(&input, b"Authorization: Bearer ms://stripe/test\r\n");
         proptest::prop_assert!(legit || !text.contains("CANARY"), "{}", text);
-        let alive = rt().block_on(raw(h.proxy, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
-        proptest::prop_assert!(alive.starts_with("HTTP/1.1 400"), "{}", alive);
+        proptest::prop_assert!(!text.contains(BASIC_CANARY), "{}", text);
+        no_value_recorded(h)?;
+        still_alive(h)?;
+    }
+}
+
+// ---------- inside a terminated tunnel ----------
+
+/// Credential headers the proxy must strip from every request to a bound host.
+const STRIPPED: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-auth-token",
+    "cookie",
+];
+
+fn tunnel_harness(which: &'static str) -> &'static H {
+    static BEARER: std::sync::OnceLock<H> = std::sync::OnceLock::new();
+    static BASIC_H: std::sync::OnceLock<H> = std::sync::OnceLock::new();
+    let cell = if which == STRIPE { &BEARER } else { &BASIC_H };
+    cell.get_or_init(|| rt().block_on(harness(Opts::default())))
+}
+
+/// CONNECTs to `host`, completes TLS trusting only the morsec CA, writes `bytes` inside the
+/// tunnel, then a final `Connection: close` request (which also completes a cut-off head), and
+/// reads until the proxy closes (at most 3 s). The write side stays open: hyper drops an
+/// in-flight request when its client half-closes, as a real client never does.
+async fn tunnel_exchange(h: &H, host: &str, bytes: &[u8]) {
+    let (code, head, tcp) = connect(h.proxy, &format!("{host}:{}", h.up.port), "").await;
+    assert_eq!(code, 200, "{head}");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(h.ca.cert_der().clone()).unwrap();
+    let mut cfg = rustls::ClientConfig::builder_with_provider(crate::tls::provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(ServerName::try_from(host.to_owned()).unwrap(), tcp)
+        .await
+        .unwrap();
+    let close = format!("\r\n\r\nGET /end HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let _ = tls.write_all(bytes).await;
+    let _ = tls.write_all(close.as_bytes()).await;
+    let _ = tls.flush().await;
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut out)).await;
+}
+
+/// Pieces that go into a header block inside the tunnel.
+fn tunnel_headers(host: &'static str) -> Vec<&'static [u8]> {
+    let mut v: Vec<&'static [u8]> = vec![
+        b"Authorization: Bearer ms://stripe/test\r\n",
+        b"authorization: bearer ms://stripe/test\r\n",
+        b"Authorization: Bearer sk_test_ms_0000placeholder\r\n",
+        b"Authorization: Basic eC1hY2Nlc3MtdG9rZW46bXM6Ly9naXQvdGVzdA==\r\n",
+        b"Authorization: Basic bXM6Ly9naXQvdGVzdDptczovL2dpdC90ZXN0\r\n",
+        b"Authorization: Basic bXM6Ly9zdHJpcGUvdGVzdDo=\r\n",
+        b"Proxy-Authorization: Basic bXMtc2Vzc2lvbjp4\r\n",
+        b"X-Api-Key: AGENTSECRET\r\n",
+        b"Api-Key: AGENTSECRET\r\n",
+        b"Cookie: s=AGENTSECRET\r\n",
+        b"Authorization: Bearer AGENTSECRET\r\n",
+        b"Authorization: Basic QUdFTlRTRUNSRVQ6QUdFTlRTRUNSRVQ=\r\n",
+        b"X-Auth-Token: AGENTSECRET\r\n",
+        b"Connection: X-Api-Key\r\n",
+        b"X-Note: ms://stripe/test\r\n",
+        b"X-Other: ms://maps/test\r\n",
+        b"Expect: 100-continue\r\n",
+        b"Accept: */*\r\n",
+    ];
+    v.push(if host == STRIPE {
+        b"Host: maps.example.com\r\n"
+    } else {
+        b"Host: api.stripe.com\r\n"
+    });
+    v
+}
+
+/// One well-formed request inside the tunnel: line, Host, header pieces, and a body framed by
+/// Content-Length or by chunks (with an optional trailer).
+fn tunnel_request(host: &'static str) -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+    use proptest::prelude::*;
+    let lines: Vec<&'static [u8]> = if host == STRIPE {
+        vec![
+            b"GET /v1/charges",
+            b"POST /v1/charges",
+            b"GET https://api.stripe.com/v1",
+            b"GET /v1?key=ms://stripe/test",
+            b"GET /v1?x=ms%3A%2F%2Fmaps%2Ftest",
+        ]
+    } else {
+        vec![
+            b"GET /org/repo.git/info/refs?service=git-receive-pack",
+            b"POST /org/repo.git/git-receive-pack",
+            b"GET https://git.example.com/x",
+        ]
+    };
+    let body = prop_oneof![
+        Just(Vec::new()),
+        prop::collection::vec(any::<u8>(), 0..40),
+        Just(b"ms://stripe/test".to_vec()),
+        Just(b"{\"k\":\"ms://maps/test\"}".to_vec()),
+        Just(b"ms://git/test".to_vec()),
+    ];
+    (
+        prop::sample::select(lines),
+        prop::collection::vec(prop::sample::select(tunnel_headers(host)), 0..6),
+        body,
+        0u8..4,
+        prop::collection::vec(1usize..8, 1..4),
+        any::<bool>(),
+    )
+        .prop_map(move |(line, hs, body, framing, cuts, own)| {
+            let mut r = line.to_vec();
+            r.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+            r.extend_from_slice(host.as_bytes());
+            r.extend_from_slice(b"\r\n");
+            // Half the requests carry the binding's own placeholder, so swaps happen often.
+            if own {
+                r.extend_from_slice(if host == STRIPE {
+                    b"Authorization: Bearer ms://stripe/test\r\n"
+                } else {
+                    b"Authorization: Basic eC1hY2Nlc3MtdG9rZW46bXM6Ly9naXQvdGVzdA==\r\n"
+                });
+            }
+            for h in hs {
+                r.extend_from_slice(h);
+            }
+            match framing {
+                0 if body.is_empty() => r.extend_from_slice(b"\r\n"),
+                0 | 1 => {
+                    r.extend_from_slice(
+                        format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                    );
+                    r.extend_from_slice(&body);
+                }
+                _ => {
+                    r.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                    let mut rest = &body[..];
+                    let mut i = 0;
+                    while !rest.is_empty() {
+                        let n = cuts[i % cuts.len()].min(rest.len());
+                        r.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+                        r.extend_from_slice(&rest[..n]);
+                        r.extend_from_slice(b"\r\n");
+                        rest = &rest[n..];
+                        i += 1;
+                    }
+                    r.extend_from_slice(b"0\r\n");
+                    if framing == 3 {
+                        r.extend_from_slice(b"X-Trailer: ms://stripe/test\r\n");
+                    }
+                    r.extend_from_slice(b"\r\n");
+                }
+            }
+            r
+        })
+}
+
+fn tunnel_input(host: &'static str) -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+    use proptest::prelude::*;
+    let lines: Vec<&'static [u8]> = vec![b"GET /", b"POST /x", b"GET https://api.stripe.com/"];
+    let pipelined = prop::collection::vec(tunnel_request(host), 1..4).prop_map(|v| v.concat());
+    let pipelined_dyn = prop::collection::vec(tunnel_request(host), 1..4)
+        .prop_map(|v| v.concat())
+        .prop_flat_map(|seed| ms_fuzz::mutated(vec![seed], &[]));
+    prop_oneof![
+        4 => pipelined,
+        2 => pipelined_dyn,
+        2 => ms_fuzz::mutated(proxy_corpus("tunnel"), &[]),
+        1 => assembled(lines),
+    ]
+}
+
+/// What the upstream got must hold the value only where the binding puts it, and no credential
+/// the agent supplied.
+fn check_upstream(
+    h: &H,
+    input: &[u8],
+    host: &str,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    use proptest::{prop_assert, prop_assert_eq};
+    let seen = std::mem::take(&mut *h.up.echo.seen.lock().unwrap());
+    for r in &seen {
+        prop_assert!(!r.uri.contains("CANARY"), "value in the target: {}", r.uri);
+        prop_assert!(!has(&r.body, b"CANARY"), "value in the body");
+        for (k, v) in &r.headers {
+            if STRIPPED.contains(&k.as_str()) {
+                prop_assert!(
+                    !has(v, b"AGENTSECRET"),
+                    "agent credential {} reached upstream",
+                    k
+                );
+            }
+            let text = String::from_utf8_lossy(v);
+            if host == STRIPE {
+                prop_assert!(!text.contains(BASIC_CANARY));
+                if text.contains("CANARY") {
+                    prop_assert_eq!(k.as_str(), "authorization");
+                    prop_assert_eq!(text.as_ref(), format!("Bearer {CANARY}"));
+                    prop_assert!(
+                        has(input, b"ms://stripe/test")
+                            || has(input, b"sk_test_ms_0000placeholder"),
+                        "value sent without a placeholder"
+                    );
+                }
+            } else {
+                prop_assert!(!text.contains("CANARY"), "raw value in {}: {}", k, text);
+                if k == "authorization"
+                    && let Some(b64) = text.strip_prefix("Basic ")
+                    && let Ok(d) = B64.decode(b64)
+                {
+                    let d = String::from_utf8_lossy(&d);
+                    if d.contains("CANARY") {
+                        prop_assert!(d.ends_with(&format!(":{BASIC_CANARY}")), "{}", d);
+                        prop_assert!(!d[..d.len() - BASIC_CANARY.len() - 1].contains(':'));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+proptest::proptest! {
+    #![proptest_config(ms_fuzz::config(96))]
+    // protects=GW-1/INJ-4 inside a terminated tunnel to a Bearer-bound host: for any mutated or
+    // assembled request (pipelined, chunked, absolute-form, duplicate and agent credentials) the
+    // value reaches the upstream only as `authorization: Bearer <value>` and only when the agent
+    // sent the placeholder, agent credential headers never reach it, nothing is recorded with
+    // the value, and the proxy keeps serving; fails_when=any of those breaks; no_claim=h2 inside
+    // the tunnel (swap_over_http2)
+    #[test]
+    fn fuzz_tunnel_bearer(input in tunnel_input(STRIPE)) {
+        let h = tunnel_harness(STRIPE);
+        rt().block_on(tunnel_exchange(h, STRIPE, &input));
+        check_upstream(h, &input, STRIPE)?;
+        no_value_recorded(h)?;
+        still_alive(h)?;
+    }
+
+    // protects=as above for a Basic binding (token in the password): the raw value never
+    // reaches the upstream, and decoded Basic credentials hold it only as `<user>:<value>`;
+    // fails_when=the value appears anywhere else; no_claim=real git (itests_git)
+    #[test]
+    fn fuzz_tunnel_basic(input in tunnel_input(BASIC)) {
+        let h = tunnel_harness(BASIC);
+        rt().block_on(tunnel_exchange(h, BASIC, &input));
+        check_upstream(h, &input, BASIC)?;
+        no_value_recorded(h)?;
+        still_alive(h)?;
     }
 }

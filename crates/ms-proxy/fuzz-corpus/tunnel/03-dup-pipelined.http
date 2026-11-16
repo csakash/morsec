@@ -1,0 +1,9 @@
+GET /a HTTP/1.1
+Host: api.stripe.com
+Authorization: Bearer ms://stripe/test
+Authorization: Bearer ms://stripe/test
+
+GET /b HTTP/1.1
+Host: api.stripe.com
+Authorization: Bearer AGENTSECRET
+

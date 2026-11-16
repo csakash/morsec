@@ -1,0 +1,6 @@
+GET /v1/charges HTTP/1.1
+Host: api.stripe.com
+Authorization: Bearer ms://stripe/test
+X-Api-Key: AGENTSECRET
+Cookie: s=AGENTSECRET
+

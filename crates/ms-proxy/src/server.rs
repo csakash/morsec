@@ -1026,3 +1026,55 @@ mod loopback_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn authority() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[a-zA-Z0-9.\\-\\[\\]:@%_]{1,40}",
+            "\\[[0-9a-fA-F:.]{0,30}\\](:[0-9]{0,6})?",
+            "[a-zA-Z0-9.-]{1,20}\\.{0,3}(:[0-9]{0,6})?",
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ms_fuzz::config(1024))]
+
+        // protects=CONNECT/Host authority parsing (`split_authority`) and the session tag in
+        // Proxy-Authorization (`proxy_user`) never panic on agent-shaped input; the host comes
+        // back lowercase with no trailing dot or brackets, the port is the authority's or the
+        // default, and a session user never holds a ':'; fails_when=any of those breaks;
+        // no_claim=which session the tag resolves to (ms-session)
+        #[test]
+        fn fuzz_head_helpers_authority(
+            a in authority(),
+            default_port in any::<u16>(),
+            pa in prop::collection::vec(any::<u8>(), 0..40),
+            user in "[ -~]{0,20}",
+        ) {
+            if let Ok(auth) = a.parse::<http::uri::Authority>() {
+                let (host, port) = split_authority(&auth, default_port);
+                prop_assert_eq!(&host, &host.to_ascii_lowercase());
+                prop_assert!(!host.ends_with('.'));
+                prop_assert!(!host.starts_with('[') && !host.ends_with(']'));
+                prop_assert_eq!(port, auth.port_u16().unwrap_or(default_port));
+            }
+            for value in [
+                pa.clone(),
+                format!("Basic {}", B64.encode(user.as_bytes())).into_bytes(),
+                format!("bAsIc {}", B64.encode(&pa)).into_bytes(),
+            ] {
+                let Ok(v) = http::HeaderValue::from_bytes(&value) else { continue };
+                let mut req = Request::new(());
+                req.headers_mut().insert(http::header::PROXY_AUTHORIZATION, v);
+                let (parts, ()) = req.into_parts();
+                if let Some(u) = proxy_user(&parts) {
+                    prop_assert!(!u.contains(':'));
+                }
+            }
+        }
+    }
+}

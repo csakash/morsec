@@ -872,6 +872,7 @@ dependencies = [
  "hyper-util",
  "ms-approve",
  "ms-core",
+ "ms-fuzz",
  "ms-receipts",
  "ms-vault",
  "proptest",

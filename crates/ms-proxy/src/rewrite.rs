@@ -618,7 +618,72 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(512))]
+        #![proptest_config(ms_fuzz::config(512))]
+
+        // protects=percent-decoding (used to spot hidden placeholders) inverts the encoder the
+        // query swap uses, and never panics on arbitrary text; fails_when=a round trip changes
+        // the text or a stray '%' panics; no_claim=double encoding (decoded once by design)
+        #[test]
+        fn fuzz_head_helpers(text in any::<String>(), junk in "[%0-9a-fA-FzZ]{0,12}") {
+            let mut enc = Vec::new();
+            pct_encode_into(&mut enc, text.as_bytes());
+            let enc = String::from_utf8(enc).unwrap();
+            let dec = pct_decode(&enc);
+            prop_assert_eq!(dec.as_ref(), text.as_str());
+            let _ = pct_decode(&junk);
+            let _ = pct_decode(&format!("{text}{junk}"));
+        }
+
+        // protects=a Basic swap writes exactly one Authorization header that decodes to the
+        // agent's other half joined with the value in the bound half, for either field, and the
+        // value appears nowhere else; fails_when=the pair is wrong, a second credential header
+        // survives, or the value leaks into another header or the target; no_claim=transport
+        #[test]
+        fn fuzz_head_helpers_basic(
+            user_field in any::<bool>(),
+            other in "[ -9;-~]{0,16}",
+            extra in prop::collection::vec(("[a-z-]{1,10}", arb_header_value()), 0..4),
+            path in "/[a-z0-9/]{0,12}",
+        ) {
+            let field = if user_field { BasicField::User } else { BasicField::Password };
+            let bs = [binding("git/test", "git.example.com", Location::Basic { field })];
+            let pair = if user_field {
+                format!("ms://git/test:{other}")
+            } else {
+                format!("{other}:ms://git/test")
+            };
+            let auth = format!("Basic {}", B64.encode(&pair));
+            let mut hs: Vec<(&str, &str)> = vec![("authorization", auth.as_str())];
+            for (k, v) in &extra {
+                hs.push((k.as_str(), v.as_str()));
+            }
+            let mut p = parts(&path, &hs);
+            match plan("git.example.com", 443, &p, b"", &bs) {
+                Plan::Forward(Some(b)) => {
+                    apply(&mut p, b, &[b], SECRET).unwrap();
+                    let auths: Vec<_> = p.headers.get_all(AUTHORIZATION).iter().collect();
+                    prop_assert_eq!(auths.len(), 1);
+                    let d = basic_decoded(auths[0]).unwrap();
+                    let secret = std::str::from_utf8(SECRET).unwrap();
+                    let want = if user_field {
+                        format!("{secret}:{other}")
+                    } else {
+                        format!("{other}:{secret}")
+                    };
+                    prop_assert_eq!(d.as_str(), want.as_str());
+                    for (k, v) in &p.headers {
+                        if k != AUTHORIZATION {
+                            prop_assert!(!String::from_utf8_lossy(v.as_bytes()).contains("CANARY"));
+                        }
+                    }
+                    prop_assert!(!p.uri.to_string().contains("CANARY"));
+                }
+                // An extra header with a foreign ref, or a second Basic placeholder, refuses.
+                Plan::Block(_) | Plan::Ambiguous => {}
+                Plan::Forward(None) => prop_assert!(false, "the Basic placeholder was not seen"),
+            }
+        }
+
         // protects=the head rewriter never panics and only ever writes the value into the
         // configured location; fails_when=any input panics, or the canary appears anywhere but
         // the Authorization header; no_claim=hyper's own parser (see the listener fuzz in itests)
