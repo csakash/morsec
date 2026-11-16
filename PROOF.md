@@ -59,7 +59,7 @@ steps in `packaging/RELEASING.md`.
 
 | Check | Result |
 |---|---|
-| `npm run build` (scripts/check.sh) on fc4f353 | **all checks passed**: fmt, build, clippy `-D warnings`, 494 cargo tests (0 failed), deny, audit, supply chain, 59 packaging tests + shellcheck, ARI-42 scan, security evals (canary, doctor e2e, agent_e2e) |
+| `npm run build` (scripts/check.sh) on a3bdd6f (and on fc4f353) | **all checks passed**: fmt, build, clippy `-D warnings`, 494 cargo tests (0 failed), deny, audit, supply chain, 59 packaging tests + shellcheck, ARI-42 scan, security evals (canary, doctor e2e, agent_e2e) |
 | Kill receipts | `stop_kills_a_running_command` (buffered) and `stop_kill_is_recorded_when_streaming` (streamed): exactly one `{"failed":"killed: morsec was stopped (ms stop)"}` receipt, with the same argv hash as the start receipt, and no value in receipts |
 | Install test | `test_installed_ms_finds_its_shim`, `test_control_without_shim_is_reported`, `test_formula_test_block` pass. The real `~/.claude/settings.json`, `~/.codex/config.toml`, `~/.ssh`, `~/.gitconfig`, `~/.git-credentials` and `~/.morsec/shims` are unchanged, checked by the test. No processes or temp dirs are left behind |
 | `scripts/release-check.sh` on this branch | Fails at step 1, as specified: "the workspace version is 0.0.0: bump [workspace.package] version in Cargo.toml first" |
@@ -67,7 +67,7 @@ steps in `packaging/RELEASING.md`.
 | Script tests on a throwaway workspace | Unbumped stops at step 1; 1.2.3 passes the version step; a stale `Cargo.lock` fails step 1; the changelog step fails when the file is missing and passes with an entry |
 | `scripts/release.sh build` (unsigned, from a clean clone of c201467) | Tarball holds `bin/ms`, `bin/ms-shim`, `bin/msd`. BUILDINFO has `unsigned_sha256.ms-shim` and `code_sha256.ms-shim`. The SBOM includes `ms-run`. The rendered formula installs all three |
 | `MORSEC_SIGN_IDENTITY=- scripts/release.sh build` (ad-hoc) | `ms-shim` signed `Identifier=cc.morsec.ms-shim`, flags `adhoc,runtime`, machocmp `--same` passed. BUILDINFO is byte-identical to the unsigned build's |
-| `scripts/release.sh verify-repro` | see the note at the end |
+| `scripts/release.sh verify-repro` on a3bdd6f | **reproducible: both builds are identical**, including `ms-shim` (`unsigned_sha256.ms-shim=bc7ca1b2…`). A first run was split by a commit made between its two builds (only `ms`, which embeds the commit, differed); `verify-repro` now pins one commit for both builds |
 
 Not tested (human steps): a Developer ID signature, notarization, `spctl`, a real `brew install`
 from the tap, `brew test`, `brew upgrade`, and the clean-VM install and its timing.
@@ -112,6 +112,6 @@ from the tap, `brew test`, `brew upgrade`, and the clean-VM install and its timi
 ## How to revert
 
 `git revert` the loop's merge commit on main (or its commits on this branch: bed8c5c spec,
-94fd7a3, the check.sh commit, c201467, fc4f353). Nothing outside the repo changes: no release,
+94fd7a3, the check.sh commit, c201467, fc4f353, a3bdd6f, and this PROOF update). Nothing outside the repo changes: no release,
 tag, tap or user data was created. After a revert, the release again ships only `ms` and `msd`
 (run mode needs a manual `ms-shim`), and `ms stop` kills runs without a kill receipt.
