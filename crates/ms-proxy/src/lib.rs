@@ -14,6 +14,8 @@ mod ca;
 mod config;
 mod deps;
 mod error;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzzing;
 mod idle;
 mod rewrite;
 mod server;

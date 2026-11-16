@@ -1450,7 +1450,7 @@ fn fuzz_harness() -> &'static H {
 }
 
 fn proxy_corpus(name: &str) -> Vec<Vec<u8>> {
-    ms_fuzz::corpus(format!("{}/fuzz-corpus/{name}", env!("CARGO_MANIFEST_DIR")))
+    ms_fuzz::seeds(&format!("proxy-{name}"))
 }
 
 /// Header pieces shared by the listener and tunnel targets: placeholders, agent credentials,

@@ -1,4 +1,4 @@
-"""Every test docs/THREAT_MODEL.md names must exist. Run by scripts/check.sh (hardening loop).
+"""Every test docs/threat-model.md names must exist. Run by scripts/check.sh (hardening loop).
 
 A name is written `path::test_name` in backticks; `*` in a name matches any suffix (for a family
 such as `fuzz_frame_*`). The test is found when `path` holds `fn <name>`.
@@ -10,7 +10,7 @@ import os
 import re
 import sys
 
-DOC = "docs/THREAT_MODEL.md"
+DOC = "docs/threat-model.md"
 REF = re.compile(r"`((?:crates|tests)/[^`:]+)::([A-Za-z0-9_*]+)`")
 
 

@@ -1,7 +1,7 @@
 //! Fuzz targets for IPC framing, message decoding and the live server (hardening loop, SPEC S2).
 //!
 //! proptest on stable (SPEC D1). `MORSEC_FUZZ_CASES` sets the case count; seeds come from
-//! `fuzz-corpus/frames` (raw byte streams) and `fuzz-corpus/messages` (JSON envelopes).
+//! `fuzz/corpus/ipc-frames` (raw byte streams) and `fuzz/corpus/ipc-messages` (JSON envelopes).
 
 use std::io;
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ use tokio::net::UnixStream;
 const CANARY: &[u8] = b"sk_live_CANARY_c0ffee_DO_NOT_LEAK";
 
 fn corpus(name: &str) -> Vec<Vec<u8>> {
-    ms_fuzz::corpus(format!("{}/fuzz-corpus/{name}", env!("CARGO_MANIFEST_DIR")))
+    ms_fuzz::seeds(&format!("ipc-{name}"))
 }
 
 /// Tokens worth inserting whole into a mutated message.

@@ -677,7 +677,7 @@ mod tests {
     }
 
     fn corpus() -> Vec<Vec<u8>> {
-        ms_fuzz::corpus(concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz-corpus/dotenv"))
+        ms_fuzz::seeds("dotenv")
     }
 
     /// Tokens worth inserting whole into a mutated `.env`.
@@ -809,7 +809,7 @@ mod tests {
         }
 
         // protects=the same invariants on byte-mutated seeds from the committed corpus
-        // (fuzz-corpus/dotenv); fails_when=a mutated real-world file panics or breaks an
+        // (fuzz/corpus/dotenv); fails_when=a mutated real-world file panics or breaks an
         // invariant; no_claim=coverage guidance (proptest, SPEC D1)
         #[test]
         fn fuzz_dotenv_corpus(s in ms_fuzz::mutated_str(corpus(), DICT)) {

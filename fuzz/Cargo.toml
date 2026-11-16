@@ -1,9 +1,11 @@
-# cargo-fuzz harness for the dotenv parser (L04). Not a workspace member: it needs nightly and
-# libfuzzer. Run with: cd crates/ms-import/fuzz && cargo +nightly fuzz run dotenv ../fuzz-corpus/dotenv
-# The same properties, and more, run on stable as the `fuzz_dotenv_*` proptests (hardening loop,
-# SPEC D1), which read the same seed corpus and run in the gate.
+# Coverage-guided fuzz harnesses (cargo-fuzz, libFuzzer; nightly only). L24 owns `fuzz/`.
+#
+# Not a workspace member, so the main workspace (its lockfile and gate) never builds it. The gate
+# fuzzes on stable instead: the `fuzz_*` proptests in each crate, which read the same seeds in
+# corpus/ (see README.md). Run one target, keeping the committed seeds read-only:
+#   cd fuzz && cargo +nightly fuzz run dotenv runs/dotenv corpus/dotenv
 [package]
-name = "ms-import-fuzz"
+name = "morsec-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
@@ -13,14 +15,38 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-ms-import = { path = ".." }
+tokio = { version = "1", features = ["rt", "io-util"] }
+ms-import = { path = "../crates/ms-import" }
+ms-ipc = { path = "../crates/ms-ipc" }
+ms-proxy = { path = "../crates/ms-proxy", features = ["fuzzing"] }
 
-# Its own workspace, so the main workspace (and its lockfile and gate) never builds it.
+# Its own workspace, so the main workspace never builds it.
 [workspace]
 
 [[bin]]
 name = "dotenv"
 path = "fuzz_targets/dotenv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_frame"
+path = "fuzz_targets/ipc_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_decode"
+path = "fuzz_targets/ipc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_head"
+path = "fuzz_targets/proxy_head.rs"
 test = false
 doc = false
 bench = false

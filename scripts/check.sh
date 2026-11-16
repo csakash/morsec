@@ -52,7 +52,7 @@ python3 -I -m unittest discover -s packaging/tests
 shellcheck scripts/release.sh
 
 step "7c fuzz: fuzz_* property targets with more cases, 90 s ceiling (hardening loop)"
-# proptest on stable (SPEC D1-D4, docs/THREAT_MODEL.md): the dotenv parser, the proxy's request
+# proptest on stable (SPEC D1-D4, docs/threat-model.md): the dotenv parser, the proxy's request
 # handling and IPC framing/decoding/server. Step 4 ran them at their small default counts; this
 # runs them deeper. Pure parsers get many cases; the targets that drive a live proxy or socket
 # per case get fewer. The whole step runs under one hard ceiling: past it, every process of the

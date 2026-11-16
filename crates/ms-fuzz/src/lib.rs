@@ -7,7 +7,7 @@
 //! - [`config`]: the case count comes from `MORSEC_FUZZ_CASES` (default: the target's own small
 //!   count), so `cargo test` stays fast, the gate's fuzz step runs more, and a long local session
 //!   is the same test with a large number.
-//! - [`corpus`]: every file in a directory, sorted by name. An empty or missing corpus panics:
+//! - [`seeds`] / [`corpus`]: every file in `fuzz/corpus/<name>` (or any directory), sorted by name. An empty or missing corpus panics:
 //!   a target must never silently lose its seeds.
 //! - [`mutated`]: a seed with up to eight byte-level edits (flip, insert, delete, duplicate,
 //!   splice from another seed, truncate, insert a dictionary token).
@@ -64,6 +64,19 @@ pub fn corpus(dir: impl AsRef<Path>) -> Vec<Vec<u8>> {
         .collect();
     assert!(!seeds.is_empty(), "fuzz corpus {} is empty", dir.display());
     seeds
+}
+
+/// The committed seed corpus `fuzz/corpus/<name>` at the workspace root (L24 owns `fuzz/`), shared
+/// by the stable `fuzz_*` proptests and the nightly cargo-fuzz harnesses in `fuzz/`.
+///
+/// # Panics
+/// As [`corpus`].
+pub fn seeds(name: &str) -> Vec<Vec<u8>> {
+    corpus(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/corpus")
+            .join(name),
+    )
 }
 
 /// One byte-level edit.
