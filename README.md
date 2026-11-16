@@ -26,7 +26,8 @@ ms doctor
 ```
 
 The agent only ever sees `ms://stripe/test`; `msd` swaps the real key in on requests to
-`api.stripe.com` and records every use (`ms log`). For commands that need a value (`psql`,
+`api.stripe.com` and records every use (`ms log`). Upgrade with
+`brew upgrade morsec && ms init && ms run --link-shims` (no auto-update). For commands that need a value (`psql`,
 `ssh`, `git`, deploy scripts), use run mode; `ms stop` cuts every agent off at once. The whole
 walk-through, including Codex and run mode, is [docs/ONBOARDING.md](docs/ONBOARDING.md).
 

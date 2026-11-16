@@ -11,14 +11,22 @@ session; the target is under 5 minutes.
 
 ## 1. Install
 
-Apple silicon, macOS 13 or later:
+Apple silicon, macOS 13 or later (once the first release is out; until then, build from source
+with `scripts/install-dev.sh`, see the README):
 
 ```bash
 brew install csakash/tap/morsec
 ```
 
 That installs `ms`, `mors`, `msd` (the daemon) and `ms-shim` (run mode), all signed with the
-project's Developer ID and notarized. There is no auto-update; upgrade with `brew upgrade morsec`.
+project's Developer ID and notarized. There is no auto-update. To upgrade:
+
+```bash
+brew upgrade morsec && ms init && ms run --link-shims
+```
+
+`ms init` is safe to re-run: it keeps your vault and points msd's LaunchAgent at the new
+version; `--link-shims` refreshes the run shims, which are copies of the old `ms-shim`.
 To check a download yourself, see [packaging/VERIFY.md](../packaging/VERIFY.md).
 
 ## 2. Set up
@@ -38,19 +46,23 @@ Type a value (hidden input):
 ms add stripe/test --tier test
 ```
 
-Or move a whole `.env` into the vault. It shows a review table first, then rewrites the file
-with references, so it is safe to commit:
+Or move a whole `.env` into the vault. It shows a review table first (the variables it takes as
+secrets, with a tier and, for known providers, hosts), then stores those and rewrites them as
+references. Check the table, and use `--include` for anything it missed, before you commit the
+file; values already in git history stay readable there:
 
 ```bash
 ms import .env
 ```
 
-Keys are `production` tier unless you say otherwise; a production key asks you (Touch ID) before
-each use. `test` keys never prompt.
+`ms add` keys are `production` tier unless you say otherwise; `ms import` proposes a tier per
+variable. A production key asks you (Touch ID) before use, once or for the agent session as you
+choose; `test` keys never prompt.
 
 ## 4. Say where each key may go
 
-A key allows nothing until you give it a target. For an HTTP API (swap mode, the default):
+A key you added with `ms add` allows nothing until you give it a target. For an HTTP API (swap
+mode, the default):
 
 ```bash
 ms rules stripe/test --add-host api.stripe.com
@@ -116,4 +128,5 @@ There were no public releases before 1.0. If you used `scripts/install-dev.sh`:
 3. The keychain trusts the signed release `msd`, not a dev build, so don't carry a dev build's
    vault over: start over with `ms init --force` (old receipts are kept, renamed, for
    inspection) and add your keys again.
-4. `ms connect` your agents again and run `ms doctor`.
+4. `ms run --link-shims` (your old shims are copies of the dev `ms-shim`), `ms connect` your
+   agents again, and run `ms doctor`.

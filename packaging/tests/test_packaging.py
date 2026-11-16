@@ -264,15 +264,51 @@ class FormulaTests(unittest.TestCase):
 
 
 class InstalledBinsTests(unittest.TestCase):
+    BINS = '    bin.install "bin/ms", "bin/msd", "bin/ms-shim"\n'
+
+    def setUp(self):
+        with open(os.path.join(PKG, "homebrew", "morsec.rb.in"), encoding="utf-8") as f:
+            self.t = f.read()
+        self.assertIn(self.BINS, self.t)
+
     def test_reads_the_bin_install_line(self):
-        t = 'x\n    bin.install "bin/a", "bin/b-c"\n    bin.install_symlink "a" => "z"\n'
-        self.assertEqual(formula.installed_bins(t), ["a", "b-c"])
+        t = self.t.replace(self.BINS, '    bin.install "bin/ms", "bin/b-c"\n')
+        self.assertEqual(formula.installed_bins(t), ["ms", "b-c"])
 
     def test_refuses_what_it_cannot_read_exactly(self):
-        for t in ("", 'bin.install "bin/a"\nbin.install "bin/b"\n', 'bin.install "bin/a", libexec/"x"\n',
-                  'bin.install "bin/a", "bin/a"\n', 'bin.install "bin/#{x}"\n', 'bin.install Dir["bin/*"]\n'):
-            with self.assertRaises(formula.FormulaError, msg=t):
-                formula.installed_bins(t)
+        for line in ('    bin.install "bin/ms"\n    bin.install "bin/msd"\n', '    bin.install "bin/ms", libexec/"x"\n',
+                     '    bin.install "bin/ms", "bin/ms"\n', '    bin.install "bin/#{x}"\n', '    bin.install Dir["bin/*"]\n',
+                     '    bin.install "bin/.."\n', ""):
+            with self.assertRaises(formula.FormulaError, msg=line):
+                formula.installed_bins(self.t.replace(self.BINS, line))
+        with self.assertRaises(formula.FormulaError):
+            formula.installed_bins("")
+
+    # protects=the whole formula is whitelisted, not just def install: post_install, service,
+    # system calls, writes, a renamed or commented def line all fail (re-review finding);
+    # fails_when=one of them passes; no_claim=Ruby semantics beyond these line forms
+    def test_refuses_anything_outside_the_known_statements(self):
+        t = self.t
+        cases = [
+            t.replace("  test do", '  def post_install\n    system "curl", "x"\n  end\n\n  test do'),
+            t.replace("  test do", '  service do\n    run bin/"msd"\n  end\n\n  test do'),
+            t.replace("  def install", "  def install # bins"),
+            t.replace("  def install", "  def install()"),
+            t.replace(self.BINS, self.BINS + '    system "curl", "x"\n'),
+            t.replace(self.BINS, self.BINS + '    (bin/"x").write "echo"\n'),
+            t.replace(self.BINS, self.BINS + '    libexec.install "bin/x"\n'),
+            t.replace('bin.install_symlink "ms" => "mors"', 'bin.install_symlink "ms" => ".."'),
+            t.replace('bin.install_symlink "ms" => "mors"', 'bin.install_symlink "ms" => "msd"'),
+            t.replace('bin.install_symlink "ms" => "mors"', 'bin.install_symlink "x" => "mors"'),
+            t.replace("  test do", "  test do\n    system bin/\"ms\", \"init\""),
+            t.replace("  def caveats", "  def install\n  end\n\n  def caveats"),
+            t.replace('desc "', 'desc "#{`id`}'),
+            t + "system 'x'\n",
+        ]
+        for i, bad in enumerate(cases):
+            self.assertNotEqual(bad, t, i)
+            with self.assertRaises(formula.FormulaError, msg=str(i)):
+                formula.installed_bins(bad)
 
     # protects=the formula can't install or write anything the bin.install check doesn't see
     # (security review observation); fails_when=libexec.install or a write in def install passes;

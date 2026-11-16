@@ -120,10 +120,14 @@ class InstalledShimTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        for g in cls.groups:
+        for g, rc in cls.groups:
+            # A finished command (rc written) left nothing behind, and its group id may already
+            # belong to someone else: only kill a group whose command never finished.
+            if os.path.exists(rc):
+                continue
             try:
                 os.killpg(g, signal.SIGKILL)
-            except ProcessLookupError:
+            except OSError:
                 pass
         if cls.msd is not None:
             cls.msd.terminate()
@@ -188,7 +192,7 @@ class InstalledShimTests(unittest.TestCase):
              f"(sleep 0.3; /bin/sh '{script}' > '{out}' 2>&1; echo $? > '{rc}.tmp'; mv '{rc}.tmp' '{rc}') "
              "</dev/null >/dev/null 2>&1 &"],
             env={"PATH": "/usr/bin:/bin"}, start_new_session=True)
-        cls.groups.append(p.pid)
+        cls.groups.append((p.pid, rc))
         if p.wait() != 0:
             raise AssertionError("could not start a detached shell")
         deadline = time.monotonic() + 120

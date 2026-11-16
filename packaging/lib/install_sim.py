@@ -24,7 +24,6 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import formula  # noqa: E402
 
-SYMLINK = re.compile(r'^\s*bin\.install_symlink\s+"([A-Za-z0-9._-]+)"\s*=>\s*"([A-Za-z0-9._-]+)"\s*$', re.M)
 SHARE = ("BUILDINFO", "morsec.cdx.json")
 
 
@@ -37,7 +36,7 @@ def install(tarball: str, template: str, version: str, prefix: str) -> str:
     if not formula.VERSION.fullmatch(version):
         raise InstallError(f"version {version!r} is not MAJOR.MINOR.PATCH[-pre]")
     bins = formula.installed_bins(template)
-    links = SYMLINK.findall(template)
+    links = formula.SYMLINK.findall(template)
     keg = os.path.join(prefix, "Cellar", "morsec", version)
     if os.path.exists(keg):
         raise InstallError(f"{keg} already exists")

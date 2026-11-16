@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.join(PKG, "lib"))
 import releasecheck  # noqa: E402
 
 CHECK = os.path.join(ROOT, "scripts", "release-check.sh")
-TEMPLATE = 'bin.install "bin/ms", "bin/msd", "bin/ms-shim"\n'
+with open(os.path.join(PKG, "homebrew", "morsec.rb.in"), encoding="utf-8") as _f:
+    TEMPLATE = _f.read()
 TARGETS = "# c\nms cc.morsec.ms\nmsd cc.morsec.msd\nms-shim cc.morsec.ms-shim\n"
 
 
@@ -85,7 +86,7 @@ class BinariesTests(unittest.TestCase):
         for b in ("ms", "msd", "ms-shim"):
             self.put(b)
         with self.assertRaisesRegex(releasecheck.CheckError, "sign-targets"):
-            releasecheck.check_binaries('bin.install "bin/ms", "bin/msd"\n', TARGETS, self.tmp)
+            releasecheck.check_binaries(TEMPLATE.replace(', "bin/ms-shim"', ""), TARGETS, self.tmp)
         with self.assertRaisesRegex(releasecheck.CheckError, "sign-targets"):
             releasecheck.check_binaries(TEMPLATE, "ms a\nmsd b\n", self.tmp)
         os.remove(os.path.join(self.tmp, "ms-shim"))

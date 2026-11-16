@@ -24,32 +24,74 @@ class FormulaError(Exception):
     pass
 
 
+# A file name: no leading dot (so never "." or ".."), no slash.
+NAME = r"[A-Za-z0-9_-][A-Za-z0-9._-]*"
 BIN_INSTALL = re.compile(r'^\s*bin\.install\s+(.+?)\s*$', re.M)
-BIN_ARG = re.compile(r'"bin/([A-Za-z0-9._-]+)"')
+BIN_ARG = re.compile(rf'"bin/({NAME})"')
+SYMLINK = re.compile(rf'bin\.install_symlink\s+"({NAME})"\s*=>\s*"({NAME})"')
 
-
-# The only statements the formula's `def install` may hold, so nothing is installed (or written)
-# that the bin.install check below doesn't see.
+# The whole formula, line by line: what may appear in the class body and in each block. Anything
+# else, another method (post_install, service), a `system` call or a write, is refused, so
+# nothing is installed, written or run that the bin.install check doesn't see.
+CLASS_STMT = re.compile(
+    r'(desc|homepage|url|version|sha256) "[^"#\\$`]*"'
+    r'|depends_on (arch|macos): :[a-z0-9_]+( # [^#`]*)?'
+    r'|def install|def caveats|test do|end')
 INSTALL_STMT = re.compile(
-    r'(bin\.install\s+.+|bin\.install_symlink\s+"[A-Za-z0-9._-]+"\s*=>\s*"[A-Za-z0-9._-]+"'
-    r'|\(share/"morsec"\)\.install(\s+"share/morsec/[A-Za-z0-9._-]+",?)+)')
+    rf'bin\.install "bin/{NAME}"(, "bin/{NAME}")*'
+    rf'|bin\.install_symlink "{NAME}" => "{NAME}"'
+    rf'|\(share/"morsec"\)\.install "share/morsec/{NAME}"(, "share/morsec/{NAME}")*')
+TEST_STMT = re.compile(r'assert_match "[^"#`$\\]*", shell_output\("#\{bin\}/' + NAME + r'[^"`$\\]*"(, [0-9]+)?\)'
+                       r'|assert_match "morsec #\{version\}", shell_output\("#\{bin\}/' + NAME + r' --version"\)')
+CAVEATS_STMT = re.compile(r'<<~EOS|EOS|[^#`$\\]*')
 
 
-def _install_block(template: str) -> list[str]:
-    m = re.search(r"^  def install\n(.*?)^  end\n", template, re.M | re.S)
-    if not m:
+def check_structure(template: str) -> None:
+    """Refuses a formula that does anything but the known statements (see CLASS_STMT)."""
+    lines = template.splitlines()
+    i = 0
+    while i < len(lines) and (not lines[i].strip() or lines[i].startswith("#")):
+        i += 1
+    if i >= len(lines) or lines[i] != "class Morsec < Formula":
+        raise FormulaError("the formula must start with `class Morsec < Formula`")
+    if [l for l in lines[i + 1:] if l.strip()][-1:] != ["end"]:
+        raise FormulaError("the formula must end with the class's `end`")
+    block = None
+    seen = []
+    for raw in lines[i + 1:-1] if lines[-1] == "end" else lines[i + 1:]:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line == "end" and raw == "end":
+            break
+        if block is None:
+            if not raw.startswith("  ") or raw.startswith("   ") or not CLASS_STMT.fullmatch(line):
+                raise FormulaError(f"unexpected statement in the formula: {line!r}")
+            if line in ("def install", "def caveats", "test do"):
+                if line in seen:
+                    raise FormulaError(f"{line!r} appears twice")
+                seen.append(line)
+                block = line
+            elif line == "end":
+                raise FormulaError("unbalanced `end` in the formula")
+            continue
+        if raw == "  end":
+            block = None
+            continue
+        ok = {"def install": INSTALL_STMT, "test do": TEST_STMT, "def caveats": CAVEATS_STMT}[block]
+        if not ok.fullmatch(line):
+            raise FormulaError(f"unexpected statement in {block}: {line!r}")
+    if block is not None:
+        raise FormulaError(f"{block!r} is not closed")
+    if "def install" not in seen:
         raise FormulaError("the formula has no `def install … end` block")
-    return [l.strip() for l in m.group(1).splitlines() if l.strip() and not l.strip().startswith("#")]
 
 
 def installed_bins(template: str) -> list[str]:
     """The bin/ tools the formula installs: the names in its single `bin.install "bin/…", …`
-    line, in order. Refuses anything it can't read exactly, so a check built on it fails closed:
-    when the template has a `def install` block, every statement in it must be a known form."""
-    if re.search(r"^  def install$", template, re.M):
-        for stmt in _install_block(template):
-            if not INSTALL_STMT.fullmatch(stmt):
-                raise FormulaError(f"unexpected statement in def install: {stmt!r}")
+    line, in order. The whole formula must pass check_structure, and anything it can't read
+    exactly is refused, so a check built on it fails closed."""
+    check_structure(template)
     lines = BIN_INSTALL.findall(template)
     if len(lines) != 1:
         raise FormulaError(f"the formula must have exactly one bin.install line, found {len(lines)}")
@@ -62,6 +104,9 @@ def installed_bins(template: str) -> list[str]:
         names.append(m.group(1))
     if len(set(names)) != len(names):
         raise FormulaError("bin.install names a binary twice")
+    for target, link in SYMLINK.findall(template):
+        if target not in names or link in names:
+            raise FormulaError(f"install_symlink {link} => {target} must point at an installed tool and not replace one")
     return names
 
 
