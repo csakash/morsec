@@ -209,8 +209,9 @@ class InstalledShimTests(unittest.TestCase):
         self.assertEqual(_snapshot(), self.real, "the install test touched the real HOME")
 
     # protects=L28: the formula installs ms-shim next to ms, so run mode works from a Homebrew
-    # install (ms resolves its Cellar path and finds ms-shim there); fails_when=the formula or
-    # the release drops ms-shim; no_claim=a real brew install or a signed build (human step)
+    # install (ms resolves its Cellar path and finds ms-shim there), and the shims link to the
+    # opt path so they survive brew upgrade; fails_when=the formula or the release drops ms-shim,
+    # or a shim names the versioned keg; no_claim=a real brew install or a signed build (human step)
     def test_installed_ms_finds_its_shim(self):
         cellar = os.path.join(self.prefix, "Cellar", "morsec", VERSION, "bin")
         self.assertEqual(sorted(os.listdir(cellar)), sorted(self.bins + ["mors"]))
@@ -222,10 +223,15 @@ class InstalledShimTests(unittest.TestCase):
         code, out = self.outside("ms run --link-shims && ms doctor", self.prefix)
         self.assertIn("linked psql", out)
         self.assertIn("✓ 1 shim linked in", section(out, "run shims"), out)
-        # The shim is the Cellar's ms-shim (a hard link), not something else named psql.
-        linked = os.stat(os.path.join(self.home, ".morsec", "shims", "psql"))
-        real = os.stat(os.path.join(cellar, "ms-shim"))
-        self.assertEqual((linked.st_dev, linked.st_ino), (real.st_dev, real.st_ino))
+        # The shim is a symlink to the stable opt path (it follows brew upgrade), and it is the
+        # Cellar's ms-shim, not something else named psql.
+        psql = os.path.join(self.home, ".morsec", "shims", "psql")
+        self.assertTrue(os.path.islink(psql))
+        opt_shim = os.path.join(os.path.realpath(self.prefix), "opt", "morsec", "bin", "ms-shim")
+        self.assertEqual(os.readlink(psql), opt_shim)
+        self.assertEqual(os.path.realpath(psql), os.path.realpath(os.path.join(cellar, "ms-shim")))
+        # No LaunchAgent in this HOME (ms init is not run here): doctor says so, as info.
+        self.assertIn("no LaunchAgent at", section(out, "launchagent"), out)
 
     # protects=the shim check bites: without ms-shim in the formula, doctor and --link-shims say
     # it is missing; fails_when=a release without ms-shim passes doctor; no_claim=-

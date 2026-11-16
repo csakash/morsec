@@ -8,6 +8,7 @@
 
 mod add;
 mod approve;
+mod brew;
 mod connect;
 mod connect_codex;
 mod doctor;

@@ -22,11 +22,13 @@ That installs `ms`, `mors`, `msd` (the daemon) and `ms-shim` (run mode), all sig
 project's Developer ID and notarized. There is no auto-update. To upgrade:
 
 ```bash
-brew upgrade morsec && ms init && ms run --link-shims
+brew upgrade morsec
+launchctl kickstart -k gui/$(id -u)/cc.morsec.msd
 ```
 
-`ms init` is safe to re-run: it keeps your vault and points msd's LaunchAgent at the new
-version; `--link-shims` refreshes the run shims, which are copies of the old `ms-shim`.
+msd's LaunchAgent and the run shims point at Homebrew's stable `opt/morsec` path, so they pick
+up the new version on their own; the second line restarts the running msd on it (Homebrew
+can't). `ms doctor` warns if the LaunchAgent or a shim is still pinned to one version.
 To check a download yourself, see [packaging/VERIFY.md](../packaging/VERIFY.md).
 
 ## 2. Set up
@@ -128,5 +130,5 @@ There were no public releases before 1.0. If you used `scripts/install-dev.sh`:
 3. The keychain trusts the signed release `msd`, not a dev build, so don't carry a dev build's
    vault over: start over with `ms init --force` (old receipts are kept, renamed, for
    inspection) and add your keys again.
-4. `ms run --link-shims` (your old shims are copies of the dev `ms-shim`), `ms connect` your
-   agents again, and run `ms doctor`.
+4. `ms run --link-shims` (it replaces the dev build's shims with links to the release),
+   `ms connect` your agents again, and run `ms doctor`.

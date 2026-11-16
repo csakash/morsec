@@ -39,7 +39,8 @@ fn main() {
         .unwrap_or_default();
     if name.is_empty() || name == "ms-shim" {
         eprintln!(
-            "morsec: ms-shim runs as a link named after a tool (psql, stripe…) in ~/.morsec/shims; create the links with: ms run --link-shims"
+            "morsec: {} (psql, stripe…) in ~/.morsec/shims; create the links with: ms run --link-shims",
+            ms_run::SHIM_MARKER
         );
         std::process::exit(EXIT_USAGE);
     }

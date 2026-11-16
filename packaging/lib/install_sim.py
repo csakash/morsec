@@ -2,8 +2,9 @@
 
 Used by the packaging tests and scripts/release-check.sh to prove that what the formula installs
 works as installed: ms, msd and ms-shim land together in <prefix>/Cellar/morsec/<version>/bin
-(so `ms` finds `ms-shim` next to its real path), `mors` is a symlink to `ms` there, and every
-tool is linked into <prefix>/bin the way `brew link` does. It reads the formula template's
+(so `ms` finds `ms-shim` next to its real path), `mors` is a symlink to `ms` there,
+<prefix>/opt/morsec links to that version's keg, and every tool is linked into <prefix>/bin the
+way `brew link` does. It reads the formula template's
 `bin.install` and `bin.install_symlink` lines, so a template that drops a binary installs
 without it. It never runs brew and never writes outside <prefix>.
 
@@ -65,6 +66,15 @@ def install(tarball: str, template: str, version: str, prefix: str) -> str:
         if target not in bins:
             raise InstallError(f"install_symlink {name} => {target}, which is not installed")
         os.symlink(target, os.path.join(cellar_bin, name))
+    # Homebrew's stable link to the installed version: <prefix>/opt/morsec -> ../Cellar/morsec/<version>.
+    # ms init and ms run --link-shims point at it so msd's LaunchAgent and the shims survive
+    # `brew upgrade` (launchagent-opt-path).
+    opt = os.path.join(prefix, "opt")
+    os.makedirs(opt, exist_ok=True)
+    link = os.path.join(opt, "morsec")
+    if os.path.islink(link):
+        os.remove(link)  # brew moves it to the newly installed version
+    os.symlink(os.path.join("..", "Cellar", "morsec", version), link)
     # `brew link`: <prefix>/bin/<tool> -> ../Cellar/morsec/<version>/bin/<tool>.
     linked = os.path.join(prefix, "bin")
     os.makedirs(linked, exist_ok=True)

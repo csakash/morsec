@@ -27,6 +27,11 @@
 //! [`error::adapter_invalid`] so the agent gets the right code. Values an adapter reads from the
 //! vault are redacted from output only if they are among the call's keys.
 
+/// Text every `ms-shim` build prints when run under its own name (and so carries in its
+/// binary). `ms run --link-shims` uses it to recognise a shim left by an older version and
+/// replace it. Changing it orphans older shims (they would be reported as foreign files).
+pub const SHIM_MARKER: &str = "ms-shim runs as a link named after a tool";
+
 pub mod adapters;
 pub mod client;
 pub mod context;

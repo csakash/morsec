@@ -95,3 +95,71 @@ fn ref_without_daemon_fails_closed() {
     let out = Command::new(shim()).output().unwrap();
     assert_eq!(out.status.code(), Some(64));
 }
+
+// protects=launchagent-opt-path: a shim that is a symlink into a Homebrew-style prefix
+// (shims/tool -> <prefix>/opt/morsec/bin/ms-shim, opt/morsec -> ../Cellar/morsec/<ver>) still
+// passes through to the real tool without looping, still fails closed with a ref and no msd, and
+// keeps working after the opt link moves to a new version and the old keg is deleted;
+// fails_when=the symlinked shim recurses, runs the tool with a ref, or breaks on upgrade;
+// no_claim=brew itself (a fake prefix, brew never runs)
+#[test]
+fn symlinked_through_opt_survives_upgrade() {
+    let d = tempfile::tempdir().unwrap();
+    let prefix = std::fs::canonicalize(d.path()).unwrap();
+    let keg = |v: &str| prefix.join("Cellar/morsec").join(v).join("bin");
+    place_shim(&keg("1.0.0"), "ms-shim");
+    std::fs::create_dir_all(prefix.join("opt")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/morsec/1.0.0", prefix.join("opt/morsec")).unwrap();
+    let shims = prefix.join("shims");
+    std::fs::create_dir_all(&shims).unwrap();
+    std::os::unix::fs::symlink(prefix.join("opt/morsec/bin/ms-shim"), shims.join("tool")).unwrap();
+    let real = prefix.join("real");
+    script(&real, "tool", "echo \"real:$*\"; exit 3");
+    let ran = prefix.join("ran");
+    script(&real, "guarded", &format!("touch '{}'", ran.display()));
+    std::os::unix::fs::symlink(prefix.join("opt/morsec/bin/ms-shim"), shims.join("guarded"))
+        .unwrap();
+    // The shim directory twice, and the keg's bin too: still no loop.
+    let path = std::env::join_paths([&shims, &keg("1.0.0"), &shims, &real]).unwrap();
+    let run = |args: &[&str]| {
+        // Through PATH lookup, as an agent's shell does: argv[0] is the bare name.
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg("\"$@\"")
+            .arg("sh")
+            .args(args)
+            .env_clear()
+            .env("PATH", &path)
+            .env("MORSEC_SOCKET", prefix.join("no.sock"))
+            .output()
+            .unwrap()
+    };
+    let out = run(&["tool", "a b"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "real:a b\n");
+    assert_eq!(out.status.code(), Some(3));
+    let out = run(&["guarded", "--token=ms://svc/prod"]);
+    assert_eq!(out.status.code(), Some(69));
+    assert!(!ran.exists());
+
+    // brew upgrade: new keg, opt moved, old keg deleted. The same symlinks keep working.
+    place_shim(&keg("1.1.0"), "ms-shim");
+    std::fs::remove_file(prefix.join("opt/morsec")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/morsec/1.1.0", prefix.join("opt/morsec")).unwrap();
+    std::fs::remove_dir_all(prefix.join("Cellar/morsec/1.0.0")).unwrap();
+    let out = run(&["tool", "after"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "real:after\n");
+    assert_eq!(out.status.code(), Some(3));
+}
+
+// protects=every ms-shim build carries ms_run::SHIM_MARKER, which `ms run --link-shims` uses to
+// recognise and replace shims left by an older version; fails_when=the marker is not in the
+// binary; no_claim=-
+#[test]
+fn binary_carries_the_marker() {
+    let bytes = std::fs::read(shim()).unwrap();
+    let m = ms_run::SHIM_MARKER.as_bytes();
+    assert!(bytes.windows(m.len()).any(|w| w == m));
+    let out = Command::new(shim()).output().unwrap();
+    assert_eq!(out.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(ms_run::SHIM_MARKER));
+}
