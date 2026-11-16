@@ -16,12 +16,13 @@ The trusted comment names the version, the full commit and the target.
 
 ```bash
 tar -xzf morsec-<version>-aarch64-apple-darwin.tar.gz
-codesign --verify --strict --verbose=2 morsec-<version>/bin/ms morsec-<version>/bin/msd
+codesign --verify --strict --verbose=2 morsec-<version>/bin/ms morsec-<version>/bin/msd morsec-<version>/bin/ms-shim
 codesign -d --verbose=2 morsec-<version>/bin/msd   # Identifier=cc.morsec.msd, flags include runtime,
                                                    # Authority=Developer ID Application: …, a Timestamp,
                                                    # TeamIdentifier = packaging/macos/team-id at the tag
 codesign -d --entitlements - morsec-<version>/bin/msd   # empty: morsec has no entitlements
 spctl --assess --type install --verbose=4 morsec-<version>/bin/msd   # accepted, source=Notarized Developer ID
+codesign -d --verbose=2 morsec-<version>/bin/ms-shim   # Identifier=cc.morsec.ms-shim (ms: cc.morsec.ms)
 ```
 
 ## 3. Rebuild and compare
@@ -44,6 +45,7 @@ which covers every byte except the signature and the two size fields signing cha
 mkdir /tmp/rebuild/x && tar -xzf /tmp/rebuild/morsec-*.tar.gz -C /tmp/rebuild/x
 python3 -I packaging/lib/machocmp.py --same morsec-<version>/bin/msd /tmp/rebuild/x/morsec-<version>/bin/msd
 python3 -I packaging/lib/machocmp.py --same morsec-<version>/bin/ms  /tmp/rebuild/x/morsec-<version>/bin/ms
+python3 -I packaging/lib/machocmp.py --same morsec-<version>/bin/ms-shim /tmp/rebuild/x/morsec-<version>/bin/ms-shim
 ```
 
 Each prints the code digest, which is also `code_sha256.*` in `BUILDINFO`.
@@ -52,7 +54,7 @@ Don't use `codesign --remove-signature` for this: it leaves a different `__LINKE
 
 What is and isn't reproducible:
 
-- `ms` and `msd` before signing, the SBOM and `BUILDINFO`: byte-identical across clean builds,
+- `ms`, `msd` and `ms-shim` before signing, the SBOM and `BUILDINFO`: byte-identical across clean builds,
   whatever the build directory, `CARGO_HOME` and `RUSTUP_HOME` paths, on the same toolchain and
   SDK (`scripts/release.sh verify-repro` proves it at release
   time).

@@ -50,7 +50,7 @@ struct Cli {
 enum Command {
     /// Create the vault and start the daemon.
     Init(service::InitArgs),
-    /// Add a secret (hidden input, or from 1Password/Bitwarden).
+    /// Add a secret (hidden input, or --stdin from a pipe).
     Add(add::AddArgs),
     /// Move a .env into the vault and rewrite it with references.
     Import(import::ImportArgs),

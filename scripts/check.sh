@@ -48,7 +48,7 @@ cargo metadata --format-version 1 --locked | python3 -I scripts/supply_chain_che
 
 step "7b release tooling: packaging tests and shellcheck (L10)"
 python3 -I -m unittest discover -s packaging/tests
-shellcheck scripts/release.sh
+shellcheck scripts/release.sh scripts/release-check.sh
 
 step "8/8 ARI-42 scan"
 python3 .claude/skills/ari42/scripts/ari42_scan.py check . --fail-on high
