@@ -248,20 +248,27 @@ fn log_path(home: &Path) -> PathBuf {
 /// The program a LaunchAgent plist runs: the first `ProgramArguments` string, as `ms init`
 /// writes it (XML). `None` when the plist has no such entry.
 pub(crate) fn plist_program(plist: &str) -> Option<String> {
-    let after = &plist[plist.find("<key>ProgramArguments</key>")?..];
-    let array = after.find("<array>")?;
-    let after = &after[array..];
-    let start = after.find("<string>")? + "<string>".len();
-    let end = after[start..].find("</string>")? + start;
-    // Nothing but whitespace between <array> and the first <string>.
-    if !after["<array>".len()..start - "<string>".len()]
-        .trim()
-        .is_empty()
-    {
+    // Comments out of the way first (the template carries one), refusing an unclosed one.
+    let mut text = String::with_capacity(plist.len());
+    let mut rest = plist;
+    while let Some(i) = rest.find("<!--") {
+        text.push_str(&rest[..i]);
+        rest = &rest[i + 4..][rest[i + 4..].find("-->")? + 3..];
+    }
+    text.push_str(rest);
+    // Exactly one ProgramArguments key, followed (after whitespace only) by <array>, then
+    // (after whitespace only) by the first <string>. Anything else is not the form `ms init`
+    // writes, and is reported as such rather than guessed at (security review S2).
+    const KEY: &str = "<key>ProgramArguments</key>";
+    if text.matches(KEY).count() != 1 {
         return None;
     }
+    let after = text[text.find(KEY)? + KEY.len()..].trim_start();
+    let after = after.strip_prefix("<array>")?.trim_start();
+    let after = after.strip_prefix("<string>")?;
+    let end = after.find("</string>")?;
     Some(
-        after[start..end]
+        after[..end]
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
@@ -486,5 +493,17 @@ mod tests {
         let not_first =
             "<key>ProgramArguments</key><array><integer>1</integer><string>/x</string></array>";
         assert_eq!(plist_program(not_first), None);
+        // An empty array followed by another key's array: not taken for the program.
+        let elsewhere = "<key>ProgramArguments</key><array/><key>Other</key><array><string>/msd</string></array>";
+        assert_eq!(plist_program(elsewhere), None);
+        let twice = "<key>ProgramArguments</key><array><string>/a</string></array><key>ProgramArguments</key><array><string>/b</string></array>";
+        assert_eq!(plist_program(twice), None);
+        // A commented-out entry is ignored; the real one is read.
+        let commented = "<!-- <key>ProgramArguments</key><array><string>/fake</string></array> --><key>ProgramArguments</key><array><string>/x</string></array>";
+        assert_eq!(plist_program(commented).as_deref(), Some("/x"));
+        assert_eq!(
+            plist_program("<!-- unclosed <key>ProgramArguments</key>"),
+            None
+        );
     }
 }

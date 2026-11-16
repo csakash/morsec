@@ -99,6 +99,17 @@ fn has_marker(bytes: &[u8]) -> bool {
             .any(|w| w == ms_run::SHIM_MARKER.as_bytes())
 }
 
+/// Largest file read when looking for the marker; `ms-shim` is a few MiB.
+const MAX_SHIM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Is the file at `p` (following links) an older `ms-shim`? Only a regular file of plausible
+/// size is read, so a planted link to a FIFO, a device or a huge file can't hang or exhaust
+/// `--link-shims` and `ms doctor` (security review S1).
+fn marked(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= MAX_SHIM_BYTES)
+        && std::fs::read(p).is_ok_and(|b| has_marker(&b))
+}
+
 /// The installed `ms-shim`: where it is, its identity and bytes, and (Homebrew) the stable path
 /// shims should link to.
 pub(crate) struct Shim {
@@ -168,8 +179,7 @@ impl Shim {
                 .as_deref()
                 .and_then(Path::file_name)
                 .is_some_and(|n| n == "ms-shim");
-            let marked = std::fs::read(p).is_ok_and(|b| has_marker(&b));
-            return if marked || (names_shim && std::fs::metadata(p).is_err()) {
+            return if marked(p) || (names_shim && std::fs::metadata(p).is_err()) {
                 Entry::Stale
             } else {
                 Entry::Foreign
@@ -187,7 +197,7 @@ impl Shim {
                 Entry::Pinned
             };
         }
-        if std::fs::read(p).is_ok_and(|b| has_marker(&b)) {
+        if marked(p) {
             Entry::Stale
         } else {
             Entry::Foreign
@@ -332,6 +342,41 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dev).unwrap();
         std::fs::write(dev.join("msd"), "dev").unwrap();
         assert_eq!(preferred(&dev.join("msd")), dev.join("msd"));
+    }
+
+    // protects=a planted link to a FIFO, a device or a huge file is classified without reading
+    // it (no hang, no unbounded read); fails_when=classify blocks or reads /dev/zero;
+    // no_claim=-
+    #[test]
+    fn classify_never_reads_special_files() {
+        let d = tempfile::tempdir().unwrap();
+        let shim_path = d.path().join("ms-shim");
+        std::fs::write(&shim_path, shim_bytes("x")).unwrap();
+        let shim = Shim::open(&shim_path, None).unwrap();
+        let fifo = d.path().join("fifo");
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let big = d.path().join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_SHIM_BYTES + 1)
+            .unwrap();
+        for (name, target) in [
+            ("zero", Path::new("/dev/zero")),
+            ("fifo", fifo.as_path()),
+            ("big", big.as_path()),
+        ] {
+            let link = d.path().join(format!("link-{name}"));
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            assert_eq!(shim.classify(&link), Entry::Foreign, "{name}");
+        }
+        assert_eq!(shim.classify(&fifo), Entry::Foreign);
+        assert_eq!(shim.classify(&big), Entry::Foreign);
     }
 
     // protects=only executables that carry the ms-shim marker count as old shims; fails_when=a

@@ -636,30 +636,51 @@ fn launch_agent_check(plist: &Path) -> Item {
         }
     };
     let Some(program) = crate::service::plist_program(&text).map(PathBuf::from) else {
-        return Item::warn(format!(
-            "LaunchAgent {} names no program in the form ms init writes · run: ms init",
+        return Item::fail(format!(
+            "LaunchAgent {} names no program in the form ms init writes, so it may start nothing · run: ms init",
             plist.display()
         ));
     };
     let p = program.display();
-    let keg = crate::brew::keg_of(&program).map(|(_, v)| v.to_owned());
+    let keg = crate::brew::keg_of(&program).map(|(prefix, v)| (prefix.to_path_buf(), v.to_owned()));
     if !std::fs::metadata(&program).is_ok_and(|m| m.is_file()) {
         return Item::fail(match keg {
-            Some(v) => format!(
+            Some((_, v)) => format!(
                 "LaunchAgent starts msd from morsec {v}, which is no longer installed (brew upgrade removes old versions), so msd can't start ({p}) · run: ms init"
             ),
             None => format!("LaunchAgent starts {p}, which does not exist · run: ms init"),
         });
     }
-    if let Some(v) = keg
-        && std::fs::canonicalize(&program)
-            .ok()
-            .and_then(|real| crate::brew::stable_path(&real))
-            .is_some()
-    {
+    if program.file_name().is_none_or(|n| n != "msd") {
         return Item::warn(format!(
-            "LaunchAgent is pinned to morsec {v} ({p}); the next brew upgrade will stop msd from starting · run: ms init"
+            "LaunchAgent {} starts {p}, which is not msd · run: ms init",
+            plist.display()
         ));
+    }
+    if let Some((prefix, v)) = keg {
+        let opt = prefix.join("opt/morsec/bin/msd");
+        let real = std::fs::canonicalize(&program).ok();
+        if let Ok(opt_real) = std::fs::canonicalize(&opt) {
+            if real.as_ref() != Some(&opt_real) {
+                let now = crate::brew::keg_of(&opt_real).map_or_else(
+                    || "another version".to_owned(),
+                    |(_, w)| format!("morsec {w}"),
+                );
+                return Item::warn(format!(
+                    "LaunchAgent is pinned to morsec {v} ({p}), but {now} is installed: msd runs the old version and stops starting when brew cleans it up · run: ms init"
+                ));
+            }
+            if real.as_deref().and_then(crate::brew::stable_path).is_some() {
+                return Item::warn(format!(
+                    "LaunchAgent is pinned to morsec {v} ({p}); the next brew upgrade will stop msd from starting · run: ms init"
+                ));
+            }
+            return Item::warn(format!(
+                "LaunchAgent is pinned to morsec {v} ({p}): ms init can't use {} because it or {}/opt is not owned by you or root, or is writable by others; the next brew upgrade will stop msd from starting",
+                opt.display(),
+                prefix.display()
+            ));
+        }
     }
     Item::pass(format!("LaunchAgent starts {p}"))
 }
@@ -1918,9 +1939,32 @@ mod tests {
             it.text
         );
 
-        // brew upgrade: 1.0.0 is gone.
+        // brew upgrade with cleanup deferred: 1.1.0 is current, 1.0.0 still on disk.
         b.install("1.1.0", &shim_bytes("2"));
         b.point_opt("1.1.0");
+        let it = launch_agent_check(&plist);
+        assert_eq!(it.mark, Mark::Warn, "{}", it.text);
+        assert!(
+            it.text.contains("pinned to morsec 1.0.0")
+                && it.text.contains("morsec 1.1.0 is installed"),
+            "{}",
+            it.text
+        );
+
+        // A group-writable opt: ms init can't use it, and doctor says why.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let opt = b.prefix.join("opt");
+            write(&b.keg_bin("1.1.0").join("msd"));
+            std::fs::set_permissions(&opt, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let it = launch_agent_check(&plist);
+            assert_eq!(it.mark, Mark::Warn, "{}", it.text);
+            assert!(it.text.contains("not owned by you or root"), "{}", it.text);
+            std::fs::set_permissions(&opt, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write(&v1.join("msd"));
+        }
+
+        // brew cleanup: 1.0.0 is gone.
         b.uninstall("1.0.0");
         let it = launch_agent_check(&plist);
         assert_eq!(it.mark, Mark::Fail, "{}", it.text);
@@ -1934,6 +1978,12 @@ mod tests {
         write(&b.opt_bin("msd"));
         assert_eq!(launch_agent_check(&plist).mark, Mark::Pass);
 
+        // A program that is not msd.
+        write(Path::new("/bin/sh"));
+        let it = launch_agent_check(&plist);
+        assert_eq!(it.mark, Mark::Warn, "{}", it.text);
+        assert!(it.text.contains("not msd"), "{}", it.text);
+
         // A non-Homebrew program that is gone, and one that exists.
         write(&b.prefix.join("dev/msd"));
         let it = launch_agent_check(&plist);
@@ -1944,7 +1994,7 @@ mod tests {
         assert_eq!(launch_agent_check(&plist).mark, Mark::Pass);
 
         std::fs::write(&plist, "<plist><dict></dict></plist>").unwrap();
-        assert_eq!(launch_agent_check(&plist).mark, Mark::Warn);
+        assert_eq!(launch_agent_check(&plist).mark, Mark::Fail);
     }
 
     #[test]
