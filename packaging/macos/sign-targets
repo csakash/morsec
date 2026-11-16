@@ -2,7 +2,10 @@
 # The identifiers are frozen. The L01 keychain ACL trusts msd's designated requirement
 # (identifier + Developer ID team): changing cc.morsec.msd locks every user out of their keys
 # after an upgrade. packaging/tests pins these values.
-# L11 adds its helper app here, and extends the signing loop in scripts/release.sh for a .app
-# bundle (inside-out signing; machocmp handles thin Mach-O files only). Today only bin/ tools.
+# This is also the list of what ships: scripts/release.sh builds, hashes, signs and archives
+# exactly these bin/ tools, the formula must install exactly these (packaging tests and
+# scripts/release-check.sh check both). ms-shim (L12 run mode) must sit next to ms.
+# A .app bundle would need inside-out signing; machocmp handles thin Mach-O files only.
 ms cc.morsec.ms
 msd cc.morsec.msd
+ms-shim cc.morsec.ms-shim

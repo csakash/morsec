@@ -13,7 +13,9 @@ class Morsec < Formula
   depends_on macos: :ventura # built with MACOSX_DEPLOYMENT_TARGET=13.0
 
   def install
-    bin.install "bin/ms", "bin/msd"
+    # ms-shim (run mode) must sit next to ms: ms run --link-shims and ms doctor look for it
+    # beside ms's real path, which is this Cellar bin/. The list matches packaging/macos/sign-targets.
+    bin.install "bin/ms", "bin/msd", "bin/ms-shim"
     bin.install_symlink "ms" => "mors"
     (share/"morsec").install "share/morsec/BUILDINFO", "share/morsec/morsec.cdx.json"
   end
@@ -22,12 +24,16 @@ class Morsec < Formula
     <<~EOS
       Set morsec up (creates the vault and starts msd as a LaunchAgent):
         ms init
-      morsec has no auto-update. Upgrade with: brew upgrade morsec
+      morsec has no auto-update. Upgrade with:
+        brew upgrade morsec && ms init && ms run --link-shims
+      (ms init points msd's LaunchAgent at the new version; --link-shims refreshes the run shims.)
     EOS
   end
 
   test do
     assert_match "morsec #{version}", shell_output("#{bin}/ms --version")
     assert_match "morsec #{version}", shell_output("#{bin}/mors --version")
+    # Under its own name ms-shim refuses (exit 64) and says how to link it.
+    assert_match "ms run --link-shims", shell_output("#{bin}/ms-shim 2>&1", 64)
   end
 end

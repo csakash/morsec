@@ -7,7 +7,8 @@ cd "$(dirname "$0")/.."
 root="$(pwd -P)"
 bin_dir="${MORSEC_BIN_DIR:-$HOME/.local/bin}"
 
-cargo build --release --locked -p ms-cli -p msd
+# ms-run builds ms-shim: ms finds it next to its real path (target/release), for run mode.
+cargo build --release --locked -p ms-cli -p msd -p ms-run
 mkdir -p "$bin_dir"
 
 link() { # link <target> <name>

@@ -226,7 +226,8 @@ class FormulaTests(unittest.TestCase):
         self.assertIn(f'url "{self.URL}"', out)
         self.assertIn('sha256 "' + "a" * 64 + '"', out)
         self.assertIn('bin.install_symlink "ms" => "mors"', out)
-        self.assertIn('bin.install "bin/ms", "bin/msd"', out)
+        self.assertIn('bin.install "bin/ms", "bin/msd", "bin/ms-shim"', out)
+        self.assertIn('shell_output("#{bin}/ms-shim 2>&1", 64)', out)
         self.assertIn("depends_on arch: :arm64", out)
         self.assertIn("depends_on macos: :ventura", out)
         self.assertIn('shell_output("#{bin}/mors --version")', out)
@@ -262,11 +263,98 @@ class FormulaTests(unittest.TestCase):
             formula.render(self.template + "\n# @OTHER@\n", "0.1.0", "a" * 64, self.URL)
 
 
+class InstalledBinsTests(unittest.TestCase):
+    BINS = '    bin.install "bin/ms", "bin/msd", "bin/ms-shim"\n'
+
+    def setUp(self):
+        with open(os.path.join(PKG, "homebrew", "morsec.rb.in"), encoding="utf-8") as f:
+            self.t = f.read()
+        self.assertIn(self.BINS, self.t)
+
+    def test_reads_the_bin_install_line(self):
+        t = self.t.replace(self.BINS, '    bin.install "bin/ms", "bin/b-c"\n')
+        self.assertEqual(formula.installed_bins(t), ["ms", "b-c"])
+
+    def test_refuses_what_it_cannot_read_exactly(self):
+        for line in ('    bin.install "bin/ms"\n    bin.install "bin/msd"\n', '    bin.install "bin/ms", libexec/"x"\n',
+                     '    bin.install "bin/ms", "bin/ms"\n', '    bin.install "bin/#{x}"\n', '    bin.install Dir["bin/*"]\n',
+                     '    bin.install "bin/.."\n', ""):
+            with self.assertRaises(formula.FormulaError, msg=line):
+                formula.installed_bins(self.t.replace(self.BINS, line))
+        with self.assertRaises(formula.FormulaError):
+            formula.installed_bins("")
+
+    # protects=the whole formula is whitelisted, not just def install: post_install, service,
+    # system calls, writes, a renamed or commented def line all fail (re-review finding);
+    # fails_when=one of them passes; no_claim=Ruby semantics beyond these line forms
+    def test_refuses_anything_outside_the_known_statements(self):
+        t = self.t
+        cases = [
+            t.replace("  test do", '  def post_install\n    system "curl", "x"\n  end\n\n  test do'),
+            t.replace("  test do", '  service do\n    run bin/"msd"\n  end\n\n  test do'),
+            t.replace("  def install", "  def install # bins"),
+            t.replace("  def install", "  def install()"),
+            t.replace(self.BINS, self.BINS + '    system "curl", "x"\n'),
+            t.replace(self.BINS, self.BINS + '    (bin/"x").write "echo"\n'),
+            t.replace(self.BINS, self.BINS + '    libexec.install "bin/x"\n'),
+            t.replace('bin.install_symlink "ms" => "mors"', 'bin.install_symlink "ms" => ".."'),
+            t.replace('bin.install_symlink "ms" => "mors"', 'bin.install_symlink "ms" => "msd"'),
+            t.replace('bin.install_symlink "ms" => "mors"', 'bin.install_symlink "x" => "mors"'),
+            t.replace("  test do", "  test do\n    system bin/\"ms\", \"init\""),
+            t.replace("  def caveats", "  def install\n  end\n\n  def caveats"),
+            t.replace('desc "', 'desc "#{`id`}'),
+            t + "system 'x'\n",
+        ]
+        for i, bad in enumerate(cases):
+            self.assertNotEqual(bad, t, i)
+            with self.assertRaises(formula.FormulaError, msg=str(i)):
+                formula.installed_bins(bad)
+
+    # protects=the formula can't install or write anything the bin.install check doesn't see
+    # (security review observation); fails_when=libexec.install or a write in def install passes;
+    # no_claim=-
+    def test_install_block_holds_only_known_statements(self):
+        with open(os.path.join(PKG, "homebrew", "morsec.rb.in"), encoding="utf-8") as f:
+            t = f.read()
+        self.assertEqual(formula.installed_bins(t), ["ms", "msd", "ms-shim"])
+        anchor = '    bin.install_symlink "ms" => "mors"\n'
+        self.assertIn(anchor, t)
+        for extra in ('    libexec.install "bin/x"\n', '    (bin/"x").write "echo"\n', '    system "curl", "x"\n',
+                      '    bin.install_symlink "ms" => "../x"\n'):
+            with self.assertRaises(formula.FormulaError, msg=extra):
+                formula.installed_bins(t.replace(anchor, anchor + extra))
+
+    def test_sign_targets_rows(self):
+        self.assertEqual(formula.sign_targets("# c\n\nms cc.x\n"), [("ms", "cc.x")])
+        with self.assertRaises(formula.FormulaError):
+            formula.sign_targets("ms\n")
+
+
 class FrozenConfigTests(unittest.TestCase):
     def test_signing_identifiers_are_frozen(self):
         with open(os.path.join(PKG, "macos", "sign-targets"), encoding="utf-8") as f:
             rows = [l.split() for l in f if l.strip() and not l.startswith("#")]
-        self.assertEqual(rows, [["ms", "cc.morsec.ms"], ["msd", "cc.morsec.msd"]])
+        self.assertEqual(rows, [["ms", "cc.morsec.ms"], ["msd", "cc.morsec.msd"],
+                                ["ms-shim", "cc.morsec.ms-shim"]])
+
+    # protects=L28: what the formula installs is exactly what release.sh builds and signs
+    # (sign-targets), so ms-shim can't be dropped from one and not the other; fails_when=the two
+    # lists differ; no_claim=the built binaries themselves (scripts/release-check.sh)
+    def test_formula_installs_exactly_the_signed_binaries(self):
+        with open(os.path.join(PKG, "macos", "sign-targets"), encoding="utf-8") as f:
+            signed = [n for n, _ in formula.sign_targets(f.read())]
+        with open(os.path.join(PKG, "homebrew", "morsec.rb.in"), encoding="utf-8") as f:
+            self.assertEqual(formula.installed_bins(f.read()), signed)
+        self.assertIn("ms-shim", signed)
+
+    # protects=release.sh ships what sign-targets lists, not a hard-coded pair; fails_when=a
+    # loop over a fixed `ms msd` list comes back; no_claim=-
+    def test_release_script_has_no_fixed_binary_list(self):
+        with open(RELEASE, encoding="utf-8") as f:
+            text = f.read()
+        self.assertNotRegex(text, r"for b in ms msd")
+        self.assertIn("-p ms-run", text)
+        self.assertIn("--root ms-run", text)
 
     def test_msd_identifier_matches_launch_agent_label(self):
         with open(os.path.join(ROOT, "crates", "ms-cli", "src", "service.rs"), encoding="utf-8") as f:
