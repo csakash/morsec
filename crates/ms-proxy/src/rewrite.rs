@@ -636,8 +636,13 @@ mod tests {
             prop_assert_eq!(dec.as_ref(), text.as_str());
             let _ = pct_decode(&junk);
             let _ = pct_decode(&format!("{text}{junk}"));
-            // Real heads from the corpus, mutated: decoding never panics and never grows.
-            prop_assert!(pct_decode(&seed).len() <= seed.len() * 3);
+            // Real heads from the corpus, mutated: decoding never panics, leaves text without a
+            // '%' as it is, and grows only by U+FFFD (3 bytes) for each byte that is not UTF-8.
+            let dec = pct_decode(&seed);
+            if !seed.contains('%') {
+                prop_assert_eq!(dec.as_ref(), seed.as_str());
+            }
+            prop_assert!(dec.len() <= seed.len() * 3);
         }
 
         // protects=a Basic swap writes exactly one Authorization header that decodes to the

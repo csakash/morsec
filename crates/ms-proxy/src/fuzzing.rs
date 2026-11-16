@@ -12,7 +12,7 @@ use http::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use ms_core::KeyName;
 
 use crate::config::{BasicField, Binding, Location};
-use crate::rewrite::{Plan, apply, plan};
+use crate::rewrite::{Plan, apply, placeholder_in_location, plan};
 
 const HOST: &str = "api.example.com";
 const SECRET: &[u8] = b"sk_FUZZ_CANARY_0b1c";
@@ -93,6 +93,11 @@ pub fn head(data: &[u8]) {
     let Plan::Forward(Some(b)) = plan(HOST, 443, &parts, body, &all) else {
         return;
     };
+    // A swap only ever follows the binding's own placeholder in the binding's own location.
+    assert!(
+        placeholder_in_location(&parts, b),
+        "swap planned without the placeholder in its location"
+    );
     let local: Vec<&Binding> = all.iter().collect();
     if apply(&mut parts, b, &local, SECRET).is_err() {
         return;

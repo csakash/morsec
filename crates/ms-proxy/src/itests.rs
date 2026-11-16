@@ -1858,7 +1858,14 @@ fn check_upstream(
                     && d.contains("CANARY")
                 {
                     prop_assert_eq!(k.as_str(), "authorization");
-                    prop_assert_eq!(d.as_str(), format!("x-access-token:{BASIC_CANARY}"));
+                    // The value goes in the password; the user half is the agent's own, kept as
+                    // it was sent (a mutated case may have changed it, so only a generated
+                    // request pins it exactly).
+                    let user = d.strip_suffix(&format!(":{BASIC_CANARY}"));
+                    prop_assert!(user.is_some_and(|u| !u.contains(':')), "{}", d);
+                    if sent.is_some() {
+                        prop_assert_eq!(user, Some("x-access-token"));
+                    }
                     swapped = true;
                 }
             }
