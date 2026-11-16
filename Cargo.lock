@@ -829,6 +829,8 @@ dependencies = [
  "base64 0.22.1",
  "libc",
  "ms-core",
+ "ms-fuzz",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,0 +1,1 @@
+{"v": 1, "id": 5, "body": {"type": "run_stream", "argv": ["psql", "-c", "select 1"], "cwd": "/tmp"}}
