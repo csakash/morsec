@@ -27,7 +27,8 @@ do, and `ms doctor` reports the same verdict.
    `SecCodeCheckValidity` against the requirement. The audit token carries the PID version, so a
    PID that exited and was reused fails the lookup instead of matching the new process. Because
    the connected socket itself is checked, swapping the path between "check" and "connect" can't
-   win: there is no separate check of the path.
+   win: there is no separate check of the path. Then (see "Socket directory and TOCTOU") the
+   verified process must hold the server end of this connection alone.
 3. **Requirement (release):** the client reads its own signing information
    (`SecCodeCopySigningInformation` on `SecCodeCopySelf`). If it has a Team ID `T`, the peer must
    satisfy the Developer ID designated requirement for msd:
@@ -62,10 +63,17 @@ do, and `ms doctor` reports the same verdict.
   same user, who owns the directory and can always replace the path.
 - So the fix does not rely on the path at all; it authenticates the peer of the connected
   socket. A client-side path or directory check would add nothing against a same-uid attacker.
-- `LOCAL_PEERTOKEN` reports the credentials of the process that called `listen()`. msd only
-  listens on sockets it binds itself, and the audit token's PID version changes on exec, so an
-  attacker that listens and then execs msd (or hands msd a socket) presents a stale token, which
-  fails.
+- Correction from code review (R1, reproduced): `LOCAL_PEERTOKEN` does **not** pin the
+  process that called `listen()`. It describes whatever image runs now at the PID that last
+  touched the listening socket, and exec keeps the PID. A process can listen, fork a child that
+  keeps the listener (or accept first and keep or pass on the connection), then exec the genuine
+  msd: the token names msd while another process reads. So a signature check alone is not
+  enough. The client also requires that **the verified process itself holds the server end of
+  this connection** (`proc_pidfdinfo`: its socket is our socket's `unsi_conn_so`), **that nobody
+  else holds a reference to it** (no `PROC_FP_SHARED`: not dup'd, forked or in flight over
+  `SCM_RIGHTS`) and **that it is close-on-exec** (an inherited descriptor never is). It waits up to
+  2 s for msd to accept, then looks the audit token up again, so the image can't have changed
+  in between.
 
 ## Out of scope (recorded as residual risk)
 
@@ -83,6 +91,9 @@ do, and `ms doctor` reports the same verdict.
   read zero bytes (no frame, no value).
 - Opt-out visible: same impostor with `MORSEC_DEV_UNVERIFIED_DAEMON=1` on this unsigned build:
   the warning is on stderr (proves the dev path is the only way past, and is loud).
+- Exec bypass (review R1): a process listens on the path and execs the real msd at the same
+  PID while a forked child keeps the listener, or after accepting (connection shared with a
+  child, or inherited alone). Each is refused with its reason, and the child reads nothing.
 - Real msd passes: start the real `target/debug/msd` (memory vault, temp HOME, temp socket);
   the verification API accepts it against a requirement that pins its cdhash, and refuses an
   impostor and the Developer ID requirement (an ad-hoc msd is not a release).

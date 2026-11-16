@@ -186,7 +186,7 @@ pub fn outcome(result: ms_core::Result<ResponseBody>) -> Outcome {
             ));
             Outcome::Exit(EXIT_INTERNAL)
         }
-        Err(e @ Error::DaemonUnavailable { .. }) => {
+        Err(e @ (Error::DaemonUnavailable { .. } | Error::DaemonNotVerified { .. })) => {
             say(&e.to_string());
             Outcome::Exit(EXIT_UNAVAILABLE)
         }

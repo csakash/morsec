@@ -295,13 +295,23 @@ fn daemon_section(report: &mut Report) -> Option<DaemonInfo> {
             return None;
         }
         Err(Error::DaemonNotVerified { detail }) => {
-            // T-03: something answers on the socket, but it is not the signed msd. Nothing was
-            // sent to it; say so instead of "not running".
+            // T-03: nothing was sent. Say whether this ms can't verify anything (a dev build,
+            // the fix is on this side) or the process on the socket failed the check.
+            let advice = if matches!(
+                ms_ipc::peer_verify::current_trust(),
+                ms_ipc::peer_verify::Trust::Refuse(_)
+            ) {
+                "this ms can't verify msd; nothing was sent".to_owned()
+            } else {
+                format!(
+                    "nothing was sent to it; check what serves {}, then restart msd: launchctl kickstart -k gui/$UID/{}",
+                    ms_ipc::default_socket_path()
+                        .map_or_else(|_| "the socket".to_owned(), |p| p.display().to_string()),
+                    crate::service::LABEL
+                )
+            };
             items.push(Item::fail(format!(
-                "msd identity not verified · {detail} · nothing was sent to it; check what serves {}, then restart msd: launchctl kickstart -k gui/$UID/{}",
-                ms_ipc::default_socket_path()
-                    .map_or_else(|_| "the socket".to_owned(), |p| p.display().to_string()),
-                crate::service::LABEL
+                "msd identity not verified · {detail} · {advice}"
             )));
             report.section("morsec", items);
             return None;
@@ -1579,8 +1589,8 @@ mod tests {
 
     // protects=T-03 ms doctor reports the peer verdict: verified is a pass naming the team, the
     // dev opt-out is a loud warning, a failed check is a failure carrying the reason;
-    // fails_when=an unverified or impostor peer shows as a pass; no_claim=the live connect (the
-    // ms-cli peer_verify test drives that)
+    // fails_when=an unverified or impostor peer shows as a pass; no_claim=the live connect (msd's
+    // tests/peer_verify.rs drives that)
     #[test]
     fn identity_verdicts() {
         use ms_ipc::peer_verify::PeerIdentity;

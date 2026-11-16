@@ -220,7 +220,7 @@ mod tests {
     // protects=T-03 dev builds fail closed: no Team ID and no opt-out refuses, with a message
     // naming the fix; an unreadable own signature refuses even with the opt-out;
     // fails_when=an unsigned client talks to an unverified daemon by default;
-    // no_claim=the stderr warning text (tests/peer_verify.rs in ms-cli checks it live)
+    // no_claim=the stderr warning text (msd's tests/peer_verify.rs checks it live)
     #[test]
     fn dev_builds_need_the_explicit_opt_out() {
         match policy(&OwnSignature::NoTeam, false) {

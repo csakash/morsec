@@ -258,3 +258,125 @@ fn real_msd_passes_the_signature_check() {
     let err = verify_peer(&to_imp, &pin).expect_err("an impostor must fail");
     assert!(!err.is_empty());
 }
+
+/// A same-user attacker that listens on `path` and then execs the real msd at the same PID (so
+/// the socket's peer token names msd), keeping the connection for itself. Written in Python so
+/// the listen / fork / exec order is exact. Modes:
+/// - `holder`: a forked child keeps the listener and accepts later (the review's R1 bypass).
+/// - `dup`: the attacker accepts first, a forked child keeps a copy, msd inherits the other.
+/// - `inherit`: the attacker accepts first and msd inherits the only copy.
+///
+/// The child writes the number of bytes it read to `out` once `go` exists.
+const ATTACKER: &str = r#"
+import os, socket, sys, time
+path, msd, other, state, port, out, go, mode = sys.argv[1:9]
+def drain(c):
+    while not os.path.exists(go): time.sleep(0.02)
+    c.settimeout(3); n = 0
+    try:
+        while True:
+            d = c.recv(4096)
+            if not d: break
+            n += len(d)
+    except Exception: pass
+    open(out, "w").write(str(n))
+s = socket.socket(socket.AF_UNIX); s.bind(path); s.listen(8)
+if mode == "holder":
+    if os.fork() == 0:
+        while not os.path.exists(go): time.sleep(0.02)
+        c, _ = s.accept(); drain(c); os._exit(0)
+else:
+    c, _ = s.accept()
+    os.set_inheritable(c.fileno(), True)
+    if mode == "dup" and os.fork() == 0:
+        drain(c); os._exit(0)
+    if mode == "inherit": open(out, "w").write("0")
+os.execv(msd, [msd, "--foreground", "--vault", "memory", "--socket", other, "--state-dir", state, "--proxy-port", port])
+"#;
+
+/// Runs [`ATTACKER`] in `mode`, connects to its socket, waits for the exec'd msd, and returns
+/// what `verify_peer` (pinned to the real msd's cdhash) said and how many bytes the attacker's
+/// child read after the check.
+fn attack(mode: &str) -> (Result<(), String>, usize) {
+    let d = tmpdir();
+    let run = d.path().join("run");
+    private_dir(&run);
+    let (path, other) = (run.join("msd.sock"), run.join("real.sock"));
+    let (out, go) = (d.path().join("got"), d.path().join("go"));
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+        .to_string();
+    let mut args: Vec<PathBuf> = vec![path.clone(), msd(), other.clone(), run.join("state")];
+    args.push(PathBuf::from(port));
+    args.extend([out.clone(), go.clone(), PathBuf::from(mode)]);
+    let child = Command::new("python3")
+        .arg("-I")
+        .arg("-c")
+        .arg(ATTACKER)
+        .args(&args)
+        .env("HOME", d.path())
+        .env("MORSEC_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _attacker = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "attacker did not listen");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let conn = UnixStream::connect(&path).unwrap();
+    while UnixStream::connect(&other).is_err() {
+        assert!(Instant::now() < deadline, "the exec'd msd is not up");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pin = format!("cdhash H\"{}\"", msd_cdhash());
+    let verdict = verify_peer(&conn, &pin);
+    std::fs::write(&go, b"").unwrap();
+    drop(conn);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let got = loop {
+        if let Ok(t) = std::fs::read_to_string(&out) {
+            if let Ok(n) = t.trim().parse() {
+                break n;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the attacker's child never reported"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (verdict, got)
+}
+
+// protects=T-03 (review R1) a same-user process that listens on the socket path, forks a child
+// to keep the listener and execs the genuine msd (so the peer token names msd) is refused: the
+// verified msd never accepted the connection; fails_when=the signature alone is trusted;
+// no_claim=a Developer ID msd (the cdhash pin stands in for the release requirement)
+#[test]
+fn exec_msd_behind_a_forked_listener_is_refused() {
+    let (verdict, got) = attack("holder");
+    let err = verdict.expect_err("the bypass must fail");
+    assert!(err.contains("did not accept"), "{err}");
+    assert_eq!(got, 0);
+}
+
+// protects=T-03 (review R1) an attacker that accepts first and execs msd with the connection
+// inherited is refused, whether a child keeps a copy (shared) or not (not close-on-exec);
+// fails_when=msd holding the socket is taken to mean msd alone reads it; no_claim=fds msd itself
+// shares (it shares none)
+#[test]
+fn exec_msd_with_an_inherited_connection_is_refused() {
+    let (verdict, got) = attack("dup");
+    let err = verdict.expect_err("a shared connection must fail");
+    assert!(err.contains("another process also holds"), "{err}");
+    assert_eq!(got, 0);
+    let (verdict, _) = attack("inherit");
+    let err = verdict.expect_err("an inherited connection must fail");
+    assert!(err.contains("close-on-exec"), "{err}");
+}
