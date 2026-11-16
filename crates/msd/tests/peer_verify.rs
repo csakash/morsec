@@ -340,10 +340,10 @@ fn attack(mode: &str) -> (Result<(), String>, usize) {
     drop(conn);
     let deadline = Instant::now() + Duration::from_secs(10);
     let got = loop {
-        if let Ok(t) = std::fs::read_to_string(&out) {
-            if let Ok(n) = t.trim().parse() {
-                break n;
-            }
+        if let Ok(t) = std::fs::read_to_string(&out)
+            && let Ok(n) = t.trim().parse()
+        {
+            break n;
         }
         assert!(
             Instant::now() < deadline,
