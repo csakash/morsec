@@ -47,7 +47,8 @@ impl Client {
         check_server_uid(server_uid, own_uid()?, path)?;
         // T-03: the uid says nothing about *which* same-user process answers. Before the first
         // frame, check the connected peer's code signature (see `peer_verify`).
-        let identity = crate::peer_verify::check_connected(&stream)
+        let identity = verify_server(&stream)
+            .await
             .map_err(|detail| Error::DaemonNotVerified { detail })?;
         Ok(Self {
             stream,
@@ -207,6 +208,27 @@ impl Client {
         }
         Ok(env.body)
     }
+}
+
+/// Applies the peer-verification policy to a fresh connection. The signature check can poll for
+/// up to 2 s, so it runs off the async workers (a long-lived `ms mcp` connects per tool call),
+/// on its own descriptor for the same socket. The dev opt-out and refusals decide at once.
+async fn verify_server(stream: &UnixStream) -> std::result::Result<PeerIdentity, String> {
+    use crate::peer_verify::{Trust, apply, current_trust, verify_peer};
+    let trust = current_trust();
+    if !matches!(trust, Trust::Verify { .. }) {
+        return apply(trust, |_| Err("no signature check in this mode".into()));
+    }
+    let fd = {
+        use std::os::fd::AsFd;
+        stream
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| format!("can't duplicate the connection for the check: {e}"))?
+    };
+    tokio::task::spawn_blocking(move || apply(trust, |req| verify_peer(&fd, req)))
+        .await
+        .map_err(|e| format!("the check did not finish: {e}"))?
 }
 
 /// Stdin bytes per `RunInput` frame.

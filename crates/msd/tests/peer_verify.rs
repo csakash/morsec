@@ -368,8 +368,8 @@ fn exec_msd_behind_a_forked_listener_is_refused() {
 
 // protects=T-03 (review R1) an attacker that accepts first and execs msd with the connection
 // inherited is refused, whether a child keeps a copy (shared) or not (not close-on-exec);
-// fails_when=msd holding the socket is taken to mean msd alone reads it; no_claim=fds msd itself
-// shares (it shares none)
+// fails_when=msd holding the socket is taken to mean msd alone reads it; no_claim=msd's own brief
+// shared / not-close-on-exec moments (waited out: ms-ipc transient_states_are_waited_out)
 #[test]
 fn exec_msd_with_an_inherited_connection_is_refused() {
     let (verdict, got) = attack("dup");

@@ -156,12 +156,8 @@ pub fn verify_peer<S: std::os::fd::AsFd>(_socket: &S, _requirement: &str) -> Res
     Err("code-signature checks are macOS only (Linux peer verification is L21)".into())
 }
 
-/// Applies [`current_trust`] to a freshly connected socket. `Err` is the reason to show.
-pub fn check_connected<S: std::os::fd::AsFd>(socket: &S) -> Result<PeerIdentity, String> {
-    apply(current_trust(), |req| verify_peer(socket, req))
-}
-
-/// [`check_connected`] with the policy and the signature check passed in (tests).
+/// Applies `trust` to a connection: `verify` runs the signature check (only for
+/// [`Trust::Verify`]). `Err` is the reason to show.
 pub fn apply(
     trust: Trust,
     verify: impl FnOnce(&str) -> Result<(), String>,

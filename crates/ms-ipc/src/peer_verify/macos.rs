@@ -138,20 +138,37 @@ pub(super) fn parse_unix_record(b: &[u8]) -> Option<UnixRecord> {
     })
 }
 
-/// The decision on one candidate descriptor in the peer: is it the server end of our
-/// connection, held by this process alone, and closed on exec?
-pub(super) fn owns_server_end(r: &UnixRecord, server_so: u64) -> Result<bool, String> {
-    if server_so == 0 || r.so != server_so {
-        return Ok(false);
-    }
-    if r.status & rec::FP_SHARED != 0 {
-        return Err("another process also holds this connection".into());
-    }
-    if r.status & rec::FP_CLEXEC == 0 {
-        return Err("msd's end of this connection is not close-on-exec".into());
-    }
-    Ok(true)
+/// What one descriptor in the peer says about our connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Ownership {
+    /// Some other socket.
+    NotOurs,
+    /// The server end of our connection, held by this process alone and close-on-exec.
+    Sole,
+    /// The server end, but not (yet) safe. msd passes through both states briefly on its own:
+    /// right after `accept` (close-on-exec is set by a second call) and while a child it forks
+    /// has not exec'd yet (shared). The attacks leave them permanent (a holder never drops its
+    /// copy on its own, and an inherited descriptor never becomes close-on-exec), so these are
+    /// waited out until the deadline rather than refused at once (review R6).
+    NotYet(&'static str),
 }
+
+/// The decision on one candidate descriptor in the peer.
+pub(super) fn owns_server_end(r: &UnixRecord, server_so: u64) -> Ownership {
+    if server_so == 0 || r.so != server_so {
+        Ownership::NotOurs
+    } else if r.status & rec::FP_SHARED != 0 {
+        Ownership::NotYet("another process also holds this connection")
+    } else if r.status & rec::FP_CLEXEC == 0 {
+        Ownership::NotYet("msd's end of this connection is not close-on-exec")
+    } else {
+        Ownership::Sole
+    }
+}
+
+/// msd closed the connection before the check finished, typically because the calling process
+/// already holds msd's per-process connection limit (review R7). Nothing was sent.
+const CLOSED_EARLY: &str = "msd closed the connection before it could be verified (msd refused it, or this process holds too many connections to msd)";
 
 fn pid_arg(pid: u32) -> Result<libc::c_int, String> {
     libc::c_int::try_from(pid)
@@ -222,22 +239,33 @@ fn socket_fds(pid: libc::c_int) -> Result<Vec<libc::c_int>, String> {
         .collect())
 }
 
-/// Waits (up to [`ACCEPT_WAIT`]) until `pid` has accepted our connection, then checks that it
-/// alone holds the server end.
-fn wait_for_sole_owner(pid: libc::c_int, server_so: u64) -> Result<(), String> {
+/// Waits (up to [`ACCEPT_WAIT`]) until `pid` holds the server end of our connection (`own_fd`
+/// in this process) alone and close-on-exec.
+fn wait_for_sole_owner(pid: libc::c_int, own_fd: libc::c_int) -> Result<(), String> {
+    // SAFETY: getpid has no preconditions.
+    let me = unsafe { libc::getpid() };
     let deadline = Instant::now() + ACCEPT_WAIT;
+    let mut last = None;
     loop {
+        let ours = unix_record(me, own_fd)
+            .ok_or_else(|| "can't read this connection's socket record".to_owned())?;
+        if ours.conn_so == 0 {
+            return Err(CLOSED_EARLY.into());
+        }
         for fd in socket_fds(pid)? {
-            if let Some(r) = unix_record(pid, fd)
-                && owns_server_end(&r, server_so)?
-            {
-                return Ok(());
+            match unix_record(pid, fd).map(|r| owns_server_end(&r, ours.conn_so)) {
+                Some(Ownership::Sole) => return Ok(()),
+                Some(Ownership::NotYet(why)) => last = Some(why),
+                Some(Ownership::NotOurs) | None => {}
             }
         }
         if Instant::now() >= deadline {
-            return Err(format!(
-                "the verified process (pid {pid}) did not accept this connection; another process holds the socket"
-            ));
+            return Err(match last {
+                Some(why) => format!("{why} (still so after {}s)", ACCEPT_WAIT.as_secs()),
+                None => format!(
+                    "the verified process (pid {pid}) did not accept this connection; another process holds the socket"
+                ),
+            });
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -268,11 +296,7 @@ pub(super) fn verify_peer(fd: BorrowedFd<'_>, requirement: &str) -> Result<(), S
     // audit_token_t val[5] is the PID.
     let pid = u32::from_ne_bytes([token[20], token[21], token[22], token[23]]);
     let pid = pid_arg(pid)?;
-    // SAFETY: getpid has no preconditions.
-    let me = unsafe { libc::getpid() };
-    let ours = unix_record(me, fd.as_raw_fd())
-        .ok_or_else(|| "can't read this connection's socket record".to_owned())?;
-    wait_for_sole_owner(pid, ours.conn_so)?;
+    wait_for_sole_owner(pid, fd.as_raw_fd())?;
     // Same token again: if the process exec'd (or exited) since the first lookup, its PID
     // version changed and this fails.
     check_token(&token, &requirement)
@@ -340,23 +364,19 @@ mod tests {
     #[test]
     fn sole_owner_decision_table() {
         let ok = parse_unix_record(&record(rec::FP_CLEXEC, 7, 9, rec::SOCKINFO_UN)).unwrap();
-        assert_eq!(owns_server_end(&ok, 7), Ok(true));
-        assert_eq!(owns_server_end(&ok, 8), Ok(false));
-        assert_eq!(owns_server_end(&ok, 0), Ok(false));
+        assert_eq!(owns_server_end(&ok, 7), Ownership::Sole);
+        assert_eq!(owns_server_end(&ok, 8), Ownership::NotOurs);
+        assert_eq!(owns_server_end(&ok, 0), Ownership::NotOurs);
         let shared = UnixRecord {
             status: rec::FP_CLEXEC | rec::FP_SHARED,
             ..ok
         };
         assert!(
-            owns_server_end(&shared, 7)
-                .unwrap_err()
-                .contains("another process")
+            matches!(owns_server_end(&shared, 7), Ownership::NotYet(w) if w.contains("another process"))
         );
         let inheritable = UnixRecord { status: 0, ..ok };
         assert!(
-            owns_server_end(&inheritable, 7)
-                .unwrap_err()
-                .contains("close-on-exec")
+            matches!(owns_server_end(&inheritable, 7), Ownership::NotYet(w) if w.contains("close-on-exec"))
         );
         assert_eq!(parse_unix_record(&record(rec::FP_CLEXEC, 7, 9, 2)), None);
         assert_eq!(
@@ -385,12 +405,83 @@ mod tests {
         let ours = unix_record(me, client.as_raw_fd()).unwrap();
         let theirs = unix_record(me, accepted.as_raw_fd()).unwrap();
         assert_eq!(ours.conn_so, theirs.so);
-        assert_eq!(owns_server_end(&theirs, ours.conn_so), Ok(true));
+        assert_eq!(owns_server_end(&theirs, ours.conn_so), Ownership::Sole);
         let dup = accepted.try_clone().unwrap();
         let shared = unix_record(me, accepted.as_raw_fd()).unwrap();
-        assert!(owns_server_end(&shared, ours.conn_so).is_err());
+        assert!(matches!(
+            owns_server_end(&shared, ours.conn_so),
+            Ownership::NotYet(_)
+        ));
         drop(dup);
         assert!(socket_fds(me).unwrap().contains(&accepted.as_raw_fd()));
+    }
+
+    fn pair(
+        dir: &std::path::Path,
+    ) -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        let path = dir.join("s.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        (client, listener.accept().unwrap().0)
+    }
+
+    // protects=review R6: msd's own brief states (shared while a forked child hasn't exec'd,
+    // not close-on-exec right after accept) are waited out, not refused; fails_when=the real msd
+    // is refused while it forks or accepts; no_claim=msd's actual fork timing (the attack tests
+    // show the permanent states still fail)
+    #[test]
+    fn transient_states_are_waited_out() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::Builder::new()
+            .prefix("mspvt")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (client, accepted) = pair(dir.path());
+        // SAFETY: getpid has no preconditions.
+        let me = unsafe { libc::getpid() };
+        let dup = accepted.try_clone().unwrap();
+        let fd = accepted.as_raw_fd();
+        // SAFETY: `fd` is open (owned by `accepted`); F_SETFD only changes its descriptor flags.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(dup);
+            std::thread::sleep(Duration::from_millis(300));
+            // SAFETY: as above; `accepted` outlives this thread (joined below).
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        });
+        let started = Instant::now();
+        assert_eq!(wait_for_sole_owner(me, client.as_raw_fd()), Ok(()));
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        t.join().unwrap();
+    }
+
+    // protects=review R7: a connection msd closes before the check finishes gets its own error,
+    // not an impostor alarm; fails_when=it waits out the deadline and blames another process;
+    // no_claim=msd's per-peer limit itself (ipc.rs per_peer_cap)
+    #[test]
+    fn closed_connection_is_reported_as_closed() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::Builder::new()
+            .prefix("mspvc")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (client, accepted) = pair(dir.path());
+        drop(accepted);
+        // SAFETY: getpid has no preconditions.
+        let me = unsafe { libc::getpid() };
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_sole_owner(me, client.as_raw_fd()),
+            Err(CLOSED_EARLY.into())
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     // protects=the Developer ID requirement for msd is valid requirement language;
