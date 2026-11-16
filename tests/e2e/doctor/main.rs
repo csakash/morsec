@@ -323,7 +323,7 @@ impl World {
         std::fs::write(
             &script,
             format!(
-                "export PATH='{}' HOME='{}' MORSEC_SOCKET='{}' TMPDIR='{}/tmp' LANG=C\nunset CLAUDE_CONFIG_DIR CODEX_HOME\n{exports}\ncd '{}'\n{command}\n",
+                "export PATH='{}' HOME='{}' MORSEC_SOCKET='{}' TMPDIR='{}/tmp' LANG=C MORSEC_DEV_UNVERIFIED_DAEMON=1\nunset CLAUDE_CONFIG_DIR CODEX_HOME\n{exports}\ncd '{}'\n{command}\n",
                 self.path_var(),
                 self.home.display(),
                 self.sock.display(),
@@ -351,7 +351,7 @@ impl World {
         loop {
             if let Ok(code) = std::fs::read_to_string(&rc) {
                 let text = std::fs::read_to_string(&out).unwrap_or_default();
-                return (code.trim().parse().unwrap_or(-1), text);
+                return (code.trim().parse().unwrap_or(-1), drop_dev_warning(&text));
             }
             assert!(Instant::now() < deadline, "detached command never finished");
             std::thread::sleep(Duration::from_millis(50));
@@ -369,7 +369,9 @@ impl World {
             .env("HOME", &self.home)
             .env("TMPDIR", self.dir.path().join("tmp"))
             .env("LANG", "C")
-            .env("MORSEC_SOCKET", &self.sock);
+            .env("MORSEC_SOCKET", &self.sock)
+            // Cargo-built ms: the explicit dev opt-out (T-03); a signed release ignores it.
+            .env("MORSEC_DEV_UNVERIFIED_DAEMON", "1");
         let out = cmd.output().unwrap();
         (
             out.status.code().unwrap_or(-1),
@@ -624,4 +626,13 @@ fn live_refused_inside_an_agent() {
     let (code, _, err) = w.in_agent("ms doctor --live");
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("runs only from your own terminal"), "{err}");
+}
+
+/// Drops the cargo-built ms's one-line "DEV BUILD" notice (T-03 dev opt-out) from merged
+/// stdout+stderr, so commands whose stdout is parsed (`ms mcp --catalog`) still parse.
+fn drop_dev_warning(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.starts_with("morsec: DEV BUILD:"))
+        .map(|l| format!("{l}\n"))
+        .collect()
 }
