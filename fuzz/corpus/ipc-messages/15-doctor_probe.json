@@ -1,0 +1,1 @@
+{"v": 1, "id": 15, "body": {"type": "doctor_probe", "nonce": "0123456789abcdef0123456789abcdef", "report": {"proxy_reached": true, "direct_open": false, "detail": "ok"}}}

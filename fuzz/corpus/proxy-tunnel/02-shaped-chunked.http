@@ -1,0 +1,9 @@
+POST /v1/charges HTTP/1.1
+Host: api.stripe.com
+Authorization: Bearer sk_test_ms_0000placeholder
+Transfer-Encoding: chunked
+
+4
+a=b&
+0
+

@@ -800,11 +800,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-fuzz"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "ms-import"
 version = "0.0.0"
 dependencies = [
  "libc",
  "ms-core",
+ "ms-fuzz",
  "ms-vault",
  "proptest",
  "serde",
@@ -822,6 +830,8 @@ dependencies = [
  "core-foundation",
  "libc",
  "ms-core",
+ "ms-fuzz",
+ "proptest",
  "security-framework",
  "security-framework-sys",
  "serde",
@@ -865,6 +875,7 @@ dependencies = [
  "hyper-util",
  "ms-approve",
  "ms-core",
+ "ms-fuzz",
  "ms-receipts",
  "ms-vault",
  "proptest",

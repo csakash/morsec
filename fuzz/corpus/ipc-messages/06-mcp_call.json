@@ -1,0 +1,1 @@
+{"v": 1, "id": 6, "body": {"type": "mcp_call", "tool": "run_git_push", "rules_version": 3, "cwd": "/tmp", "arguments": {"remote": "origin", "n": [1, 2, {"x": null}]}}}

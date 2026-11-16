@@ -30,3 +30,5 @@ core-foundation = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+ms-fuzz = { workspace = true }
+proptest = { workspace = true }

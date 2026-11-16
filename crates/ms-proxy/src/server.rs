@@ -109,12 +109,14 @@ fn text(status: StatusCode, msg: impl Into<String>) -> Response<Body> {
     r
 }
 
-/// `host` lowercased without a trailing dot or IPv6 brackets, and the port.
+/// `host` lowercased without a trailing dot or IPv6 brackets, and the port. The dot comes off
+/// before the brackets do, so `[::1].` gives `::1`, not `::1]` (hardening loop finding).
 fn split_authority(a: &http::uri::Authority, default_port: u16) -> (String, u16) {
-    let host = a
-        .host()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
+    let host = a.host().trim_end_matches('.');
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
         .trim_end_matches('.')
         .to_ascii_lowercase();
     (host, a.port_u16().unwrap_or(default_port))
@@ -1023,6 +1025,101 @@ mod loopback_tests {
             "[2002:7f00:1::]:4571",
         ] {
             assert!(!run(refused), "{refused}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // protects=authority normalisation found by fuzz_head_helpers_authority: a trailing dot
+    // after IPv6 brackets no longer leaves a ']' in the host, userinfo never reaches the host,
+    // and the ordinary forms are unchanged; fails_when=`[::1].` gives `::1]` (the old order:
+    // brackets, then the dot) or a normal host changes; no_claim=SSRF handling of the result
+    // (ssrf.rs; a host like `]` fails to resolve and is refused)
+    #[test]
+    fn split_authority_dot_after_brackets() {
+        let split = |s: &str| split_authority(&s.parse().unwrap(), 443);
+        assert_eq!(split("[::1].:8443"), ("::1".to_owned(), 8443));
+        assert_eq!(split("[::1]."), ("::1".to_owned(), 443));
+        // `[` is userinfo here; the host is what follows the '@'.
+        assert_eq!(split("[@]."), ("]".to_owned(), 443));
+        assert_eq!(
+            split("user@api.stripe.com:443"),
+            ("api.stripe.com".to_owned(), 443)
+        );
+        assert_eq!(split("[::1]:80"), ("::1".to_owned(), 80));
+        assert_eq!(
+            split("API.Stripe.COM.:443"),
+            ("api.stripe.com".to_owned(), 443)
+        );
+        assert_eq!(split("api.stripe.com"), ("api.stripe.com".to_owned(), 443));
+    }
+
+    fn authority() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[a-zA-Z0-9.\\-\\[\\]:@%_]{1,40}",
+            "\\[[0-9a-fA-F:.]{0,30}\\](:[0-9]{0,6})?",
+            "[a-zA-Z0-9.-]{1,20}\\.{0,3}(:[0-9]{0,6})?",
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ms_fuzz::config(1024))]
+
+        // protects=CONNECT/Host authority parsing (`split_authority`) and the session tag in
+        // Proxy-Authorization (`proxy_user`) never panic on agent-shaped input; the host comes
+        // back lowercase with no trailing dot or brackets, the port is the authority's or the
+        // default, and a session user never holds a ':'; fails_when=any of those breaks;
+        // no_claim=which session the tag resolves to (ms-session)
+        #[test]
+        fn fuzz_head_helpers_authority(
+            a in authority(),
+            default_port in any::<u16>(),
+            pa in prop::collection::vec(any::<u8>(), 0..40),
+            user in "[ -~]{0,20}",
+        ) {
+            if let Ok(auth) = a.parse::<http::uri::Authority>() {
+                let (host, port) = split_authority(&auth, default_port);
+                prop_assert_eq!(&host, &host.to_ascii_lowercase());
+                prop_assert!(!host.ends_with('.'));
+                // A bracketed host (IPv6) loses its brackets, with or without a trailing dot.
+                let raw = auth.host().trim_end_matches('.');
+                if raw.starts_with('[') && raw.ends_with(']') {
+                    prop_assert!(!host.starts_with('[') && !host.ends_with(']'), "{} -> {}", a, host);
+                }
+                prop_assert_eq!(port, auth.port_u16().unwrap_or(default_port));
+            }
+            for value in [
+                pa.clone(),
+                format!("Basic {}", B64.encode(user.as_bytes())).into_bytes(),
+                format!("bAsIc {}", B64.encode(&pa)).into_bytes(),
+            ] {
+                let Ok(v) = http::HeaderValue::from_bytes(&value) else { continue };
+                let mut req = Request::new(());
+                req.headers_mut().insert(http::header::PROXY_AUTHORIZATION, v);
+                let (parts, ()) = req.into_parts();
+                let got = proxy_user(&parts);
+                // The session tag is the user half of `Basic user:pass`, whatever the case of
+                // the scheme; anything else is no tag.
+                let want = std::str::from_utf8(&value)
+                    .ok()
+                    .and_then(|v| v.get(..6).filter(|p| p.eq_ignore_ascii_case("basic ")).map(|_| &v[6..]))
+                    .and_then(|b| B64.decode(b.trim()).ok())
+                    .and_then(|d| String::from_utf8(d).ok())
+                    .map(|d| d.split_once(':').map_or(d.clone(), |(u, _)| u.to_owned()));
+                prop_assert_eq!(got, want);
+            }
+            // A well-formed tag always comes back as its user.
+            if !user.contains(':') {
+                let v = http::HeaderValue::from_str(&format!("Basic {}", B64.encode(format!("{user}:pw"))))
+                    .unwrap();
+                let mut req = Request::new(());
+                req.headers_mut().insert(http::header::PROXY_AUTHORIZATION, v);
+                prop_assert_eq!(proxy_user(&req.into_parts().0), Some(user.clone()));
+            }
         }
     }
 }

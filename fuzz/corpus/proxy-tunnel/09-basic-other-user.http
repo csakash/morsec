@@ -1,0 +1,6 @@
+POST /org/repo.git/git-receive-pack HTTP/1.1
+Host: git.example.com
+Authorization: Basic eC1hY2NFc3MtdG9rZW46bXM6Ly9naXQvdGVzdA==
+Content-Length: 4
+
+0000

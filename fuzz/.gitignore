@@ -1,0 +1,5 @@
+target/
+artifacts/
+# What a libFuzzer run adds to its corpus. The committed seeds live in corpus/ (read-only to a run:
+# pass runs/<target> first, corpus/<target> second).
+runs/

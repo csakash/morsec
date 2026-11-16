@@ -1,0 +1,1 @@
+{"v": 1, "id": 9, "body": {"type": "mint", "key": "aws/dev", "scope": "s3:read"}}

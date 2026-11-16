@@ -1,0 +1,4 @@
+GET /org/repo.git/info/refs?service=git-upload-pack HTTP/1.1
+Host: git.example.com
+Authorization: Basic bXM6Ly9naXQvdGVzdDptczovL2dpdC90ZXN0
+
