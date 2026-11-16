@@ -39,9 +39,10 @@ steps are yours, below.
 
    It checks the version (not 0.0.0, the same for every crate, `Cargo.lock` agrees, no `v<version>`
    tag elsewhere), the CHANGELOG section, `cargo build --release --locked`, the packaging tests
-   (including the install test: the formula's binaries installed into a temp prefix, `ms doctor`
-   finding `ms-shim`), and that the formula installs exactly the binaries sign-targets lists and
-   the build produced. It signs, tags and publishes nothing. Fix anything it reports first.
+   (including the install test, on the debug build: the formula's binaries installed into a temp
+   prefix, `ms doctor` finding `ms-shim`), that the formula installs exactly the binaries
+   sign-targets lists and the release build produced, and that those release binaries, installed
+   the way the formula does, pass its `test do` block. It signs, tags and publishes nothing. Fix anything it reports first.
 3. `git tag -s v<version>` (or `-a`).
 4. Check reproducibility: `scripts/release.sh verify-repro`.
 5. Build the release:

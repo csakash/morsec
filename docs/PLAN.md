@@ -17,7 +17,7 @@ the requirements it touches and the test that proves them.
 
 ## 1. At a glance
 
-- **30 loops in 6 waves**, from an empty repo to v1.0; 29 are active, because L25 `menubar-app`
+- **30 loops in 7 waves**, from an empty repo to v1.0 and then v1.x (wave 6: L26, L27); 29 are active, because L25 `menubar-app`
   is deferred (CLI only). Loops inside a wave run in parallel; waves run in order.
 - **Critical path:** `foundation` → `swap-proxy` → `daemon` → `connect-claude` → `e2e-canary`
   (v0.1), then `run-core` → `run-postgres` (v0.2), `mint-*` and `linux-platform` (v0.3),
@@ -69,9 +69,11 @@ flowchart TB
   end
   subgraph W5["Wave 5 · v1.0"]
     L25["L25 menubar-app (deferred)"]
+    L28["L28 release-1.0"]
+  end
+  subgraph W6["Wave 6 · v1.x"]
     L26["L26 import-password-managers"]
     L27["L27 export-ari42"]
-    L28["L28 release-1.0"]
   end
   L00 --> L01 & L02 & L03 & L04 & L05 & L06
   L01 & L02 & L03 & L05 & L06 --> L07
@@ -87,14 +89,15 @@ flowchart TB
   L17 --> L22
   L12 --> L23
   L18 & L19 & L20 & L21 & L22 & L23 --> L24
-  L24 --> L26 & L27
-  L26 & L27 --> L28
+  L24 --> L28
+  L28 --> L26 & L27
   L11 -.-> L25
   classDef deferred stroke-dasharray: 5 5,color:#888
   class L25 deferred
 ```
 
-Arrows are hard dependencies. Wave 5 also uses L02, L04 and L11, which are merged long before.
+Arrows are hard dependencies. Waves 5 and 6 also use L02, L04 and L11, which are merged long
+before. L26 and L27 come after the CLI release (v1.x); the release does not wait for them.
 L25 (dashed) is deferred by the CLI-only decision and is not on the path to v1.0. The first
 public CLI release is cut once L11–L17 and L29 have merged (see "First public CLI release").
 
@@ -861,7 +864,8 @@ security review): L18–L24 merged. **Human:** the external review is booked and
 
 ### Wave 5 (v1.0)
 
-**5a: parallel** (L26 and L27; L25 is deferred)
+**Changed 16 November 2026:** the CLI launch (L28) no longer waits for L26 or L27; both move to
+wave 6 (v1.x), after the 1.0 release. L25 stays deferred.
 
 #### L25 `menubar-app` · L · **deferred (out of scope)**
 - **Out of scope as of 14 November 2026.** The user decided morsec ships as a CLI only for now.
@@ -877,6 +881,41 @@ security review): L18–L24 merged. **Human:** the external review is booked and
 - **Verify:** UI tests for each panel; Stop works with the CLI unavailable; the app has no
   entitlement to read vault items.
 - **ARI-42:** AUTH-4, LOG-4.
+
+#### L28 `release-1.0` · M
+- **Depends on:** L24 (no longer L26 or L27: those are v1.x). **Owns:** `packaging/` (Homebrew
+  formula), `docs/`, `README.md`.
+- **Build:** a CLI release: the Homebrew formula (`ms` and `mors`), onboarding docs, a measured
+  time to first protected session, migration notes from v0.x, and the 1.0 signed and notarized
+  release of `ms`, `msd` and `ms-shim`. No app and no cask (CLI-only decision).
+- **Verify:** a clean-machine install-to-protected-session run under 5 minutes; release artifacts
+  verified.
+- **Done in loop `release-cli` (prep, no human steps):** the release ships `ms-shim` with `ms`
+  and `msd` (`packaging/macos/sign-targets` is the one list release.sh builds, signs and
+  archives; the formula installs the same list, pinned by tests; identifier `cc.morsec.ms-shim`);
+  an install test puts the formula's binaries in a temp prefix and shows `ms doctor` finds
+  `ms-shim` (and fails without it); `ms stop` writes a receipt for every run it kills (L12 N3);
+  `scripts/release-check.sh` checks version, CHANGELOG, `cargo build --release --locked`,
+  packaging tests and formula-vs-build, and signs, tags and publishes nothing; `CHANGELOG.md`.
+- **Left for the human (packaging/RELEASING.md):** Developer ID certificate, notary profile,
+  `team-id` and `minisign.pub`; the version bump and CHANGELOG section (through a loop); the tag;
+  `release.sh release`; the GitHub release; the `csakash/homebrew-tap` repo; the clean-VM
+  install and its timing (the measured time to first protected session).
+- **Also done in `release-cli`:** onboarding docs (`docs/ONBOARDING.md`, with migration notes
+  from dev installs: there were no public v0.x releases) and a current `README.md`.
+- **Still open:** the Homebrew `msd_path()` follow-up (L10 notes: `ms init`'s LaunchAgent should
+  point at `$(brew --prefix)/opt/morsec/bin/msd`, not the versioned Cellar path that `brew
+  upgrade` removes). Fix it before the first release.
+
+**v1.0 gate** (the CLI release; the PRD's menu-bar app is deferred by the CLI-only decision, and
+1Password/Bitwarden import and the ARI-42 export moved to v1.x): L28 merged, and the human release
+steps in `packaging/RELEASING.md` done (signed, notarized, tapped, clean-VM install under 5
+minutes).
+
+### Wave 6 (v1.x, after the CLI release)
+
+**Parallel** (L26 and L27). Moved here from wave 5 on 16 November 2026: the CLI launch doesn't
+wait for them.
 
 #### L26 `import-password-managers` · M
 - **Depends on:** L04. **Owns:** `crates/ms-import/src/{onepassword,bitwarden}/`.
@@ -894,31 +933,8 @@ security review): L18–L24 merged. **Human:** the external review is booked and
 - **Verify:** the export holds only the requested period and project (LOG-4); no values (canary scan).
 - **ARI-42:** LOG-4, GOV-1.
 
-**5b: sequential**
-
-#### L28 `release-1.0` · M
-- **Depends on:** L26, L27. **Owns:** `packaging/` (Homebrew formula), `docs/`, `README.md`.
-- **Build:** a CLI release: the Homebrew formula (`ms` and `mors`), onboarding docs, a measured
-  time to first protected session, migration notes from v0.x, and the 1.0 signed and notarized
-  release of `ms` and `msd`. No app and no cask (CLI-only decision).
-- **Verify:** a clean-machine install-to-protected-session run under 5 minutes; release artifacts
-  verified.
-- **Done in loop `release-cli` (prep, no human steps):** the release ships `ms-shim` with `ms`
-  and `msd` (`packaging/macos/sign-targets` is the one list release.sh builds, signs and
-  archives; the formula installs the same list, pinned by tests; identifier `cc.morsec.ms-shim`);
-  an install test puts the formula's binaries in a temp prefix and shows `ms doctor` finds
-  `ms-shim` (and fails without it); `ms stop` writes a receipt for every run it kills (L12 N3);
-  `scripts/release-check.sh` checks version, CHANGELOG, `cargo build --release --locked`,
-  packaging tests and formula-vs-build, and signs, tags and publishes nothing; `CHANGELOG.md`.
-- **Left for the human (packaging/RELEASING.md):** Developer ID certificate, notary profile,
-  `team-id` and `minisign.pub`; the version bump and CHANGELOG section (through a loop); the tag;
-  `release.sh release`; the GitHub release; the `csakash/homebrew-tap` repo; the clean-VM
-  install and its timing. Still open from the card: onboarding docs, migration notes, the
-  measured time to first protected session, and the Homebrew `msd_path()` follow-up (L10 notes:
-  the LaunchAgent should point at `$(brew --prefix)/opt/morsec/bin/msd`, not the Cellar).
-
-**v1.0 gate** (PRD: 1Password/Bitwarden import, ARI-42 export; the PRD's menu-bar app is deferred
-by the CLI-only decision): **Human:** 3 startups use the export in a real customer security review.
+**v1.x gate** (PRD: 1Password/Bitwarden import, ARI-42 export): L26 and L27 merged. **Human:** 3
+startups use the export in a real customer security review.
 
 ---
 

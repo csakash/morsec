@@ -28,9 +28,28 @@ BIN_INSTALL = re.compile(r'^\s*bin\.install\s+(.+?)\s*$', re.M)
 BIN_ARG = re.compile(r'"bin/([A-Za-z0-9._-]+)"')
 
 
+# The only statements the formula's `def install` may hold, so nothing is installed (or written)
+# that the bin.install check below doesn't see.
+INSTALL_STMT = re.compile(
+    r'(bin\.install\s+.+|bin\.install_symlink\s+"[A-Za-z0-9._-]+"\s*=>\s*"[A-Za-z0-9._-]+"'
+    r'|\(share/"morsec"\)\.install(\s+"share/morsec/[A-Za-z0-9._-]+",?)+)')
+
+
+def _install_block(template: str) -> list[str]:
+    m = re.search(r"^  def install\n(.*?)^  end\n", template, re.M | re.S)
+    if not m:
+        raise FormulaError("the formula has no `def install … end` block")
+    return [l.strip() for l in m.group(1).splitlines() if l.strip() and not l.strip().startswith("#")]
+
+
 def installed_bins(template: str) -> list[str]:
     """The bin/ tools the formula installs: the names in its single `bin.install "bin/…", …`
-    line, in order. Refuses anything it can't read exactly, so a check built on it fails closed."""
+    line, in order. Refuses anything it can't read exactly, so a check built on it fails closed:
+    when the template has a `def install` block, every statement in it must be a known form."""
+    if re.search(r"^  def install$", template, re.M):
+        for stmt in _install_block(template):
+            if not INSTALL_STMT.fullmatch(stmt):
+                raise FormulaError(f"unexpected statement in def install: {stmt!r}")
     lines = BIN_INSTALL.findall(template)
     if len(lines) != 1:
         raise FormulaError(f"the formula must have exactly one bin.install line, found {len(lines)}")

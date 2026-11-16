@@ -21,7 +21,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import signal
 import time
+import tomllib
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,7 +37,9 @@ import install_sim  # noqa: E402
 
 IS_MAC_ARM = sys.platform == "darwin" and platform.machine() == "arm64"
 BUILT = os.path.join(ROOT, "target", "debug")
-VERSION = "0.0.0"
+with open(os.path.join(ROOT, "Cargo.toml"), "rb") as _f:
+    # The workspace version the built binaries carry (every crate inherits it).
+    VERSION = tomllib.load(_f)["workspace"]["package"]["version"]
 REAL_HOME = os.path.expanduser("~")
 # What the test must never touch (mtime, or absence, before and after).
 # (Not ~/.claude itself: a running Claude Code writes under it all the time.)
@@ -91,6 +95,8 @@ class InstalledShimTests(unittest.TestCase):
         cls.sock = os.path.join(cls.dir, "s.sock")
         cls.runs = 0
         cls.msd = None
+        # Process groups of the detached shells, killed in tearDownClass whatever happened.
+        cls.groups = []
         try:
             tar = cls.tarball()
             template = _read(os.path.join(PKG, "homebrew", "morsec.rb.in"))
@@ -114,6 +120,11 @@ class InstalledShimTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        for g in cls.groups:
+            try:
+                os.killpg(g, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         if cls.msd is not None:
             cls.msd.terminate()
             try:
@@ -171,11 +182,15 @@ class InstalledShimTests(unittest.TestCase):
             f.write(
                 f"export PATH='{prefix}/bin:{env['PATH']}' HOME='{cls.home}' MORSEC_SOCKET='{cls.sock}' "
                 f"TMPDIR='{env['TMPDIR']}' LANG=C\nunset CLAUDE_CONFIG_DIR CODEX_HOME\ncd '{cls.home}'\n{command}\n")
-        subprocess.run(
+        # Its own session and process group (setsid), so teardown can kill whatever is left.
+        p = subprocess.Popen(
             ["/bin/sh", "-c",
              f"(sleep 0.3; /bin/sh '{script}' > '{out}' 2>&1; echo $? > '{rc}.tmp'; mv '{rc}.tmp' '{rc}') "
              "</dev/null >/dev/null 2>&1 &"],
-            env={"PATH": "/usr/bin:/bin"}, check=True)
+            env={"PATH": "/usr/bin:/bin"}, start_new_session=True)
+        cls.groups.append(p.pid)
+        if p.wait() != 0:
+            raise AssertionError("could not start a detached shell")
         deadline = time.monotonic() + 120
         while not os.path.exists(rc):
             if time.monotonic() > deadline:

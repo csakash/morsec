@@ -389,7 +389,7 @@ cmd_verify_repro() {
   say "build 1"; cat "$a/out/SHA256SUMS"; grep -E '^(unsigned|code)_sha256' "$a/out/BUILDINFO"
   say "build 2"; cat "$b/out/SHA256SUMS"; grep -E '^(unsigned|code)_sha256' "$b/out/BUILDINFO"
   local same=1 bin bins_list
-  bins_list="$(shipped_bins "$pk")" || exit 1
+  bins_list="$(shipped_bins "$a/src/packaging")" || exit 1
   cmp -s "$a/out/SHA256SUMS" "$b/out/SHA256SUMS" || same=0
   cmp -s "$a/out/BUILDINFO" "$b/out/BUILDINFO" || same=0
   while read -r bin; do cmp -s "$a/unsigned/$bin" "$b/unsigned/$bin" || same=0; done <<<"$bins_list"

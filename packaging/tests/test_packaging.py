@@ -274,6 +274,20 @@ class InstalledBinsTests(unittest.TestCase):
             with self.assertRaises(formula.FormulaError, msg=t):
                 formula.installed_bins(t)
 
+    # protects=the formula can't install or write anything the bin.install check doesn't see
+    # (security review observation); fails_when=libexec.install or a write in def install passes;
+    # no_claim=-
+    def test_install_block_holds_only_known_statements(self):
+        with open(os.path.join(PKG, "homebrew", "morsec.rb.in"), encoding="utf-8") as f:
+            t = f.read()
+        self.assertEqual(formula.installed_bins(t), ["ms", "msd", "ms-shim"])
+        anchor = '    bin.install_symlink "ms" => "mors"\n'
+        self.assertIn(anchor, t)
+        for extra in ('    libexec.install "bin/x"\n', '    (bin/"x").write "echo"\n', '    system "curl", "x"\n',
+                      '    bin.install_symlink "ms" => "../x"\n'):
+            with self.assertRaises(formula.FormulaError, msg=extra):
+                formula.installed_bins(t.replace(anchor, anchor + extra))
+
     def test_sign_targets_rows(self):
         self.assertEqual(formula.sign_targets("# c\n\nms cc.x\n"), [("ms", "cc.x")])
         with self.assertRaises(formula.FormulaError):

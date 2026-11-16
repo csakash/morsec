@@ -41,6 +41,9 @@ metadata() { (cd "$root" && cargo metadata --format-version 1 --no-deps --locked
 check_version() {
   step "1/5 version"
   version="$(metadata | py "$pk/lib/releasecheck.py" version)" || exit 1
+  # --no-deps never compares with Cargo.lock; a full resolve with --locked does.
+  (cd "$root" && cargo metadata --format-version 1 --locked >/dev/null) ||
+    die "Cargo.lock does not match Cargo.toml: run cargo build once and commit Cargo.lock"
   local tagged head
   if tagged="$(git -C "$root" rev-parse -q --verify "refs/tags/v$version^{commit}")"; then
     head="$(git -C "$root" rev-parse HEAD)"

@@ -109,13 +109,66 @@ class BinariesTests(unittest.TestCase):
 
 
 class ScriptTests(unittest.TestCase):
+    """release-check.sh against a throwaway workspace (never this repo: a bumped repo would run
+    the whole checklist, and these tests are part of it). The script finds its root from its
+    own path, so a copy in the fixture checks the fixture."""
+
+    def fixture(self, version: str, lock_version: str | None = None) -> str:
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        os.makedirs(os.path.join(d, "scripts"))
+        shutil.copy(CHECK, os.path.join(d, "scripts", "release-check.sh"))
+        shutil.copytree(os.path.join(PKG, "lib"), os.path.join(d, "packaging", "lib"))
+        for crate in ("ms-cli", "msd"):
+            os.makedirs(os.path.join(d, "crates", crate, "src"))
+            with open(os.path.join(d, "crates", crate, "Cargo.toml"), "w") as f:
+                f.write(f'[package]\nname = "{crate}"\nversion.workspace = true\nedition = "2021"\n')
+            with open(os.path.join(d, "crates", crate, "src", "main.rs"), "w") as f:
+                f.write("fn main() {}\n")
+        with open(os.path.join(d, "Cargo.toml"), "w") as f:
+            f.write(f'[workspace]\nmembers = ["crates/ms-cli", "crates/msd"]\nresolver = "2"\n'
+                    f'[workspace.package]\nversion = "{version}"\n')
+        lv = lock_version or version
+        with open(os.path.join(d, "Cargo.lock"), "w") as f:
+            f.write(f'version = 4\n\n[[package]]\nname = "ms-cli"\nversion = "{lv}"\n\n'
+                    f'[[package]]\nname = "msd"\nversion = "{lv}"\n')
+        subprocess.run(["git", "init", "-q", d], check=True)
+        return d
+
+    def run_check(self, d: str, *steps: str) -> subprocess.CompletedProcess:
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("CARGO_TARGET", "MORSEC_"))}
+        return subprocess.run(["bash", os.path.join(d, "scripts", "release-check.sh"), *steps],
+                              capture_output=True, text=True, timeout=120, env=env)
+
     # protects=release-check stops at step 1 while the version is 0.0.0 and never reaches the
     # build; fails_when=it builds or passes unbumped; no_claim=-
     def test_stops_at_an_unbumped_version(self):
-        r = subprocess.run(["bash", CHECK], capture_output=True, text=True, timeout=120)
+        r = self.run_check(self.fixture("0.0.0"))
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("0.0.0", r.stderr)
         self.assertNotIn("2/5", r.stdout)
+
+    def test_version_step_passes_a_bumped_workspace(self):
+        r = self.run_check(self.fixture("1.2.3"), "version")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("version 1.2.3", r.stdout)
+
+    # protects=a stale Cargo.lock fails step 1 on its own (not only at the build); fails_when=a
+    # lock at another version passes; no_claim=-
+    def test_version_step_refuses_a_stale_lock(self):
+        r = self.run_check(self.fixture("1.2.3", lock_version="1.2.2"), "version")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("Cargo.lock", r.stderr)
+
+    def test_changelog_step_on_the_fixture(self):
+        d = self.fixture("1.2.3")
+        r = self.run_check(d, "changelog")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("CHANGELOG.md is missing", r.stderr)
+        with open(os.path.join(d, "CHANGELOG.md"), "w") as f:
+            f.write("## [1.2.3] - 2026-12-01\n- first\n")
+        r = self.run_check(d, "changelog")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_unknown_step_is_usage(self):
         r = subprocess.run(["bash", CHECK, "publish"], capture_output=True, text=True)

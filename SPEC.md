@@ -45,11 +45,13 @@ A local pre-release checklist. Runs, stopping at the first failure, never skippi
    (otherwise that version was already released).
 2. **changelog**: `CHANGELOG.md` has a `## [<version>]` section with at least one entry.
 3. **build**: `cargo build --release --locked -p ms-cli -p msd -p ms-run`; the built `ms --version`
-   prints `morsec <version>`.
+   prints `morsec <version>` (optionally followed by ` (<commit>)`).
 4. **packaging tests**: `python3 -I -m unittest discover -s packaging/tests` (including the
-   install test, run against the release binaries) and `shellcheck` on both scripts.
+   install test, which uses the debug build because it needs msd's debug-only Touch ID stand-in)
+   and `shellcheck` on both scripts.
 5. **formula matches build**: binaries the formula installs == sign-targets == built binaries
-   present in `target/release`, each a thin arm64 Mach-O executable.
+   present in `target/release`, each a thin arm64 Mach-O executable; the release binaries,
+   installed from a tarball through the formula's install lines, pass its `test do` block.
 
 It never signs, notarizes, tags, pushes, uploads or touches the tap repo, and reads no
 credential variable. Version and changelog logic lives in `packaging/lib/releasecheck.py` with
