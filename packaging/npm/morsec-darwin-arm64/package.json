@@ -1,0 +1,11 @@
+{
+  "name": "morsec-darwin-arm64",
+  "version": "@VERSION@",
+  "description": "morsec's signed and notarized binaries for Apple silicon macOS (installed by the morsec package)",
+  "license": "@LICENSE@",
+  "homepage": "https://github.com/csakash/morsec",
+  "repository": { "type": "git", "url": "git+https://github.com/csakash/morsec.git" },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin/ms", "bin/msd", "bin/ms-shim", "README.md"]
+}

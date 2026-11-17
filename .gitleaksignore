@@ -1,0 +1,23 @@
+# gitleaks findings reviewed in the distribution loop's pre-public audit (2026-11-17):
+# every one is a test canary, a fake fixture, a redaction-test sample or a PEM header constant,
+# not a real credential. Add a line here only after the same review; never for a real secret.
+
+28a74a7ec6908d09bcf6e27f67701e6b3485492c:crates/msd/tests/peer_verify.rs:stripe-access-token:22
+36d9fb01ff54fa6ab171b60cb398c02f250e98bc:crates/ms-connect/tests/claude.rs:curl-auth-header:1032
+6482302af669f648d3ead58eeb44d692bbc69274:crates/ms-receipts/src/redact.rs:generic-api-key:508
+6c96d8ae2e4f1852527917b79b33d1c4347828ca:crates/ms-cli/src/import.rs:stripe-access-token:356
+6c96d8ae2e4f1852527917b79b33d1c4347828ca:crates/ms-cli/tests/import_add.rs:stripe-access-token:17
+85d5b15778e364ef68069a93b54642600d4515a3:crates/ms-import/fuzz-corpus/dotenv/01-basic.env:stripe-access-token:2
+85d5b15778e364ef68069a93b54642600d4515a3:crates/ms-import/fuzz-corpus/dotenv/08-json-pem.env:private-key:2
+8a346456288f7ed950562c4e4ff21f555d90be57:crates/ms-import/src/classify.rs:generic-api-key:326
+8a346456288f7ed950562c4e4ff21f555d90be57:crates/ms-import/src/envfile.rs:stripe-access-token:305
+b6dbb1117420f859d8c2f4d4778544e4965e7a5c:tests/e2e/fixture/charge.sh:curl-auth-user:3
+c6aed7c6fd9b6f08d957ef1438a59e57b4473f65:crates/ms-import/src/dotenv.rs:stripe-access-token:550
+e22b7929bee84247daa2e0cb84b63b790c99a4fb:crates/ms-receipts/src/redact.rs:curl-auth-header:465
+e22b7929bee84247daa2e0cb84b63b790c99a4fb:crates/ms-receipts/src/redact.rs:generic-api-key:472
+e22b7929bee84247daa2e0cb84b63b790c99a4fb:crates/ms-receipts/src/redact.rs:private-key:478
+e22b7929bee84247daa2e0cb84b63b790c99a4fb:crates/ms-receipts/src/redact.rs:stripe-access-token:471
+e22b7929bee84247daa2e0cb84b63b790c99a4fb:crates/ms-receipts/tests/store.rs:stripe-access-token:410
+fbaf76d4932c0b6fb11aa423134bb51affb2fbda:crates/ms-run/src/adapters/ssh_git/cred.rs:generic-api-key:304
+fbaf76d4932c0b6fb11aa423134bb51affb2fbda:crates/ms-run/src/adapters/ssh_git/cred.rs:generic-api-key:308
+fbaf76d4932c0b6fb11aa423134bb51affb2fbda:crates/ms-run/src/adapters/ssh_git/key.rs:private-key:17

@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "ms-approve"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "block2",
  "hex",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "ms-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "ms-connect"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hex",
  "libc",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "ms-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proptest",
  "serde",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "ms-e2e"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -801,14 +801,14 @@ dependencies = [
 
 [[package]]
 name = "ms-fuzz"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "ms-import"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "ms-core",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "ms-ipc"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "core-foundation",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "ms-mcp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hex",
  "ms-core",
@@ -858,14 +858,14 @@ dependencies = [
 
 [[package]]
 name = "ms-mint"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ms-core",
 ]
 
 [[package]]
 name = "ms-proxy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "ms-receipts"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hex",
  "hmac",
@@ -910,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "ms-rules"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "ms-run"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "ms-scan"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "ms-session"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "ms-core",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "ms-vault"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "core-foundation",
  "libc",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "msd"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "hex",

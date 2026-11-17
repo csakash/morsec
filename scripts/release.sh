@@ -50,12 +50,16 @@ check_host() {
   need python3 "Install Python 3.11 or later."
   need codesign "Install the Xcode command line tools."
   need shasum "It ships with macOS."
+  need npm "Install Node.js (it brings npm); the npm packages are staged with npm pack."
 }
 
 # Version of the ms-cli package in the workspace at $1.
-workspace_version() {
+workspace_version() { workspace_field "$1" version; }
+
+# workspace_field <workspace> <field>: a field of the ms-cli package (version, license).
+workspace_field() {
   cargo metadata --format-version 1 --no-deps --locked --manifest-path "$1/Cargo.toml" |
-    py -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="ms-cli"))'
+    py -c 'import json,sys; m=json.load(sys.stdin); print(next(p[sys.argv[1]] for p in m["packages"] if p["name"]=="ms-cli"))' "$2"
 }
 
 sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
@@ -271,7 +275,19 @@ build_release() {
     "$stage/share/morsec/morsec.cdx.json=share/morsec/morsec.cdx.json:0644"
   cp "$stage/share/morsec/BUILDINFO" "$out/BUILDINFO"
   cp "$stage/share/morsec/morsec.cdx.json" "$out/morsec-$version.cdx.json"
-  (cd "$out" && shasum -a 256 "$tarball" "morsec-$version.cdx.json" BUILDINFO >SHA256SUMS)
+
+  # The curl installer, with the team and the minisign key embedded. It is listed in
+  # SHA256SUMS, so the minisign signature covers it too.
+  local -a pubarg=()
+  if [ -f "$bpk/minisign.pub" ]; then
+    pubarg=(--pubkey-file "$bpk/minisign.pub")
+  else
+    [ "$mode" = build ] || die "packaging/minisign.pub is missing"
+    printf 'release.sh: warning: no packaging/minisign.pub, so install.sh has no key to check SHA256SUMS.minisig with\n' >&2
+  fi
+  py "$bpk/lib/installer.py" --template "$bpk/install.sh" --team-file "$bpk/macos/team-id" \
+    ${pubarg[@]+"${pubarg[@]}"} --out "$out/install.sh" >/dev/null
+  (cd "$out" && shasum -a 256 "$tarball" "morsec-$version.cdx.json" BUILDINFO install.sh >SHA256SUMS)
 
   local key="${MORSEC_MINISIGN_KEY:-}" pub="${MORSEC_MINISIGN_PUB:-$pk/minisign.pub}"
   if [ "$mode" = release ]; then pub="$pk/minisign.pub"; fi
@@ -300,8 +316,30 @@ build_release() {
     cp "$out/homebrew-tap/Formula/morsec.rb" "$pk/homebrew/Formula/morsec.rb"
   fi
 
+  # Only a Developer ID build gets publishable npm packs in npm/; any other build's packs go
+  # where no one would publish them by mistake (RELEASING publishes dist/<version>/npm/).
+  local npm_dir=npm
+  [ "$signing" = developer-id ] || npm_dir="npm-$signing-NOT-FOR-PUBLISHING"
+  stage_npm "$out" "$tarball" "$version" "$(workspace_field "$src" license)" "$npm_dir"
+
   say "done: $out"
   (cd "$out" && cat SHA256SUMS)
+}
+
+# stage_npm <out> <tarball> <version> <cargo license> <dir>: the npm packages, from the binaries in the
+# release tarball (signed in a release), packed with npm pack and checked against the tarball.
+# Publishing them is a human step (packaging/RELEASING.md).
+stage_npm() {
+  local out="$1" tarball="$2" version="$3" license="$4" n="$1/$5"
+  say "npm packages (morsec, morsec-darwin-arm64)"
+  mkdir -p "$n"
+  py "$bpk/lib/npm.py" stage --tarball "$out/$tarball" --version "$version" --license "$license" \
+    --templates "$bpk/npm" --sign-targets "$bpk/macos/sign-targets" --out "$n" >/dev/null
+  # --ignore-scripts: nothing in either package may run, at pack time or install time.
+  (cd "$n" && npm pack --ignore-scripts --silent --pack-destination . ./morsec-darwin-arm64 ./morsec >/dev/null)
+  py "$bpk/lib/npm.py" verify --tarball "$out/$tarball" --version "$version" \
+    --sign-targets "$bpk/macos/sign-targets" --dir "$n"
+  (cd "$n" && shasum -a 256 "morsec-darwin-arm64-$version.tgz" "morsec-$version.tgz" >SHA256SUMS)
 }
 
 new_out() { # new_out <dir>: refuses to reuse a non-empty directory

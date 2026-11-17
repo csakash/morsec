@@ -25,6 +25,43 @@ spctl --assess --type install --verbose=4 morsec-<version>/bin/msd   # accepted,
 codesign -d --verbose=2 morsec-<version>/bin/ms-shim   # Identifier=cc.morsec.ms-shim (ms: cc.morsec.ms)
 ```
 
+## The curl installer
+
+`install.sh` does steps 1 and 2 for you before it installs anything:
+
+- It checks the minisign signature of `SHA256SUMS` when `minisign` is installed. The public key is
+  embedded in the script.
+- It checks the tarball's sha256.
+- For every binary it checks `codesign --verify --strict` against the Developer ID requirement of
+  team `554MCRUAKK`, the identifier, and `spctl`'s "Notarized Developer ID".
+
+To read it before running it, download it, check it against the signed `SHA256SUMS`, then run it:
+
+```bash
+curl -fsSLO https://github.com/csakash/morsec/releases/latest/download/install.sh
+curl -fsSLO https://github.com/csakash/morsec/releases/latest/download/SHA256SUMS
+curl -fsSLO https://github.com/csakash/morsec/releases/latest/download/SHA256SUMS.minisig
+minisign -Vm SHA256SUMS -p minisign.pub      # optional: minisign.pub from packaging/ at the tag
+shasum -a 256 -c SHA256SUMS --ignore-missing  # install.sh: OK
+less install.sh
+sh install.sh                                 # or: sh install.sh --version <version>
+```
+
+## npm
+
+The `morsec-darwin-arm64` package holds the same signed files as the tarball. `npm/SHA256SUMS`
+in the release build lists both `.tgz` files. To compare an install with a release:
+
+```bash
+d="$(npm root -g)/morsec/node_modules/morsec-darwin-arm64/bin"   # or $(npm root -g)/morsec-darwin-arm64/bin
+shasum -a 256 "$d/ms" "$d/msd" "$d/ms-shim"
+tar -xzf morsec-<version>-aarch64-apple-darwin.tar.gz && shasum -a 256 morsec-<version>/bin/*
+codesign --verify --strict --verbose=2 "$d/msd" && spctl --assess --type install --verbose=4 "$d/msd"
+```
+
+The hashes must match. Neither npm package has install scripts: `npm view morsec scripts` and
+`npm view morsec-darwin-arm64 scripts` print nothing.
+
 ## 3. Rebuild and compare
 
 On an Apple silicon Mac with the toolchain from `rust-toolchain.toml` and the Xcode / SDK named

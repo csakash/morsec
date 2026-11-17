@@ -614,12 +614,21 @@ fn agent_items(
 /// survive `brew upgrade`?
 fn launch_agent_items() -> Vec<Item> {
     match crate::service::plist_path() {
-        Ok(p) => vec![launch_agent_check(&p)],
+        // msd as installed next to this ms (canonical), to spot a LaunchAgent from another install.
+        Ok(p) => vec![launch_agent_check(
+            &p,
+            crate::brew::sibling("msd")
+                .ok()
+                .map(|(real, _)| real)
+                .filter(|m| m.is_file())
+                .as_deref(),
+        )],
         Err(e) => vec![Item::fail(format!("LaunchAgent not checked · {e}"))],
     }
 }
 
-fn launch_agent_check(plist: &Path) -> Item {
+/// `this_msd`: the canonical path of the msd installed next to this `ms`, when known.
+fn launch_agent_check(plist: &Path, this_msd: Option<&Path>) -> Item {
     let text = match std::fs::read_to_string(plist) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -647,6 +656,9 @@ fn launch_agent_check(plist: &Path) -> Item {
         return Item::fail(match keg {
             Some((_, v)) => format!(
                 "LaunchAgent starts msd from morsec {v}, which is no longer installed (brew upgrade removes old versions), so msd can't start ({p}) · run: ms init"
+            ),
+            None if crate::brew::is_npm(&program) => format!(
+                "LaunchAgent starts msd from an npm install that is gone ({p}): npm uninstall, or a switch to another Node.js version (nvm, fnm, volta) removes it · run: ms init from the morsec you use now"
             ),
             None => format!("LaunchAgent starts {p}, which does not exist · run: ms init"),
         });
@@ -682,6 +694,17 @@ fn launch_agent_check(plist: &Path) -> Item {
             ));
         }
     }
+    // Two installs (say npm and Homebrew, or two Node.js versions): msd and this ms may be
+    // different versions, and the next upgrade of this one won't reach msd.
+    if let Some(mine) = this_msd {
+        let theirs = std::fs::canonicalize(&program).ok();
+        if theirs.as_deref() != Some(mine) {
+            return Item::warn(format!(
+                "LaunchAgent starts {p}, but this ms is another install (its msd is {}): msd may run another version · run: ms init from the install you want to use",
+                mine.display()
+            ));
+        }
+    }
     Item::pass(format!("LaunchAgent starts {p}"))
 }
 
@@ -700,7 +723,7 @@ fn shim_items() -> Vec<Item> {
         )];
     }
     let shim = crate::brew::sibling("ms-shim")
-        .and_then(|(real, _)| crate::brew::Shim::open(&real, crate::brew::stable_path(&real)))
+        .and_then(|(real, _)| crate::brew::Shim::open(&real, crate::brew::link_target(&real)))
         .ok();
     let Some(home) = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -753,7 +776,7 @@ fn shim_check(
     if !pinned.is_empty() {
         items.push(Item::warn(if shim.stable.is_some() {
             format!(
-                "shims pinned to this morsec version: {} · the next brew upgrade leaves them stale · run: ms run --link-shims",
+                "shims pinned to this morsec version: {} · the next upgrade (brew upgrade, npm install -g) leaves them stale · run: ms run --link-shims",
                 pinned.join(", ")
             )
         } else {
@@ -1887,7 +1910,7 @@ mod tests {
         let v1 = b.install("1.0.0", &shim_bytes("1"));
         b.point_opt("1.0.0");
         let real = v1.join("ms-shim");
-        let shim = crate::brew::Shim::open(&real, crate::brew::stable_path(&real)).unwrap();
+        let shim = crate::brew::Shim::open(&real, crate::brew::link_target(&real)).unwrap();
         let dir = b.prefix.join("shims");
         std::fs::create_dir(&dir).unwrap();
         std::os::unix::fs::symlink(b.opt_bin("ms-shim"), dir.join("psql")).unwrap();
@@ -1924,14 +1947,14 @@ mod tests {
             )
             .unwrap();
         };
-        assert_eq!(launch_agent_check(&plist).mark, Mark::Info);
+        assert_eq!(launch_agent_check(&plist, None).mark, Mark::Info);
 
         write(&b.opt_bin("msd"));
-        let it = launch_agent_check(&plist);
+        let it = launch_agent_check(&plist, None);
         assert_eq!(it.mark, Mark::Pass, "{}", it.text);
 
         write(&v1.join("msd"));
-        let it = launch_agent_check(&plist);
+        let it = launch_agent_check(&plist, None);
         assert_eq!(it.mark, Mark::Warn, "{}", it.text);
         assert!(
             it.text.contains("1.0.0") && it.text.contains("ms init"),
@@ -1942,7 +1965,7 @@ mod tests {
         // brew upgrade with cleanup deferred: 1.1.0 is current, 1.0.0 still on disk.
         b.install("1.1.0", &shim_bytes("2"));
         b.point_opt("1.1.0");
-        let it = launch_agent_check(&plist);
+        let it = launch_agent_check(&plist, None);
         assert_eq!(it.mark, Mark::Warn, "{}", it.text);
         assert!(
             it.text.contains("pinned to morsec 1.0.0")
@@ -1957,7 +1980,7 @@ mod tests {
             let opt = b.prefix.join("opt");
             write(&b.keg_bin("1.1.0").join("msd"));
             std::fs::set_permissions(&opt, std::fs::Permissions::from_mode(0o775)).unwrap();
-            let it = launch_agent_check(&plist);
+            let it = launch_agent_check(&plist, None);
             assert_eq!(it.mark, Mark::Warn, "{}", it.text);
             assert!(it.text.contains("not owned by you or root"), "{}", it.text);
             std::fs::set_permissions(&opt, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1966,7 +1989,7 @@ mod tests {
 
         // brew cleanup: 1.0.0 is gone.
         b.uninstall("1.0.0");
-        let it = launch_agent_check(&plist);
+        let it = launch_agent_check(&plist, None);
         assert_eq!(it.mark, Mark::Fail, "{}", it.text);
         assert!(
             it.text.contains("morsec 1.0.0") && it.text.contains("no longer installed"),
@@ -1976,25 +1999,76 @@ mod tests {
         assert!(it.text.contains("run: ms init"));
         // ...while one written with the opt path keeps working.
         write(&b.opt_bin("msd"));
-        assert_eq!(launch_agent_check(&plist).mark, Mark::Pass);
+        assert_eq!(launch_agent_check(&plist, None).mark, Mark::Pass);
 
         // A program that is not msd.
         write(Path::new("/bin/sh"));
-        let it = launch_agent_check(&plist);
+        let it = launch_agent_check(&plist, None);
         assert_eq!(it.mark, Mark::Warn, "{}", it.text);
         assert!(it.text.contains("not msd"), "{}", it.text);
 
         // A non-Homebrew program that is gone, and one that exists.
         write(&b.prefix.join("dev/msd"));
-        let it = launch_agent_check(&plist);
+        let it = launch_agent_check(&plist, None);
         assert_eq!(it.mark, Mark::Fail);
         assert!(it.text.contains("does not exist"), "{}", it.text);
         std::fs::create_dir_all(b.prefix.join("dev")).unwrap();
         std::fs::write(b.prefix.join("dev/msd"), "dev").unwrap();
-        assert_eq!(launch_agent_check(&plist).mark, Mark::Pass);
+        assert_eq!(launch_agent_check(&plist, None).mark, Mark::Pass);
 
         std::fs::write(&plist, "<plist><dict></dict></plist>").unwrap();
-        assert_eq!(launch_agent_check(&plist).mark, Mark::Fail);
+        assert_eq!(launch_agent_check(&plist, None).mark, Mark::Fail);
+    }
+
+    // protects=an npm install: the LaunchAgent into node_modules passes while it is there, and
+    // when it is gone (npm uninstall, another Node.js version) doctor fails naming npm and ms
+    // init; a LaunchAgent that starts another install's msd warns; fails_when=a vanished npm
+    // install gets the generic message, or two installs pass silently; no_claim=npm, launchctl
+    #[test]
+    fn launch_agent_npm_and_two_installs() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let npm_bin = |node: &str| {
+            root.join(format!(
+                "nvm/{node}/lib/node_modules/morsec/node_modules/morsec-darwin-arm64/bin"
+            ))
+        };
+        let v22 = npm_bin("v22");
+        std::fs::create_dir_all(&v22).unwrap();
+        std::fs::write(v22.join("msd"), "msd").unwrap();
+        let plist = root.join("cc.morsec.msd.plist");
+        std::fs::write(
+            &plist,
+            crate::service::render_plist(&v22.join("msd"), Path::new("/tmp/msd.log")),
+        )
+        .unwrap();
+        // Run from that same install: pass.
+        let it = launch_agent_check(&plist, Some(&v22.join("msd")));
+        assert_eq!(it.mark, Mark::Pass, "{}", it.text);
+        // ms now comes from another Node.js version's install: warn, name both, say ms init.
+        let v24 = npm_bin("v24");
+        std::fs::create_dir_all(&v24).unwrap();
+        std::fs::write(v24.join("msd"), "msd").unwrap();
+        let it = launch_agent_check(&plist, Some(&v24.join("msd")));
+        assert_eq!(it.mark, Mark::Warn, "{}", it.text);
+        assert!(
+            it.text.contains("another install")
+                && it.text.contains(&v24.display().to_string())
+                && it.text.contains("ms init"),
+            "{}",
+            it.text
+        );
+        // The old Node.js version is removed: fail, naming npm and Node versions.
+        std::fs::remove_dir_all(root.join("nvm/v22")).unwrap();
+        let it = launch_agent_check(&plist, Some(&v24.join("msd")));
+        assert_eq!(it.mark, Mark::Fail, "{}", it.text);
+        assert!(
+            it.text.contains("npm install that is gone")
+                && it.text.contains("Node.js")
+                && it.text.contains("run: ms init"),
+            "{}",
+            it.text
+        );
     }
 
     #[test]

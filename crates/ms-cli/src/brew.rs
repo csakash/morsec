@@ -46,12 +46,32 @@ pub(crate) fn keg_of(real: &Path) -> Option<(&Path, &str)> {
     Some((p, version))
 }
 
+/// macOS's `admin` group. Its members can already become root with sudo, so a directory only
+/// `admin` can write grants no one more than they have. Homebrew makes its prefix directories
+/// (`/opt/homebrew/opt`, `/opt/homebrew/lib`) `drwxrwxr-x <user>:admin` by default.
+const ADMIN_GID: u32 = 80;
+
+/// A directory no other user can change: owned by `uid` or root, and writable by no one else,
+/// except the `admin` group (see [`ADMIN_GID`]) or, for a root-owned sticky directory such as
+/// `/tmp`, everyone (they can't rename what they don't own there).
+fn safe_dir(m: &std::fs::Metadata, uid: u32) -> bool {
+    m.is_dir() && safe_owner_mode(m.uid(), m.gid(), m.mode(), uid)
+}
+
+fn safe_owner_mode(owner: u32, gid: u32, mode: u32, uid: u32) -> bool {
+    let owner_ok = owner == uid || owner == 0;
+    // gid 80 is `admin` on macOS only; elsewhere it means nothing special.
+    let admin_only = cfg!(target_os = "macos") && mode & 0o002 == 0 && gid == ADMIN_GID;
+    let writers_ok = mode & 0o022 == 0 || admin_only || (owner == 0 && mode & 0o1000 != 0);
+    owner_ok && writers_ok
+}
+
 /// `<prefix>/opt/morsec/bin/<tool>` for a keg binary at canonical path `real`, only when that
 /// path resolves to exactly `real` (the `opt` link points at this keg). `None` otherwise: not a
 /// Homebrew keg, no `opt` link (a custom `HOMEBREW_CELLAR`), or `opt` on another version.
 ///
-/// Defence in depth: `<prefix>/opt` and the `opt/morsec` link must belong to this user or root
-/// and `opt` must not be group- or world-writable, so another user can't repoint the link later.
+/// Defence in depth: `<prefix>/opt` must be a [`safe_dir`] and the `opt/morsec` link must belong
+/// to this user or root, so another user can't repoint the link later.
 /// (The keg itself sits in the same prefix, so this asks no more of `opt` than of the keg.)
 pub(crate) fn stable_path(real: &Path) -> Option<PathBuf> {
     let (prefix, _) = keg_of(real)?;
@@ -62,13 +82,62 @@ pub(crate) fn stable_path(real: &Path) -> Option<PathBuf> {
     let owned = |m: &std::fs::Metadata| m.uid() == uid || m.uid() == 0;
     let opt_meta = std::fs::symlink_metadata(&opt).ok()?;
     let link_meta = std::fs::symlink_metadata(&link).ok()?;
-    if !opt_meta.is_dir() || !owned(&opt_meta) || opt_meta.mode() & 0o022 != 0 || !owned(&link_meta)
-    {
+    if !safe_dir(&opt_meta, uid) || !owned(&link_meta) {
         return None;
     }
     let stable = link.join("bin").join(tool);
     let resolved = std::fs::canonicalize(&stable).ok()?;
     (resolved == real).then_some(stable)
+}
+
+/// The npm platform package that holds the binaries (packaging/npm, loop distribution).
+const NPM_PACKAGE: &str = "morsec-darwin-arm64";
+
+/// Is `p` a tool of an npm install, `.../node_modules/morsec-darwin-arm64/bin/<tool>`? Purely
+/// lexical: nothing is read from disk.
+pub(crate) fn is_npm(p: &Path) -> bool {
+    // The last four components, each a plain name (a `..` or `.` anywhere there refuses it).
+    let names: Option<Vec<&std::ffi::OsStr>> = p
+        .components()
+        .rev()
+        .take(4)
+        .map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    // pnpm's store keeps a version in the path (.pnpm/<pkg>@<version>/...), so it would not
+    // survive an upgrade: not treated as an npm install.
+    let in_pnpm_store = p.components().any(|c| c.as_os_str() == ".pnpm");
+    p.is_absolute()
+        && !in_pnpm_store
+        && matches!(names.as_deref(), Some([tool, bin, pkg, nm])
+            if !tool.is_empty() && *bin == "bin" && *pkg == NPM_PACKAGE && *nm == "node_modules")
+}
+
+/// `real` itself when it is a tool of an npm install whose package directories nobody else can
+/// write: `npm install -g morsec@<new>` replaces the files at this same path, so a symlink to it
+/// follows upgrades the way Homebrew's `opt` link does (a hard link would keep the old file).
+/// `None` otherwise. Defence in depth: every directory from `bin/` up to `/` must be a
+/// [`safe_dir`], or another user could swap the file a shim runs.
+pub(crate) fn npm_path(real: &Path) -> Option<PathBuf> {
+    if !is_npm(real) {
+        return None;
+    }
+    let uid = rustix::process::getuid().as_raw();
+    for d in real.parent()?.ancestors() {
+        let m = std::fs::symlink_metadata(d).ok()?;
+        if !safe_dir(&m, uid) {
+            return None;
+        }
+    }
+    Some(real.to_path_buf())
+}
+
+/// What a run shim should be a symlink to so it survives upgrades: Homebrew's `opt` path, else
+/// the npm package's own path. `None` (a dev or manual install): shims are hard links.
+pub(crate) fn link_target(real: &Path) -> Option<PathBuf> {
+    stable_path(real).or_else(|| npm_path(real))
 }
 
 /// The path to record for a binary whose canonical path is `real`: the stable `opt` path in a
@@ -342,6 +411,103 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dev).unwrap();
         std::fs::write(dev.join("msd"), "dev").unwrap();
         assert_eq!(preferred(&dev.join("msd")), dev.join("msd"));
+    }
+
+    // protects=npm installs are recognised exactly by .../node_modules/morsec-darwin-arm64/bin/<tool>
+    // and shims link to that path only when no one else can write its directories;
+    // fails_when=another package, a relative path or a group-writable package dir yields a link
+    // target; no_claim=npm itself (never run)
+    #[test]
+    fn npm_paths() {
+        assert!(is_npm(Path::new(
+            "/Users/u/.nvm/versions/node/v22.1.0/lib/node_modules/morsec/node_modules/morsec-darwin-arm64/bin/msd"
+        )));
+        assert!(is_npm(Path::new(
+            "/opt/homebrew/lib/node_modules/morsec-darwin-arm64/bin/ms-shim"
+        )));
+        for bad in [
+            "/x/node_modules/morsec-darwin-x64/bin/msd",
+            "/x/node_modules/morsec-darwin-arm64/lib/msd",
+            "/x/vendor/morsec-darwin-arm64/bin/msd",
+            "node_modules/morsec-darwin-arm64/bin/msd",
+            "/x/node_modules/morsec-darwin-arm64/bin/../msd",
+            "/morsec-darwin-arm64/bin/msd",
+            "/g/.pnpm/morsec-darwin-arm64@0.1.0/node_modules/morsec-darwin-arm64/bin/msd",
+        ] {
+            assert!(!is_npm(Path::new(bad)), "{bad}");
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let bin = root.join("lib/node_modules/morsec/node_modules/morsec-darwin-arm64/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for p in [
+            bin.as_path(),
+            bin.parent().unwrap(),
+            bin.parent().unwrap().parent().unwrap(),
+        ] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shim = bin.join("ms-shim");
+        std::fs::write(&shim, shim_bytes("npm")).unwrap();
+        assert_eq!(npm_path(&shim), Some(shim.clone()));
+        assert_eq!(link_target(&shim), Some(shim.clone()));
+        // The LaunchAgent records the npm path as it is (there is no opt link to prefer).
+        assert_eq!(preferred(&shim), shim);
+        let pkg = bin.parent().unwrap();
+        std::fs::set_permissions(pkg, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(npm_path(&shim), None, "group-writable package dir");
+        assert_eq!(link_target(&shim), None);
+        std::fs::set_permissions(pkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Any ancestor counts, not just the package's own directories (security review S2).
+        let lib = root.join("lib");
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(npm_path(&shim), None, "group-writable ancestor");
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(npm_path(&shim), Some(shim.clone()));
+        // A dev build is not an npm install.
+        assert_eq!(link_target(&root.join("target/debug/ms-shim")), None);
+    }
+
+    // protects=who may write a directory a LaunchAgent or shim trusts: owner or root, plus only
+    // the admin group (sudoers anyway; Homebrew's default drwxrwxr-x <user>:admin) or a
+    // root-owned sticky dir; fails_when=another user or group, or world write, is accepted, or
+    // Homebrew's default prefix is refused; no_claim=ACLs (not consulted)
+    #[test]
+    fn safe_dir_rules() {
+        let me = 501;
+        assert!(safe_owner_mode(me, 20, 0o40755, me));
+        assert!(safe_owner_mode(0, 0, 0o40755, me));
+        assert!(
+            safe_owner_mode(me, ADMIN_GID, 0o40775, me),
+            "Homebrew's /opt/homebrew/opt"
+        );
+        assert!(safe_owner_mode(0, 0, 0o41777, me), "/tmp");
+        assert!(
+            !safe_owner_mode(me, 20, 0o40775, me),
+            "group staff can write"
+        );
+        assert!(
+            !safe_owner_mode(me, ADMIN_GID, 0o40777, me),
+            "world-writable"
+        );
+        assert!(!safe_owner_mode(502, 20, 0o40755, me), "another user's dir");
+        assert!(
+            !safe_owner_mode(me, 20, 0o41777, me),
+            "sticky but not root's"
+        );
+        assert!(
+            !safe_owner_mode(502, ADMIN_GID, 0o40775, me),
+            "another user's admin dir"
+        );
+        assert!(
+            safe_owner_mode(0, ADMIN_GID, 0o40775, me),
+            "root's admin dir"
+        );
+        assert!(
+            !safe_owner_mode(0, 0, 0o40777, me),
+            "root's, world-writable, not sticky"
+        );
     }
 
     // protects=a planted link to a FIFO, a device or a huge file is classified without reading
