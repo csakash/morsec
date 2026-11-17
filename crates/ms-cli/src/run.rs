@@ -152,7 +152,7 @@ fn link_shims() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let shim = match brew::sibling("ms-shim")
-        .and_then(|(real, _)| brew::Shim::open(&real, brew::stable_path(&real)))
+        .and_then(|(real, _)| brew::Shim::open(&real, brew::link_target(&real)))
     {
         Ok(s) if s.real.is_file() => s,
         _ => {
@@ -198,7 +198,8 @@ pub(crate) fn fetch_rules() -> Result<ms_rules::Rules, String> {
 }
 
 /// Makes `dir` hold exactly one shim per name in `want`: symlinks to the stable
-/// `opt/morsec/bin/ms-shim` in a Homebrew install (they follow `brew upgrade`), else hard links of
+/// `opt/morsec/bin/ms-shim` in a Homebrew install (they follow `brew upgrade`), or to the npm
+/// package's own `ms-shim` in an npm install (it follows `npm install -g`), else hard links of
 /// `ms-shim`, or copies when a link can't cross file systems. Shims left by an older version are
 /// replaced. Files that are not shims are left alone and reported.
 fn sync_shims(
@@ -338,7 +339,7 @@ mod tests {
         std::fs::write(shims.join("mine"), "user file").unwrap();
 
         let real = v1.join("ms-shim");
-        let shim = brew::Shim::open(&real, brew::stable_path(&real)).unwrap();
+        let shim = brew::Shim::open(&real, brew::link_target(&real)).unwrap();
         assert_eq!(shim.stable.as_deref(), Some(b.opt_bin("ms-shim").as_path()));
         assert_eq!(shim.classify(&shims.join("psql")), Entry::Pinned);
         let want: BTreeSet<String> = ["psql".into(), "stripe".into()].into();

@@ -71,6 +71,56 @@ pub(crate) fn stable_path(real: &Path) -> Option<PathBuf> {
     (resolved == real).then_some(stable)
 }
 
+/// The npm platform package that holds the binaries (packaging/npm, loop distribution).
+const NPM_PACKAGE: &str = "morsec-darwin-arm64";
+
+/// Is `p` a tool of an npm install, `.../node_modules/morsec-darwin-arm64/bin/<tool>`? Purely
+/// lexical: nothing is read from disk.
+pub(crate) fn is_npm(p: &Path) -> bool {
+    // The last four components, each a plain name (a `..` or `.` anywhere there refuses it).
+    let names: Option<Vec<&std::ffi::OsStr>> = p
+        .components()
+        .rev()
+        .take(4)
+        .map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    p.is_absolute()
+        && matches!(names.as_deref(), Some([tool, bin, pkg, nm])
+            if !tool.is_empty() && *bin == "bin" && *pkg == NPM_PACKAGE && *nm == "node_modules")
+}
+
+/// `real` itself when it is a tool of an npm install whose package directories nobody else can
+/// write: `npm install -g morsec@<new>` replaces the files at this same path, so a symlink to it
+/// follows upgrades the way Homebrew's `opt` link does (a hard link would keep the old file).
+/// `None` otherwise. Defence in depth, as for `opt`: `bin/`, the package directory and its
+/// `node_modules/` must belong to this user or root and not be group- or world-writable, or
+/// another user could swap the file a shim runs.
+pub(crate) fn npm_path(real: &Path) -> Option<PathBuf> {
+    if !is_npm(real) {
+        return None;
+    }
+    let uid = rustix::process::getuid().as_raw();
+    let bin = real.parent()?;
+    let pkg = bin.parent()?;
+    let nm = pkg.parent()?;
+    for d in [bin, pkg, nm] {
+        let m = std::fs::symlink_metadata(d).ok()?;
+        if !m.is_dir() || !(m.uid() == uid || m.uid() == 0) || m.mode() & 0o022 != 0 {
+            return None;
+        }
+    }
+    Some(real.to_path_buf())
+}
+
+/// What a run shim should be a symlink to so it survives upgrades: Homebrew's `opt` path, else
+/// the npm package's own path. `None` (a dev or manual install): shims are hard links.
+pub(crate) fn link_target(real: &Path) -> Option<PathBuf> {
+    stable_path(real).or_else(|| npm_path(real))
+}
+
 /// The path to record for a binary whose canonical path is `real`: the stable `opt` path in a
 /// Homebrew install, else `real` itself (a dev build or a manual install keeps its path).
 pub(crate) fn preferred(real: &Path) -> PathBuf {
@@ -342,6 +392,55 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dev).unwrap();
         std::fs::write(dev.join("msd"), "dev").unwrap();
         assert_eq!(preferred(&dev.join("msd")), dev.join("msd"));
+    }
+
+    // protects=npm installs are recognised exactly by .../node_modules/morsec-darwin-arm64/bin/<tool>
+    // and shims link to that path only when no one else can write its directories;
+    // fails_when=another package, a relative path or a group-writable package dir yields a link
+    // target; no_claim=npm itself (never run)
+    #[test]
+    fn npm_paths() {
+        assert!(is_npm(Path::new(
+            "/Users/u/.nvm/versions/node/v22.1.0/lib/node_modules/morsec/node_modules/morsec-darwin-arm64/bin/msd"
+        )));
+        assert!(is_npm(Path::new(
+            "/opt/homebrew/lib/node_modules/morsec-darwin-arm64/bin/ms-shim"
+        )));
+        for bad in [
+            "/x/node_modules/morsec-darwin-x64/bin/msd",
+            "/x/node_modules/morsec-darwin-arm64/lib/msd",
+            "/x/vendor/morsec-darwin-arm64/bin/msd",
+            "node_modules/morsec-darwin-arm64/bin/msd",
+            "/x/node_modules/morsec-darwin-arm64/bin/../msd",
+            "/morsec-darwin-arm64/bin/msd",
+        ] {
+            assert!(!is_npm(Path::new(bad)), "{bad}");
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let bin = root.join("lib/node_modules/morsec/node_modules/morsec-darwin-arm64/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for p in [
+            bin.as_path(),
+            bin.parent().unwrap(),
+            bin.parent().unwrap().parent().unwrap(),
+        ] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shim = bin.join("ms-shim");
+        std::fs::write(&shim, shim_bytes("npm")).unwrap();
+        assert_eq!(npm_path(&shim), Some(shim.clone()));
+        assert_eq!(link_target(&shim), Some(shim.clone()));
+        // The LaunchAgent records the npm path as it is (there is no opt link to prefer).
+        assert_eq!(preferred(&shim), shim);
+        let pkg = bin.parent().unwrap();
+        std::fs::set_permissions(pkg, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(npm_path(&shim), None, "group-writable package dir");
+        assert_eq!(link_target(&shim), None);
+        std::fs::set_permissions(pkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A dev build is not an npm install.
+        assert_eq!(link_target(&root.join("target/debug/ms-shim")), None);
     }
 
     // protects=a planted link to a FIFO, a device or a huge file is classified without reading
