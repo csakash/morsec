@@ -145,6 +145,7 @@ Not tested here; these are human steps:
 - `packaging/install.sh` and `packaging/lib/installer.py`: the installer, which runs on users'
   machines.
 - `scripts/check.sh`, `scripts/release-check.sh` and `scripts/release.sh`.
+- `crates/msd/tests/cli.rs`: the version test reads `CARGO_PKG_VERSION` instead of 0.0.0.
 
 Specific risks:
 
