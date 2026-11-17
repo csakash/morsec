@@ -283,12 +283,13 @@ class InstallerTests(unittest.TestCase):
         code, out = self.install()
         self.assertEqual(code, 0, out)
         self.assertInstalled("0.2.0")
-        self.assertIn("Upgraded from 0.1.0", out)
+        self.assertIn("Changed from morsec 0.1.0 to 0.2.0", out)
         self.assertIn("launchctl kickstart -k", out)
         self.assertIn("ms run --link-shims", out)
         code, out = self.install(env={"MORSEC_VERSION": "v0.1.0"})
         self.assertEqual(code, 0, out)
         self.assertInstalled("0.1.0")
+        self.assertEqual([n for n in os.listdir(self.bindir) if "morsec-new" in n or n.endswith(".new")], [])
 
     # protects=files the installer did not write are never overwritten (a dev install's links,
     # a user's own ms), and nothing at all is changed then; fails_when=any foreign file is
@@ -332,6 +333,13 @@ class InstallerTests(unittest.TestCase):
         os.makedirs(shared)
         os.chmod(shared, 0o777)
         code, out = self.install(env={"MORSEC_INSTALL_DIR": shared})
+        self.assertEqual(code, 1, out)
+        self.assertIn("writable by other users", out)
+        self.assertEqual(os.listdir(shared), [])
+        # A symlinked install dir is judged by the directory it points to.
+        link = os.path.join(self.case, "link-bin")
+        os.symlink(shared, link)
+        code, out = self.install(env={"MORSEC_INSTALL_DIR": link})
         self.assertEqual(code, 1, out)
         self.assertIn("writable by other users", out)
         self.assertEqual(os.listdir(shared), [])

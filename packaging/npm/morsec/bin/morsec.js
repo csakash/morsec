@@ -82,14 +82,21 @@ function findBinary() {
 
 function run(bin) {
   const child = spawn(bin, process.argv.slice(2), { stdio: "inherit" });
-  // The terminal sends Ctrl-C and friends to the whole foreground group, so ms gets them itself:
-  // this process only waits and then reports how ms ended.
+  // The terminal sends Ctrl-C and Ctrl-\ to the whole foreground group, so ms gets those itself:
+  // ignore them here. SIGTERM and SIGHUP may be sent to this process alone (a parent stopping
+  // `ms mcp`, `kill <pid>`), so pass them on; a second copy of the same signal is harmless.
   const ignore = () => {};
-  for (const s of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]) process.on(s, ignore);
+  const forward = (s) => () => {
+    try {
+      child.kill(s);
+    } catch {}
+  };
+  const handlers = { SIGINT: ignore, SIGQUIT: ignore, SIGTERM: forward("SIGTERM"), SIGHUP: forward("SIGHUP") };
+  for (const [s, h] of Object.entries(handlers)) process.on(s, h);
   child.on("error", (e) => fail(`can't run ${bin}: ${e.message}`));
   child.on("exit", (code, signal) => {
     if (signal) {
-      for (const s of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]) process.removeListener(s, ignore);
+      for (const [s, h] of Object.entries(handlers)) process.removeListener(s, h);
       process.kill(process.pid, signal);
       // Only reached if the signal did not end this process: exit the way a shell reports it.
       setTimeout(() => process.exit(128 + (require("os").constants.signals[signal] || 0)), 200);

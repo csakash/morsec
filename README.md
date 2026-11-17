@@ -39,7 +39,8 @@ ms doctor
 The agent only ever sees `ms://stripe/test`; `msd` swaps the real key in on requests to
 `api.stripe.com` and records every use (`ms log`). There is no auto-update: upgrade with
 `brew upgrade morsec`, `npm install -g morsec@latest` or the curl installer again, then restart
-msd with `launchctl kickstart -k gui/$(id -u)/cc.morsec.msd`. For commands that need a value (`psql`,
+msd with `launchctl kickstart -k gui/$(id -u)/cc.morsec.msd` (after a curl upgrade, also
+`ms run --link-shims`). For commands that need a value (`psql`,
 `ssh`, `git`, deploy scripts), use run mode; `ms stop` cuts every agent off at once. The whole
 walk-through, including Codex and run mode, is [docs/ONBOARDING.md](docs/ONBOARDING.md).
 

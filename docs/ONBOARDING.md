@@ -56,17 +56,20 @@ brew upgrade morsec                 # or: npm install -g morsec@latest, or run t
 launchctl kickstart -k gui/$(id -u)/cc.morsec.msd
 ```
 
-msd's LaunchAgent and the run shims point at a path that stays the same through an upgrade:
+msd's LaunchAgent points at a path that stays the same through an upgrade:
 
 - Homebrew's `opt/morsec`;
 - the npm package's own directory;
 - `~/.local/bin` for the curl installer.
 
 So the new version is picked up on its own, and the second line restarts the running msd on it.
-After a curl upgrade, also run `ms run --link-shims` (the installer reminds you).
+The run shims follow upgrades in Homebrew and npm installs too. With the curl installer they are
+hard links to the old file, so after a curl upgrade also run `ms run --link-shims` (the
+installer reminds you).
 
 If you installed with npm and then switch Node versions (nvm, fnm, volta), the global packages
-change with the Node version. Install morsec under the new one and run `ms init` again. `ms doctor`
+change with the Node version. Install morsec under the new one, run `ms init` again, and
+`ms connect` your agents again (their settings name the `ms` inside the old install). `ms doctor`
 flags a LaunchAgent whose install is gone, or one that starts another install's msd.
 
 To check a download yourself, see [packaging/VERIFY.md](../packaging/VERIFY.md).

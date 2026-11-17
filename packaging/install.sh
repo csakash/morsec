@@ -104,7 +104,13 @@ case "$dir" in
 esac
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/morsec-install.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+# Temp files written next to the targets, removed if the install is interrupted.
+partial=""
+cleanup() {
+  rm -rf "$tmp"
+  for p in $partial; do rm -f "$p"; done
+}
+trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
 fetch() { # fetch <url> <file>
@@ -185,6 +191,11 @@ say "morsec: code signatures ok (team $MORSEC_TEAM_ID, notarized)"
 
 # --- install --------------------------------------------------------------------------------
 mkdir -p "$dir"
+# Check and use the real directory: ~/.local/bin is often a symlink (dotfile managers).
+dir="$(cd "$dir" && pwd -P)" || die "can't use $dir"
+case "$dir" in
+  *[[:space:]]*) die "the install directory must not contain spaces ($dir)" ;;
+esac
 me="$(id -u)"
 [ "$(stat -f %u "$dir")" = "$me" ] || die "$dir is not owned by you"
 mode="$(stat -f %Lp "$dir")"
@@ -236,22 +247,25 @@ if [ "$changes" = 0 ] && [ "$previous" = "$ver" ]; then
 else
   for pair in $BINS; do
     b="${pair%%:*}"
+    partial="$partial $dir/.$b.morsec-new.$$"
     cp "$src/$b" "$dir/.$b.morsec-new.$$"
     chmod 755 "$dir/.$b.morsec-new.$$"
     mv -f "$dir/.$b.morsec-new.$$" "$dir/$b"
   done
   if [ ! -L "$dir/mors" ]; then
+    partial="$partial $dir/.mors.morsec-new.$$"
     ln -s ms "$dir/.mors.morsec-new.$$"
     mv -f "$dir/.mors.morsec-new.$$" "$dir/mors"
   fi
+  partial="$partial $manifest.new.$$"
   {
     echo "version $ver"
     for pair in $BINS; do
       b="${pair%%:*}"
       echo "$(sha256 "$dir/$b")  $b"
     done
-  } >"$dir/.$MANIFEST_NAME.new.$$"
-  mv -f "$dir/.$MANIFEST_NAME.new.$$" "$manifest"
+  } >"$manifest.new.$$"
+  mv -f "$manifest.new.$$" "$manifest"
   say "morsec $ver installed in $dir: ms, mors, msd, ms-shim"
 fi
 
@@ -271,7 +285,7 @@ if [ -n "$other" ] && [ "$other" != "$dir/ms" ]; then
 fi
 say ""
 if [ -n "$previous" ] && [ "$previous" != "$ver" ]; then
-  say "Upgraded from $previous. Restart msd on the new version and refresh the run shims:"
+  say "Changed from morsec $previous to $ver. Restart msd on this version and refresh the run shims:"
   say "  launchctl kickstart -k gui/\$(id -u)/cc.morsec.msd"
   say "  ms run --link-shims"
   say "  ms doctor"

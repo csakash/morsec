@@ -87,7 +87,11 @@ pub(crate) fn is_npm(p: &Path) -> bool {
             _ => None,
         })
         .collect();
+    // pnpm's store keeps a version in the path (.pnpm/<pkg>@<version>/...), so it would not
+    // survive an upgrade: not treated as an npm install.
+    let in_pnpm_store = p.components().any(|c| c.as_os_str() == ".pnpm");
     p.is_absolute()
+        && !in_pnpm_store
         && matches!(names.as_deref(), Some([tool, bin, pkg, nm])
             if !tool.is_empty() && *bin == "bin" && *pkg == NPM_PACKAGE && *nm == "node_modules")
 }
@@ -413,6 +417,7 @@ pub(crate) mod tests {
             "node_modules/morsec-darwin-arm64/bin/msd",
             "/x/node_modules/morsec-darwin-arm64/bin/../msd",
             "/morsec-darwin-arm64/bin/msd",
+            "/g/.pnpm/morsec-darwin-arm64@0.1.0/node_modules/morsec-darwin-arm64/bin/msd",
         ] {
             assert!(!is_npm(Path::new(bad)), "{bad}");
         }
