@@ -6,11 +6,21 @@ entries. Move the entries from Unreleased into it when you bump the version.
 
 ## [Unreleased]
 
-- First CLI release (L28): `ms` / `mors`, `msd`, `ms-shim`, installed with Homebrew from
-  `csakash/tap`. Swap mode (proxy), run mode (`ms run`, shims), `ms mcp`, `ms doctor`, and
+## [0.1.0] - 2026-11-17
+
+First public release. Apple silicon macOS 13 or later only (`aarch64-apple-darwin`).
+
+- `ms` / `mors`, `msd` and `ms-shim`, signed with Developer ID (team `554MCRUAKK`) and
+  notarized. Swap mode (proxy), run mode (`ms run`, shims), `ms mcp`, `ms doctor`, and
   connectors for Claude Code and Codex.
+- Three ways to install the same signed binaries: Homebrew (`brew install csakash/tap/morsec`),
+  npm (`npm install -g morsec`, with the binaries in the `morsec-darwin-arm64` platform package
+  and no install scripts), and a curl installer (`install.sh`, a release asset) that checks the
+  checksums, the minisign signature when minisign is installed, the code signature, the team and
+  notarization before it installs into `~/.local/bin`.
 - `ms stop` now leaves a receipt for every run it kills.
-- `brew upgrade morsec` is enough to upgrade: `ms init` points msd's LaunchAgent, and
-  `ms run --link-shims` points the run shims, at Homebrew's stable `opt/morsec` path instead of
-  the versioned Cellar path. `ms doctor` flags a LaunchAgent whose version is gone, or one or
-  shims still pinned to a version. Dev and manual installs keep their paths.
+- Upgrading needs no `ms init`: msd's LaunchAgent and the run shims point at Homebrew's stable
+  `opt/morsec` path, or at the npm package's path, which `npm install -g` keeps. `ms doctor`
+  flags a LaunchAgent whose install is gone (a removed Homebrew version, or an npm install under
+  a Node version you switched away from), one that starts a different install's msd, and shims
+  still pinned to a version.

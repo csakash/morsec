@@ -10,3 +10,17 @@ target/
 proof/
 .gstack/
 .loops/
+# Never commit: Python caches, npm credentials and packs, signing material (release keys stay
+# offline; packaging/minisign.pub is the only key file that belongs here).
+__pycache__/
+*.pyc
+.npmrc
+*.tgz
+*.key
+*.minisign
+minisign.key
+*.p12
+*.p8
+*.cer
+.claude/settings.local.json
+.DS_Store
