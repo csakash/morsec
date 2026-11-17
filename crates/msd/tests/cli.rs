@@ -124,7 +124,8 @@ fn version_under_both_names() {
     let sock = d.path().join("none.sock");
     let (code, out, _) = run(&ms(), &["--version"], &sock);
     assert_eq!(code, 0);
-    let re_ok = out.starts_with("morsec 0.0.0 (") && out.trim_end().ends_with(')');
+    let re_ok = out.starts_with(&format!("morsec {} (", env!("CARGO_PKG_VERSION")))
+        && out.trim_end().ends_with(')');
     assert!(re_ok, "{out:?}");
     let (code2, out2, _) = run(&mors(d.path()), &["-V"], &sock);
     assert_eq!((code2, out2), (0, out));
