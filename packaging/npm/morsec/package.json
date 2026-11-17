@@ -1,0 +1,12 @@
+{
+  "name": "morsec",
+  "version": "@VERSION@",
+  "description": "Local secret broker: coding agents use your secrets without seeing them (ms / mors)",
+  "license": "@LICENSE@",
+  "homepage": "https://github.com/csakash/morsec",
+  "repository": { "type": "git", "url": "git+https://github.com/csakash/morsec.git" },
+  "bin": { "ms": "bin/morsec.js", "mors": "bin/morsec.js" },
+  "files": ["bin/morsec.js", "README.md"],
+  "engines": { "node": ">=18" },
+  "optionalDependencies": { "morsec-darwin-arm64": "@VERSION@" }
+}
