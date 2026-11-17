@@ -336,6 +336,17 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("writable by other users", out)
         self.assertEqual(os.listdir(shared), [])
+        # A symlinked install dir on PATH is not reported as missing from PATH.
+        real = os.path.join(self.case, "real-bin")
+        os.makedirs(real)
+        linked = os.path.join(self.case, "linked-bin")
+        os.symlink(real, linked)
+        code, out = self.install(env={"MORSEC_INSTALL_DIR": linked,
+                                      "PATH": f"{linked}:{self.stubs}:/usr/bin:/bin:/usr/sbin:/sbin"})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.isfile(os.path.join(real, "ms")))
+        self.assertNotIn("not on your PATH", out)
+        self.assertNotIn("not this install", out)
         # A symlinked install dir is judged by the directory it points to.
         link = os.path.join(self.case, "link-bin")
         os.symlink(shared, link)

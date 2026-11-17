@@ -108,6 +108,7 @@ tmp="$(mktemp -d "${TMPDIR:-/tmp}/morsec-install.XXXXXX")"
 partial=""
 cleanup() {
   rm -rf "$tmp"
+  set -f # the names are split on spaces only, never globbed
   for p in $partial; do rm -f "$p"; done
 }
 trap cleanup EXIT
@@ -192,6 +193,7 @@ say "morsec: code signatures ok (team $MORSEC_TEAM_ID, notarized)"
 # --- install --------------------------------------------------------------------------------
 mkdir -p "$dir"
 # Check and use the real directory: ~/.local/bin is often a symlink (dotfile managers).
+dir_given="$dir"
 dir="$(cd "$dir" && pwd -P)" || die "can't use $dir"
 case "$dir" in
   *[[:space:]]*) die "the install directory must not contain spaces ($dir)" ;;
@@ -271,15 +273,15 @@ fi
 
 # --- next steps -----------------------------------------------------------------------------
 case ":${PATH:-}:" in
-  *":$dir:"*) ;;
+  *":$dir_given:"* | *":$dir:"*) ;;
   *)
     say ""
-    say "$dir is not on your PATH. Add it, for zsh:"
-    say "  echo 'export PATH=\"$dir:\$PATH\"' >> ~/.zshrc && exec zsh"
+    say "$dir_given is not on your PATH. Add it, for zsh:"
+    say "  echo 'export PATH=\"$dir_given:\$PATH\"' >> ~/.zshrc && exec zsh"
     ;;
 esac
 other="$(command -v ms 2>/dev/null || true)"
-if [ -n "$other" ] && [ "$other" != "$dir/ms" ]; then
+if [ -n "$other" ] && [ "$other" != "$dir/ms" ] && [ "$other" != "$dir_given/ms" ]; then
   say ""
   say "note: \`ms\` on your PATH is $other, not this install. Remove the other one or put $dir first."
 fi

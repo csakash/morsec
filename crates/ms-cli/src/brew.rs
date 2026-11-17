@@ -46,12 +46,32 @@ pub(crate) fn keg_of(real: &Path) -> Option<(&Path, &str)> {
     Some((p, version))
 }
 
+/// macOS's `admin` group. Its members can already become root with sudo, so a directory only
+/// `admin` can write grants no one more than they have. Homebrew makes its prefix directories
+/// (`/opt/homebrew/opt`, `/opt/homebrew/lib`) `drwxrwxr-x <user>:admin` by default.
+const ADMIN_GID: u32 = 80;
+
+/// A directory no other user can change: owned by `uid` or root, and writable by no one else,
+/// except the `admin` group (see [`ADMIN_GID`]) or, for a root-owned sticky directory such as
+/// `/tmp`, everyone (they can't rename what they don't own there).
+fn safe_dir(m: &std::fs::Metadata, uid: u32) -> bool {
+    m.is_dir() && safe_owner_mode(m.uid(), m.gid(), m.mode(), uid)
+}
+
+fn safe_owner_mode(owner: u32, gid: u32, mode: u32, uid: u32) -> bool {
+    let owner_ok = owner == uid || owner == 0;
+    let writers_ok = mode & 0o022 == 0
+        || (mode & 0o002 == 0 && gid == ADMIN_GID)
+        || (owner == 0 && mode & 0o1000 != 0);
+    owner_ok && writers_ok
+}
+
 /// `<prefix>/opt/morsec/bin/<tool>` for a keg binary at canonical path `real`, only when that
 /// path resolves to exactly `real` (the `opt` link points at this keg). `None` otherwise: not a
 /// Homebrew keg, no `opt` link (a custom `HOMEBREW_CELLAR`), or `opt` on another version.
 ///
-/// Defence in depth: `<prefix>/opt` and the `opt/morsec` link must belong to this user or root
-/// and `opt` must not be group- or world-writable, so another user can't repoint the link later.
+/// Defence in depth: `<prefix>/opt` must be a [`safe_dir`] and the `opt/morsec` link must belong
+/// to this user or root, so another user can't repoint the link later.
 /// (The keg itself sits in the same prefix, so this asks no more of `opt` than of the keg.)
 pub(crate) fn stable_path(real: &Path) -> Option<PathBuf> {
     let (prefix, _) = keg_of(real)?;
@@ -62,8 +82,7 @@ pub(crate) fn stable_path(real: &Path) -> Option<PathBuf> {
     let owned = |m: &std::fs::Metadata| m.uid() == uid || m.uid() == 0;
     let opt_meta = std::fs::symlink_metadata(&opt).ok()?;
     let link_meta = std::fs::symlink_metadata(&link).ok()?;
-    if !opt_meta.is_dir() || !owned(&opt_meta) || opt_meta.mode() & 0o022 != 0 || !owned(&link_meta)
-    {
+    if !safe_dir(&opt_meta, uid) || !owned(&link_meta) {
         return None;
     }
     let stable = link.join("bin").join(tool);
@@ -99,9 +118,8 @@ pub(crate) fn is_npm(p: &Path) -> bool {
 /// `real` itself when it is a tool of an npm install whose package directories nobody else can
 /// write: `npm install -g morsec@<new>` replaces the files at this same path, so a symlink to it
 /// follows upgrades the way Homebrew's `opt` link does (a hard link would keep the old file).
-/// `None` otherwise. Defence in depth: every directory from `bin/` up to `/` must belong to this
-/// user or root and not be group- or world-writable (a root-owned sticky directory such as
-/// `/tmp` excepted), or another user could swap the file a shim runs.
+/// `None` otherwise. Defence in depth: every directory from `bin/` up to `/` must be a
+/// [`safe_dir`], or another user could swap the file a shim runs.
 pub(crate) fn npm_path(real: &Path) -> Option<PathBuf> {
     if !is_npm(real) {
         return None;
@@ -109,11 +127,7 @@ pub(crate) fn npm_path(real: &Path) -> Option<PathBuf> {
     let uid = rustix::process::getuid().as_raw();
     for d in real.parent()?.ancestors() {
         let m = std::fs::symlink_metadata(d).ok()?;
-        let sticky_root = m.uid() == 0 && m.mode() & 0o1000 != 0;
-        if !m.is_dir()
-            || !(m.uid() == uid || m.uid() == 0)
-            || (m.mode() & 0o022 != 0 && !sticky_root)
-        {
+        if !safe_dir(&m, uid) {
             return None;
         }
     }
@@ -453,6 +467,35 @@ pub(crate) mod tests {
         assert_eq!(npm_path(&shim), Some(shim.clone()));
         // A dev build is not an npm install.
         assert_eq!(link_target(&root.join("target/debug/ms-shim")), None);
+    }
+
+    // protects=who may write a directory a LaunchAgent or shim trusts: owner or root, plus only
+    // the admin group (sudoers anyway; Homebrew's default drwxrwxr-x <user>:admin) or a
+    // root-owned sticky dir; fails_when=another user or group, or world write, is accepted, or
+    // Homebrew's default prefix is refused; no_claim=ACLs (not consulted)
+    #[test]
+    fn safe_dir_rules() {
+        let me = 501;
+        assert!(safe_owner_mode(me, 20, 0o40755, me));
+        assert!(safe_owner_mode(0, 0, 0o40755, me));
+        assert!(
+            safe_owner_mode(me, ADMIN_GID, 0o40775, me),
+            "Homebrew's /opt/homebrew/opt"
+        );
+        assert!(safe_owner_mode(0, 0, 0o41777, me), "/tmp");
+        assert!(
+            !safe_owner_mode(me, 20, 0o40775, me),
+            "group staff can write"
+        );
+        assert!(
+            !safe_owner_mode(me, ADMIN_GID, 0o40777, me),
+            "world-writable"
+        );
+        assert!(!safe_owner_mode(502, 20, 0o40755, me), "another user's dir");
+        assert!(
+            !safe_owner_mode(me, 20, 0o41777, me),
+            "sticky but not root's"
+        );
     }
 
     // protects=a planted link to a FIFO, a device or a huge file is classified without reading
