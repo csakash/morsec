@@ -11,24 +11,64 @@ session; the target is under 5 minutes.
 
 ## 1. Install
 
-Apple silicon, macOS 13 or later (once the first release is out; until then, build from source
-with `scripts/install-dev.sh`, see the README):
+You need an Apple silicon Mac with macOS 13 or later. Each of the three ways below installs `ms`,
+`mors`, `msd` (the daemon) and `ms-shim` (run mode). They are the same files, signed with the
+project's Developer ID (team `554MCRUAKK`) and notarized. Pick one.
+
+**Homebrew**
 
 ```bash
 brew install csakash/tap/morsec
 ```
 
-That installs `ms`, `mors`, `msd` (the daemon) and `ms-shim` (run mode), all signed with the
-project's Developer ID and notarized. There is no auto-update. To upgrade:
+**npm.** You need an arm64 Node.js 18 or later. The binaries come in the `morsec-darwin-arm64`
+package. Neither package runs anything when it is installed.
 
 ```bash
-brew upgrade morsec
+npm install -g morsec
+```
+
+**curl.** This installs into `~/.local/bin`, or into `MORSEC_INSTALL_DIR`. It never uses sudo.
+Before it installs anything, it checks:
+
+- the release checksums;
+- their minisign signature, when `minisign` is installed;
+- each binary's code signature and team;
+- notarization.
+
+It only replaces files it installed itself.
+
+```bash
+curl -fsSL https://github.com/csakash/morsec/releases/latest/download/install.sh | sh
+```
+
+To read the installer before you run it, download `install.sh`, `SHA256SUMS` and
+`SHA256SUMS.minisig` from the [latest release](https://github.com/csakash/morsec/releases/latest).
+Check them as [packaging/VERIFY.md](../packaging/VERIFY.md) shows, then run
+`sh install.sh` (add `--version 0.1.0` to pin a version). To build from source instead, use
+`scripts/install-dev.sh` (see the README). The curl installer won't overwrite the links that
+script makes.
+
+There is no auto-update. To upgrade, use the same channel you installed with, then restart msd:
+
+```bash
+brew upgrade morsec                 # or: npm install -g morsec@latest, or run the curl installer again
 launchctl kickstart -k gui/$(id -u)/cc.morsec.msd
 ```
 
-msd's LaunchAgent and the run shims point at Homebrew's stable `opt/morsec` path, so they pick
-up the new version on their own; the second line restarts the running msd on it (Homebrew
-can't). `ms doctor` warns if the LaunchAgent or a shim is still pinned to one version.
+msd's LaunchAgent and the run shims point at a path that stays the same through an upgrade:
+
+- Homebrew's `opt/morsec`;
+- the npm package's own directory;
+- `~/.local/bin` for the curl installer.
+
+So the new version is picked up on its own, and the second line restarts the running msd on it.
+After a curl upgrade, also run `ms run --link-shims` (the installer reminds you).
+
+If you installed with npm and then switch Node versions (nvm, fnm, volta), the global packages
+change with the Node version. Install morsec under the new one and run `ms init` again. `ms doctor`
+flags a LaunchAgent whose install is gone, or one that starts another install's msd.
+
 To check a download yourself, see [packaging/VERIFY.md](../packaging/VERIFY.md).
 
 ## 2. Set up
@@ -126,7 +166,8 @@ There were no public releases before 1.0. If you used `scripts/install-dev.sh`:
 
 1. Stop the dev daemon (`launchctl bootout gui/$(id -u)/cc.morsec.msd` if `ms init` installed
    its LaunchAgent) and remove the links it made in `~/.local/bin` (`ms`, `mors`, `msd`).
-2. `brew install csakash/tap/morsec`.
+2. Install a release (section 1). The curl installer refuses to replace the dev links in
+   `~/.local/bin`, so remove them first, as step 1 says.
 3. The keychain trusts the signed release `msd`, not a dev build, so don't carry a dev build's
    vault over: start over with `ms init --force` (old receipts are kept, renamed, for
    inspection) and add your keys again.

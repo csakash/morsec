@@ -9,10 +9,21 @@ Coding agents use your API keys, database passwords and tokens without ever seei
 
 ## Install
 
-Apple silicon, macOS 13 or later (once the first release is out):
+Apple silicon, macOS 13 or later. Pick one; all three install the same Developer ID signed,
+notarized binaries:
 
 ```bash
-brew install csakash/tap/morsec
+brew install csakash/tap/morsec                  # Homebrew
+npm install -g morsec                            # npm (no install scripts)
+curl -fsSL https://github.com/csakash/morsec/releases/latest/download/install.sh | sh   # into ~/.local/bin
+```
+
+The curl installer checks the checksums, the minisign signature (if minisign is installed), the
+code signature, the team and notarization before installing anything, and never uses sudo. To
+read it first: download `install.sh`, check it against the release's `SHA256SUMS`, then
+`sh install.sh` ([packaging/VERIFY.md](packaging/VERIFY.md)). Then:
+
+```bash
 ms init
 ```
 
@@ -26,8 +37,9 @@ ms doctor
 ```
 
 The agent only ever sees `ms://stripe/test`; `msd` swaps the real key in on requests to
-`api.stripe.com` and records every use (`ms log`). Upgrade with
-`brew upgrade morsec` and restart msd with `launchctl kickstart -k gui/$(id -u)/cc.morsec.msd` (no auto-update). For commands that need a value (`psql`,
+`api.stripe.com` and records every use (`ms log`). There is no auto-update: upgrade with
+`brew upgrade morsec`, `npm install -g morsec@latest` or the curl installer again, then restart
+msd with `launchctl kickstart -k gui/$(id -u)/cc.morsec.msd`. For commands that need a value (`psql`,
 `ssh`, `git`, deploy scripts), use run mode; `ms stop` cuts every agent off at once. The whole
 walk-through, including Codex and run mode, is [docs/ONBOARDING.md](docs/ONBOARDING.md).
 
