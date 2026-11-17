@@ -99,20 +99,21 @@ pub(crate) fn is_npm(p: &Path) -> bool {
 /// `real` itself when it is a tool of an npm install whose package directories nobody else can
 /// write: `npm install -g morsec@<new>` replaces the files at this same path, so a symlink to it
 /// follows upgrades the way Homebrew's `opt` link does (a hard link would keep the old file).
-/// `None` otherwise. Defence in depth, as for `opt`: `bin/`, the package directory and its
-/// `node_modules/` must belong to this user or root and not be group- or world-writable, or
-/// another user could swap the file a shim runs.
+/// `None` otherwise. Defence in depth: every directory from `bin/` up to `/` must belong to this
+/// user or root and not be group- or world-writable (a root-owned sticky directory such as
+/// `/tmp` excepted), or another user could swap the file a shim runs.
 pub(crate) fn npm_path(real: &Path) -> Option<PathBuf> {
     if !is_npm(real) {
         return None;
     }
     let uid = rustix::process::getuid().as_raw();
-    let bin = real.parent()?;
-    let pkg = bin.parent()?;
-    let nm = pkg.parent()?;
-    for d in [bin, pkg, nm] {
+    for d in real.parent()?.ancestors() {
         let m = std::fs::symlink_metadata(d).ok()?;
-        if !m.is_dir() || !(m.uid() == uid || m.uid() == 0) || m.mode() & 0o022 != 0 {
+        let sticky_root = m.uid() == 0 && m.mode() & 0o1000 != 0;
+        if !m.is_dir()
+            || !(m.uid() == uid || m.uid() == 0)
+            || (m.mode() & 0o022 != 0 && !sticky_root)
+        {
             return None;
         }
     }
@@ -444,6 +445,12 @@ pub(crate) mod tests {
         assert_eq!(npm_path(&shim), None, "group-writable package dir");
         assert_eq!(link_target(&shim), None);
         std::fs::set_permissions(pkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Any ancestor counts, not just the package's own directories (security review S2).
+        let lib = root.join("lib");
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(npm_path(&shim), None, "group-writable ancestor");
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(npm_path(&shim), Some(shim.clone()));
         // A dev build is not an npm install.
         assert_eq!(link_target(&root.join("target/debug/ms-shim")), None);
     }

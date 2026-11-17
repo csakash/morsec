@@ -36,7 +36,6 @@ need shellcheck "brew install shellcheck"
 need git "Install the Xcode command line tools."
 need node "https://nodejs.org"
 need npm "https://nodejs.org"
-need minisign "brew install minisign"
 
 version=""
 metadata() { (cd "$root" && cargo metadata --format-version 1 --no-deps --locked); }

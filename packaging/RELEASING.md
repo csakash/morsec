@@ -128,6 +128,8 @@ It does the following, in order:
      `npm pack --ignore-scripts`;
    - `npm/SHA256SUMS`.
 
+   Only a Developer ID `release` writes `npm/`. A `build` (unsigned or ad-hoc) writes its packs to `npm-none-NOT-FOR-PUBLISHING/` or `npm-adhoc-NOT-FOR-PUBLISHING/`, so they can't be published by mistake.
+
    The binaries in the platform package are copied out of the signed tarball. `release.sh`
    re-opens both packs and checks four things: every binary's sha256 equals the tarball's, the
    modes are 0755, the file lists are exact, and there is no `scripts` key, so nothing runs at

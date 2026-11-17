@@ -316,17 +316,21 @@ build_release() {
     cp "$out/homebrew-tap/Formula/morsec.rb" "$pk/homebrew/Formula/morsec.rb"
   fi
 
-  stage_npm "$out" "$tarball" "$version" "$(workspace_field "$src" license)"
+  # Only a Developer ID build gets publishable npm packs in npm/; any other build's packs go
+  # where no one would publish them by mistake (RELEASING publishes dist/<version>/npm/).
+  local npm_dir=npm
+  [ "$signing" = developer-id ] || npm_dir="npm-$signing-NOT-FOR-PUBLISHING"
+  stage_npm "$out" "$tarball" "$version" "$(workspace_field "$src" license)" "$npm_dir"
 
   say "done: $out"
   (cd "$out" && cat SHA256SUMS)
 }
 
-# stage_npm <out> <tarball> <version> <cargo license>: the npm packages, from the binaries in the
+# stage_npm <out> <tarball> <version> <cargo license> <dir>: the npm packages, from the binaries in the
 # release tarball (signed in a release), packed with npm pack and checked against the tarball.
 # Publishing them is a human step (packaging/RELEASING.md).
 stage_npm() {
-  local out="$1" tarball="$2" version="$3" license="$4" n="$1/npm"
+  local out="$1" tarball="$2" version="$3" license="$4" n="$1/$5"
   say "npm packages (morsec, morsec-darwin-arm64)"
   mkdir -p "$n"
   py "$bpk/lib/npm.py" stage --tarball "$out/$tarball" --version "$version" --license "$license" \
