@@ -8,7 +8,7 @@
 #                agrees (--locked), and a v<version> tag, if it exists, is on HEAD
 #   2 changelog  CHANGELOG.md has a "## [<version>]" section with entries
 #   3 build      cargo build --release --locked (ms, msd, ms-shim); ms --version matches
-#   4 tests      packaging tests (including the install test) and shellcheck
+#   4 tests      packaging tests (Homebrew, npm and curl-installer installs), plus shellcheck
 #   5 binaries   the formula installs exactly sign-targets, each built as an arm64 executable,
 #                and the release binaries pass the formula's test block from a temp prefix
 #
@@ -34,6 +34,9 @@ need cargo "https://rustup.rs"
 need python3 "Install Python 3.12 or later."
 need shellcheck "brew install shellcheck"
 need git "Install the Xcode command line tools."
+need node "https://nodejs.org"
+need npm "https://nodejs.org"
+need minisign "brew install minisign"
 
 version=""
 metadata() { (cd "$root" && cargo metadata --format-version 1 --no-deps --locked); }
@@ -90,6 +93,8 @@ check_tests() {
   (cd "$root" && cargo build --locked -p ms-cli -p msd -p ms-run)
   (cd "$root" && py -m unittest discover -s packaging/tests)
   shellcheck "$root/scripts/release.sh" "$root/scripts/release-check.sh"
+  shellcheck -s sh "$root/packaging/install.sh"
+  node --check "$root/packaging/npm/morsec/bin/morsec.js"
 }
 
 check_binaries() {

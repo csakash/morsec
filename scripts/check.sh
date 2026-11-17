@@ -21,6 +21,9 @@ need cargo-audit "cargo install --locked cargo-audit"
 need python3 "your OS package manager"
 need shellcheck "brew install shellcheck"
 need perl "your OS package manager (macOS ships it)"
+need node "https://nodejs.org (the npm packages' launcher and tests)"
+need npm "https://nodejs.org (npm pack and the npm install tests)"
+need minisign "brew install minisign (the curl installer's tests)"
 
 step() { printf '\n== %s\n' "$*"; }
 
@@ -50,6 +53,8 @@ cargo metadata --format-version 1 --locked | python3 -I scripts/supply_chain_che
 step "7b release tooling: packaging tests and shellcheck (L10)"
 python3 -I -m unittest discover -s packaging/tests
 shellcheck scripts/release.sh scripts/release-check.sh
+shellcheck -s sh packaging/install.sh
+node --check packaging/npm/morsec/bin/morsec.js
 
 step "7c fuzz: fuzz_* property targets with more cases, 90 s ceiling (hardening loop)"
 # proptest on stable (SPEC D1-D4, docs/threat-model.md): the dotenv parser, the proxy's request

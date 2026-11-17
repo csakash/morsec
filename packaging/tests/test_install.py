@@ -77,18 +77,18 @@ def section(doctor_out: str, name: str) -> str:
     return "\n".join(body)
 
 
-@unittest.skipUnless(IS_MAC_ARM, "the release is macOS arm64 only")
-class InstalledShimTests(unittest.TestCase):
+class LiveMsd:
+    """A throwaway msd (memory vault, temp socket, state dir and HOME) started from an installed
+    msd (cls.msd_path), and outside() to run the installed ms as a user's own terminal would."""
+
+    # Directories put on PATH after the install's bin/ (npm's launcher needs node), with a
+    # trailing ':'.
+    extra_path = ""
+
     @classmethod
-    def setUpClass(cls):
-        cls.real = _snapshot()
-        cls.bins = [n for n, _ in formula.sign_targets(_read(os.path.join(PKG, "macos", "sign-targets")))]
-        for b in cls.bins:
-            p = os.path.join(BUILT, b)
-            if not os.path.isfile(p):
-                raise AssertionError(f"{p} is not built; run cargo build --workspace first (scripts/check.sh does)")
+    def init_dirs(cls, prefix: str):
         # /tmp keeps the socket path short; mkdtemp makes it 0700.
-        cls.dir = os.path.realpath(tempfile.mkdtemp(prefix="msinst", dir="/tmp"))
+        cls.dir = os.path.realpath(tempfile.mkdtemp(prefix=prefix, dir="/tmp"))
         cls.home = os.path.join(cls.dir, "home")
         for d in (cls.home, os.path.join(cls.dir, "tmp")):
             os.makedirs(d)
@@ -97,26 +97,16 @@ class InstalledShimTests(unittest.TestCase):
         cls.msd = None
         # Process groups of the detached shells, killed in tearDownClass whatever happened.
         cls.groups = []
-        try:
-            tar = cls.tarball()
-            template = _read(os.path.join(PKG, "homebrew", "morsec.rb.in"))
-            cls.prefix = os.path.join(cls.dir, "brew")
-            cls.cellar = install_sim.install(tar, template, VERSION, cls.prefix)
-            # The control: the same tarball through a formula that does not install ms-shim.
-            old = template.replace('bin.install "bin/ms", "bin/msd", "bin/ms-shim"', 'bin.install "bin/ms", "bin/msd"')
-            assert old != template, "the template's bin.install line changed; update this test"
-            cls.control = os.path.join(cls.dir, "brew-old")
-            install_sim.install(tar, old, VERSION, cls.control)
-            cls.start_msd()
-            code, out = cls.outside(
-                "printf 'not-a-real-value' | ms add run/inst --stdin --mode run --tier test >/dev/null && "
-                "(sleep 1; printf 'o\\n'; sleep 3) | script -q /dev/null ms rules run/inst --add-command '[\"psql\"]' >/dev/null",
-                cls.prefix)
-            if code != 0:
-                raise AssertionError(f"setting up the run key failed:\n{out}")
-        except BaseException:
-            cls.tearDownClass()
-            raise
+
+    @classmethod
+    def add_run_key(cls, prefix: str):
+        """A test-tier run key that allows psql, so doctor and --link-shims want one shim."""
+        code, out = cls.outside(
+            "printf 'not-a-real-value' | ms add run/inst --stdin --mode run --tier test >/dev/null && "
+            "(sleep 1; printf 'o\\n'; sleep 3) | script -q /dev/null ms rules run/inst --add-command '[\"psql\"]' >/dev/null",
+            prefix)
+        if code != 0:
+            raise AssertionError(f"setting up the run key failed:\n{out}")
 
     @classmethod
     def tearDownClass(cls):
@@ -140,20 +130,6 @@ class InstalledShimTests(unittest.TestCase):
         shutil.rmtree(cls.dir, ignore_errors=True)
 
     @classmethod
-    def tarball(cls) -> str:
-        stage = os.path.join(cls.dir, "stage")
-        os.makedirs(stage)
-        entries = [(os.path.join(BUILT, b), f"bin/{b}", 0o755) for b in cls.bins]
-        for name in install_sim.SHARE:
-            p = os.path.join(stage, name)
-            with open(p, "w", encoding="utf-8") as f:
-                f.write("placeholder for the install test\n")
-            entries.append((p, f"share/morsec/{name}", 0o644))
-        out = os.path.join(cls.dir, f"morsec-{VERSION}-aarch64-apple-darwin.tar.gz")
-        archive.build(out, f"morsec-{VERSION}", 1_700_000_000, entries)
-        return out
-
-    @classmethod
     def env(cls) -> dict[str, str]:
         # The binaries under test are cargo builds with no Developer ID, so ms only talks to msd
         # with the explicit dev opt-out (T-03, ms-ipc peer_verify). A signed release ignores it.
@@ -164,7 +140,7 @@ class InstalledShimTests(unittest.TestCase):
     def start_msd(cls):
         log = open(os.path.join(cls.dir, "msd.log"), "wb")
         cls.msd = subprocess.Popen(
-            [os.path.join(cls.prefix, "bin", "msd"), "--foreground", "--vault", "memory", "--socket", cls.sock,
+            [cls.msd_path, "--foreground", "--vault", "memory", "--socket", cls.sock,
              "--state-dir", os.path.join(cls.dir, "state"), "--proxy-port", "0", "--test-touch-id", "allow"],
             env=cls.env(), stdout=subprocess.DEVNULL, stderr=log, stdin=subprocess.DEVNULL)
         log.close()
@@ -187,7 +163,7 @@ class InstalledShimTests(unittest.TestCase):
         env = cls.env()
         with open(script, "w", encoding="utf-8") as f:
             f.write(
-                f"export PATH='{prefix}/bin:{env['PATH']}' HOME='{cls.home}' MORSEC_SOCKET='{cls.sock}' "
+                f"export PATH='{prefix}/bin:{cls.extra_path}{env['PATH']}' HOME='{cls.home}' MORSEC_SOCKET='{cls.sock}' "
                 f"TMPDIR='{env['TMPDIR']}' LANG=C MORSEC_DEV_UNVERIFIED_DAEMON=1\nunset CLAUDE_CONFIG_DIR CODEX_HOME\ncd '{cls.home}'\n{command}\n")
         # Its own session and process group (setsid), so teardown can kill whatever is left.
         p = subprocess.Popen(
@@ -204,6 +180,49 @@ class InstalledShimTests(unittest.TestCase):
                 raise AssertionError(f"detached command never finished: {command}")
             time.sleep(0.05)
         return int(_read(rc).strip() or -1), _read(out)
+
+
+@unittest.skipUnless(IS_MAC_ARM, "the release is macOS arm64 only")
+class InstalledShimTests(LiveMsd, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.real = _snapshot()
+        cls.bins = [n for n, _ in formula.sign_targets(_read(os.path.join(PKG, "macos", "sign-targets")))]
+        for b in cls.bins:
+            p = os.path.join(BUILT, b)
+            if not os.path.isfile(p):
+                raise AssertionError(f"{p} is not built; run cargo build --workspace first (scripts/check.sh does)")
+        cls.init_dirs("msinst")
+        try:
+            tar = cls.tarball()
+            template = _read(os.path.join(PKG, "homebrew", "morsec.rb.in"))
+            cls.prefix = os.path.join(cls.dir, "brew")
+            cls.cellar = install_sim.install(tar, template, VERSION, cls.prefix)
+            # The control: the same tarball through a formula that does not install ms-shim.
+            old = template.replace('bin.install "bin/ms", "bin/msd", "bin/ms-shim"', 'bin.install "bin/ms", "bin/msd"')
+            assert old != template, "the template's bin.install line changed; update this test"
+            cls.control = os.path.join(cls.dir, "brew-old")
+            install_sim.install(tar, old, VERSION, cls.control)
+            cls.msd_path = os.path.join(cls.prefix, "bin", "msd")
+            cls.start_msd()
+            cls.add_run_key(cls.prefix)
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def tarball(cls) -> str:
+        stage = os.path.join(cls.dir, "stage")
+        os.makedirs(stage)
+        entries = [(os.path.join(BUILT, b), f"bin/{b}", 0o755) for b in cls.bins]
+        for name in install_sim.SHARE:
+            p = os.path.join(stage, name)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("placeholder for the install test\n")
+            entries.append((p, f"share/morsec/{name}", 0o644))
+        out = os.path.join(cls.dir, f"morsec-{VERSION}-aarch64-apple-darwin.tar.gz")
+        archive.build(out, f"morsec-{VERSION}", 1_700_000_000, entries)
+        return out
 
     def tearDown(self):
         self.assertEqual(_snapshot(), self.real, "the install test touched the real HOME")

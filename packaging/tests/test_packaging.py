@@ -481,6 +481,19 @@ class ReleaseScriptTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "f.rb")))
 
+    # protects=distribution: the 0.1.0 formula downloads the release tarball from the public
+    # GitHub release of csakash/morsec; fails_when=the default URL points anywhere else
+    def test_formula_targets_the_github_release(self):
+        out = os.path.join(self.tmp, "f.rb")
+        r = subprocess.run(["bash", RELEASE, "formula", "--version", "0.1.0", "--sha256", "a" * 64, "--out", out],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(out, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn('  url "https://github.com/csakash/morsec/releases/download/v0.1.0/'
+                      'morsec-0.1.0-aarch64-apple-darwin.tar.gz"\n', text)
+        self.assertIn('  version "0.1.0"\n', text)
+
     def test_unknown_subcommand(self):
         r = subprocess.run(["bash", RELEASE, "publish"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
