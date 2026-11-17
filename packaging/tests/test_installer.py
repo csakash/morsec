@@ -341,7 +341,7 @@ class InstallerTests(unittest.TestCase):
         os.makedirs(real)
         linked = os.path.join(self.case, "linked-bin")
         os.symlink(real, linked)
-        code, out = self.install(env={"MORSEC_INSTALL_DIR": linked,
+        code, out = self.install(env={"MORSEC_INSTALL_DIR": linked + "/",
                                       "PATH": f"{linked}:{self.stubs}:/usr/bin:/bin:/usr/sbin:/sbin"})
         self.assertEqual(code, 0, out)
         self.assertTrue(os.path.isfile(os.path.join(real, "ms")))

@@ -60,9 +60,9 @@ fn safe_dir(m: &std::fs::Metadata, uid: u32) -> bool {
 
 fn safe_owner_mode(owner: u32, gid: u32, mode: u32, uid: u32) -> bool {
     let owner_ok = owner == uid || owner == 0;
-    let writers_ok = mode & 0o022 == 0
-        || (mode & 0o002 == 0 && gid == ADMIN_GID)
-        || (owner == 0 && mode & 0o1000 != 0);
+    // gid 80 is `admin` on macOS only; elsewhere it means nothing special.
+    let admin_only = cfg!(target_os = "macos") && mode & 0o002 == 0 && gid == ADMIN_GID;
+    let writers_ok = mode & 0o022 == 0 || admin_only || (owner == 0 && mode & 0o1000 != 0);
     owner_ok && writers_ok
 }
 
@@ -495,6 +495,18 @@ pub(crate) mod tests {
         assert!(
             !safe_owner_mode(me, 20, 0o41777, me),
             "sticky but not root's"
+        );
+        assert!(
+            !safe_owner_mode(502, ADMIN_GID, 0o40775, me),
+            "another user's admin dir"
+        );
+        assert!(
+            safe_owner_mode(0, ADMIN_GID, 0o40775, me),
+            "root's admin dir"
+        );
+        assert!(
+            !safe_owner_mode(0, 0, 0o40777, me),
+            "root's, world-writable, not sticky"
         );
     }
 

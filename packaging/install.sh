@@ -193,7 +193,9 @@ say "morsec: code signatures ok (team $MORSEC_TEAM_ID, notarized)"
 # --- install --------------------------------------------------------------------------------
 mkdir -p "$dir"
 # Check and use the real directory: ~/.local/bin is often a symlink (dotfile managers).
+# As given, without trailing slashes, for the PATH hints below (PATH entries rarely have them).
 dir_given="$dir"
+while [ "${dir_given%/}" != "$dir_given" ] && [ "$dir_given" != / ]; do dir_given="${dir_given%/}"; done
 dir="$(cd "$dir" && pwd -P)" || die "can't use $dir"
 case "$dir" in
   *[[:space:]]*) die "the install directory must not contain spaces ($dir)" ;;
