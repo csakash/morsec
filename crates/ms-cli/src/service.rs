@@ -32,6 +32,18 @@ pub struct InitArgs {
     /// Old name for `ms start` (kept so scripts keep working; it needs Touch ID now).
     #[arg(long, conflicts_with_all = ["force", "trust"], hide = true)]
     resume: bool,
+    /// Set up this Mac only, even inside a project.
+    #[arg(long, conflicts_with_all = ["project", "trust", "resume"])]
+    machine: bool,
+    /// Protect this project (default: the current folder's project).
+    #[arg(long, value_name = "PATH", num_args = 0..=1, conflicts_with_all = ["force", "trust", "resume"])]
+    project: Option<Option<PathBuf>>,
+    /// The project's name (default: its folder's name).
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["machine", "force", "trust", "resume"])]
+    name: Option<String>,
+    /// Don't connect the coding agents found on this Mac.
+    #[arg(long)]
+    no_connect: bool,
 }
 
 fn say(s: &str) {
@@ -379,18 +391,104 @@ async fn trust() -> ExitCode {
     }
 }
 
-pub(crate) async fn init(a: &InitArgs) -> ExitCode {
-    if a.trust {
-        return trust().await;
+/// Runs `f` on a fresh current-thread runtime (`ms init` runs on its own thread, because the
+/// project steps drive their own IPC runtimes).
+fn block<T>(f: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| panic!("starting the IPC client: {e}"))
+        .block_on(f)
+}
+
+/// `git rev-parse --show-toplevel` from `dir`, canonical; `None` outside a repository. Runs git
+/// without a pager, fsmonitor or prompts, like `envfile::git_history`.
+fn git_top(dir: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--show-toplevel",
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    if a.resume {
-        eprintln!("note: ms init --resume is now ms start, which asks for Touch ID");
-        return start().await;
+    let s = String::from_utf8(out.stdout).ok()?;
+    std::fs::canonicalize(s.trim_end_matches('\n')).ok()
+}
+
+/// Which mode `ms init` runs in (design §4.1), or a refusal for `--project` at a refused root.
+fn choose_mode(a: &InitArgs) -> Result<ms_projects::mode::Mode, String> {
+    use ms_projects::mode::{MachineWhy, Mode, refused_root};
+    if a.machine || a.force {
+        return Ok(Mode::Machine(MachineWhy::Asked));
     }
-    let msd = match msd_path() {
-        Ok(p) => p,
-        Err(e) => return fail(&e),
-    };
+    let home = std::fs::canonicalize(home()?)
+        .map_err(|e| format!("morsec: finding your home folder: {e}"))?;
+    let cwd = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|e| format!("morsec: finding the current folder: {e}"))?;
+    if let Some(p) = &a.project {
+        let root = match p {
+            Some(p) => {
+                std::fs::canonicalize(p).map_err(|e| format!("morsec: {}: {e}", p.display()))?
+            }
+            None => git_top(&cwd)
+                .filter(|t| *t != home && *t != Path::new("/"))
+                .unwrap_or(cwd),
+        };
+        if !root.is_dir() {
+            return Err(format!("morsec: {} is not a folder", root.display()));
+        }
+        if refused_root(&root, &home).is_some() {
+            return Err(format!(
+                "morsec: {} is your home folder, a folder above it or a system folder, so it is not scanned as a project. Run ms init inside the project",
+                root.display()
+            ));
+        }
+        return Ok(Mode::Project(root));
+    }
+    let has_marker = std::fs::read_dir(&cwd)
+        .map(|d| {
+            d.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(ms_projects::mode::is_marker)
+            })
+        })
+        .unwrap_or(false);
+    let top = git_top(&cwd);
+    Ok(ms_projects::mode::detect(ms_projects::mode::Inputs {
+        cwd: &cwd,
+        home: &home,
+        git_top: top.as_deref(),
+        cwd_has_marker: has_marker,
+    }))
+}
+
+/// Machine step 1: vault, LaunchAgent, msd (today's `ms init`). Skipped when msd answers.
+/// `Ok(false)`: stop here (`--no-launchd`).
+fn machine_setup(a: &InitArgs) -> Result<bool, ExitCode> {
+    if !a.force
+        && matches!(
+            block(request(RequestBody::Status)),
+            Ok(ResponseBody::Status { .. })
+        )
+    {
+        say("morsec is already set up.");
+        return Ok(true);
+    }
+    let msd = msd_path().map_err(|e| fail(&e))?;
     let mut cmd = Command::new(&msd);
     cmd.arg("--init");
     if a.force {
@@ -398,27 +496,204 @@ pub(crate) async fn init(a: &InitArgs) -> ExitCode {
     }
     let code = match cmd.status() {
         Ok(s) => s.code().unwrap_or(1),
-        Err(e) => return fail(&format!("morsec: running {}: {e}", msd.display())),
+        Err(e) => return Err(fail(&format!("morsec: running {}: {e}", msd.display()))),
     };
     match code {
         0 => say("morsec is set up: vault keys created, empty rules, receipts started."),
         MSD_ALREADY => say("morsec is already set up (ms init --force starts over)."),
-        _ => return fail("morsec: setup failed (see above). Nothing was started"),
+        _ => {
+            return Err(fail(
+                "morsec: setup failed (see above). Nothing was started",
+            ));
+        }
     }
     if a.no_launchd {
         say(&format!(
             "Start the daemon with: {} --foreground",
             msd.display()
         ));
-        return ExitCode::SUCCESS;
+        return Ok(false);
     }
-    if let Err(e) = tokio::task::spawn_blocking(move || install_launch_agent(&msd))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()))
+    install_launch_agent(&msd).map_err(|e| fail(&e))?;
+    Ok(true)
+}
+
+/// Machine step 2: is the CA trusted? Asks macOS once when it isn't and there is a terminal.
+fn ca_row() -> Option<String> {
+    let (mode, pem) = match block(request(RequestBody::Status)) {
+        Ok(ResponseBody::Status { mode, ca_pem, .. }) => (mode, ca_pem),
+        _ => return None,
+    };
+    if mode == "dev-memory" {
+        // A memory daemon's CA is new at every start: trusting it would pile up certificates.
+        return Some("not trusted for a dev daemon (it changes at every start)".into());
+    }
+    let pem = pem?;
+    match crate::doctor::ca_trusted(&pem) {
+        Some(true) => None,
+        _ if crate::tty::stdin_is_tty() => {
+            if block(trust()) == ExitCode::SUCCESS {
+                Some("trusted".into())
+            } else {
+                Some(
+                    "not trusted: swaps for Go tools will fail until you run ms init --trust"
+                        .into(),
+                )
+            }
+        }
+        _ => Some("not trusted: swaps for Go tools will fail until you run ms init --trust".into()),
+    }
+}
+
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| {
+        std::env::split_paths(&p).any(|d| d.is_absolute() && d.join(bin).is_file())
+    })
+}
+
+/// Machine step 3: connect the agents found on this Mac. A failure is reported, not fatal.
+fn connect_agents() -> Vec<(String, bool)> {
+    let Ok(home) = home() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (id, name, bin, dir) in [
+        ("claude-code", "Claude Code", "claude", ".claude"),
+        ("codex", "Codex", "codex", ".codex"),
+    ] {
+        if !on_path(bin) && !home.join(dir).exists() {
+            continue;
+        }
+        let args = crate::connect::ConnectArgs {
+            agent: Some(id.to_owned()),
+            dry_run: false,
+            yes: true,
+            env: Vec::new(),
+            mcp_env: Vec::new(),
+            with_mcp: false,
+            wrap: false,
+            statusline: false,
+            force: false,
+            #[cfg(debug_assertions)]
+            rules: None,
+            session_env: false,
+        };
+        out.push((
+            name.to_owned(),
+            crate::connect::connect(&args) == ExitCode::SUCCESS,
+        ));
+    }
+    out
+}
+
+pub(crate) fn init(a: &InitArgs) -> ExitCode {
+    if a.trust {
+        return block(trust());
+    }
+    if a.resume {
+        eprintln!("note: ms init --resume is now ms start, which asks for Touch ID");
+        return block(start());
+    }
+    let mode = match choose_mode(a) {
+        Ok(m) => m,
+        Err(e) => return fail(&e),
+    };
+    let project = match &mode {
+        ms_projects::mode::Mode::Project(root) => Some(root.clone()),
+        ms_projects::mode::Mode::Machine(_) => None,
+    };
+    if project.is_some()
+        && let Some(who) = crate::connect::inside_agent()
     {
-        return fail(&e);
+        return fail(&format!(
+            "morsec: ms init moves a project's secrets and gives its keys their services, so it runs only from your own terminal, not inside an agent session ({who}). Ask the user to run it"
+        ));
     }
-    status().await
+    match machine_setup(a) {
+        Ok(true) => {}
+        Ok(false) => return ExitCode::SUCCESS,
+        Err(code) => return code,
+    }
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let home_dir = home().ok().and_then(|h| std::fs::canonicalize(h).ok());
+    let mut ok = true;
+    let mut slug = None;
+    if let Some(root) = &project {
+        match crate::init_project::run(root, a.name.as_deref()) {
+            Ok(rep) => {
+                ok = rep.save_error.is_none();
+                slug = Some(rep.slug.clone());
+                rows.extend(crate::init_project::summary_rows(&rep, home_dir.as_deref()));
+            }
+            Err(e) => {
+                ok = false;
+                rows.push(("Project".into(), format!("not set up: {e}")));
+            }
+        }
+    }
+    if let Some(ca) = ca_row() {
+        rows.push(("CA".into(), ca));
+    }
+    if !a.no_connect {
+        let agents = connect_agents();
+        let done: Vec<&str> = agents
+            .iter()
+            .filter(|(_, ok)| *ok)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let failed: Vec<&str> = agents
+            .iter()
+            .filter(|(_, ok)| !*ok)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        if !done.is_empty() {
+            rows.push(("Agents".into(), format!("{} connected", done.join(", "))));
+        }
+        if !failed.is_empty() {
+            rows.push((
+                "Agents".into(),
+                format!(
+                    "{} could not be connected (see above): ms connect <agent>",
+                    failed.join(", ")
+                ),
+            ));
+        }
+    }
+    let problems = crate::doctor::static_problems();
+    if !problems.is_empty() {
+        rows.push((
+            "Checks".into(),
+            format!("{} from ms doctor:", problems.len()),
+        ));
+        for p in problems {
+            rows.push((String::new(), p));
+        }
+    }
+
+    println!();
+    match block(request(RequestBody::Status)) {
+        Ok(ResponseBody::Status {
+            running: Some(false),
+            ..
+        }) => say("morsec is stopped: resume with ms start (Touch ID)."),
+        _ => say("morsec is on."),
+    }
+    if !rows.is_empty() {
+        println!();
+    }
+    for (label, text) in &rows {
+        say(&format!("{label:<10} {text}"));
+    }
+    if let Some(slug) = slug.filter(|_| ok) {
+        println!();
+        say(&format!("See everything: ms projects {slug}"));
+    }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(test)]

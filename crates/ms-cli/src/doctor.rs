@@ -71,18 +71,7 @@ pub(crate) fn run(a: &DoctorArgs) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let mut report = Report::default();
-    let daemon = daemon_section(&mut report);
-    // Shown even when msd is down: a LaunchAgent left pointing at a deleted version is a
-    // common reason it is.
-    report.section("launchagent", launch_agent_items());
-    let port = daemon.as_ref().and_then(|d| d.proxy_port);
-    if daemon.is_some() {
-        report.section("run shims", shim_items());
-    }
-    agent_section(&mut report, &claude_target(), port);
-    agent_section(&mut report, &codex_target(), port);
-    report.section("mcp", mcp_checks());
+    let (mut report, daemon) = static_report();
     if a.live {
         if daemon.is_none() {
             report.section(
@@ -112,6 +101,39 @@ pub(crate) fn run(a: &DoctorArgs) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// The static checks (no agent is started).
+fn static_report() -> (Report, Option<DaemonInfo>) {
+    let mut report = Report::default();
+    let daemon = daemon_section(&mut report);
+    // Shown even when msd is down: a LaunchAgent left pointing at a deleted version is a
+    // common reason it is.
+    report.section("launchagent", launch_agent_items());
+    let port = daemon.as_ref().and_then(|d| d.proxy_port);
+    if daemon.is_some() {
+        report.section("run shims", shim_items());
+    }
+    agent_section(&mut report, &claude_target(), port);
+    agent_section(&mut report, &codex_target(), port);
+    report.section("mcp", mcp_checks());
+    (report, daemon)
+}
+
+/// `ms init` machine step 4 (L31): the static checks' failures, one line each (`section: text`),
+/// for the summary. Nothing is printed here.
+pub(crate) fn static_problems() -> Vec<String> {
+    let (report, _) = static_report();
+    report
+        .sections
+        .iter()
+        .flat_map(|(title, items)| {
+            items
+                .iter()
+                .filter(|i| i.mark == Mark::Fail)
+                .map(move |i| format!("{title}: {}", i.text))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -458,10 +480,8 @@ fn classify_signature(path: &Path, verified: bool, details: &str) -> Item {
 
 /// Is the CA msd uses trusted by macOS? Checked from the PEM msd sent (never `ca.pem` on disk),
 /// through a private temp file, with `security verify-cert -L` (local only, no network).
-fn ca_item(pem: Option<&str>) -> Item {
-    let Some(pem) = pem else {
-        return Item::info("no morsec CA yet (it is made when a key is first allowed a host)");
-    };
+/// `Err` when it could not be checked.
+fn ca_trust(pem: &str) -> std::result::Result<bool, String> {
     let dir = std::env::temp_dir().join(format!(
         "morsec-doctor-{}-{}",
         std::process::id(),
@@ -481,24 +501,38 @@ fn ca_item(pem: Option<&str>) -> Item {
                     .write_all(pem.as_bytes())
             })
     };
-    let item = match made {
-        Err(e) => Item::warn(format!("CA trust not checked · writing a temp copy: {e}")),
-        Ok(()) => match Command::new("/usr/bin/security")
+    let out = match made {
+        Err(e) => Err(format!("writing a temp copy: {e}")),
+        Ok(()) => Command::new("/usr/bin/security")
             .args(["verify-cert", "-q", "-L", "-c"])
             .arg(dir.join("ca.pem"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-        {
-            Ok(s) if s.success() => Item::pass("morsec CA trusted by macOS"),
-            Ok(_) => Item::warn(
-                "morsec CA not trusted by macOS (agents trust it through their connector; other tools won't) · fix: ms init --trust",
-            ),
-            Err(e) => Item::warn(format!("CA trust not checked · security: {e}")),
-        },
+            .map(|s| s.success())
+            .map_err(|e| format!("security: {e}")),
     };
     let _ = std::fs::remove_dir_all(&dir);
-    item
+    out
+}
+
+/// `ms init` machine step 2 (L31): `Some(trusted)`, or `None` when it could not be checked.
+pub(crate) fn ca_trusted(pem: &str) -> Option<bool> {
+    ca_trust(pem).ok()
+}
+
+fn ca_item(pem: Option<&str>) -> Item {
+    let Some(pem) = pem else {
+        return Item::info("no morsec CA yet (it is made when a key is first allowed a host)");
+    };
+    match ca_trust(pem) {
+        Ok(true) => Item::pass("morsec CA trusted by macOS"),
+        Ok(false) => Item::warn(
+            "morsec CA not trusted by macOS (agents trust it through their connector; other tools won't) · fix: ms init --trust",
+        ),
+        Err(e) if e.starts_with("security") => Item::warn(format!("CA trust not checked · {e}")),
+        Err(e) => Item::warn(format!("CA trust not checked · {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
