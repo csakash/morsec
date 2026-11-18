@@ -1,0 +1,1628 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>morsec: agents use the keys, never see them</title>
+<meta name="description" content="Coding agents use your API keys, database passwords and tokens without ever seeing them.">
+<link rel="canonical" href="https://morsec.motiontic.com/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#f2f0eb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f0f0e" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="website">
+<meta property="og:title" content="morsec: agents use the keys, never see them">
+<meta property="og:description" content="Coding agents use your API keys, database passwords and tokens without ever seeing them.">
+<meta property="og:url" content="https://morsec.motiontic.com/">
+<meta name="twitter:card" content="summary">
+<style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..700&family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap">
+<style>
+/* morsec — tactile brutalism: warm paper, 1px ink rules, square cells, hairline isometric figures.
+   Archivo (grotesk with a width axis) for display and labels, Instrument Serif italic for one accent,
+   IBM Plex Mono for references, receipts and anything a terminal would print. */
+:root {
+  --paper: #f2f0eb;
+  --paper-2: #e9e6df;
+  --ink: #121212;
+  --ink-2: #3d3b37;
+  --muted: #77736b;
+  --rule: #121212;
+  --faint: #cfcbc2;
+  --signal: #2340e8;
+  --deny: #d4301f;
+  --f-sans: "Archivo", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --f-serif: "Instrument Serif", "Times New Roman", Georgia, serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --wrap: 1240px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0f0f0e; --paper-2: #181816; --ink: #ebe8e1; --ink-2: #c4c0b7; --muted: #8b877e;
+    --rule: #ebe8e1; --faint: #34332f; --signal: #8193ff; --deny: #ff6a58; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0f0f0e; --paper-2: #181816; --ink: #ebe8e1; --ink-2: #c4c0b7; --muted: #8b877e;
+  --rule: #ebe8e1; --faint: #34332f; --signal: #8193ff; --deny: #ff6a58; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--paper); color: var(--ink);
+  font: 400 15.5px/1.55 var(--f-sans); font-stretch: 100%;
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+}
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 60; background: var(--paper); }
+a { color: inherit; }
+h1, h2, h3 { margin: 0; font-weight: 450; text-wrap: balance; letter-spacing: -0.02em; }
+p { margin: 0; text-wrap: pretty; }
+code, .mono { font-family: var(--f-mono); font-size: .92em; }
+em.it { font-family: var(--f-serif); font-style: italic; font-weight: 400; letter-spacing: -0.01em; }
+:focus-visible { outline: 1.5px solid var(--signal); outline-offset: 2px; }
+::selection { background: var(--ink); color: var(--paper); }
+
+.wrap {
+  max-width: var(--wrap); margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+/* the frame: every block is a cell in one ruled sheet */
+.sheet { border: 0; }
+html, body { overflow-x: clip; }
+/* rows: rules between cells inside, and one full-bleed line above each row; no outer frame */
+.row { display: grid; gap: 1px; background: var(--rule); position: relative; }
+.sheet > .row + .row, .sheet > .row + .band, .sheet > .band + .row, .foot .row { margin-top: 1px; }
+.sheet > .row + .row::before, .sheet > .row + .band::before, .sheet > .band + .row::before, .foot .row::before {
+  content: ""; position: absolute; left: 50%; width: 100vw; margin-left: -50vw; top: -1px; height: 1px; background: var(--rule); pointer-events: none;
+}
+.row > * { background: var(--paper); min-width: 0; }
+.cell { padding: 28px; }
+
+.lbl { font: 500 11px/1.2 var(--f-sans); font-stretch: 125%; letter-spacing: .08em; text-transform: uppercase; }
+.lbl.m { color: var(--muted); }
+.num { font: 500 12px/1 var(--f-mono); }
+
+/* header */
+.top { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 50; background: var(--paper); }
+.top { border-bottom: 1px solid var(--rule); }
+.top .row { grid-template-columns: auto minmax(0, 1fr) auto; background: var(--paper); }
+.top .brand { padding-left: 0; }
+.top .act { padding-right: 0 !important; }
+.top .nav { border-left: 1px solid var(--rule); align-self: stretch; }
+.top .row > * { display: flex; align-items: center; min-height: 64px; }
+.brand { padding: 0 24px; gap: 12px; text-decoration: none; font: 600 15px/1 var(--f-sans); font-stretch: 125%; letter-spacing: .12em; }
+.mk { display: inline-flex; gap: 3px; align-items: center; }
+.mk i { display: block; height: 3px; background: currentColor; }
+.mk i.d { width: 3px; } .mk i.l { width: 10px; }
+.nav { padding: 0 24px; gap: 30px; }
+.nav a { text-decoration: none; font: 500 11.5px/1 var(--f-sans); font-stretch: 112%; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); }
+.nav a:hover, .nav a[aria-current="page"] { color: var(--ink); text-decoration: underline; text-underline-offset: 5px; text-decoration-thickness: 1px; }
+.top .act { padding: 0 12px; gap: 10px; }
+.theme { appearance: none; border: 1px solid var(--rule); background: none; color: var(--ink); width: 38px; height: 38px; display: grid; place-items: center; cursor: pointer; }
+.theme svg { width: 16px; height: 16px; }
+
+/* buttons: rectangles with a corner arrow */
+.btn {
+  display: inline-flex; align-items: center; justify-content: space-between; gap: 28px;
+  min-height: 46px; padding: 0 16px 0 18px; border: 1px solid var(--rule); background: var(--paper); color: var(--ink);
+  font: 500 11.5px/1 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; text-decoration: none; cursor: pointer;
+  transition: background .25s var(--ease), color .25s var(--ease);
+}
+.btn svg { width: 14px; height: 14px; flex: none; transition: transform .35s var(--ease); }
+.btn:hover { background: var(--ink); color: var(--paper); }
+.btn:hover svg { transform: translate(2px, -2px); }
+.btn.solid { background: var(--ink); color: var(--paper); }
+.btn.solid:hover { background: var(--paper); color: var(--ink); }
+.btn.sm { min-height: 38px; gap: 18px; padding: 0 12px 0 14px; }
+
+.foot { padding-block: 0 48px; }
+.foot { margin-top: 1px; }
+.foot .row { grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); }
+.foot .big { padding-left: 0 !important; }
+.foot .big { padding: 26px 28px 18px; font: 400 clamp(56px, 11vw, 150px)/.86 var(--f-sans); font-stretch: 62%; letter-spacing: -0.02em; text-transform: uppercase; }
+.foot .links { padding: 28px; display: grid; gap: 18px; align-content: space-between; }
+.foot nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 20px; }
+.foot nav a { text-decoration: none; font: 500 11.5px/1.3 var(--f-sans); font-stretch: 112%; letter-spacing: .08em; text-transform: uppercase; }
+.foot nav a:hover { text-decoration: underline; text-underline-offset: 4px; }
+.foot small { font: 400 12px/1.5 var(--f-mono); color: var(--muted); }
+
+/* hairline figures use the page's ink */
+[data-hairline] {
+  --hairline-plate: var(--paper);
+  --hairline-hi: var(--ink);
+  --hairline-edge: color-mix(in srgb, var(--ink) 78%, var(--paper));
+  --hairline-mid: color-mix(in srgb, var(--ink) 48%, var(--paper));
+  --hairline-lo: color-mix(in srgb, var(--ink) 24%, var(--paper));
+  --hairline-stroke: 1;
+  aspect-ratio: 5 / 4;
+}
+[data-hairline] svg .sig { fill: none; stroke: var(--signal); stroke-width: 2; stroke-linecap: butt; transition: none; }
+[data-hairline] svg .sig.thin { stroke-width: 1.3; }
+[data-hairline] svg .bad { fill: none; stroke: var(--deny); stroke-width: 2; stroke-linecap: butt; transition: none; }
+[data-hairline] svg .deny { stroke: var(--deny); }
+[data-hairline] svg .on { stroke: var(--signal); }
+[data-hairline] svg .bead { fill: var(--signal); stroke: none; }
+[data-hairline] svg .ink { fill: none; stroke: var(--hl-hi); stroke-width: 1.6; stroke-linecap: butt; }
+[data-hairline] svg .ink.on { stroke: var(--signal); }
+[data-hairline] svg .gone { opacity: 0; }
+
+@media (max-width: 860px) {
+  .nav { display: none !important; }
+  .btn { white-space: nowrap; }
+  .brand { padding: 0 16px; }
+  .brand .lbl { display: none; }
+  .top .act { padding: 0 8px; gap: 8px; }
+  .top .btn.sm { gap: 10px; padding: 0 10px; }
+  .top .row { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .foot .row { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 440px) {
+  .brand { padding: 0 12px; letter-spacing: .08em; }
+  .top .btn.sm svg { display: none; }
+  .theme { width: 34px; height: 34px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
+
+
+section, [id] { scroll-margin-top: 72px; }
+/* cells on the page edge sit flush with the logo; inner cells keep their padding */
+.sheet > .row > .cell:first-child, .sheet > .row > .hero-l { padding-left: 0; }
+.sheet > .row > .cell:last-child { padding-right: 0; }
+.sheet > .sec > .cell:nth-child(3n+1) { padding-left: 0; }
+.sheet > .sec > .cell:nth-child(3n) { padding-right: 0; }
+.sheet > .rel .checks li:nth-child(2n) { padding-right: 0; }
+.sheet > .row > .cell.left { padding-left: 28px; }
+@media (max-width: 1080px) {
+  .sheet > .sec > .cell { padding: 28px; }
+  .sheet > .sec > .cell:nth-child(2n+1) { padding-left: 0; }
+  .sheet > .sec > .cell:nth-child(2n) { padding-right: 0; }
+  .sheet > .row > .cell:not(:first-child), .sheet > .row > .cell:not(:last-child) { padding-left: 0; padding-right: 0; }
+  .sheet > .row > .cell.left { padding: 28px; }
+}
+@media (max-width: 640px) { .sheet > .sec > .cell { padding: 24px 0 !important; } }
+/* hero */
+.hero { grid-template-columns: minmax(0, 1fr) minmax(0, 1.12fr); }
+.hero-l { padding: 40px 32px 32px; display: grid; gap: 26px; align-content: space-between; }
+.hero-l .top-lbl { display: flex; justify-content: space-between; gap: 16px; }
+.hero h1 { font-size: clamp(44px, 6.2vw, 86px); line-height: .96; letter-spacing: -0.035em; font-weight: 440; }
+.hero h1 em.it { font-size: 1.04em; }
+.lede { font-size: 17px; line-height: 1.55; color: var(--ink-2); max-width: 30em; }
+.ref { font-family: var(--f-mono); font-size: .9em; color: var(--signal); white-space: nowrap; border-bottom: 1px solid currentColor; }
+.inst { border: 1px solid var(--rule); }
+.inst [role="tablist"] { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--rule); }
+.inst [role="tab"] { appearance: none; border: 0; border-right: 1px solid var(--rule); background: var(--paper); color: var(--muted); padding: 11px 12px; text-align: left; cursor: pointer; font: 500 11px/1 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center; }
+.inst [role="tab"]:last-child { border-right: 0; }
+.inst [role="tab"] .num { color: inherit; }
+.inst [role="tab"][aria-selected="true"] { background: var(--ink); color: var(--paper); }
+.inst .cmd { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+.inst code { display: block; padding: 16px 16px; white-space: nowrap; overflow-x: auto; font-size: 13.5px; scrollbar-width: none; }
+.inst code::-webkit-scrollbar { display: none; }
+.inst code i { font-style: normal; color: var(--muted); margin-right: 10px; user-select: none; }
+.inst .copy { appearance: none; border: 0; border-left: 1px solid var(--rule); background: var(--paper); color: var(--ink); padding: 0 16px; cursor: pointer; font: 500 11px/1 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; }
+.inst .copy:hover { background: var(--ink); color: var(--paper); }
+.inst .note { border-top: 1px solid var(--rule); padding: 9px 16px; font: 400 12px/1.45 var(--f-mono); color: var(--muted); }
+.ctas { display: flex; flex-wrap: wrap; gap: 10px; }
+
+.hero-r { display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; }
+.hero-r .bar { display: flex; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--rule); }
+.stage-wrap { position: relative; display: grid; align-content: center; background:
+  linear-gradient(var(--faint) 1px, transparent 1px) 0 0 / 32px 32px,
+  linear-gradient(90deg, var(--faint) 1px, transparent 1px) 0 0 / 32px 32px; }
+.stage-wrap::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 50%, transparent 40%, var(--paper) 86%); }
+.stage-wrap [data-hairline] { position: relative; z-index: 1; }
+.legend { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--rule); }
+.legend button { appearance: none; border: 0; border-right: 1px solid var(--rule); background: var(--paper); color: var(--ink-2); text-align: left; padding: 12px 14px 14px; display: grid; gap: 7px; align-content: start; cursor: default; font: inherit; transition: background .3s var(--ease), color .3s var(--ease); }
+.legend button:last-child { border-right: 0; }
+.legend .d { display: flex; gap: 3px; height: 6px; align-items: center; }
+.legend .d i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
+.legend b { font: 500 10.5px/1.2 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; color: var(--ink); }
+.legend span { font: 400 11.5px/1.4 var(--f-mono); color: var(--muted); }
+.legend button.on { background: var(--ink); color: var(--paper); }
+.legend button.on b { color: var(--paper); } .legend button.on span { color: color-mix(in srgb, var(--paper) 70%, var(--ink)); }
+.legend button.on.bad { background: var(--deny); }
+.ticker { border-top: 1px solid var(--rule); font: 400 12px/1 var(--f-mono); }
+.ticker div { display: grid; grid-template-columns: 74px 96px minmax(0, 1fr) 72px; gap: 12px; padding: 9px 18px; border-bottom: 1px dashed var(--faint); white-space: nowrap; }
+.ticker div:last-child { border-bottom: 0; }
+.ticker span { overflow: hidden; text-overflow: ellipsis; }
+.ticker .t { color: var(--muted); } .ticker .a { color: var(--signal); } .ticker .b { color: var(--deny); }
+.ticker div.new { animation: slip .5s var(--ease); }
+@keyframes slip { from { background: var(--paper-2); } }
+
+/* morse band */
+.band { overflow: hidden; background: var(--paper); position: relative; width: 100vw; margin-left: calc(50% - 50vw); }
+.band .track { display: flex; width: max-content; animation: run 60s linear infinite; }
+.band .chunk { display: flex; align-items: center; gap: 0; padding: 16px 0; }
+.band .ch { display: grid; gap: 7px; justify-items: start; padding: 0 9px; }
+.band .ch .m { display: flex; gap: 3px; height: 5px; align-items: center; }
+.band .ch .m i { display: block; height: 3px; background: var(--ink); }
+.band .ch .m i.d { width: 3px; } .band .ch .m i.l { width: 11px; }
+.band .ch b { font: 500 10px/1 var(--f-mono); color: var(--muted); }
+.band .sp { width: 26px; }
+@keyframes run { to { transform: translateX(-50%); } }
+
+/* section heads */
+.head { grid-template-columns: minmax(0, 1fr) minmax(0, 2.4fr); }
+.head .cell:first-child { display: flex; flex-direction: column; justify-content: space-between; gap: 18px; }
+.head h2 { font-size: clamp(32px, 4.2vw, 56px); line-height: 1; letter-spacing: -0.03em; font-weight: 440; }
+.head p { font-size: 16.5px; color: var(--ink-2); max-width: 44em; margin-top: 18px; }
+
+/* tiles */
+.tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.tile { display: flex; flex-direction: column; }
+.tile .fig [data-hairline] { aspect-ratio: 5 / 4; }
+.tile .fig { border-bottom: 1px solid var(--rule); background:
+  radial-gradient(circle at 1px 1px, var(--faint) 1px, transparent 0) 0 0 / 14px 14px; }
+.tile .cap { padding: 18px 20px 22px; display: grid; gap: 12px; align-content: start; }
+.tile h3 { font: 500 13px/1.25 var(--f-sans); font-stretch: 118%; letter-spacing: .07em; text-transform: uppercase; }
+.tile .rule { width: 26px; height: 1px; background: var(--ink); }
+.tile p { color: var(--ink-2); font-size: 14.5px; }
+.tile code { color: var(--ink); }
+
+/* run mode */
+.runrow { grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); }
+.runrow .cell { display: grid; gap: 16px; align-content: start; }
+.runrow h3 { font-size: 26px; line-height: 1.1; letter-spacing: -0.02em; font-weight: 450; }
+.runrow p { color: var(--ink-2); }
+.tty { font: 400 12.5px/1 var(--f-mono); }
+.tty .l { display: grid; grid-template-columns: 34px minmax(0, 1fr); border-bottom: 1px dashed var(--faint); }
+.tty .l:last-child { border-bottom: 0; }
+.tty .n { color: var(--muted); padding: 9px 0 9px 12px; border-right: 1px solid var(--faint); }
+.tty .c { padding: 9px 14px; white-space: pre; overflow-x: auto; }
+.tty .p { color: var(--muted); } .tty .r { color: var(--signal); } .tty .x { background: var(--ink); color: var(--paper); padding: 0 4px; }
+.tty-box { border: 1px solid var(--rule); }
+.tty-box .bar { display: flex; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--rule); }
+
+/* security */
+.sec { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.sec .cell { display: grid; gap: 14px; align-content: start; min-height: 220px; }
+.sec .try { font: 400 12px/1.4 var(--f-mono); color: var(--deny); display: flex; gap: 8px; }
+.sec .try::before { content: "×"; }
+.sec h3 { font: 500 14px/1.25 var(--f-sans); font-stretch: 118%; letter-spacing: .06em; text-transform: uppercase; }
+.sec p { color: var(--ink-2); font-size: 14.5px; }
+.sec .k { margin-top: auto; font: 400 11.5px/1.4 var(--f-mono); color: var(--muted); }
+
+/* receipts as a schedule */
+.sched { grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr); }
+.sched .left { display: grid; align-content: space-between; gap: 24px; background:
+  linear-gradient(var(--faint) 1px, transparent 1px) 0 0 / 38px 38px,
+  linear-gradient(90deg, var(--faint) 1px, transparent 1px) 0 0 / 38px 38px, var(--paper); }
+.sched .left h2 { font: 400 clamp(44px, 5.4vw, 76px)/.9 var(--f-sans); font-stretch: 70%; letter-spacing: -0.01em; text-transform: uppercase; background: var(--paper); justify-self: start; padding: 6px 10px 2px; border: 1px solid var(--rule); }
+.sched .left p { background: var(--paper); border: 1px solid var(--rule); padding: 14px 16px; color: var(--ink-2); font-size: 15px; max-width: 30em; }
+.ev { display: grid; grid-template-columns: 112px minmax(0, 1fr); border-bottom: 1px solid var(--rule); }
+.ev:last-child { border-bottom: 0; }
+.ev .when { padding: 16px 14px; border-right: 1px solid var(--rule); font: 500 12px/1.3 var(--f-mono); }
+.ev .when small { display: block; color: var(--muted); font-weight: 400; margin-top: 4px; }
+.ev .what { padding: 14px 18px; display: grid; gap: 6px; font: 400 13px/1.45 var(--f-mono); color: var(--ink-2); }
+.ev .what b { font: 500 13px/1.3 var(--f-sans); font-stretch: 112%; letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.ev .res { text-decoration: underline; text-underline-offset: 3px; }
+.ev .res.a { color: var(--signal); } .ev .res.b { color: var(--deny); }
+.verify { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px 18px; border-top: 1px solid var(--rule); font: 400 12px/1.3 var(--f-mono); }
+
+.rel { grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); }
+.rel .fig { background: radial-gradient(circle at 1px 1px, var(--faint) 1px, transparent 0) 0 0 / 14px 14px, var(--paper); display: grid; align-content: center; }
+.checks { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: var(--rule); }
+.checks li { background: var(--paper); padding: 24px 26px; display: grid; gap: 10px; align-content: start; }
+.checks b { font: 500 14px/1.2 var(--f-sans); font-stretch: 118%; letter-spacing: .07em; text-transform: uppercase; }
+.checks p { color: var(--ink-2); font-size: 14.5px; }
+.checks .num { color: var(--muted); }
+/* numbers + cta */
+.nums { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); }
+.nums .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; margin-top: 26px; }
+.nums .n { font: 400 clamp(46px, 5vw, 64px)/1 var(--f-sans); letter-spacing: -0.03em; }
+.nums .u { width: 26px; height: 1px; background: var(--ink); margin: 12px 0; }
+.nums .grid p { font: 500 11px/1.35 var(--f-sans); font-stretch: 118%; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-2); }
+.cta { display: grid; gap: 22px; align-content: start; }
+.cta h2 { font-size: clamp(32px, 3.6vw, 46px); line-height: 1.02; letter-spacing: -0.03em; font-weight: 440; }
+.cta ul { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+.cta li { border-bottom: 1px solid var(--rule); padding: 10px 0; font-size: 14.5px; color: var(--ink-2); display: grid; grid-template-columns: 30px minmax(0, 1fr); }
+.cta li .num { color: var(--muted); padding-top: 3px; }
+
+/* get started */
+.start { grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr); }
+.steps { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); counter-reset: s; }
+.steps li { counter-increment: s; border-bottom: 1px solid var(--rule); padding: 14px 0; display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 2px 0; }
+.steps li::before { content: counter(s, decimal-leading-zero); font: 500 12px/1.6 var(--f-mono); color: var(--muted); grid-row: span 2; }
+.steps b { font: 500 13px/1.4 var(--f-sans); font-stretch: 118%; letter-spacing: .06em; text-transform: uppercase; }
+.steps p { font-size: 14.5px; color: var(--ink-2); }
+
+/* faq */
+.faq { grid-template-columns: minmax(0, 1fr) minmax(0, 2.4fr); }
+.faq details { border-bottom: 1px solid var(--rule); }
+.faq details:last-child { border-bottom: 0; }
+.faq summary { list-style: none; cursor: pointer; padding: 20px 28px; display: grid; grid-template-columns: 40px minmax(0, 1fr) 20px; align-items: baseline; font-size: 18px; letter-spacing: -0.01em; }
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary .num { color: var(--muted); }
+.faq summary::after { content: "+"; font: 300 22px/1 var(--f-sans); text-align: right; transition: transform .35s var(--ease); }
+.faq details[open] summary::after { transform: rotate(45deg); }
+.faq details p { padding: 0 28px 22px 68px; color: var(--ink-2); max-width: 64ch; }
+
+@media (max-width: 1080px) {
+  .hero, .runrow, .sched, .nums, .start, .rel { grid-template-columns: minmax(0, 1fr); }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sec { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .head, .faq { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .cell { padding: 22px 18px; }
+  .hero-l { padding: 28px 18px 22px; }
+  .tiles, .sec, .checks { grid-template-columns: minmax(0, 1fr); }
+  .inst [role="tab"] .num { display: none; }
+  .legend { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .legend button:nth-child(2) { border-right: 0; }
+  .legend button:nth-child(-n+2) { border-bottom: 1px solid var(--rule); }
+  .ticker div { grid-template-columns: 62px 78px minmax(0, 1fr) 58px; gap: 8px; padding: 9px 12px; font-size: 11px; }
+  .nums .grid { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .ev { grid-template-columns: 86px minmax(0, 1fr); }
+  .faq summary { padding: 18px; grid-template-columns: 32px minmax(0, 1fr) 20px; font-size: 16.5px; }
+  .faq details p { padding: 0 18px 20px 50px; }
+}
+</style>
+
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="row">
+      <a class="brand" href="#top" aria-label="morsec home"><span class="mk" aria-hidden="true"><i class="d"></i><i class="l"></i><i class="d"></i></span>MORSEC</a>
+      <nav class="nav" aria-label="Main">
+        <a href="#how">How it works</a>
+        <a href="#security">Security</a>
+        <a href="#start">Get started</a>
+        <a href="docs.html">Docs</a>
+      </nav>
+      <div class="act">
+        <button class="theme" type="button" id="theme" aria-label="Switch light or dark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/></svg>
+        </button>
+        <a class="btn sm solid" href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener">Book a call <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M4 12 12 4M5.5 4H12v6.5"/></svg></a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main id="top" class="wrap">
+<div class="sheet">
+
+  <section class="row hero">
+    <div class="hero-l">
+      <div class="top-lbl"><span class="lbl">Secret broker for coding agents</span><span class="lbl m">For macOS</span></div>
+      <h1>Your agents use the keys. They <em class="it">never</em> see them.</h1>
+      <p class="lede">Claude Code and Codex work with <span class="ref">ms://stripe/test</span>. The real key stays on your Mac.</p>
+      <div class="inst" id="install">
+        <div role="tablist" aria-label="Install with">
+          <button role="tab" aria-selected="true" data-cmd="brew install csakash/tap/morsec">Homebrew <span class="num">01</span></button>
+          <button role="tab" aria-selected="false" data-cmd="npm install -g morsec">npm <span class="num">02</span></button>
+          <button role="tab" aria-selected="false" data-cmd="curl -fsSL https://github.com/csakash/morsec/releases/latest/download/install.sh | sh">curl <span class="num">03</span></button>
+        </div>
+        <div class="cmd"><code><i>$</i><span id="cmd">brew install csakash/tap/morsec</span></code><button class="copy" type="button" id="copy">Copy</button></div>
+      </div>
+      <div class="ctas">
+        <a class="btn solid" href="docs.html#quickstart">Read the quickstart <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M4 12 12 4M5.5 4H12v6.5"/></svg></a>
+        <a class="btn" href="#how">How it works <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M4 12 12 4M5.5 4H12v6.5"/></svg></a>
+      </div>
+    </div>
+
+    <div class="hero-r">
+      <div class="bar"><span class="lbl">One key, two requests</span><span class="lbl m">Live</span></div>
+      <div class="stage-wrap"><div data-hairline id="hero-fig" role="img" aria-label="An agent sends a reference as Morse code. The broker fetches the key from the keychain and sends one unbroken line to Stripe. A second send toward an unknown host piles up against a gate and is blocked."><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="legend" id="legend">
+        <button type="button" data-n="1"><span class="d"><i></i></span><b>Agent</b><span>has a name</span></button>
+        <button type="button" data-n="2"><span class="d"><i></i><i></i></span><b>morsec</b><span>adds the key</span></button>
+        <button type="button" data-n="3"><span class="d"><i></i><i></i><i></i></span><b>api.stripe.com</b><span>gets the key</span></button>
+        <button type="button" data-n="4" class="b4"><span class="d"><i></i><i></i><i></i><i></i></span><b>Unknown host</b><span>gets nothing</span></button>
+      </div>
+    </div>
+  </section>
+
+  <div class="band" aria-hidden="true"><div class="track" id="band"></div></div>
+
+  <section class="row head" id="how">
+    <div class="cell"><span class="lbl">How it works</span></div>
+    <div class="cell">
+      <h2>Names travel. Values arrive only where they're allowed.</h2>
+    </div>
+  </section>
+
+  <section class="row tiles">
+    <article class="tile">
+      <div class="fig"><div data-hairline data-fig="tileImport" role="img" aria-label="Lines of a .env file hand their values to a vault and keep a Morse reference"><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="cap"><span class="num">01</span><h3>Keys become references</h3><span class="rule"></span><p>Your <code>.env</code> keeps names. The keys move to your keychain.</p></div>
+    </article>
+    <article class="tile">
+      <div class="fig"><div data-hairline data-fig="tileSwap" role="img" aria-label="Morse marks enter the broker and one unbroken line leaves for the bound host"><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="cap"><span class="num">02</span><h3>Swapped in on the way out</h3><span class="rule"></span><p>The key is added on the way out, only for hosts you allow.</p></div>
+    </article>
+    <article class="tile">
+      <div class="fig"><div data-hairline data-fig="tileBlock" role="img" aria-label="A gate stands up and the Morse marks pile against it"><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="cap"><span class="num">03</span><h3>Anywhere else, it stays a name</h3><span class="rule"></span><p>Sent anywhere else, it stays a name. Even a tricked agent leaks nothing.</p></div>
+    </article>
+    <article class="tile">
+      <div class="fig"><div data-hairline data-fig="tileApprove" role="img" aria-label="A request waits at a gate until a Touch ID pad is pressed, then one line reaches the database"><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="cap"><span class="num">04</span><h3>Production waits for you</h3><span class="rule"></span><p>Production keys wait for your Touch ID.</p></div>
+    </article>
+  </section>
+
+  <section class="row head" id="security">
+    <div class="cell"><span class="lbl">Security model</span></div>
+    <div class="cell">
+      <h2>Built for an agent that runs as you.</h2>
+    </div>
+  </section>
+  <section class="row sec">
+    <div class="cell"><span class="try">read the key</span><h3>Locked to morsec</h3><p>Only the signed morsec daemon can open your keychain items.</p></div>
+    <div class="cell"><span class="try">approve itself</span><h3>You approve, not the agent</h3><p>Approvals happen in your terminal, with Touch ID.</p></div>
+    <div class="cell"><span class="try">cover its tracks</span><h3>Every use is recorded</h3><p>Allowed or blocked, each use leaves a tamper-evident receipt.</p></div>
+  </section>
+
+  <section class="row nums">
+    <div class="cell">
+      <span class="lbl m">By the numbers</span>
+      <div class="grid">
+        <div><div class="n">0</div><div class="u"></div><p>secrets in the agent's context</p></div>
+        <div><div class="n">3</div><div class="u"></div><p>ways to install</p></div>
+        <div><div class="n">1</div><div class="u"></div><p>command to cut every agent off</p></div>
+      </div>
+    </div>
+    <div class="cell cta" id="call">
+      <span class="lbl m">Rolling out to a team?</span>
+      <h2>Let's set up your agents.</h2>
+      <div><a class="btn solid" href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener">Book a discovery call <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M4 12 12 4M5.5 4H12v6.5"/></svg></a></div>
+    </div>
+  </section>
+
+  <section class="row start" id="start">
+    <div class="cell">
+      <span class="lbl m">Get started</span>
+      <h2 style="font-size:clamp(30px,3.4vw,44px);line-height:1.02;letter-spacing:-0.03em;font-weight:440;margin:16px 0 22px">Set up in five minutes.</h2>
+    </div>
+    <div class="cell">
+      <div class="tty-box">
+        <div class="bar"><span class="lbl">~/code/shop</span><button class="btn sm" type="button" id="copy-start" style="min-height:28px">Copy</button></div>
+        <div class="tty" id="start-code">
+          <div class="l"><span class="n">1</span><span class="c"><span class="p">$</span> brew install csakash/tap/morsec &amp;&amp; ms init</span></div>
+          <div class="l"><span class="n">2</span><span class="c"><span class="p">$</span> ms import .env</span></div>
+          <div class="l"><span class="n">3</span><span class="c"><span class="p">$</span> ms rules stripe/test --add-host api.stripe.com</span></div>
+          <div class="l"><span class="n">4</span><span class="c"><span class="p">$</span> ms connect claude-code</span></div>
+          <div class="l"><span class="n">5</span><span class="c"><span class="p">$</span> ms doctor</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="row faq" id="faq">
+    <div class="cell"><span class="lbl">Questions</span></div>
+    <div>
+      <details open><summary><span class="num">01</span>Does morsec send my secrets anywhere?</summary><p>No. Keys stay in your Mac's keychain and only go where you allow.</p></details>
+      <details><summary><span class="num">02</span>Which agents does it work with?</summary><p>Claude Code and Codex today, plus any MCP client. Cursor and Gemini are next.</p></details>
+      <details><summary><span class="num">03</span>What if the agent edits its settings to skip morsec?</summary><p>Nothing leaks: it never had a key. It just loses access.</p></details>
+      <details><summary><span class="num">04</span>What happens when msd isn't running?</summary><p>Nothing goes out. morsec fails closed.</p></details>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <div class="row">
+      <div class="big" aria-label="morsec">Morsec</div>
+      <div class="links">
+        <nav aria-label="Footer">
+          <a href="docs.html">Docs</a>
+          <a href="https://github.com/csakash/morsec">GitHub</a>
+          <a href="https://github.com/csakash/morsec/releases">Releases</a>
+          <a href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener">Book a call</a>
+        </nav>
+        <small>Named after Morse code.</small>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+/* hairline kernel from @lucasmarkes/hairline, MIT License, Copyright (c) Lucas Markes.
+   Permission is hereby granted, free of charge, to any person obtaining a copy of this software, to deal in it
+   without restriction, provided this notice is included in all copies or substantial portions of the software. */
+/* hairline kernel sha256:346b48bdef2cdfafd5343eba01494255cf75f9c078e6fcd1aafc62bab62980a1 */
+/*
+ * HL: everything a figure may call. Read this index; the code under it is the
+ * package's src/core, unchanged, and a figure should not need to read it.
+ *
+ * Every figure is drawn in a 400 × 320 viewBox. World space is x/y on the
+ * ground and z up. Plates are filled with the ground colour and painted back
+ * to front, so a nearer one covers a farther one: append in that order. At
+ * the default camera, Cam(45, 0.5, S), +x runs down to the right and +y down
+ * to the left, so the corner with the largest x and y is nearest the viewer:
+ * append by ascending x + y, from the far corner (smallest x and y) to it.
+ *
+ * Camera
+ *   Cam(azDeg, k, S)                       a camera: azimuth in degrees, k = sin(elevation) (0.5 is the 2:1 view), S = scale
+ *   fit(C, points, cx, cy)                 centres the box of [x, y, z] points on (cx, cy); call it once, before proj
+ *                                          it only centres, it never scales: choose S by trying values, with the most extreme pose in points.
+ *                                          The six figures use S 1.42 to 2.12; the boxes they fit come out 230 to 310 wide and 180 to 245 tall
+ *   proj(C)                                returns P(x, y, z), which gives [sx, sy]
+ *   unproj(C, sx, sy, z)                   the world [x, y] under a screen point, on the plane at height z
+ *   facing(C)                              returns front(sample): whether a ring sample faces the camera
+ * Rounded solids
+ *   rrect(u0, v0, u1, v1, r, n)            a rounded rectangle, as a ring of samples {u, v, nu, nv}
+ *   circ(R, n)                             a circle, as a ring
+ *   rings(x0, y0, x1, y1, r, b)            [ring, inner]: a rounded footprint and its crease ring, inset by b
+ *                                          r, the corner radius, is cut to half the shorter side. b, the crease's inset in world units
+ *                                          (0.6 to 2.2 in the figures), must stay under half the shorter side or the crease turns inside out
+ *   prism(P, front, ring, inner, z0, z1)   {sil, crease}: a solid standing from z0 to z1, as two path strings
+ *   ringAt(P, ring, z)                     the ring's points, projected at height z
+ *   run(ring, keep)                        the one cyclic run of samples that pass keep
+ *   hull(points)                           the convex hull of screen points
+ *   extremes(P, ring)                      [left, right, nearest] samples: where dashed drops fall from
+ *   fillet(points, radii, n)               rounds every vertex of a closed polygon; returns the new points
+ *                                          radii is an array, one radius per vertex, each cut to half its shorter edge; a single number gives NaN.
+ *                                          n is the steps round each corner, default 4: each vertex becomes n + 1 points
+ *   ghost(P, front, ring, z0, depth)       a reflection's path {d, y0, y1}; reflect() draws it for you
+ * Paths and numbers
+ *   poly(points)                           a closed path string
+ *   open(points)                           an open polyline string
+ *   seg(a, b)                              one segment between two screen points [sx, sy], as its own subpath; project world points with P first
+ *   clamp(v, a, b)
+ *   lerp(a, b, t)
+ *   rad(deg)
+ *   r2(n)                                  two decimals
+ * The continuous clock: one spring per moving number
+ *   spring(x, opts)                        at rest on x; write .t to retarget; opts {k, c, m, eps}, default k 100, c 18, m 1
+ *   stepS(sp, dt)                          advances by dt seconds; returns whether it is still moving
+ * The discrete clock: a 700ms tween on (.32, .72, 0, 1)
+ *   tween(v, dur)                          at rest on v; dur defaults to 700 (ms)
+ *   tset(tw, to, now, delay)               retargets from where it is, after delay ms: the stagger
+ *                                          the same target again does nothing, so calling it on every pointer move is safe
+ *   tval(tw, now)                          its value at now
+ *   tdone(tw, now)                         whether it has landed
+ *   bezier(x1, y1, x2, y2)                 a CSS cubic-bezier, as a function of progress
+ *   EASE_LIFT                              the lift curve itself
+ *   reducedMotion()                        true when the reader asked for less motion; springs and tweens already land at once
+ *   setReducedMotion(on)                   the loop's business, not a figure's
+ * Drawing
+ *   mk(tag, attrs, parent)                 one svg element: the only way a figure makes a node
+ *   solid(parent)                          {g, sil, cr}: a group holding a silhouette path and a crease path
+ *   put(solid, paths)                      writes prism()'s {sil, crease} into solid()'s {sil, cr}: sil into sil, crease into cr
+ *   flatDot(parent, C, r, cls)             a dot lying on the ground plane; cls is "dot", "dot m" or "dot off"
+ *   place(el, point)                       moves a dot or a circle to [sx, sy]
+ *   reflect(svg, parent, P, front, ring, z0, depth)   a fading mirror under a solid
+ *   fade(svg, y0, y1, a0)                  a vertical fade, as a mask; returns the value for a mask attribute
+ * Life
+ *   register(stage, tick)                  joins the one frame loop; tick(dt in seconds, now in ms) returns true to ask for another frame; gives {wake, unregister}
+ *   pointer(stage, handlers)               {move(point), down(point), leave()}, points in viewBox units; returns its disposer
+ *   disposer()                             {add, on, dispose}: collects tear-down, so destroy is bag.dispose
+ * The bench's business, not a figure's
+ *   css(lightDark)
+ *   inject(root)
+ *   tour(stage, stops, onStop)             an unseen pointer that walks the stops, [x, y] in viewBox units or null to leave, and gives way to a real one; onStop(i) on each arrival; returns {stop}
+ *   LAP                                    the default stops: a diamond around the centre, then a leave
+ *
+ * Classes, on path, polygon, ellipse and line. They are the whole palette; a
+ * figure sets no colour, width or fill of its own.
+ *     (none)   filled with the ground colour, medium stroke
+ *     sil      the silhouette's stroke        hi    the bright stroke: the only highlight
+ *     lo       the dim stroke                 nf    no fill        fo   fill only, no stroke
+ *     dash     a dashed guide
+ *     dot      a bright dot                   dot m   a medium dot     dot off   a dim dot
+ */
+var HL = (() => {
+  var __defProp = Object.defineProperty;
+  var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+  var __getOwnPropNames = Object.getOwnPropertyNames;
+  var __hasOwnProp = Object.prototype.hasOwnProperty;
+  var __export = (target, all) => {
+    for (var name in all)
+      __defProp(target, name, { get: all[name], enumerable: true });
+  };
+  var __copyProps = (to, from, except, desc) => {
+    if (from && typeof from === "object" || typeof from === "function") {
+      for (let key of __getOwnPropNames(from))
+        if (!__hasOwnProp.call(to, key) && key !== except)
+          __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+    }
+    return to;
+  };
+  var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+  // packages/hairline/src/core/kernel.ts
+  var kernel_exports = {};
+  __export(kernel_exports, {
+    Cam: () => Cam,
+    EASE_LIFT: () => EASE_LIFT,
+    LAP: () => LAP,
+    bezier: () => bezier,
+    circ: () => circ,
+    clamp: () => clamp,
+    css: () => css,
+    disposer: () => disposer,
+    extremes: () => extremes,
+    facing: () => facing,
+    fade: () => fade,
+    fillet: () => fillet,
+    fit: () => fit,
+    flatDot: () => flatDot,
+    ghost: () => ghost,
+    hull: () => hull,
+    inject: () => inject,
+    lerp: () => lerp,
+    mk: () => mk,
+    open: () => open,
+    place: () => place,
+    pointer: () => pointer,
+    poly: () => poly,
+    prism: () => prism,
+    proj: () => proj,
+    put: () => put,
+    r2: () => r2,
+    rad: () => rad,
+    reducedMotion: () => reducedMotion,
+    reflect: () => reflect,
+    register: () => register,
+    ringAt: () => ringAt,
+    rings: () => rings,
+    rrect: () => rrect,
+    run: () => run,
+    seg: () => seg,
+    setReducedMotion: () => setReducedMotion,
+    solid: () => solid,
+    spring: () => spring,
+    stepS: () => stepS,
+    tdone: () => tdone,
+    tour: () => tour,
+    tset: () => tset,
+    tval: () => tval,
+    tween: () => tween,
+    unproj: () => unproj
+  });
+
+  // packages/hairline/src/core/iso.ts
+  var clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  var lerp = (a, b, t) => a + (b - a) * t;
+  var rad = (d) => d * Math.PI / 180;
+  var r2 = (n) => Math.round(n * 100) / 100;
+  var poly = (pts) => "M" + pts.map((p) => r2(p[0]) + " " + r2(p[1])).join("L") + "Z";
+  var seg = (a, b) => `M${r2(a[0])} ${r2(a[1])}L${r2(b[0])} ${r2(b[1])}`;
+  var open = (pts) => pts.length < 2 ? "" : "M" + pts.map((p) => r2(p[0]) + " " + r2(p[1])).join("L");
+  var Cam = (azDeg, k, S) => ({ az: rad(azDeg), k, S, ox: 0, oy: 0 });
+  function proj(C) {
+    const c = Math.cos(C.az), s = Math.sin(C.az), zf = Math.sqrt(1 - C.k * C.k);
+    return (x, y, z) => {
+      const X = x * c - y * s, Y = x * s + y * c;
+      return [C.ox + C.S * X, C.oy + C.S * (Y * C.k - z * zf)];
+    };
+  }
+  function unproj(C, sx, sy, z) {
+    const c = Math.cos(C.az), s = Math.sin(C.az), zf = Math.sqrt(1 - C.k * C.k);
+    const X = (sx - C.ox) / C.S, Y = ((sy - C.oy) / C.S + z * zf) / C.k;
+    return [X * c + Y * s, -X * s + Y * c];
+  }
+  function fit(C, pts, cx, cy) {
+    C.ox = 0;
+    C.oy = 0;
+    const P = proj(C);
+    let a = 1e9, b = -1e9, c = 1e9, d = -1e9;
+    for (const p of pts) {
+      const q = P(p[0], p[1], p[2]);
+      a = Math.min(a, q[0]);
+      b = Math.max(b, q[0]);
+      c = Math.min(c, q[1]);
+      d = Math.max(d, q[1]);
+    }
+    C.ox = cx - (a + b) / 2;
+    C.oy = cy - (c + d) / 2;
+  }
+  function rrect(u0, v0, u1, v1, r, n = 4) {
+    r = Math.max(0, Math.min(r, (u1 - u0) / 2, (v1 - v0) / 2));
+    const out = [];
+    for (const [cu, cv, a0] of [[u1 - r, v1 - r, 0], [u0 + r, v1 - r, 90], [u0 + r, v0 + r, 180], [u1 - r, v0 + r, 270]])
+      for (let k = 0; k <= n; k++) {
+        const a = rad(a0 + 90 * k / n), ca = Math.cos(a), sa = Math.sin(a);
+        out.push({ u: cu + r * ca, v: cv + r * sa, nu: ca, nv: sa });
+      }
+    return out;
+  }
+  function circ(R, n = 96) {
+    const out = [];
+    for (let k = 0; k < n; k++) {
+      const a = k / n * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+      out.push({ u: R * ca, v: R * sa, nu: ca, nv: sa });
+    }
+    return out;
+  }
+  function hull(input) {
+    const pts = input.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const x = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lo = [], up = [];
+    for (const p of pts) {
+      while (lo.length > 1 && x(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop();
+      lo.push(p);
+    }
+    for (let i = pts.length - 1; i >= 0; i--) {
+      const p = pts[i];
+      while (up.length > 1 && x(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop();
+      up.push(p);
+    }
+    lo.pop();
+    up.pop();
+    return lo.concat(up);
+  }
+  var ringAt = (P, ring, z) => ring.map((q) => P(q.u, q.v, z));
+  var facing = (C) => {
+    const s = Math.sin(C.az), c = Math.cos(C.az);
+    return (q) => q.nu * s + q.nv * c >= -1e-6;
+  };
+  function run(ring, keep) {
+    const n = ring.length;
+    let s = -1;
+    for (let i = 0; i < n; i++) if (keep(ring[i]) && !keep(ring[(i + n - 1) % n])) {
+      s = i;
+      break;
+    }
+    if (s < 0) return keep(ring[0]) ? ring.slice() : [];
+    const out = [];
+    for (let k = 0; k < n && keep(ring[(s + k) % n]); k++) out.push(ring[(s + k) % n]);
+    return out;
+  }
+  function prism(P, front, ring, inner, z0, z1) {
+    return {
+      sil: poly(hull(ringAt(P, ring, z1).concat(ringAt(P, ring, z0)))),
+      crease: inner ? open(ringAt(P, run(inner, front), z1)) : ""
+    };
+  }
+  var rings = (x0, y0, x1, y1, r, b) => [
+    rrect(x0, y0, x1, y1, r),
+    rrect(x0 + b, y0 + b, x1 - b, y1 - b, Math.max(0.3, r - b))
+  ];
+  function extremes(P, ring) {
+    const pr = ring.map((q) => P(q.u, q.v, 0));
+    let a = 0, b = 0, c = 0;
+    pr.forEach((p, k) => {
+      if (p[0] < pr[a][0]) a = k;
+      if (p[0] > pr[b][0]) b = k;
+      if (p[1] > pr[c][1]) c = k;
+    });
+    return [ring[a], ring[b], ring[c]];
+  }
+  function fillet(pts, rs, n = 4) {
+    const m = pts.length, out = [];
+    for (let i = 0; i < m; i++) {
+      const a = pts[(i + m - 1) % m], p = pts[i], b = pts[(i + 1) % m];
+      const la = Math.hypot(a[0] - p[0], a[1] - p[1]), lb = Math.hypot(b[0] - p[0], b[1] - p[1]);
+      const t = Math.min(rs[i], la / 2, lb / 2);
+      const p1 = [p[0] + (a[0] - p[0]) / la * t, p[1] + (a[1] - p[1]) / la * t];
+      const p2 = [p[0] + (b[0] - p[0]) / lb * t, p[1] + (b[1] - p[1]) / lb * t];
+      for (let k = 0; k <= n; k++) {
+        const s = k / n, w = 1 - s;
+        out.push([w * w * p1[0] + 2 * w * s * p[0] + s * s * p2[0], w * w * p1[1] + 2 * w * s * p[1] + s * s * p2[1]]);
+      }
+    }
+    return out;
+  }
+  function ghost(P, front, ring, z0, depth) {
+    const f = run(ring, front), lowP = ringAt(P, f, z0 - depth);
+    return {
+      d: open(lowP) + [f[0], f[f.length - 1]].map((q) => seg(P(q.u, q.v, z0), P(q.u, q.v, z0 - depth))).join(""),
+      y0: Math.min(...ringAt(P, f, z0).map((p) => p[1])),
+      y1: Math.max(...lowP.map((p) => p[1])) + 2
+    };
+  }
+
+  // packages/hairline/src/core/motion.ts
+  var reduced = false;
+  var setReducedMotion = (on) => {
+    reduced = on;
+  };
+  var reducedMotion = () => reduced;
+  function spring(x, o = {}) {
+    return { x, v: 0, t: x, k: o.k ?? 100, c: o.c ?? 18, m: o.m ?? 1, eps: o.eps ?? 0.01 };
+  }
+  function stepS(sp, dt) {
+    if (reduced) {
+      sp.x = sp.t;
+      sp.v = 0;
+      return false;
+    }
+    const n = Math.max(1, Math.ceil(dt * 240)), h = dt / n;
+    for (let i = 0; i < n; i++) {
+      const a = (-sp.k * (sp.x - sp.t) - sp.c * sp.v) / sp.m;
+      sp.v += a * h;
+      sp.x += sp.v * h;
+    }
+    if (Math.abs(sp.x - sp.t) < sp.eps && Math.abs(sp.v) < sp.eps * 10) {
+      sp.x = sp.t;
+      sp.v = 0;
+      return false;
+    }
+    return true;
+  }
+  function bezier(x1, y1, x2, y2) {
+    const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+    const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+    const X = (u) => ((ax * u + bx) * u + cx) * u;
+    const Y = (u) => ((ay * u + by) * u + cy) * u;
+    const dX = (u) => (3 * ax * u + 2 * bx) * u + cx;
+    return (t) => {
+      if (t <= 0) return 0;
+      if (t >= 1) return 1;
+      let u = t;
+      for (let i = 0; i < 8; i++) {
+        const e = X(u) - t;
+        if (Math.abs(e) < 1e-5) break;
+        const d = dX(u);
+        if (Math.abs(d) < 1e-6) break;
+        u -= e / d;
+      }
+      if (!(u >= 0 && u <= 1) || Math.abs(X(u) - t) > 1e-4) {
+        let lo = 0, hi = 1;
+        u = t;
+        for (let i = 0; i < 24; i++) {
+          if (X(u) < t) lo = u;
+          else hi = u;
+          u = (lo + hi) / 2;
+        }
+      }
+      return Y(u);
+    };
+  }
+  var EASE_LIFT = bezier(0.32, 0.72, 0, 1);
+  var tween = (v, dur = 700) => ({ from: v, to: v, t0: -1e9, dur });
+  var tval = (tw, now) => {
+    const p = clamp((now - tw.t0) / tw.dur, 0, 1);
+    return tw.from + (tw.to - tw.from) * (reduced ? 1 : EASE_LIFT(p));
+  };
+  var tset = (tw, to, now, delay) => {
+    if (tw.to === to) return;
+    tw.from = tval(tw, now);
+    tw.to = to;
+    tw.t0 = now + delay;
+  };
+  var tdone = (tw, now) => reduced || now >= tw.t0 + tw.dur;
+
+  // packages/hairline/src/core/stage.ts
+  var NS = "http://www.w3.org/2000/svg";
+  function mk(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    if (attrs) for (const k in attrs) e.setAttribute(k, String(attrs[k]));
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function solid(parent) {
+    const g = mk("g", {}, parent);
+    return { g, sil: mk("path", { class: "sil" }, g), cr: mk("path", { class: "nf lo" }, g) };
+  }
+  var put = (el, s) => {
+    el.sil.setAttribute("d", s.sil);
+    el.cr.setAttribute("d", s.crease);
+  };
+  var flatDot = (parent, C, r, cls) => mk("ellipse", { rx: r2(r * C.S), ry: r2(r * C.S * C.k), class: cls }, parent);
+  var place = (el, q) => {
+    el.setAttribute("cx", String(r2(q[0])));
+    el.setAttribute("cy", String(r2(q[1])));
+  };
+  var fid = 0;
+  function fade(svg, y0, y1, a0 = 0.7) {
+    const id = "hl-fd" + ++fid, defs = mk("defs", {}, svg);
+    const lg = mk("linearGradient", { id: id + "g", gradientUnits: "userSpaceOnUse", x1: 0, y1: r2(y0), x2: 0, y2: r2(y1) }, defs);
+    mk("stop", { offset: 0, "stop-color": "#fff", "stop-opacity": a0 }, lg);
+    mk("stop", { offset: 1, "stop-color": "#fff", "stop-opacity": 0 }, lg);
+    const m = mk("mask", { id, maskUnits: "userSpaceOnUse", x: 0, y: 0, width: 400, height: 320 }, defs);
+    mk("rect", { x: 0, y: 0, width: 400, height: 320, fill: `url(#${id}g)` }, m);
+    return `url(#${id})`;
+  }
+  function reflect(svg, parent, P, front, ring, z0, depth) {
+    const r = ghost(P, front, ring, z0, depth);
+    const gh = mk("g", { class: "ghost", mask: fade(svg, r.y0, r.y1) }, parent);
+    mk("path", { d: r.d }, gh);
+  }
+  var boards = [];
+  var byStage = /* @__PURE__ */ new Map();
+  var raf = 0;
+  var last = 0;
+  var io = null;
+  var rm = null;
+  function frame() {
+    const now = performance.now();
+    const dt = Math.min(0.05, Math.max(0, (now - last) / 1e3));
+    last = now;
+    let any = false;
+    for (const b of boards.slice()) if (b.vis && b.awake) {
+      try {
+        b.awake = !!b.tick(dt, now);
+      } catch (err) {
+        b.awake = false;
+        setTimeout(() => {
+          throw err;
+        });
+      }
+      any = any || b.awake;
+    }
+    raf = any ? requestAnimationFrame(frame) : 0;
+  }
+  function wake(b) {
+    b.awake = true;
+    if (!raf) {
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+  }
+  var onMotion = () => {
+    setReducedMotion(!!rm?.matches);
+    boards.forEach(wake);
+  };
+  function start() {
+    if (io) return;
+    io = new IntersectionObserver((es) => {
+      for (const e of es) {
+        const set = byStage.get(e.target);
+        if (!set) continue;
+        for (const b of set) {
+          b.vis = e.isIntersecting;
+          if (b.vis) wake(b);
+        }
+      }
+    }, { rootMargin: "80px" });
+    rm = matchMedia("(prefers-reduced-motion: reduce)");
+    setReducedMotion(rm.matches);
+    rm.addEventListener("change", onMotion);
+  }
+  function stop() {
+    if (raf) cancelAnimationFrame(raf);
+    raf = 0;
+    io?.disconnect();
+    io = null;
+    rm?.removeEventListener("change", onMotion);
+    rm = null;
+  }
+  function register(stage, tick) {
+    start();
+    const b = { stage, tick, vis: false, awake: true };
+    boards.push(b);
+    const peers = byStage.get(stage);
+    if (peers) {
+      for (const p of peers) b.vis = p.vis;
+      peers.add(b);
+      if (b.vis) wake(b);
+    } else {
+      byStage.set(stage, /* @__PURE__ */ new Set([b]));
+      io.observe(stage);
+    }
+    tick(0, performance.now());
+    let gone = false;
+    return {
+      wake: () => {
+        if (!gone) wake(b);
+      },
+      unregister: () => {
+        if (gone) return;
+        gone = true;
+        boards = boards.filter((x) => x !== b);
+        const set = byStage.get(stage);
+        if (set) {
+          set.delete(b);
+          if (!set.size) {
+            byStage.delete(stage);
+            io?.unobserve(stage);
+          }
+        }
+        if (!boards.length) stop();
+      }
+    };
+  }
+  var handlers = /* @__PURE__ */ new WeakMap();
+  var touring = /* @__PURE__ */ new WeakMap();
+  function pointer(stage, on) {
+    handlers.set(stage, on);
+    let tm = 0;
+    const pt = (e) => {
+      const r = stage.getBoundingClientRect();
+      return [(e.clientX - r.left) / r.width * 400, (e.clientY - r.top) / r.height * 320];
+    };
+    const move = (e) => {
+      clearTimeout(tm);
+      touring.get(stage)?.hold();
+      on.move(pt(e), e);
+    };
+    const down = (e) => {
+      clearTimeout(tm);
+      touring.get(stage)?.hold();
+      if (e.pointerType !== "mouse") stage.releasePointerCapture?.(e.pointerId);
+      if (on.down) on.down(pt(e), e);
+      else on.move(pt(e), e);
+    };
+    const leave = (e) => {
+      clearTimeout(tm);
+      tm = window.setTimeout(() => {
+        on.leave(e);
+        touring.get(stage)?.release();
+      }, e.pointerType === "mouse" ? 0 : 1400);
+    };
+    stage.addEventListener("pointermove", move);
+    stage.addEventListener("pointerdown", down);
+    stage.addEventListener("pointerleave", leave);
+    return () => {
+      clearTimeout(tm);
+      if (handlers.get(stage) === on) handlers.delete(stage);
+      stage.removeEventListener("pointermove", move);
+      stage.removeEventListener("pointerdown", down);
+      stage.removeEventListener("pointerleave", leave);
+    };
+  }
+  var LAP = [[128, 150], [200, 118], [272, 150], [200, 206], null];
+  var TRAVEL = 900;
+  var DWELL = 1200;
+  var REST = 1800;
+  var RESUME = 1200;
+  var STAGGER = 450;
+  var GHOST = { pointerType: "ghost" };
+  var started = 0;
+  function entry([x, y]) {
+    const dx = x - 200, dy = y - 160;
+    if (!dx && !dy) return [200, 320];
+    const k = Math.min(dx ? (dx > 0 ? 200 : -200) / dx : Infinity, dy ? (dy > 0 ? 160 : -160) / dy : Infinity);
+    return [200 + dx * k, 160 + dy * k];
+  }
+  function tour(stage, stops, onStop) {
+    let i = 0;
+    let wait = RESUME + STAGGER * (started++ % 4);
+    let t = -1;
+    let at = null;
+    let origin = [200, 320];
+    let hand = false, keys = stage.contains(stage.ownerDocument.activeElement);
+    let gone = false;
+    const leave = () => {
+      at = null;
+      t = -1;
+      handlers.get(stage)?.leave(GHOST);
+    };
+    const tick = (dt) => {
+      if (hand || keys || !stops.length) return false;
+      if (reducedMotion()) {
+        if (at) leave();
+        return false;
+      }
+      if (wait > 0) {
+        wait -= dt * 1e3;
+        return true;
+      }
+      const stop2 = stops[i];
+      if (stop2 === null) {
+        if (at) leave();
+        onStop?.(i);
+        i = (i + 1) % stops.length;
+        wait = REST;
+        return true;
+      }
+      const h = handlers.get(stage);
+      if (!h) return true;
+      if (t < 0) {
+        origin = at ?? entry(stop2);
+        t = 0;
+      }
+      t = Math.min(TRAVEL, t + dt * 1e3);
+      const k = EASE_LIFT(t / TRAVEL);
+      at = [origin[0] + (stop2[0] - origin[0]) * k, origin[1] + (stop2[1] - origin[1]) * k];
+      h.move(at, GHOST);
+      if (t < TRAVEL) return true;
+      onStop?.(i);
+      i = (i + 1) % stops.length;
+      t = -1;
+      wait = DWELL;
+      return true;
+    };
+    const take = () => {
+      at = null;
+      t = -1;
+    };
+    const give = () => {
+      if (hand || keys) return;
+      i = 0;
+      t = -1;
+      wait = RESUME;
+      board.wake();
+    };
+    const me = {
+      hold: () => {
+        hand = true;
+        take();
+      },
+      release: () => {
+        if (!hand) return;
+        hand = false;
+        give();
+      }
+    };
+    const focusIn = () => {
+      keys = true;
+      take();
+    };
+    const focusOut = (e) => {
+      if (keys && !stage.contains(e.relatedTarget)) {
+        keys = false;
+        give();
+      }
+    };
+    stage.addEventListener("focusin", focusIn);
+    stage.addEventListener("focusout", focusOut);
+    touring.set(stage, me);
+    const board = register(stage, tick);
+    return {
+      stop: () => {
+        if (gone) return;
+        gone = true;
+        board.unregister();
+        stage.removeEventListener("focusin", focusIn);
+        stage.removeEventListener("focusout", focusOut);
+        if (touring.get(stage) === me) touring.delete(stage);
+        if (at) leave();
+      }
+    };
+  }
+  function disposer() {
+    let fns = [];
+    return {
+      add: (fn) => {
+        fns.push(fn);
+      },
+      on: (target, type, fn, opts) => {
+        const h = fn;
+        target.addEventListener(type, h, opts);
+        fns.push(() => target.removeEventListener(type, h, opts));
+      },
+      dispose: () => {
+        const run2 = fns;
+        fns = [];
+        for (let i = run2.length - 1; i >= 0; i--) run2[i]();
+      }
+    };
+  }
+
+  // packages/hairline/src/core/styles.ts
+  var LIGHT = { plate: "#ffffff", hi: "#232327", edge: "#a4a4ac", mid: "#c3c3c9", lo: "#e0e0e4" };
+  var DARK = { plate: "#08090a", hi: "#d0d6e0", edge: "#5b5d64", mid: "#3e3e44", lo: "#29292d" };
+  var KEYS = ["plate", "hi", "edge", "mid", "lo"];
+  var vars = (p) => KEYS.map((k) => `--hl-${k}:var(--hairline-${k},${p[k]});`).join("");
+  var EASE = "cubic-bezier(0.5,0,0.1,1)";
+  var SVG = ":where([data-hairline]>svg)";
+  function css(lightDark) {
+    const both = Object.fromEntries(KEYS.map((k) => [k, `light-dark(${LIGHT[k]},${DARK[k]})`]));
+    return [
+      // the box, and the palette: light unless something below says otherwise
+      `:where([data-hairline]){display:block;position:relative;aspect-ratio:5/4;touch-action:pan-y;user-select:none;-webkit-user-select:none;--hl-sw:var(--hairline-stroke,0.9);${vars(LIGHT)}}`,
+      // the page's color-scheme
+      lightDark ? `:where([data-hairline]){${vars(both)}}` : "",
+      // an ancestor that says dark
+      `:where(.dark,[data-theme="dark"]) :where([data-hairline]){${vars(DARK)}}`,
+      // the figure's own theme option
+      `:where([data-hairline][data-hairline-theme="light"]){${vars(LIGHT)}}`,
+      `:where([data-hairline][data-hairline-theme="dark"]){${vars(DARK)}}`,
+      `:where([data-hairline]:focus-visible){outline:1.5px solid var(--hl-hi);outline-offset:2px}`,
+      `${SVG}{position:absolute;inset:0;width:100%;height:100%;display:block}`,
+      // Riffle's live region: read, not seen
+      `:where([data-hairline]>[data-hairline-live]){position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}`,
+      // the drawing: plates are filled with the plate colour and painted back to front
+      `${SVG} :where(path,polygon,ellipse,line){fill:var(--hl-plate);stroke:var(--hl-mid);stroke-width:var(--hl-sw);vector-effect:non-scaling-stroke;stroke-linejoin:round;stroke-linecap:round;transition:stroke 260ms ${EASE}}`,
+      `${SVG} :where(.nf){fill:none}`,
+      `${SVG} :where(.fo){stroke:none}`,
+      `${SVG} :where(.sil){stroke:var(--hl-edge)}`,
+      `${SVG} :where(.hi){stroke:var(--hl-hi)}`,
+      `${SVG} :where(.lo){stroke:var(--hl-lo)}`,
+      `${SVG} :where(.dash){stroke-dasharray:1 3}`,
+      `${SVG} :where(.dot){stroke:none;fill:var(--hl-hi);transition:fill 260ms ${EASE}}`,
+      `${SVG} :where(.dot.m){fill:var(--hl-edge)}`,
+      `${SVG} :where(.dot.off){fill:var(--hl-lo)}`,
+      `${SVG} :where(.ghost path){fill:none;stroke:var(--hl-mid)}`
+    ].join("");
+  }
+  var done = /* @__PURE__ */ new WeakSet();
+  function inject(root) {
+    if (done.has(root)) return;
+    done.add(root);
+    const doc = root.nodeType === 9 ? root : root.ownerDocument;
+    const win = doc.defaultView;
+    const text = css(!!win?.CSS?.supports?.("color", "light-dark(#000,#fff)"));
+    if (win && "adoptedStyleSheets" in root) {
+      try {
+        const sheet = new win.CSSStyleSheet();
+        sheet.replaceSync(text);
+        root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+        return;
+      } catch {
+      }
+    }
+    const style = doc.createElement("style");
+    style.setAttribute("data-hairline-style", "");
+    style.textContent = text;
+    (root.nodeType === 9 ? doc.head ?? doc.documentElement : root).appendChild(style);
+  }
+  return __toCommonJS(kernel_exports);
+})();
+/* /hairline kernel */
+
+</script>
+<script>
+/* morsec figures: isometric hairline scenes drawn with the @lucasmarkes/hairline kernel (MIT).
+   The idea that runs through all of them: a reference travels the wires as Morse code. Where it is
+   allowed, the broker decodes it into one unbroken line (the value). Where it is not, it piles up
+   against a gate and goes dim. Values never travel toward the agent. */
+(() => {
+  const { Cam, fit, proj, facing, rings, prism, ringAt, rrect, run, hull, poly, open, seg, circ,
+    mk, solid, put, register, flatDot, place, clamp, lerp, reducedMotion, inject } = HL;
+  inject(document);
+
+  // ---------- morse ----------
+  const CODE = { a: ".-", b: "-...", c: "-.-.", d: "-..", e: ".", f: "..-.", g: "--.", h: "....", i: "..", j: ".---", k: "-.-",
+    l: ".-..", m: "--", n: "-.", o: "---", p: ".--.", q: "--.-", r: ".-.", s: "...", t: "-", u: "..-", v: "...-", w: ".--",
+    x: "-..-", y: "-.--", z: "--..", "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-", "5": ".....",
+    "6": "-....", "7": "--...", "8": "---..", "9": "----.", "/": "-..-.", ":": "---...", ".": ".-.-.-" };
+  /** A word as marks: [start, length] in units, front of the train first (start 0 is the head). */
+  function morse(word) {
+    const out = []; let at = 0;
+    for (const ch of word.toLowerCase()) {
+      const c = CODE[ch]; if (!c) { at += 4; continue; }
+      for (const m of c) { const l = m === "-" ? 3 : 1; out.push([at, l]); at += l + 1; }
+      at += 2;
+    }
+    return { marks: out, len: at };
+  }
+  window.MORSE = CODE;
+
+  // ---------- scene ----------
+  function scene(stage, pts, opts = {}) {
+    const svg = stage.querySelector("svg");
+    const mw = opts.w || 330, mh = opts.h || 250, cy = opts.cy || 164;
+    const C0 = Cam(45, 0.5, 1); fit(C0, pts, 200, cy);
+    const P0 = proj(C0);
+    let a = 1e9, b = -1e9, c = 1e9, d = -1e9;
+    for (const p of pts) { const q = P0(p[0], p[1], p[2]); a = Math.min(a, q[0]); b = Math.max(b, q[0]); c = Math.min(c, q[1]); d = Math.max(d, q[1]); }
+    const C = Cam(45, 0.5, Math.min(mw / (b - a), mh / (d - c)));
+    fit(C, pts, 200, cy);
+    const P = proj(C), front = facing(C);
+    const ground = mk("g", {}, svg), body = mk("g", {}, svg), top = mk("g", {}, svg);
+    return { svg, C, P, front, ground, body, top, stage };
+  }
+  /** A rounded solid; set(z0, z1) restands it. */
+  function block(sc, x0, y0, x1, y1, z0, z1, r = 3, b = 1.1, parent) {
+    const [ring, inner] = rings(x0, y0, x1, y1, r, b);
+    const s = solid(parent || sc.body);
+    const o = { s, ring, z0, z1, set(a, c) { if (a === o.z0 && c === o.z1 && o.drawn) return; o.z0 = a; o.z1 = c; o.drawn = true; put(s, prism(sc.P, sc.front, ring, inner, a, c)); } };
+    o.set(z0, z1); return o;
+  }
+  /** A cylinder centred on (cx, cy). */
+  function cyl(sc, cx, cy, R, z0, z1, parent) {
+    const shift = (rg) => rg.map((q) => ({ u: q.u + cx, v: q.v + cy, nu: q.nu, nv: q.nv }));
+    const ring = shift(circ(R, 48)), inner = shift(circ(Math.max(.4, R - 1.2), 48));
+    const s = solid(parent || sc.body);
+    const o = { s, z0, z1, set(a, c) { if (a === o.z0 && c === o.z1 && o.drawn) return; o.z0 = a; o.z1 = c; o.drawn = true; put(s, prism(sc.P, sc.front, ring, inner, a, c)); } };
+    o.set(z0, z1); return o;
+  }
+  /** A flat ellipse ring on the ground (a ripple). */
+  function groundRing(sc, cx, cy, parent) {
+    const el = mk("path", { class: "nf lo" }, parent || sc.ground);
+    return { el, set(R, cls) { el.setAttribute("d", R <= 0 ? "" : poly(circ(R, 48).map((q) => sc.P(q.u + cx, q.v + cy, 0)))); if (cls) el.setAttribute("class", cls); } };
+  }
+  /** A wire on the ground: a dashed guide, and the ability to draw any stretch of it. */
+  function wire(sc, pts, z = 0) {
+    const segs = []; let L = 0;
+    for (let i = 1; i < pts.length; i++) { const l = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); segs.push([L, l]); L += l; }
+    const at = (s) => {
+      s = clamp(s, 0, L);
+      for (let i = 0; i < segs.length; i++) {
+        const [a, l] = segs[i];
+        if (s <= a + l || i === segs.length - 1) { const t = l ? (s - a) / l : 0; return [lerp(pts[i][0], pts[i + 1][0], t), lerp(pts[i][1], pts[i + 1][1], t), z]; }
+      }
+    };
+    const sub = (s0, s1) => {
+      s0 = clamp(s0, 0, L); s1 = clamp(s1, 0, L); if (s1 - s0 < .05) return "";
+      const out = [at(s0)];
+      for (let i = 0; i < segs.length; i++) { const v = segs[i][0] + segs[i][1]; if (v > s0 && v < s1) out.push([...pts[i + 1], z]); }
+      out.push(at(s1));
+      return open(out.map((p) => sc.P(p[0], p[1], p[2])));
+    };
+    mk("path", { class: "nf dash", d: open(pts.map((p) => sc.P(p[0], p[1], z))) }, sc.ground);
+    return { L, at, sub };
+  }
+  /** A morse train on a wire; head is the distance its front has run, u the world length of one unit. */
+  function train(sc, w, word, u, cls = "sig") {
+    const m = morse(word), el = mk("path", { class: cls }, sc.top);
+    let last = "";
+    return {
+      len: m.len * u,
+      el,
+      draw(head, pile = Infinity, gapK = 1) {
+        let d = "";
+        if (head > 0) {
+          for (const [a, l] of m.marks) {
+            let s1 = head - a * u * gapK, s0 = s1 - l * u * gapK;
+            if (s1 > pile) { const k = (s1 - pile); s1 = pile - k * 0.08; s0 = s1 - l * u * 0.35; }
+            d += w.sub(s0, s1);
+          }
+        }
+        if (d !== last) { el.setAttribute("d", d); last = d; }
+      },
+      cls(c) { el.setAttribute("class", c); },
+    };
+  }
+  /** Lines on an upright face: plane x = const, rows along y. */
+  const rowsX = (sc, x, y0, y1, zs, parent, cls = "nf lo") => mk("path", { class: cls, d: zs.map((z) => seg(sc.P(x, y0, z), sc.P(x, y1, z))).join("") }, parent || sc.body);
+  const rowsY = (sc, y, x0, x1, zs, parent, cls = "nf lo") => mk("path", { class: cls, d: zs.map((z) => seg(sc.P(x0, y, z), sc.P(x1, y, z))).join("") }, parent || sc.body);
+  function dots(sc, n, x, y, parent) {
+    for (let i = 0; i < n; i++) { const d = flatDot(parent || sc.ground, sc.C, 0.9, "dot m"); place(d, sc.P(x + i * 3.2, y, 0)); }
+  }
+
+  const ease = (t) => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+  const easeIO = (t) => { t = clamp(t, 0, 1); return t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; };
+  const ph = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+  const tog = (el, c, on) => el.classList.toggle(c, !!on);
+
+  /** Runs f(t) on the shared loop, looping every `cycle` seconds while visible; at rest under reduced motion. */
+  function animate(stage, cycle, f, still) {
+    if (reducedMotion()) { f(still, true); return; }
+    let t0 = null;
+    register(stage, (_dt, now) => { if (t0 === null) t0 = now; f(((now - t0) / 1000) % cycle, false); return true; });
+  }
+
+  // =====================================================================
+  // HERO: agent, broker, Stripe, an unknown host, and the keychain
+  // =====================================================================
+  function hero(stage, hooks) {
+    const sc = scene(stage, [[0, -12, 0], [170, 124, 0], [136, -12, 56], [0, 120, 44], [0, 130, 0], [172, 90, 0], [4, 76, 44]], { w: 368, h: 286, cy: 162 });
+    const { P } = sc;
+    // wires first: they lie on the ground under everything
+    const W1 = wire(sc, [[26, 95], [34, 95], [34, 62], [42, 62]]);
+    const W2 = wire(sc, [[72, 48], [94, 48], [94, 4], [112, 4]]);
+    const W3 = wire(sc, [[72, 64], [112, 64], [112, 76], [146, 76]]);
+    const W4 = wire(sc, [[88, 92], [88, 82], [62, 82], [62, 72]]);
+    // the agent: a keyboard base and a screen whose rows are text the agent can read
+    const agent = block(sc, 0, 70, 26, 120, 0, 3, 2, .8);
+    const screen = block(sc, 6, 76, 9, 114, 3, 40, 1.2, .5);
+    rowsX(sc, 9.4, 81, 101, [34, 30.5, 27, 23.5]);
+    const ref = mk("path", { class: "ink", d: "" }, sc.body);
+    // the reference as it sits on screen: a short morse word, not a value
+    const mm = morse("ms"); let rd = "";
+    for (const [a, l] of mm.marks) rd += seg(P(9.4, 81 + a * 1.4, 18), P(9.4, 81 + (a + l) * 1.4, 18));
+    ref.setAttribute("d", rd);
+    // the broker: a sealed slab with a lens on top
+    const broker = block(sc, 42, 42, 72, 72, 0, 12, 6, 1.6);
+    const seal = cyl(sc, 57, 57, 5.5, 12, 15);
+    // Stripe: a rack with slots, and a lid that lifts when a value arrives
+    const rack = block(sc, 112, -8, 136, 16, 0, 44, 3, 1.1);
+    rowsY(sc, 16.2, 116, 132, [36, 30, 24, 18, 12]);
+    rowsX(sc, 136.2, -4, 12, [36, 30, 24, 18, 12]);
+    const lid = block(sc, 113, -7, 135, 15, 46, 48, 3, 1);
+    // the gate across the way to the unknown host
+    const gate = block(sc, 78, 54, 80.5, 74, 0, .01, .8, .4);
+    // the keychain: a vault with a dial
+    const vault = block(sc, 74, 92, 104, 118, 0, 12, 5, 1.4);
+    const dial = cyl(sc, 89, 105, 5, 12, 14);
+    // the unknown host: drawn only as a dashed outline, because nothing about it is known
+    const evil = block(sc, 146, 66, 166, 86, 0, 30, 3, 1);
+    evil.s.sil.setAttribute("class", "sil dash"); evil.s.cr.setAttribute("class", "nf dash");
+    // legend dots on the ground, one to four
+    dots(sc, 1, 4, 126); dots(sc, 2, 44, 78); dots(sc, 3, 112, 22); dots(sc, 4, 146, 92);
+    // moving parts
+    const A = train(sc, W1, "ms://", 1.15), B = train(sc, W1, "ms://", 1.15), B3 = train(sc, W3, "ms://", 1.15, "bad");
+    const val = mk("path", { class: "sig" }, sc.top), key = mk("path", { class: "sig" }, sc.top);
+    let lastStep = -1;
+    const parts = { 1: [agent, screen], 2: [broker, seal], 3: [rack, lid], 4: [evil] };
+    function step(n) { if (n === lastStep) return; lastStep = n; hooks && hooks.step && hooks.step(n); }
+    function f(t, still) {
+      // 1. the agent sends the reference
+      A.draw(ph(t, .3, 2.0) * (W1.L + A.len));
+      tog(ref, "on", t > .2 && t < 2.0);
+      // 2. the broker asks the keychain
+      const k = ph(t, 1.9, 2.6);
+      key.setAttribute("d", k > 0 && k < 1 ? W4.sub(k * W4.L - 2.2, k * W4.L) : "");
+      tog(dial.s.sil, "on", t > 1.8 && t < 2.8); tog(seal.s.sil, "on", t > 1.9 && t < 4.6);
+      // 3. the value leaves as one unbroken line, only to Stripe
+      const g = ease(ph(t, 2.6, 3.6)), r = ease(ph(t, 4.4, 5.0));
+      val.setAttribute("d", g > 0 && r < 1 ? W2.sub(r * W2.L, g * W2.L) : "");
+      const lift = ph(t, 3.5, 3.8) - ph(t, 4.2, 4.8);
+      lid.set(46 + 5 * ease(lift), 48 + 5 * ease(lift)); tog(lid.s.sil, "on", lift > .05);
+      // 4. a second send, toward the unknown host: the gate stands up and the marks pile against it
+      B.draw(ph(t, 5.0, 6.6) * (W1.L + B.len));
+      const gh = ease(ph(t, 5.4, 5.9)) * (1 - ease(ph(t, 8.6, 9.1)));
+      gate.set(0, Math.max(.01, 18 * gh));
+      B3.draw(ph(t, 6.1, 7.3) * (B3.len + 10), 5.4);
+      tog(gate.s.sil, "deny", t > 6.9 && t < 8.6);
+      B3.cls(t > 7.6 ? "bad thin" : "bad");
+      if (t > 8.6) B3.draw(0);
+      step(t < 1.9 ? 1 : t < 2.6 ? 2 : t < 5.0 ? 3 : t < 9.1 ? 4 : 0);
+      if (hooks && hooks.tick) hooks.tick(t);
+    }
+    animate(stage, 9.6, f, 3.7);
+    return { highlight(n, on) { (parts[n] || []).forEach((p) => tog(p.s.sil, "hi", on)); } };
+  }
+
+  // =====================================================================
+  // TILES
+  // =====================================================================
+  /** 01 · .env lines give up their values to the vault and keep a morse reference. */
+  function tileImport(stage) {
+    const sc = scene(stage, [[0, 0, 0], [80, 70, 0], [0, 64, 46], [80, 0, 20]], { w: 350, h: 268 });
+    const { P } = sc;
+    const W = wire(sc, [[12, 30], [30, 30], [30, 44], [52, 44]]);
+    block(sc, 0, 4, 12, 66, 0, 2.5, 2, .8);
+    block(sc, 4, 8, 7, 62, 2.5, 46, 1.2, .5);
+    const vault = block(sc, 52, 30, 80, 62, 0, 12, 5, 1.4);
+    const dial = cyl(sc, 66, 46, 5.5, 12, 14.5);
+    const lines = [38, 31, 24, 17], valEls = [], refEls = [];
+    rowsX(sc, 7.4, 12, 22, lines, sc.body);
+    lines.forEach((z) => {
+      valEls.push(mk("path", { class: "sig" }, sc.top));
+      const r = mk("path", { class: "ink" }, sc.body); refEls.push(r);
+      const m = morse("ms"); let d = ""; for (const [a, l] of m.marks) d += seg(P(7.4, 25 + a * 1.25, z), P(7.4, 25 + (a + l) * 1.25, z));
+      r.dataset.d = d;
+    });
+    function f(t) {
+      lines.forEach((z, i) => {
+        const t0 = .4 + i * .9, p = ph(t, t0, t0 + 1.1), reset = t > 6.4;
+        const v = valEls[i], r = refEls[i];
+        if (reset || p <= 0) { v.setAttribute("d", seg(P(7.4, 25, z), P(7.4, 40, z))); r.setAttribute("d", ""); return; }
+        if (p >= 1) { v.setAttribute("d", ""); r.setAttribute("d", r.dataset.d); return; }
+        // lift out of the face, fly in an arc over to the vault's dial, shrinking as it goes
+        const e = easeIO(p), x = lerp(7.4, 66, e), y = lerp(25, 46, e), zz = lerp(z, 15, e) + Math.sin(e * Math.PI) * 14;
+        const len = lerp(15, 2, e);
+        v.setAttribute("d", seg(P(x, y, zz), P(x, y + len, zz)));
+        if (p > .35) r.setAttribute("d", r.dataset.d);
+      });
+      tog(dial.s.sil, "on", [0, 1, 2, 3].some((i) => { const a = .4 + i * .9 + 1.0; return t > a && t < a + .35; }));
+    }
+    animate(stage, 7.2, f, 4.2);
+  }
+
+  /** 02 · morse in, one unbroken line out, to the bound host only. */
+  function tileSwap(stage) {
+    const sc = scene(stage, [[0, 30, 0], [96, 0, 0], [96, 24, 46], [20, 70, 0]], { w: 350, h: 268 });
+    const Win = wire(sc, [[0, 52], [26, 52]]), Wout = wire(sc, [[52, 40], [70, 40], [70, 10], [80, 10]]);
+    const broker = block(sc, 26, 26, 52, 52, 0, 11, 6, 1.6);
+    const seal = cyl(sc, 39, 39, 5, 11, 14);
+    const rack = block(sc, 80, -2, 100, 22, 0, 40, 3, 1.1);
+    rowsY(sc, 22.2, 84, 96, [32, 26, 20, 14]);
+    const lid = block(sc, 81, -1, 99, 21, 42, 44, 3, 1);
+    const T = train(sc, Win, "ms", 1.6), val = mk("path", { class: "sig" }, sc.top);
+    function f(t) {
+      T.draw(ph(t, .2, 1.8) * (Win.L + T.len));
+      tog(seal.s.sil, "on", t > 1.2 && t < 3.6);
+      const g = ease(ph(t, 1.6, 2.6)), r = ease(ph(t, 3.4, 4.0));
+      val.setAttribute("d", g > 0 && r < 1 ? Wout.sub(r * Wout.L, g * Wout.L) : "");
+      const l = ease(ph(t, 2.5, 2.8) - ph(t, 3.2, 3.8)); lid.set(42 + 5 * l, 44 + 5 * l); tog(lid.s.sil, "on", l > .05);
+    }
+    animate(stage, 4.8, f, 2.7);
+  }
+
+  /** 03 · a gate stands up; the marks pile against it and go dim. */
+  function tileBlock(stage) {
+    const sc = scene(stage, [[0, 30, 0], [100, 10, 0], [100, 30, 36], [30, 70, 0], [60, 40, 26]], { w: 350, h: 268 });
+    const Win = wire(sc, [[0, 46], [56, 46], [56, 30], [84, 30]]);
+    const gate = block(sc, 40, 36, 42.5, 56, 0, .01, .8, .4);
+    const host = block(sc, 84, 18, 104, 40, 0, 30, 3, 1);
+    host.s.sil.setAttribute("class", "sil dash"); host.s.cr.setAttribute("class", "nf dash");
+    const T = train(sc, Win, "ms://", 1.3, "bad");
+    function f(t) {
+      gate.set(0, Math.max(.01, 22 * ease(ph(t, .1, .7)) * (1 - ease(ph(t, 4.6, 5.1)))));
+      T.draw(ph(t, .5, 2.2) * (T.len + 30), 38.5);
+      T.cls(t > 2.6 ? "bad thin" : "bad");
+      tog(gate.s.sil, "deny", t > 1.6 && t < 4.6);
+      if (t > 4.6) T.draw(0);
+    }
+    animate(stage, 5.6, f, 2.4);
+  }
+
+  /** 04 · a production key waits at a gate until Touch ID; then one line reaches the database. */
+  function tileApprove(stage) {
+    const sc = scene(stage, [[-16, 40, 0], [104, 0, 0], [100, 20, 40], [20, 74, 0], [-16, 74, 0]], { w: 350, h: 268 });
+    const Win = wire(sc, [[0, 34], [30, 34]]), Wout = wire(sc, [[33, 34], [60, 34], [60, 12], [78, 12]]);
+    const gate = block(sc, 30.5, 26, 33, 42, 0, 16, .8, .4);
+    const pad = cyl(sc, 12, 60, 10, 0, 5);
+    const ripples = [0, 1, 2].map(() => groundRing(sc, 12, 60));
+    const db = [0, 1, 2].map((i) => cyl(sc, 90, 12, 11, i * 11, i * 11 + 9));
+    const T = train(sc, Win, "ms", 1.5), val = mk("path", { class: "sig" }, sc.top);
+    function f(t) {
+      T.draw(Math.min(ph(t, .2, 1.4) * (Win.L + T.len), Win.L + 2), Win.L - .6);
+      const press = ph(t, 1.6, 1.85) - ph(t, 2.1, 2.5);
+      pad.set(0, 5 - 2.4 * ease(press)); tog(pad.s.sil, "on", t > 1.6 && t < 3.2);
+      ripples.forEach((rp, i) => { const p = ph(t, 1.8 + i * .22, 2.9 + i * .22); rp.set(p > 0 && p < 1 ? 11 + p * 26 : 0, p > .6 ? "nf lo" : "nf"); });
+      gate.set(0, Math.max(.01, 16 * (1 - ease(ph(t, 2.4, 2.9))) + 16 * ease(ph(t, 5.0, 5.5))));
+      if (t > 2.6) T.draw(0);
+      const g = ease(ph(t, 2.7, 3.6)), r = ease(ph(t, 4.4, 5.0));
+      val.setAttribute("d", g > 0 && r < 1 ? Wout.sub(r * Wout.L, g * Wout.L) : "");
+      const l = ease(ph(t, 3.5, 3.8) - ph(t, 4.2, 4.8));
+      db[2].set(22 + 4 * l, 31 + 4 * l); tog(db[2].s.sil, "on", l > .05);
+    }
+    animate(stage, 6.0, f, 3.7);
+  }
+
+  /** Release · two clean builds hash the same; then the signature stamps the one that ships. */
+  function tileRelease(stage) {
+    const sc = scene(stage, [[0, -12, 0], [76, 26, 0], [0, 0, 46], [74, -12, 48], [12, 26, 0]], { w: 330, h: 250 });
+    const { P } = sc;
+    const a = block(sc, 0, 0, 24, 24, 0, 20, 3, 1.1);
+    const sa = mk("path", { class: "sig thin" }, sc.body);
+    const b = block(sc, 50, -10, 74, 14, 0, 20, 3, 1.1);
+    const sb = mk("path", { class: "sig thin" }, sc.body);
+    const link = mk("path", { class: "nf dash" }, sc.ground);
+    link.setAttribute("d", seg(P(12, 12, 20), P(62, 2, 20)));
+    const match = mk("path", { class: "sig" }, sc.top);
+    const stamp = cyl(sc, 62, 2, 6, 40, 46, sc.top);
+    function scan(el, x0, y0, x1, y1, z) { el.setAttribute("d", z <= 0 ? "" : seg(P(x1, y0, z), P(x1, y1, z)) + seg(P(x0, y1, z), P(x1, y1, z))); }
+    function f(t) {
+      const h = ph(t, .3, 1.9), z = h > 0 && h < 1 ? 1 + 18 * easeIO(h) : 0;
+      scan(sa, 0, 0, 24.3, 24.3, z); scan(sb, 50, -10, 74.3, 14.3, z);
+      const m = ease(ph(t, 2.0, 2.6)) * (1 - ease(ph(t, 4.6, 5.0)));
+      match.setAttribute("d", m > 0 ? open([P(12, 12, 20), P(lerp(12, 62, m), lerp(12, 2, m), 20)]) : "");
+      tog(a.s.sil, "on", t > 2.5 && t < 4.6); tog(b.s.sil, "on", t > 2.5 && t < 5.4);
+      const d = ease(ph(t, 2.9, 3.4)) - ease(ph(t, 3.7, 4.3));
+      stamp.set(40 - 18 * d, 46 - 18 * d); tog(stamp.s.sil, "on", d > .9);
+    }
+    animate(stage, 6.0, f, 3.5);
+  }
+
+  window.MorsecFigures = { hero, tileImport, tileSwap, tileBlock, tileApprove, tileRelease, morse };
+})();
+
+</script>
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  // theme
+  $("#theme").addEventListener("click", () => {
+    const root = document.documentElement;
+    const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    root.dataset.theme = dark ? "light" : "dark";
+  });
+  // install tabs + copy
+  const tabs = $$("#install [role=tab]");
+  tabs.forEach((b) => b.addEventListener("click", () => { tabs.forEach((t) => t.setAttribute("aria-selected", t === b)); $("#cmd").textContent = b.dataset.cmd; }));
+  async function copy(text, btn, label) {
+    try { await navigator.clipboard.writeText(text); btn.textContent = "Copied"; setTimeout(() => (btn.textContent = label), 1200); }
+    catch { const r = document.createRange(); r.selectNodeContents(btn.closest(".inst, .tty-box").querySelector("code, .tty")); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+  }
+  $("#copy").addEventListener("click", (e) => copy($("#cmd").textContent, e.currentTarget, "Copy"));
+  $("#copy-start").addEventListener("click", (e) => copy($$("#start-code .c").map((c) => c.textContent).filter((t) => t.startsWith("$ ")).map((t) => t.slice(2)).join("\n"), e.currentTarget, "Copy"));
+
+  // morse band
+  const text = "no secrets in context · keys stay in your keychain · names travel, values arrive · ";
+  const chunk = () => {
+    const c = document.createElement("div"); c.className = "chunk";
+    for (const ch of text) {
+      if (ch === " ") { const s = document.createElement("span"); s.className = "sp"; c.append(s); continue; }
+      const code = MORSE[ch]; if (!code) continue;
+      const g = document.createElement("span"); g.className = "ch";
+      g.innerHTML = `<span class="m">${[...code].map((m) => `<i class="${m === "-" ? "l" : "d"}"></i>`).join("")}</span><b>${ch.toUpperCase()}</b>`;
+      c.append(g);
+    }
+    return c;
+  };
+  $("#band").append(chunk(), chunk());
+
+  // hero figure + legend + ticker
+  const legend = $$("#legend button"), clock = $("#clock"), ticker = $("#ticker");
+  let lastLog = -1;
+  function logRow(to, res) {
+    if (!ticker) return;
+    const d = document.createElement("div"); d.className = "new";
+    d.innerHTML = `<span class="t">${new Date().toTimeString().slice(0, 8)}</span><span>claude-code</span><span>stripe/test → ${to}</span><span class="${res === "allowed" ? "a" : "b"}">${res}</span>`;
+    ticker.prepend(d); while (ticker.children.length > 2) ticker.lastChild.remove();
+  }
+  const hero = MorsecFigures.hero($("#hero-fig"), {
+    step(n) { legend.forEach((b) => { const on = +b.dataset.n === n; b.classList.toggle("on", on); b.classList.toggle("bad", on && n === 4); }); },
+    tick(t) {
+      
+      if (t > 3.6 && t < 3.8 && lastLog !== 1) { lastLog = 1; logRow("api.stripe.com", "allowed"); }
+      if (t > 7.0 && t < 7.2 && lastLog !== 2) { lastLog = 2; logRow("paste.example", "blocked"); }
+    },
+  });
+  legend.forEach((b) => {
+    b.addEventListener("mouseenter", () => hero.highlight(+b.dataset.n, true));
+    b.addEventListener("mouseleave", () => hero.highlight(+b.dataset.n, false));
+  });
+  $$("[data-fig]").forEach((el) => MorsecFigures[el.dataset.fig](el));
+})();
+</script>
+
+</body>
+</html>

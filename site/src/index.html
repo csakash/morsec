@@ -1,0 +1,427 @@
+<title>morsec</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="Coding agents use your API keys, database passwords and tokens without ever seeing them.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..700&family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap">
+<style>
+{{shared}}
+
+section, [id] { scroll-margin-top: 72px; }
+/* cells on the page edge sit flush with the logo; inner cells keep their padding */
+.sheet > .row > .cell:first-child, .sheet > .row > .hero-l { padding-left: 0; }
+.sheet > .row > .cell:last-child { padding-right: 0; }
+.sheet > .sec > .cell:nth-child(3n+1) { padding-left: 0; }
+.sheet > .sec > .cell:nth-child(3n) { padding-right: 0; }
+.sheet > .rel .checks li:nth-child(2n) { padding-right: 0; }
+.sheet > .row > .cell.left { padding-left: 28px; }
+@media (max-width: 1080px) {
+  .sheet > .sec > .cell { padding: 28px; }
+  .sheet > .sec > .cell:nth-child(2n+1) { padding-left: 0; }
+  .sheet > .sec > .cell:nth-child(2n) { padding-right: 0; }
+  .sheet > .row > .cell:not(:first-child), .sheet > .row > .cell:not(:last-child) { padding-left: 0; padding-right: 0; }
+  .sheet > .row > .cell.left { padding: 28px; }
+}
+@media (max-width: 640px) { .sheet > .sec > .cell { padding: 24px 0 !important; } }
+/* hero */
+.hero { grid-template-columns: minmax(0, 1fr) minmax(0, 1.12fr); }
+.hero-l { padding: 40px 32px 32px; display: grid; gap: 26px; align-content: space-between; }
+.hero-l .top-lbl { display: flex; justify-content: space-between; gap: 16px; }
+.hero h1 { font-size: clamp(44px, 6.2vw, 86px); line-height: .96; letter-spacing: -0.035em; font-weight: 440; }
+.hero h1 em.it { font-size: 1.04em; }
+.lede { font-size: 17px; line-height: 1.55; color: var(--ink-2); max-width: 30em; }
+.ref { font-family: var(--f-mono); font-size: .9em; color: var(--signal); white-space: nowrap; border-bottom: 1px solid currentColor; }
+.inst { border: 1px solid var(--rule); }
+.inst [role="tablist"] { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--rule); }
+.inst [role="tab"] { appearance: none; border: 0; border-right: 1px solid var(--rule); background: var(--paper); color: var(--muted); padding: 11px 12px; text-align: left; cursor: pointer; font: 500 11px/1 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; display: flex; justify-content: space-between; align-items: center; }
+.inst [role="tab"]:last-child { border-right: 0; }
+.inst [role="tab"] .num { color: inherit; }
+.inst [role="tab"][aria-selected="true"] { background: var(--ink); color: var(--paper); }
+.inst .cmd { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+.inst code { display: block; padding: 16px 16px; white-space: nowrap; overflow-x: auto; font-size: 13.5px; scrollbar-width: none; }
+.inst code::-webkit-scrollbar { display: none; }
+.inst code i { font-style: normal; color: var(--muted); margin-right: 10px; user-select: none; }
+.inst .copy { appearance: none; border: 0; border-left: 1px solid var(--rule); background: var(--paper); color: var(--ink); padding: 0 16px; cursor: pointer; font: 500 11px/1 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; }
+.inst .copy:hover { background: var(--ink); color: var(--paper); }
+.inst .note { border-top: 1px solid var(--rule); padding: 9px 16px; font: 400 12px/1.45 var(--f-mono); color: var(--muted); }
+.ctas { display: flex; flex-wrap: wrap; gap: 10px; }
+
+.hero-r { display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; }
+.hero-r .bar { display: flex; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--rule); }
+.stage-wrap { position: relative; display: grid; align-content: center; background:
+  linear-gradient(var(--faint) 1px, transparent 1px) 0 0 / 32px 32px,
+  linear-gradient(90deg, var(--faint) 1px, transparent 1px) 0 0 / 32px 32px; }
+.stage-wrap::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 50%, transparent 40%, var(--paper) 86%); }
+.stage-wrap [data-hairline] { position: relative; z-index: 1; }
+.legend { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--rule); }
+.legend button { appearance: none; border: 0; border-right: 1px solid var(--rule); background: var(--paper); color: var(--ink-2); text-align: left; padding: 12px 14px 14px; display: grid; gap: 7px; align-content: start; cursor: default; font: inherit; transition: background .3s var(--ease), color .3s var(--ease); }
+.legend button:last-child { border-right: 0; }
+.legend .d { display: flex; gap: 3px; height: 6px; align-items: center; }
+.legend .d i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
+.legend b { font: 500 10.5px/1.2 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; color: var(--ink); }
+.legend span { font: 400 11.5px/1.4 var(--f-mono); color: var(--muted); }
+.legend button.on { background: var(--ink); color: var(--paper); }
+.legend button.on b { color: var(--paper); } .legend button.on span { color: color-mix(in srgb, var(--paper) 70%, var(--ink)); }
+.legend button.on.bad { background: var(--deny); }
+.ticker { border-top: 1px solid var(--rule); font: 400 12px/1 var(--f-mono); }
+.ticker div { display: grid; grid-template-columns: 74px 96px minmax(0, 1fr) 72px; gap: 12px; padding: 9px 18px; border-bottom: 1px dashed var(--faint); white-space: nowrap; }
+.ticker div:last-child { border-bottom: 0; }
+.ticker span { overflow: hidden; text-overflow: ellipsis; }
+.ticker .t { color: var(--muted); } .ticker .a { color: var(--signal); } .ticker .b { color: var(--deny); }
+.ticker div.new { animation: slip .5s var(--ease); }
+@keyframes slip { from { background: var(--paper-2); } }
+
+/* morse band */
+.band { overflow: hidden; background: var(--paper); position: relative; width: 100vw; margin-left: calc(50% - 50vw); }
+.band .track { display: flex; width: max-content; animation: run 60s linear infinite; }
+.band .chunk { display: flex; align-items: center; gap: 0; padding: 16px 0; }
+.band .ch { display: grid; gap: 7px; justify-items: start; padding: 0 9px; }
+.band .ch .m { display: flex; gap: 3px; height: 5px; align-items: center; }
+.band .ch .m i { display: block; height: 3px; background: var(--ink); }
+.band .ch .m i.d { width: 3px; } .band .ch .m i.l { width: 11px; }
+.band .ch b { font: 500 10px/1 var(--f-mono); color: var(--muted); }
+.band .sp { width: 26px; }
+@keyframes run { to { transform: translateX(-50%); } }
+
+/* section heads */
+.head { grid-template-columns: minmax(0, 1fr) minmax(0, 2.4fr); }
+.head .cell:first-child { display: flex; flex-direction: column; justify-content: space-between; gap: 18px; }
+.head h2 { font-size: clamp(32px, 4.2vw, 56px); line-height: 1; letter-spacing: -0.03em; font-weight: 440; }
+.head p { font-size: 16.5px; color: var(--ink-2); max-width: 44em; margin-top: 18px; }
+
+/* tiles */
+.tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.tile { display: flex; flex-direction: column; }
+.tile .fig [data-hairline] { aspect-ratio: 5 / 4; }
+.tile .fig { border-bottom: 1px solid var(--rule); background:
+  radial-gradient(circle at 1px 1px, var(--faint) 1px, transparent 0) 0 0 / 14px 14px; }
+.tile .cap { padding: 18px 20px 22px; display: grid; gap: 12px; align-content: start; }
+.tile h3 { font: 500 13px/1.25 var(--f-sans); font-stretch: 118%; letter-spacing: .07em; text-transform: uppercase; }
+.tile .rule { width: 26px; height: 1px; background: var(--ink); }
+.tile p { color: var(--ink-2); font-size: 14.5px; }
+.tile code { color: var(--ink); }
+
+/* run mode */
+.runrow { grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); }
+.runrow .cell { display: grid; gap: 16px; align-content: start; }
+.runrow h3 { font-size: 26px; line-height: 1.1; letter-spacing: -0.02em; font-weight: 450; }
+.runrow p { color: var(--ink-2); }
+.tty { font: 400 12.5px/1 var(--f-mono); }
+.tty .l { display: grid; grid-template-columns: 34px minmax(0, 1fr); border-bottom: 1px dashed var(--faint); }
+.tty .l:last-child { border-bottom: 0; }
+.tty .n { color: var(--muted); padding: 9px 0 9px 12px; border-right: 1px solid var(--faint); }
+.tty .c { padding: 9px 14px; white-space: pre; overflow-x: auto; }
+.tty .p { color: var(--muted); } .tty .r { color: var(--signal); } .tty .x { background: var(--ink); color: var(--paper); padding: 0 4px; }
+.tty-box { border: 1px solid var(--rule); }
+.tty-box .bar { display: flex; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--rule); }
+
+/* security */
+.sec { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.sec .cell { display: grid; gap: 14px; align-content: start; min-height: 220px; }
+.sec .try { font: 400 12px/1.4 var(--f-mono); color: var(--deny); display: flex; gap: 8px; }
+.sec .try::before { content: "×"; }
+.sec h3 { font: 500 14px/1.25 var(--f-sans); font-stretch: 118%; letter-spacing: .06em; text-transform: uppercase; }
+.sec p { color: var(--ink-2); font-size: 14.5px; }
+.sec .k { margin-top: auto; font: 400 11.5px/1.4 var(--f-mono); color: var(--muted); }
+
+/* receipts as a schedule */
+.sched { grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr); }
+.sched .left { display: grid; align-content: space-between; gap: 24px; background:
+  linear-gradient(var(--faint) 1px, transparent 1px) 0 0 / 38px 38px,
+  linear-gradient(90deg, var(--faint) 1px, transparent 1px) 0 0 / 38px 38px, var(--paper); }
+.sched .left h2 { font: 400 clamp(44px, 5.4vw, 76px)/.9 var(--f-sans); font-stretch: 70%; letter-spacing: -0.01em; text-transform: uppercase; background: var(--paper); justify-self: start; padding: 6px 10px 2px; border: 1px solid var(--rule); }
+.sched .left p { background: var(--paper); border: 1px solid var(--rule); padding: 14px 16px; color: var(--ink-2); font-size: 15px; max-width: 30em; }
+.ev { display: grid; grid-template-columns: 112px minmax(0, 1fr); border-bottom: 1px solid var(--rule); }
+.ev:last-child { border-bottom: 0; }
+.ev .when { padding: 16px 14px; border-right: 1px solid var(--rule); font: 500 12px/1.3 var(--f-mono); }
+.ev .when small { display: block; color: var(--muted); font-weight: 400; margin-top: 4px; }
+.ev .what { padding: 14px 18px; display: grid; gap: 6px; font: 400 13px/1.45 var(--f-mono); color: var(--ink-2); }
+.ev .what b { font: 500 13px/1.3 var(--f-sans); font-stretch: 112%; letter-spacing: .04em; text-transform: uppercase; color: var(--ink); }
+.ev .res { text-decoration: underline; text-underline-offset: 3px; }
+.ev .res.a { color: var(--signal); } .ev .res.b { color: var(--deny); }
+.verify { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px 18px; border-top: 1px solid var(--rule); font: 400 12px/1.3 var(--f-mono); }
+
+.rel { grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); }
+.rel .fig { background: radial-gradient(circle at 1px 1px, var(--faint) 1px, transparent 0) 0 0 / 14px 14px, var(--paper); display: grid; align-content: center; }
+.checks { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: var(--rule); }
+.checks li { background: var(--paper); padding: 24px 26px; display: grid; gap: 10px; align-content: start; }
+.checks b { font: 500 14px/1.2 var(--f-sans); font-stretch: 118%; letter-spacing: .07em; text-transform: uppercase; }
+.checks p { color: var(--ink-2); font-size: 14.5px; }
+.checks .num { color: var(--muted); }
+/* numbers + cta */
+.nums { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); }
+.nums .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; margin-top: 26px; }
+.nums .n { font: 400 clamp(46px, 5vw, 64px)/1 var(--f-sans); letter-spacing: -0.03em; }
+.nums .u { width: 26px; height: 1px; background: var(--ink); margin: 12px 0; }
+.nums .grid p { font: 500 11px/1.35 var(--f-sans); font-stretch: 118%; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-2); }
+.cta { display: grid; gap: 22px; align-content: start; }
+.cta h2 { font-size: clamp(32px, 3.6vw, 46px); line-height: 1.02; letter-spacing: -0.03em; font-weight: 440; }
+.cta ul { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+.cta li { border-bottom: 1px solid var(--rule); padding: 10px 0; font-size: 14.5px; color: var(--ink-2); display: grid; grid-template-columns: 30px minmax(0, 1fr); }
+.cta li .num { color: var(--muted); padding-top: 3px; }
+
+/* get started */
+.start { grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr); }
+.steps { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); counter-reset: s; }
+.steps li { counter-increment: s; border-bottom: 1px solid var(--rule); padding: 14px 0; display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 2px 0; }
+.steps li::before { content: counter(s, decimal-leading-zero); font: 500 12px/1.6 var(--f-mono); color: var(--muted); grid-row: span 2; }
+.steps b { font: 500 13px/1.4 var(--f-sans); font-stretch: 118%; letter-spacing: .06em; text-transform: uppercase; }
+.steps p { font-size: 14.5px; color: var(--ink-2); }
+
+/* faq */
+.faq { grid-template-columns: minmax(0, 1fr) minmax(0, 2.4fr); }
+.faq details { border-bottom: 1px solid var(--rule); }
+.faq details:last-child { border-bottom: 0; }
+.faq summary { list-style: none; cursor: pointer; padding: 20px 28px; display: grid; grid-template-columns: 40px minmax(0, 1fr) 20px; align-items: baseline; font-size: 18px; letter-spacing: -0.01em; }
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary .num { color: var(--muted); }
+.faq summary::after { content: "+"; font: 300 22px/1 var(--f-sans); text-align: right; transition: transform .35s var(--ease); }
+.faq details[open] summary::after { transform: rotate(45deg); }
+.faq details p { padding: 0 28px 22px 68px; color: var(--ink-2); max-width: 64ch; }
+
+@media (max-width: 1080px) {
+  .hero, .runrow, .sched, .nums, .start, .rel { grid-template-columns: minmax(0, 1fr); }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sec { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .head, .faq { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .cell { padding: 22px 18px; }
+  .hero-l { padding: 28px 18px 22px; }
+  .tiles, .sec, .checks { grid-template-columns: minmax(0, 1fr); }
+  .inst [role="tab"] .num { display: none; }
+  .legend { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .legend button:nth-child(2) { border-right: 0; }
+  .legend button:nth-child(-n+2) { border-bottom: 1px solid var(--rule); }
+  .ticker div { grid-template-columns: 62px 78px minmax(0, 1fr) 58px; gap: 8px; padding: 9px 12px; font-size: 11px; }
+  .nums .grid { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .ev { grid-template-columns: 86px minmax(0, 1fr); }
+  .faq summary { padding: 18px; grid-template-columns: 32px minmax(0, 1fr) 20px; font-size: 16.5px; }
+  .faq details p { padding: 0 18px 20px 50px; }
+}
+</style>
+
+<header class="top">
+  <div class="wrap">
+    <div class="row">
+      <a class="brand" href="#top" aria-label="morsec home"><span class="mk" aria-hidden="true"><i class="d"></i><i class="l"></i><i class="d"></i></span>MORSEC</a>
+      <nav class="nav" aria-label="Main">
+        <a href="#how">How it works</a>
+        <a href="#security">Security</a>
+        <a href="#start">Get started</a>
+        <a href="docs.html">Docs</a>
+      </nav>
+      <div class="act">
+        <button class="theme" type="button" id="theme" aria-label="Switch light or dark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/></svg>
+        </button>
+        <a class="btn sm solid" href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener">Book a call {{arrow}}</a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main id="top" class="wrap">
+<div class="sheet">
+
+  <section class="row hero">
+    <div class="hero-l">
+      <div class="top-lbl"><span class="lbl">Secret broker for coding agents</span><span class="lbl m">For macOS</span></div>
+      <h1>Your agents use the keys. They <em class="it">never</em> see them.</h1>
+      <p class="lede">Claude Code and Codex work with <span class="ref">ms://stripe/test</span>. The real key stays on your Mac.</p>
+      <div class="inst" id="install">
+        <div role="tablist" aria-label="Install with">
+          <button role="tab" aria-selected="true" data-cmd="brew install csakash/tap/morsec">Homebrew <span class="num">01</span></button>
+          <button role="tab" aria-selected="false" data-cmd="npm install -g morsec">npm <span class="num">02</span></button>
+          <button role="tab" aria-selected="false" data-cmd="curl -fsSL https://github.com/csakash/morsec/releases/latest/download/install.sh | sh">curl <span class="num">03</span></button>
+        </div>
+        <div class="cmd"><code><i>$</i><span id="cmd">brew install csakash/tap/morsec</span></code><button class="copy" type="button" id="copy">Copy</button></div>
+      </div>
+      <div class="ctas">
+        <a class="btn solid" href="docs.html#quickstart">Read the quickstart {{arrow}}</a>
+        <a class="btn" href="#how">How it works {{arrow}}</a>
+      </div>
+    </div>
+
+    <div class="hero-r">
+      <div class="bar"><span class="lbl">One key, two requests</span><span class="lbl m">Live</span></div>
+      <div class="stage-wrap"><div data-hairline id="hero-fig" role="img" aria-label="An agent sends a reference as Morse code. The broker fetches the key from the keychain and sends one unbroken line to Stripe. A second send toward an unknown host piles up against a gate and is blocked."><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="legend" id="legend">
+        <button type="button" data-n="1"><span class="d"><i></i></span><b>Agent</b><span>has a name</span></button>
+        <button type="button" data-n="2"><span class="d"><i></i><i></i></span><b>morsec</b><span>adds the key</span></button>
+        <button type="button" data-n="3"><span class="d"><i></i><i></i><i></i></span><b>api.stripe.com</b><span>gets the key</span></button>
+        <button type="button" data-n="4" class="b4"><span class="d"><i></i><i></i><i></i><i></i></span><b>Unknown host</b><span>gets nothing</span></button>
+      </div>
+    </div>
+  </section>
+
+  <div class="band" aria-hidden="true"><div class="track" id="band"></div></div>
+
+  <section class="row head" id="how">
+    <div class="cell"><span class="lbl">How it works</span></div>
+    <div class="cell">
+      <h2>Names travel. Values arrive only where they're allowed.</h2>
+    </div>
+  </section>
+
+  <section class="row tiles">
+    <article class="tile">
+      <div class="fig"><div data-hairline data-fig="tileImport" role="img" aria-label="Lines of a .env file hand their values to a vault and keep a Morse reference"><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="cap"><span class="num">01</span><h3>Keys become references</h3><span class="rule"></span><p>Your <code>.env</code> keeps names. The keys move to your keychain.</p></div>
+    </article>
+    <article class="tile">
+      <div class="fig"><div data-hairline data-fig="tileSwap" role="img" aria-label="Morse marks enter the broker and one unbroken line leaves for the bound host"><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="cap"><span class="num">02</span><h3>Swapped in on the way out</h3><span class="rule"></span><p>The key is added on the way out, only for hosts you allow.</p></div>
+    </article>
+    <article class="tile">
+      <div class="fig"><div data-hairline data-fig="tileBlock" role="img" aria-label="A gate stands up and the Morse marks pile against it"><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="cap"><span class="num">03</span><h3>Anywhere else, it stays a name</h3><span class="rule"></span><p>Sent anywhere else, it stays a name. Even a tricked agent leaks nothing.</p></div>
+    </article>
+    <article class="tile">
+      <div class="fig"><div data-hairline data-fig="tileApprove" role="img" aria-label="A request waits at a gate until a Touch ID pad is pressed, then one line reaches the database"><svg viewBox="0 0 400 320"></svg></div></div>
+      <div class="cap"><span class="num">04</span><h3>Production waits for you</h3><span class="rule"></span><p>Production keys wait for your Touch ID.</p></div>
+    </article>
+  </section>
+
+  <section class="row head" id="security">
+    <div class="cell"><span class="lbl">Security model</span></div>
+    <div class="cell">
+      <h2>Built for an agent that runs as you.</h2>
+    </div>
+  </section>
+  <section class="row sec">
+    <div class="cell"><span class="try">read the key</span><h3>Locked to morsec</h3><p>Only the signed morsec daemon can open your keychain items.</p></div>
+    <div class="cell"><span class="try">approve itself</span><h3>You approve, not the agent</h3><p>Approvals happen in your terminal, with Touch ID.</p></div>
+    <div class="cell"><span class="try">cover its tracks</span><h3>Every use is recorded</h3><p>Allowed or blocked, each use leaves a tamper-evident receipt.</p></div>
+  </section>
+
+  <section class="row nums">
+    <div class="cell">
+      <span class="lbl m">By the numbers</span>
+      <div class="grid">
+        <div><div class="n">0</div><div class="u"></div><p>secrets in the agent's context</p></div>
+        <div><div class="n">3</div><div class="u"></div><p>ways to install</p></div>
+        <div><div class="n">1</div><div class="u"></div><p>command to cut every agent off</p></div>
+      </div>
+    </div>
+    <div class="cell cta" id="call">
+      <span class="lbl m">Rolling out to a team?</span>
+      <h2>Let's set up your agents.</h2>
+      <div><a class="btn solid" href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener">Book a discovery call {{arrow}}</a></div>
+    </div>
+  </section>
+
+  <section class="row start" id="start">
+    <div class="cell">
+      <span class="lbl m">Get started</span>
+      <h2 style="font-size:clamp(30px,3.4vw,44px);line-height:1.02;letter-spacing:-0.03em;font-weight:440;margin:16px 0 22px">Set up in five minutes.</h2>
+    </div>
+    <div class="cell">
+      <div class="tty-box">
+        <div class="bar"><span class="lbl">~/code/shop</span><button class="btn sm" type="button" id="copy-start" style="min-height:28px">Copy</button></div>
+        <div class="tty" id="start-code">
+          <div class="l"><span class="n">1</span><span class="c"><span class="p">$</span> brew install csakash/tap/morsec &amp;&amp; ms init</span></div>
+          <div class="l"><span class="n">2</span><span class="c"><span class="p">$</span> ms import .env</span></div>
+          <div class="l"><span class="n">3</span><span class="c"><span class="p">$</span> ms rules stripe/test --add-host api.stripe.com</span></div>
+          <div class="l"><span class="n">4</span><span class="c"><span class="p">$</span> ms connect claude-code</span></div>
+          <div class="l"><span class="n">5</span><span class="c"><span class="p">$</span> ms doctor</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="row faq" id="faq">
+    <div class="cell"><span class="lbl">Questions</span></div>
+    <div>
+      <details open><summary><span class="num">01</span>Does morsec send my secrets anywhere?</summary><p>No. Keys stay in your Mac's keychain and only go where you allow.</p></details>
+      <details><summary><span class="num">02</span>Which agents does it work with?</summary><p>Claude Code and Codex today, plus any MCP client. Cursor and Gemini are next.</p></details>
+      <details><summary><span class="num">03</span>What if the agent edits its settings to skip morsec?</summary><p>Nothing leaks: it never had a key. It just loses access.</p></details>
+      <details><summary><span class="num">04</span>What happens when msd isn't running?</summary><p>Nothing goes out. morsec fails closed.</p></details>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <div class="row">
+      <div class="big" aria-label="morsec">Morsec</div>
+      <div class="links">
+        <nav aria-label="Footer">
+          <a href="docs.html">Docs</a>
+          <a href="https://github.com/csakash/morsec">GitHub</a>
+          <a href="https://github.com/csakash/morsec/releases">Releases</a>
+          <a href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener">Book a call</a>
+        </nav>
+        <small>Named after Morse code.</small>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+/* hairline kernel from @lucasmarkes/hairline, MIT License, Copyright (c) Lucas Markes.
+   Permission is hereby granted, free of charge, to any person obtaining a copy of this software, to deal in it
+   without restriction, provided this notice is included in all copies or substantial portions of the software. */
+{{kernel}}
+</script>
+<script>
+{{figures}}
+</script>
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  // theme
+  $("#theme").addEventListener("click", () => {
+    const root = document.documentElement;
+    const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    root.dataset.theme = dark ? "light" : "dark";
+  });
+  // install tabs + copy
+  const tabs = $$("#install [role=tab]");
+  tabs.forEach((b) => b.addEventListener("click", () => { tabs.forEach((t) => t.setAttribute("aria-selected", t === b)); $("#cmd").textContent = b.dataset.cmd; }));
+  async function copy(text, btn, label) {
+    try { await navigator.clipboard.writeText(text); btn.textContent = "Copied"; setTimeout(() => (btn.textContent = label), 1200); }
+    catch { const r = document.createRange(); r.selectNodeContents(btn.closest(".inst, .tty-box").querySelector("code, .tty")); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+  }
+  $("#copy").addEventListener("click", (e) => copy($("#cmd").textContent, e.currentTarget, "Copy"));
+  $("#copy-start").addEventListener("click", (e) => copy($$("#start-code .c").map((c) => c.textContent).filter((t) => t.startsWith("$ ")).map((t) => t.slice(2)).join("\n"), e.currentTarget, "Copy"));
+
+  // morse band
+  const text = "no secrets in context · keys stay in your keychain · names travel, values arrive · ";
+  const chunk = () => {
+    const c = document.createElement("div"); c.className = "chunk";
+    for (const ch of text) {
+      if (ch === " ") { const s = document.createElement("span"); s.className = "sp"; c.append(s); continue; }
+      const code = MORSE[ch]; if (!code) continue;
+      const g = document.createElement("span"); g.className = "ch";
+      g.innerHTML = `<span class="m">${[...code].map((m) => `<i class="${m === "-" ? "l" : "d"}"></i>`).join("")}</span><b>${ch.toUpperCase()}</b>`;
+      c.append(g);
+    }
+    return c;
+  };
+  $("#band").append(chunk(), chunk());
+
+  // hero figure + legend + ticker
+  const legend = $$("#legend button"), clock = $("#clock"), ticker = $("#ticker");
+  let lastLog = -1;
+  function logRow(to, res) {
+    if (!ticker) return;
+    const d = document.createElement("div"); d.className = "new";
+    d.innerHTML = `<span class="t">${new Date().toTimeString().slice(0, 8)}</span><span>claude-code</span><span>stripe/test → ${to}</span><span class="${res === "allowed" ? "a" : "b"}">${res}</span>`;
+    ticker.prepend(d); while (ticker.children.length > 2) ticker.lastChild.remove();
+  }
+  const hero = MorsecFigures.hero($("#hero-fig"), {
+    step(n) { legend.forEach((b) => { const on = +b.dataset.n === n; b.classList.toggle("on", on); b.classList.toggle("bad", on && n === 4); }); },
+    tick(t) {
+      
+      if (t > 3.6 && t < 3.8 && lastLog !== 1) { lastLog = 1; logRow("api.stripe.com", "allowed"); }
+      if (t > 7.0 && t < 7.2 && lastLog !== 2) { lastLog = 2; logRow("paste.example", "blocked"); }
+    },
+  });
+  legend.forEach((b) => {
+    b.addEventListener("mouseenter", () => hero.highlight(+b.dataset.n, true));
+    b.addEventListener("mouseleave", () => hero.highlight(+b.dataset.n, false));
+  });
+  $$("[data-fig]").forEach((el) => MorsecFigures[el.dataset.fig](el));
+})();
+</script>

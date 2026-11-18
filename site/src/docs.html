@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>morsec docs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..700&family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap">
+<style>
+:root { padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+body { margin: 0; }
+[hidden] { display: none !important; }
+{{shared}}
+
+.docs { display: grid; grid-template-columns: 236px minmax(0, 1fr) 210px; }
+.docs > * { min-width: 0; }
+.docs article { border-left: 1px solid var(--rule); border-right: 1px solid var(--rule); }
+.side { position: sticky; top: 64px; align-self: start; max-height: calc(100vh - 64px); overflow-y: auto; display: grid; align-content: start; }
+.side .grp { display: grid; border-bottom: 1px solid var(--rule); padding: 14px 0; }
+.side .grp > span { padding: 0 18px 8px 0; }
+.side a { margin-left: -10px; padding-left: 10px !important; }
+.side a { text-decoration: none; color: var(--ink-2); padding: 6px 18px; font-size: 14px; display: flex; justify-content: space-between; }
+.side a:hover { color: var(--ink); background: var(--paper-2); }
+.side a.cur { background: var(--ink); color: var(--paper); }
+.search { display: grid; grid-template-columns: minmax(0, 1fr) auto; border-bottom: 1px solid var(--rule); }
+.search input { border: 0; outline: 0; background: var(--paper); color: var(--ink); font: 400 13px/1 var(--f-mono); padding: 14px 18px; min-width: 0; }
+.search kbd { font: 500 11px/1 var(--f-mono); border-left: 1px solid var(--rule); padding: 15px 14px; color: var(--muted); }
+
+article { padding: 0 0 40px; }
+article section { padding: 36px 40px 28px; border-bottom: 1px solid var(--rule); scroll-margin-top: 64px; }
+article section:last-of-type { border-bottom: 0; }
+.crumb { display: flex; justify-content: space-between; margin-bottom: 22px; }
+article h1 { font-size: clamp(40px, 5vw, 64px); line-height: .98; letter-spacing: -0.035em; font-weight: 440; margin-bottom: 18px; }
+article h2 { font-size: clamp(28px, 3vw, 38px); line-height: 1.02; letter-spacing: -0.03em; font-weight: 440; margin-bottom: 16px; }
+article h3 { font: 500 13px/1.3 var(--f-sans); font-stretch: 118%; letter-spacing: .07em; text-transform: uppercase; margin: 26px 0 10px; }
+article p { color: var(--ink-2); margin: 0 0 14px; max-width: 66ch; }
+article ul, article ol { color: var(--ink-2); padding-left: 22px; margin: 0 0 16px; display: grid; gap: 6px; max-width: 66ch; }
+article li::marker { color: var(--muted); font-family: var(--f-mono); font-size: 12px; }
+article p code, article li code, article td code { font-size: .86em; color: var(--ink); border-bottom: 1px solid var(--faint); }
+article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
+.lead { font-size: 18px; color: var(--ink-2); }
+
+.cb { position: relative; border: 1px solid var(--rule); margin: 0 0 18px; }
+.cb pre { margin: 0; padding: 0; font: 400 13px/1 var(--f-mono); overflow-x: auto; counter-reset: ln; }
+.cb pre .ln { display: grid; grid-template-columns: 34px minmax(0, 1fr); border-bottom: 1px dashed var(--faint); }
+.cb pre .ln:last-child { border-bottom: 0; }
+.cb pre .ln::before { counter-increment: ln; content: counter(ln); color: var(--muted); padding: 9px 0 9px 12px; border-right: 1px solid var(--faint); }
+.cb pre .ln > span { padding: 9px 14px; white-space: pre; }
+.cb .c { color: var(--muted); } .cb .pr { color: var(--muted); user-select: none; } .cb .rf { color: var(--signal); } .cb .ok { color: var(--signal); } .cb .no { color: var(--deny); }
+.cb button { position: absolute; top: 0; right: 0; appearance: none; background: var(--paper); border: 0; border-left: 1px solid var(--rule); border-bottom: 1px solid var(--rule); color: var(--ink); padding: 8px 10px; font: 500 10.5px/1 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; cursor: pointer; opacity: 0; }
+.cb:hover button, .cb button:focus-visible { opacity: 1; }
+.cb button:hover, .cb button.done { background: var(--ink); color: var(--paper); opacity: 1; }
+
+.tabs { border: 1px solid var(--rule); margin-bottom: 18px; }
+.tabs [role="tablist"] { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--rule); }
+.tabs [role="tab"] { appearance: none; border: 0; border-right: 1px solid var(--rule); background: var(--paper); color: var(--muted); padding: 11px 12px; text-align: left; cursor: pointer; font: 500 11px/1 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; display: flex; gap: 8px; align-items: center; }
+.tabs [role="tab"]:last-child { border-right: 0; }
+.tabs [role="tab"] .logo { width: 13px; height: 13px; }
+.tabs [role="tab"][aria-selected="true"] { background: var(--ink); color: var(--paper); }
+.tabs [role="tabpanel"] { padding: 18px; }
+.tabs [role="tabpanel"] .cb { margin-bottom: 14px; }
+.tabs [role="tabpanel"] p:last-child { margin-bottom: 0; }
+
+.callout { display: grid; grid-template-columns: 110px minmax(0, 1fr); border: 1px solid var(--rule); margin: 0 0 18px; }
+.callout svg { display: none; }
+.callout::before { content: "Note"; padding: 14px; border-right: 1px solid var(--rule); font: 500 10.5px/1.2 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; }
+.callout.warn::before { content: "Careful"; color: var(--deny); }
+.callout p { margin: 0; padding: 14px 16px; color: var(--ink-2); font-size: 14.5px; }
+.callout b { color: var(--ink); font-weight: 500; }
+
+.figbox { border: 1px solid var(--rule); margin: 4px 0 20px; background: radial-gradient(circle at 1px 1px, var(--faint) 1px, transparent 0) 0 0 / 14px 14px, var(--paper); }
+.figbox .cap { display: flex; justify-content: space-between; padding: 10px 14px; border-top: 1px solid var(--rule); background: var(--paper); }
+.figbox [data-hairline] { aspect-ratio: 16 / 9; max-height: 340px; margin: 0 auto; }
+
+.tbl { overflow-x: auto; border: 1px solid var(--rule); margin: 0 0 18px; }
+.tbl table { border-collapse: collapse; width: 100%; font-size: 14px; }
+.tbl th, .tbl td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+.tbl th { font: 500 10.5px/1.2 var(--f-sans); font-stretch: 118%; letter-spacing: .08em; text-transform: uppercase; background: var(--paper-2); white-space: nowrap; }
+.tbl td + td, .tbl th + th { border-left: 1px solid var(--faint); }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl td:first-child { white-space: nowrap; }
+.tbl td { color: var(--ink-2); }
+
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); margin-bottom: 18px; }
+.card { background: var(--paper); padding: 18px; text-decoration: none; display: grid; gap: 8px; transition: background .25s var(--ease), color .25s var(--ease); }
+.card:hover { background: var(--ink); color: var(--paper); }
+.card:hover span { color: color-mix(in srgb, var(--paper) 70%, var(--ink)); }
+.card b { font: 500 13px/1.3 var(--f-sans); font-stretch: 118%; letter-spacing: .07em; text-transform: uppercase; display: flex; gap: 8px; align-items: center; }
+.card b .logo { width: 15px; height: 15px; }
+.card span { font-size: 14px; color: var(--muted); }
+.badge { font: 500 10px/1 var(--f-mono); padding: 3px 6px; border: 1px solid var(--rule); letter-spacing: .03em; }
+
+.toc-col { position: sticky; top: 64px; align-self: start; display: grid; }
+.toc { display: grid; padding: 14px 0; border-bottom: 1px solid var(--rule); }
+.toc > span { padding: 0 18px 8px; }
+.toc a { text-decoration: none; color: var(--muted); padding: 4px 18px; font-size: 13px; border-left: 2px solid transparent; }
+.toc a:hover { color: var(--ink); }
+.toc a.cur { color: var(--ink); border-left-color: var(--ink); }
+.help { padding: 18px; display: grid; gap: 12px; font-size: 13.5px; color: var(--ink-2); }
+
+.pager { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--rule); margin-top: 8px; }
+.pager a { text-decoration: none; padding: 16px 18px; display: grid; gap: 6px; }
+.pager a + a { border-left: 1px solid var(--rule); text-align: right; }
+.pager a:hover { background: var(--ink); color: var(--paper); }
+.pager b { font: 500 13px/1.3 var(--f-sans); font-stretch: 118%; letter-spacing: .07em; text-transform: uppercase; }
+
+@media (max-width: 1180px) { .docs { grid-template-columns: 220px minmax(0, 1fr); } .docs article { border-right: 0; } .toc-col { display: none; } }
+@media (max-width: 820px) {
+  .docs { grid-template-columns: minmax(0, 1fr); }
+  .docs article { border-left: 0; }
+  .side { position: relative; top: 0; max-height: none; display: flex; overflow-x: auto; }
+  .side .grp { display: contents; }
+  .side .grp > span, .search { display: none; }
+  .side a { white-space: nowrap; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+  article section { padding: 28px 18px 22px; }
+  .cards { grid-template-columns: minmax(0, 1fr); }
+  .callout { grid-template-columns: minmax(0, 1fr); }
+  .callout::before { border-right: 0; border-bottom: 1px solid var(--rule); }
+}
+
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="row">
+      <a class="brand" href="index.html" aria-label="morsec home"><span class="mk" aria-hidden="true"><i class="d"></i><i class="l"></i><i class="d"></i></span>MORSEC <span class="lbl m" style="margin-left:6px">Docs</span></a>
+      <nav class="nav" aria-label="Main">
+        <a href="index.html#how">How it works</a>
+        <a href="index.html#security">Security</a>
+        <a href="docs.html" aria-current="page">Docs</a>
+        <a href="https://github.com/csakash/morsec/releases">Changelog</a>
+      </nav>
+      <div class="act">
+        <button class="theme" type="button" id="theme" aria-label="Switch light or dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/></svg></button>
+        <a class="btn sm solid" href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener">Book a call {{arrow}}</a>
+      </div>
+    </div>
+  </div>
+</header>
+<main class="wrap"><div class="docs">
+  <aside class="side" aria-label="Docs">
+    <label class="search" for="q"><input id="q" type="search" placeholder="Search docs" autocomplete="off"><kbd>/</kbd></label>
+    <div class="grp"><span class="lbl m">Start</span>
+      <a href="#overview">Overview</a>
+      <a href="#install">Install</a>
+      <a href="#quickstart">Quickstart</a>
+    </div>
+    <div class="grp"><span class="lbl m">Concepts</span>
+      <a href="#references">References</a>
+      <a href="#swap">Swap mode</a>
+      <a href="#run">Run mode</a>
+      <a href="#tiers">Tiers and approvals</a>
+      <a href="#rules">Rules</a>
+      <a href="#receipts">Receipts</a>
+    </div>
+    <div class="grp"><span class="lbl m">Agents</span>
+      <a href="#claude-code">Claude Code</a>
+      <a href="#codex">Codex</a>
+      <a href="#mcp">MCP</a>
+    </div>
+    <div class="grp"><span class="lbl m">Reference</span>
+      <a href="#commands">Commands</a>
+      <a href="#security">Security model</a>
+      <a href="#upgrade">Upgrading</a>
+      <a href="#verify">Verify a download</a>
+      <a href="#troubleshooting">Troubleshooting</a>
+    </div>
+  </aside>
+
+  <article id="doc">
+    <section id="overview">
+      <span class="crumb lbl m">Start / Overview</span>
+      <h1>morsec documentation</h1>
+      <p class="lead">morsec lets a coding agent use your API keys, database passwords and tokens without ever seeing them. The agent holds references like <code>ms://stripe/test</code>. The values stay in your macOS keychain, and <code>msd</code>, a daemon running as you, adds them at the last moment.</p>
+      <div class="figbox"><div data-hairline data-fig="hero" role="img" aria-label="An agent sends a reference; msd gets the key from the keychain and sends the value only to the bound host; a send to an unknown host is blocked"><svg viewBox="0 0 400 320"></svg></div><div class="cap"><span class="lbl">Fig. 1 — agent · morsec · bound host · unknown host</span><span class="lbl m">live</span></div></div>
+      <div class="cards">
+        <a class="card" href="#quickstart"><b>Quickstart</b><span>Install, add a key, connect an agent. About five minutes.</span></a>
+        <a class="card" href="#security"><b>Security model</b><span>What an agent running as you can try, and why it fails.</span></a>
+        <a class="card" href="#claude-code"><b>{{icon:claude}}Claude Code</b><span>Terminal, desktop app and IDE.</span></a>
+        <a class="card" href="#codex"><b>{{icon:openai}}Codex</b><span>CLI, app and IDE, plus MCP tools.</span></a>
+      </div>
+    </section>
+
+    <section id="install">
+      <span class="crumb lbl m">Start / Install</span>
+      <h2>Install</h2>
+      <p>You need an Apple silicon Mac with macOS 13 or later. Every channel installs the same four programs: <code>ms</code>, <code>mors</code> (the same command), <code>msd</code> and <code>ms-shim</code>. They are signed with Developer ID team <code>554MCRUAKK</code> and notarized.</p>
+      <div class="tabs" data-tabs>
+        <div role="tablist" aria-label="Install channel">
+          <button role="tab" aria-selected="true" aria-controls="i-brew" id="ti-brew">{{icon:homebrew}}Homebrew</button>
+          <button role="tab" aria-selected="false" aria-controls="i-npm" id="ti-npm">{{icon:npm}}npm</button>
+          <button role="tab" aria-selected="false" aria-controls="i-curl" id="ti-curl">{{icon:gnubash}}curl</button>
+        </div>
+        <div role="tabpanel" id="i-brew" aria-labelledby="ti-brew">
+          <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>brew install csakash/tap/morsec</span></span></pre></div>
+          <p>msd's LaunchAgent points at Homebrew's stable <code>opt/morsec</code> path, so upgrades are picked up after a restart.</p>
+        </div>
+        <div role="tabpanel" id="i-npm" aria-labelledby="ti-npm" hidden>
+          <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>npm install -g morsec</span></span></pre></div>
+          <p>Needs an arm64 Node.js 18 or later. The binaries come in <code>morsec-darwin-arm64</code>. Neither package runs anything at install time.</p>
+        </div>
+        <div role="tabpanel" id="i-curl" aria-labelledby="ti-curl" hidden>
+          <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>curl -fsSL https://github.com/csakash/morsec/releases/latest/download/install.sh | sh</span></span></pre></div>
+          <p>Installs into <code>~/.local/bin</code> (or <code>MORSEC_INSTALL_DIR</code>) without sudo. Before installing, it checks the checksums, their minisign signature when <code>minisign</code> is installed, each code signature and team, and notarization. Add <code>--version 0.1.0</code> to pin.</p>
+        </div>
+      </div>
+      <div class="callout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg><p><b>Read before you run.</b> Download <code>install.sh</code>, <code>SHA256SUMS</code> and <code>SHA256SUMS.minisig</code> from the release, check them as <a href="#verify">Verify a download</a> shows, then run <code>sh install.sh</code>.</p></div>
+    </section>
+
+    <section id="quickstart">
+      <span class="crumb lbl m">Start / Quickstart</span>
+      <h2>Quickstart</h2>
+      <h3>1. Set up the vault</h3>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms init</span></span></pre></div>
+      <p>Creates the vault in your login keychain, generates the local certificate authority and starts msd as a LaunchAgent. <code>ms status</code> says whether morsec is on and how many secrets it protects.</p>
+      <h3>2. Add your secrets</h3>
+      <p>Type one in (hidden input), or move a whole <code>.env</code> in. Import shows a review table first, then stores the values and rewrites the file with references.</p>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms add stripe/test --tier test</span></span><span class="ln"><span><span class="pr">$ </span>ms import .env</span></span></pre></div>
+      <div class="callout warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg><p><b>Values already in git history stay readable there.</b> Rotate any key that was ever committed, then import the new one.</p></div>
+      <h3>3. Say where each key may go</h3>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms rules stripe/test --add-host api.stripe.com</span></span></pre></div>
+      <h3>4. Connect your agent and check</h3>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms connect claude-code --env STRIPE_API_KEY=<span class="rf">ms://stripe/test</span></span></span><span class="ln"><span><span class="pr">$ </span>ms doctor</span></span><span class="ln"><span><span class="ok">  ✓</span> msd identity verified · cc.morsec.msd · team 554MCRUAKK</span></span><span class="ln"><span><span class="ok">  ✓</span> claude-code routes through morsec</span></span></pre></div>
+      <p>Start a new agent session. It sees <code>STRIPE_API_KEY=ms://stripe/test</code>. When it calls <code>api.stripe.com</code>, msd swaps the real key in on the way out.</p>
+    </section>
+
+    <section id="references">
+      <span class="crumb lbl m">Concepts / References</span>
+      <h2>References</h2>
+      <p>A reference is the name of a secret in your vault, written <code>ms://&lt;name&gt;</code>. It is what goes in your <code>.env</code>, your agent's environment and its context window. It's safe to print, paste and commit.</p>
+      <p>For SDKs that check the format of a key, morsec can hand out a shaped placeholder such as <code>sk_test_ms_…</code> that msd maps back to the reference.</p>
+    </section>
+
+    <section id="swap">
+      <span class="crumb lbl m">Concepts / Swap mode</span>
+      <h2>Swap mode, for HTTP APIs</h2>
+      <p>Connectors point the agent's <code>HTTPS_PROXY</code> at msd on loopback. For a host bound to a key, msd:</p>
+      <ol>
+        <li>terminates TLS with a certificate from your local morsec CA, whose name constraints cover only your bound hosts;</li>
+        <li>replaces the reference in the configured place (a header, basic auth or a query parameter);</li>
+        <li>strips any other credential the agent added;</li>
+        <li>forwards over a fresh TLS connection, and writes a receipt.</li>
+      </ol>
+      <p>A reference sent to a host it isn't bound to is blocked and recorded. Redirects carry no credentials, and cloud metadata and private address ranges are refused.</p>
+    </section>
+
+    <section id="run">
+      <span class="crumb lbl m">Concepts / Run mode</span>
+      <h2>Run mode, for commands</h2>
+      <p>For tools that aren't HTTP, such as <code>psql</code>, <code>ssh</code>, <code>git</code> and deploy scripts, msd runs the command for the agent. <code>ms-shim</code> sits first on the agent's <code>PATH</code> and hands calls with an <code>ms://</code> reference to msd; anything else runs the real tool unchanged.</p>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms add db/staging --mode run --tier test</span></span><span class="ln"><span><span class="pr">$ </span>ms rules db/staging --add-root ~/code/shop --add-env PGPASSWORD \</span></span><span class="ln"><span>    --add-command '["psql", "**"]'</span></span><span class="ln"><span><span class="pr">$ </span>ms run --link-shims</span></span></pre></div>
+      <ul>
+        <li><b>Postgres:</b> the password goes in a 0600 passfile only msd can reach, never in <code>argv</code>. Read-only rules set <code>default_transaction_read_only=on</code>.</li>
+        <li><b>SSH:</b> msd is the SSH agent. The private key never leaves it.</li>
+        <li><b>git over HTTPS:</b> msd is a credential helper for the bound host.</li>
+      </ul>
+      <p>Output streams back through a redactor that also catches base64 and URL-encoded forms of the value. In a command pattern, <code>*</code> matches one argument and a trailing <code>**</code> any number.</p>
+    </section>
+
+    <section id="tiers">
+      <span class="crumb lbl m">Concepts / Tiers and approvals</span>
+      <h2>Tiers and approvals</h2>
+      <p><code>test</code> keys never prompt. <code>production</code> keys, the default for <code>ms add</code>, need your approval before each use, once or for the agent session.</p>
+      <p>The request appears in your terminal (<code>ms approve</code>, or <code>ms approve --watch</code> in a spare one) as plain text built from the real command, and you confirm with Touch ID. The approval is bound to the session, key, argument hash, directory and an expiry. Inside an agent session, <code>ms approve</code> refuses.</p>
+    </section>
+
+    <section id="rules">
+      <span class="crumb lbl m">Concepts / Rules</span>
+      <h2>Rules</h2>
+      <p>Everything is denied by default. A key does nothing until you give it a target. Loosening a rule asks for Touch ID; tightening doesn't.</p>
+      <div class="tbl"><table>
+        <thead><tr><th>Field</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>hosts</code></td><td>Where a swap-mode key may be sent.</td></tr>
+          <tr><td><code>commands</code></td><td>Which commands a run-mode key may be used with, as argument patterns.</td></tr>
+          <tr><td><code>tier</code></td><td><code>test</code> or <code>production</code>.</td></tr>
+          <tr><td><code>session_ttl_secs</code></td><td>How long a session approval lasts.</td></tr>
+          <tr><td><code>read_only</code></td><td>Run database commands in a read-only transaction.</td></tr>
+          <tr><td><code>disabled</code></td><td>Turn a key off without deleting it.</td></tr>
+        </tbody>
+      </table></div>
+      <p>A project's <code>.morsec.toml</code> can only tighten your rules for that repository.</p>
+    </section>
+
+    <section id="receipts">
+      <span class="crumb lbl m">Concepts / Receipts</span>
+      <h2>Receipts</h2>
+      <p>Every use, allowed or blocked, is one record: time, agent, session, key, mechanism, host or command, a hash and redacted copy of the arguments, the rule version, the approval and the result. Records are hash-chained and MAC'd with a vault key.</p>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms log --since 2h --result blocked</span></span><span class="ln"><span><span class="pr">$ </span>ms log --verify</span></span><span class="ln"><span><span class="ok">  ✓</span> chain intact</span></span></pre></div>
+    </section>
+
+    <section id="claude-code">
+      <span class="crumb lbl m">Agents / Claude Code</span>
+      <h2>Claude Code</h2>
+      <p>Works in the terminal, the desktop app and the IDE extensions.</p>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms connect claude-code --env STRIPE_API_KEY=<span class="rf">ms://stripe/test</span> --dry-run</span></span><span class="ln"><span><span class="pr">$ </span>ms connect claude-code --env STRIPE_API_KEY=<span class="rf">ms://stripe/test</span></span></span></pre></div>
+      <p>The connector sets the agent's environment and proxy, and puts <code>~/.morsec/shims</code> first on its <code>PATH</code> for run mode. Add <code>--with-mcp</code> to expose your run commands as MCP tools. <code>ms disconnect claude-code</code> undoes it.</p>
+    </section>
+
+    <section id="codex">
+      <span class="crumb lbl m">Agents / Codex</span>
+      <h2>Codex</h2>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms connect codex --env STRIPE_API_KEY=<span class="rf">ms://stripe/test</span></span></span></pre></div>
+      <p>Sets Codex's shell environment policy, network proxy and an <code>mcp_servers.ms</code> entry. For run mode, have Codex call <code>ms run -- &lt;command&gt;</code> or use the MCP tools.</p>
+    </section>
+
+    <section id="mcp">
+      <span class="crumb lbl m">Agents / MCP</span>
+      <h2>MCP</h2>
+      <p><code>ms mcp</code> is a stdio MCP server that turns your run commands into typed tools, such as <code>db_query</code> or <code>deploy_staging</code>. It's a thin client of msd and never holds a value.</p>
+      <p>Cursor and Gemini connectors are next. <span class="badge">planned</span></p>
+    </section>
+
+    <section id="commands">
+      <span class="crumb lbl m">Reference / Commands</span>
+      <h2>Commands</h2>
+      <p><code>ms</code> and <code>mors</code> are the same program.</p>
+      <div class="tbl"><table>
+        <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>ms init</code></td><td>Create the vault and start the daemon.</td></tr>
+          <tr><td><code>ms add</code></td><td>Add a secret (hidden input, or <code>--stdin</code>).</td></tr>
+          <tr><td><code>ms import</code></td><td>Move a .env into the vault and rewrite it with references.</td></tr>
+          <tr><td><code>ms rules</code></td><td>Show or change a key's hosts, commands, tier and session length.</td></tr>
+          <tr><td><code>ms connect</code></td><td>Set up a coding agent. <code>ms disconnect</code> removes it.</td></tr>
+          <tr><td><code>ms run</code></td><td>Run a command with references resolved by the broker.</td></tr>
+          <tr><td><code>ms approve</code></td><td>Answer the request waiting for your approval (Touch ID).</td></tr>
+          <tr><td><code>ms log</code></td><td>Show receipts. <code>--verify</code> checks the chain, <code>--export</code> for a review.</td></tr>
+          <tr><td><code>ms stop</code></td><td>Revoke every grant now and kill running commands. <code>ms start</code> resumes, with Touch ID.</td></tr>
+          <tr><td><code>ms status</code></td><td>Show whether morsec is on.</td></tr>
+          <tr><td><code>ms doctor</code></td><td>Check that every connected agent routes through morsec. <code>--live</code> checks from inside the agent.</td></tr>
+          <tr><td><code>ms mcp</code></td><td>Run the MCP server for an agent.</td></tr>
+          <tr><td><code>ms scan</code></td><td>Scan agent transcripts for leaked secret values.</td></tr>
+          <tr><td><code>ms stats</code></td><td>Prompts per session, blocks and approvals.</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="security">
+      <span class="crumb lbl m">Reference / Security model</span>
+      <h2>Security model</h2>
+      <p>On macOS the agent and msd run as the same Unix user, so every control assumes the agent can read your files and reach the daemon's socket.</p>
+      <div class="tbl"><table>
+        <thead><tr><th>An agent tries to</th><th>Why it fails</th></tr></thead>
+        <tbody>
+          <tr><td>Read a value from the keychain</td><td>Items are bound to msd's code signature: identifier <code>cc.morsec.msd</code> plus the release team. Another program, or a replaced msd, can't read them.</td></tr>
+          <tr><td>Read msd's memory</td><td>Hardened runtime without <code>get-task-allow</code>. Values are zeroized after use.</td></tr>
+          <tr><td>Loosen the rules file</td><td>Rules are MAC'd with a vault key; a bad MAC is rejected. Loosening needs <code>ms rules</code> and Touch ID.</td></tr>
+          <tr><td>Fake an approval</td><td>Prompts come from the real exec plan, on your terminal, with Touch ID. Callers inside an agent session can't approve.</td></tr>
+          <tr><td>Pose as msd</td><td>A signed <code>ms</code> checks msd's signature and that msd alone holds the socket.</td></tr>
+          <tr><td>Rewrite receipts</td><td>Hash-chained and MAC'd; <code>ms log --verify</code> finds the edit.</td></tr>
+          <tr><td>Skip the proxy</td><td>It never had a value, so it only loses access. <code>ms doctor</code> reports the drift.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="callout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg><p><b>Known limit.</b> In run mode, a same-user process could read a child command's environment or passfile while it runs. morsec prefers protocols that never put the value in a child (SSH agent, git credential helper) and keeps passfiles short-lived. Running children as a separate user is on the roadmap.</p></div>
+      <p>The full threat model maps 60 threats to the tests that cover them: <a href="https://github.com/csakash/morsec/blob/main/docs/threat-model.md">docs/threat-model.md</a>.</p>
+    </section>
+
+    <section id="upgrade">
+      <span class="crumb lbl m">Reference / Upgrading</span>
+      <h2>Upgrading</h2>
+      <p>There is no auto-update. Upgrade with the channel you installed with, then restart msd:</p>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>brew upgrade morsec          <span class="c"># or npm install -g morsec@latest, or the curl installer</span></span></span><span class="ln"><span><span class="pr">$ </span>launchctl kickstart -k gui/$(id -u)/cc.morsec.msd</span></span></pre></div>
+      <p>After a curl upgrade, also run <code>ms run --link-shims</code>. If you switch Node versions with nvm, fnm or volta, install morsec under the new one, run <code>ms init</code> and reconnect your agents.</p>
+    </section>
+
+    <section id="verify">
+      <span class="crumb lbl m">Reference / Verify a download</span>
+      <h2>Verify a download</h2>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>shasum -a 256 -c SHA256SUMS</span></span><span class="ln"><span><span class="pr">$ </span>minisign -Vm SHA256SUMS -P RWRTLFpql8eLhPWagccY08QMJqtuPerVZ/+xpw9LVkhRCC3/79D4vmFy</span></span><span class="ln"><span><span class="pr">$ </span>codesign --verify --strict ms msd ms-shim</span></span><span class="ln"><span><span class="pr">$ </span>spctl -a -vv -t install msd</span></span><span class="ln"><span><span class="c">  source=Notarized Developer ID</span></span></span><span class="ln"><span><span class="c">  origin=Developer ID Application: Akash Munshi (554MCRUAKK)</span></span></span></pre></div>
+      <p>The minisign public key is also committed at <code>packaging/minisign.pub</code>. The full steps are in <a href="https://github.com/csakash/morsec/blob/main/packaging/VERIFY.md">packaging/VERIFY.md</a>.</p>
+    </section>
+
+    <section id="troubleshooting">
+      <span class="crumb lbl m">Reference / Troubleshooting</span>
+      <h2>Troubleshooting</h2>
+      <p>Start with <code>ms doctor</code>. It checks the daemon, the vault, the run shims and every connected agent, and each failure says what to run.</p>
+      <div class="tbl"><table>
+        <thead><tr><th>You see</th><th>Do this</th></tr></thead>
+        <tbody>
+          <tr><td><code>daemon not running</code></td><td><code>ms start</code>, or check <code>ms doctor</code>.</td></tr>
+          <tr><td>A request to a new host is blocked</td><td><code>ms rules &lt;key&gt; --add-host &lt;host&gt;</code>, then retry.</td></tr>
+          <tr><td>The agent still sees an old value</td><td>Start a new agent session after <code>ms connect</code>.</td></tr>
+          <tr><td>msd doesn't start after an upgrade</td><td><code>launchctl kickstart -k gui/$(id -u)/cc.morsec.msd</code></td></tr>
+        </tbody>
+      </table></div>
+      <div class="pager">
+        <a href="#overview"><span>Back to</span><b>Overview</b></a>
+        <a href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener"><span>Rolling out to a team?</span><b>Book a call</b></a>
+      </div>
+    </section>
+  </article>
+
+  <aside class="toc-col" aria-label="On this page">
+    <nav class="toc" id="toc"><span class="lbl m">On this page</span></nav>
+    <div class="help"><span class="lbl">Need a hand?</span>Setting up morsec for a team, or preparing a security review?<a class="btn sm" href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener">Book a call {{arrow}}</a></div>
+  </aside>
+</div></main>
+
+<footer class="foot">
+  <div class="wrap">
+    <div class="row">
+      <div class="big" aria-label="morsec">Morsec</div>
+      <div class="links">
+        <nav aria-label="Footer"><a href="index.html">Home</a><a href="https://github.com/csakash/morsec">GitHub</a><a href="https://github.com/csakash/morsec/releases">Releases</a><a href="https://cal.com/motiontic/morsec-discovery-call" target="_blank" rel="noopener">Book a call</a></nav>
+        <small>Named after Morse code.</small>
+      </div>
+    </div>
+  </div>
+</footer>
+<script>
+/* hairline kernel from @lucasmarkes/hairline, MIT License, Copyright (c) Lucas Markes. */
+{{kernel}}
+</script>
+<script>
+{{figures}}
+</script>
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  // copy buttons on code blocks
+  $$(".cb").forEach(cb => {
+    const b = document.createElement("button"); b.type = "button"; b.textContent = "Copy"; cb.append(b);
+    b.addEventListener("click", async () => {
+      const lines = [...cb.querySelectorAll(".ln > span")].map((s) => s.textContent);
+      const cmds = lines.filter(l => l.startsWith("$ ")).map(l => l.slice(2));
+      const text = (cmds.length ? cmds : lines).join("\n");
+      try { await navigator.clipboard.writeText(text); b.textContent = "Copied"; b.classList.add("done"); setTimeout(() => { b.textContent = "Copy"; b.classList.remove("done"); }, 1200); }
+      catch { const r = document.createRange(); r.selectNodeContents(cb.querySelector("pre")); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+    });
+  });
+  // tabs
+  $$("[data-tabs]").forEach(t => {
+    const tabs = $$('[role="tab"]', t);
+    tabs.forEach(tab => tab.addEventListener("click", () => {
+      tabs.forEach(x => { x.setAttribute("aria-selected", x === tab); document.getElementById(x.getAttribute("aria-controls")).hidden = x !== tab; });
+    }));
+  });
+  // scroll spy + on-this-page
+  document.getElementById("theme").addEventListener("click", () => { const r = document.documentElement; const dark = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; r.dataset.theme = dark ? "light" : "dark"; });
+  $$("[data-fig]").forEach((el) => MorsecFigures[el.dataset.fig](el));
+  const secs = $$("article section"), side = $$(".side a"), toc = $("#toc");
+  secs.forEach(s => { const h = s.querySelector("h1, h2"); const a = document.createElement("a"); a.href = "#" + s.id; a.textContent = h.textContent.replace(/\s+/g, " ").trim(); toc.append(a); });
+  const tocLinks = $$("a", toc);
+  const mark = id => { [...side, ...tocLinks].forEach(a => a.classList.toggle("cur", a.getAttribute("href") === "#" + id)); };
+  const io = new IntersectionObserver(es => { const v = es.filter(e => e.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0]; if (v) mark(v.target.id); }, { rootMargin: "-80px 0px -65% 0px" });
+  secs.forEach(s => io.observe(s)); mark("overview");
+  // search filter
+  const q = $("#q");
+  addEventListener("keydown", e => { if (e.key === "/" && document.activeElement !== q) { e.preventDefault(); q.focus(); } });
+  q.addEventListener("input", () => {
+    const v = q.value.trim().toLowerCase();
+    secs.forEach(s => s.hidden = v && !s.textContent.toLowerCase().includes(v));
+  });
+})();
+</script>
+</body>
+</html>
