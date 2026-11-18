@@ -748,6 +748,7 @@ dependencies = [
  "ms-import",
  "ms-ipc",
  "ms-mcp",
+ "ms-projects",
  "ms-receipts",
  "ms-rules",
  "ms-run",
@@ -861,6 +862,27 @@ name = "ms-mint"
 version = "0.1.0"
 dependencies = [
  "ms-core",
+]
+
+[[package]]
+name = "ms-projects"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "libc",
+ "ms-approve",
+ "ms-core",
+ "ms-import",
+ "ms-rules",
+ "ms-vault",
+ "rustix",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "zeroize",
 ]
 
 [[package]]
@@ -1000,6 +1022,7 @@ dependencies = [
  "ms-import",
  "ms-ipc",
  "ms-mcp",
+ "ms-projects",
  "ms-proxy",
  "ms-receipts",
  "ms-rules",

@@ -44,6 +44,10 @@ const TESTS: &[Test] = &[
     ("gate_runs_fuzz_step", gate_runs_fuzz_step),
     ("run_mode_through_shims", run_mode_through_shims),
     ("mcp_tools_end_to_end", mcp_tools_end_to_end),
+    (
+        "init_project_never_leaks_a_canary",
+        init_project_never_leaks_a_canary,
+    ),
 ];
 
 fn main() -> ExitCode {
@@ -1178,6 +1182,91 @@ fn gate_runs_fuzz_step() {
 
 /// Drops the cargo-built ms's one-line "DEV BUILD" notice (T-03 dev opt-out) from merged
 /// stdout+stderr, so commands whose stdout is parsed (`ms mcp --catalog`) still parse.
+// protects=L31 SPEC testing plan (E2E canary): `ms init` on the criterion 2 fixture shape, run
+// from the user's terminal and approved in its inline review (Touch ID stood in by
+// --test-touch-id), leaves no canary, in any encoding, in its output, msd's state (receipts,
+// rules, projects.toml), any project file other than the source file that holds a key written
+// into code, or anything a fake agent sees after (`cat` of the rewritten files, `env`); the
+// symlinked env file and node_modules are not touched. fails_when=a canary or an encoding of it
+// reaches any of those, or a file outside the walk's rules changes; no_claim=real agents
+// (tests/e2e/real-agent.sh), the real Touch ID sheet
+fn init_project_never_leaks_a_canary() {
+    let w = World::new();
+    let [stripe, db, gh] = [&w.canaries[0], &w.canaries[1], &w.canaries[2]];
+    let proj = w.dir.path().join("shop");
+    let outside = w.dir.path().join("outside");
+    for d in ["apps/web", "node_modules/x", "src"] {
+        std::fs::create_dir_all(proj.join(d)).unwrap();
+    }
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(proj.join("package.json"), "{}\n").unwrap();
+    std::fs::write(
+        proj.join(".env"),
+        format!(
+            "{}={}\n{}={}\n{}={}\nPORT=3000\n",
+            stripe.var, stripe.value, db.var, db.value, gh.var, gh.value
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("apps/web/.env"),
+        format!("{}={}\n", gh.var, gh.value),
+    )
+    .unwrap();
+    let linked = format!("{}={}\n", stripe.var, stripe.value);
+    std::fs::write(outside.join(".env"), &linked).unwrap();
+    std::os::unix::fs::symlink(outside.join(".env"), proj.join(".env.link")).unwrap();
+    let nm = format!("{}={}\n", gh.var, gh.value);
+    std::fs::write(proj.join("node_modules/x/.env"), &nm).unwrap();
+    let code_file = format!("const k = \"{}\";\n", stripe.value);
+    std::fs::write(proj.join("src/pay.ts"), &code_file).unwrap();
+
+    let (code, out) = w.outside(&format!(
+        "cd '{}' && (i=0; while [ $i -lt 200 ]; do printf 'o\\n'; sleep 0.3; i=$((i+1)); done) | script -q /dev/null ms init --no-connect",
+        proj.display()
+    ));
+    let out = out.replace("\r\n", "\n");
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("Found      4 secrets in 2 files"), "{out}");
+    assert!(
+        out.contains("In code    1 key written straight into src/pay.ts:1"),
+        "{out}"
+    );
+    w.assert_clean("ms init output", out.as_bytes());
+
+    let dotenv = std::fs::read_to_string(proj.join(".env")).unwrap();
+    assert!(dotenv.contains("ms://shop/stripe-secret-key"), "{dotenv}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("src/pay.ts")).unwrap(),
+        code_file
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join(".env")).unwrap(),
+        linked
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("node_modules/x/.env")).unwrap(),
+        nm
+    );
+    for (p, bytes) in World::files_under(&proj) {
+        if p.ends_with("src/pay.ts") || p.starts_with(proj.join("node_modules")) {
+            continue;
+        }
+        w.assert_clean(&p.display().to_string(), &bytes);
+    }
+    let state = World::files_under(&w.dir.path().join("state"));
+    assert!(state.iter().any(|(p, _)| p.ends_with("projects.toml")));
+    for (p, bytes) in state {
+        w.assert_clean(&p.display().to_string(), &bytes);
+    }
+    let (_, seen) = w.in_agent(&format!(
+        "cd '{}' && cat .env apps/web/.env && env && ms projects shop",
+        proj.display()
+    ));
+    assert!(seen.contains("ms://shop/"), "{seen}");
+    w.assert_clean("the fake agent's view of the project", seen.as_bytes());
+}
+
 fn drop_dev_warning(text: &str) -> String {
     text.lines()
         .filter(|l| !l.starts_with("morsec: DEV BUILD:"))

@@ -1123,6 +1123,47 @@ fn pin_overwrite_fails_closed() {
 // ordinary name, is refused; fails_when=put_internal can write a rules/receipts HMAC key or a
 // user key, or the items show up in list(); no_claim=ACL against other binaries (the shared
 // replace path is covered by acl_other_binary_is_denied)
+// protects=L31: the project records MAC key is created with the other internal keys, differs
+// from them, is kept by ensure, stays out of list() and can't be written through the trait or
+// put_internal; the projects floor item is writable only through put_internal;
+// fails_when=the key is missing after init, listed, rotated by ensure, or writable;
+// no_claim=ACL against other binaries (same replace path as acl_other_binary_is_denied)
+#[test]
+fn projects_internal_items() {
+    if skip() {
+        return;
+    }
+    let t = TestVault::new();
+    let v = &t.vault;
+    let pk = KeyName::new(PROJECTS_HMAC_KEY).unwrap();
+    let first = v.read_with(&pk, |b| b.to_vec()).unwrap();
+    assert_eq!(first.len(), HMAC_KEY_LEN);
+    let rules = v
+        .read_with(&KeyName::new(RULES_HMAC_KEY).unwrap(), |b| b.to_vec())
+        .unwrap();
+    assert_ne!(first, rules);
+    v.ensure_internal_keys().unwrap();
+    assert_eq!(v.read_with(&pk, |b| b.to_vec()).unwrap(), first);
+    assert!(v.list().unwrap().is_empty());
+    assert!(
+        v.put(&pk, SecretBytes::from(vec![1; 32]), meta(&pk, Tier::Test))
+            .is_err()
+    );
+    assert!(v.put_internal(&pk, SecretBytes::from(vec![1; 32])).is_err());
+    let state = KeyName::new(PROJECTS_STATE_KEY).unwrap();
+    v.put_internal(&state, SecretBytes::from(b"v=3".to_vec()))
+        .unwrap();
+    assert_eq!(v.read_with(&state, |b| b.to_vec()).unwrap(), b"v=3");
+    assert!(
+        v.put(
+            &state,
+            SecretBytes::from(b"v=0".to_vec()),
+            meta(&state, Tier::Test)
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn put_internal_only_daemon_items() {
     if skip() {

@@ -6,6 +6,19 @@ entries. Move the entries from Unreleased into it when you bump the version.
 
 ## [Unreleased]
 
+- `ms init` now sets up the project you run it in, in one command. In a project folder it finds
+  the secrets in every `.env` file (as deep as the project goes, skipping `node_modules` and other
+  dependency folders, never following symlinks), moves them into the vault, rewrites the files
+  with `ms://` references, and asks you once (Touch ID) to let the keys it knows reach their
+  services. Keys written straight into code are reported with file and line, never changed. A
+  short summary says what is protected, what still needs you, and which files are in git
+  history. Run in your home folder it only sets up this Mac. New flags: `--machine`,
+  `--project [PATH]`, `--name`, `--no-connect`. It also connects Claude Code and Codex when it
+  finds them.
+- `ms projects [NAME]` lists the projects `ms init` set up, or shows one in full (no values).
+- An existing `CLAUDE.md` or `AGENTS.md` gets a short note telling agents to keep `ms://`
+  references as they are. morsec never creates those files.
+
 - Keys stored by another morsec build (for example a dev build, before you installed the signed
   release) no longer break the vault. `ms doctor`, `ms status` and `ms init` list them by name
   with the command that removes each one (`security delete-generic-password -s cc.morsec.vault

@@ -21,8 +21,11 @@ use ms_vault::{Listing, Vault, VaultExt};
 use tokio::sync::watch;
 
 mod mcp;
+mod projects;
 mod run;
 mod ssh_git;
+
+pub use projects::{PROJECTS_FILE, reset_project_records};
 
 use crate::backend::{Backend, DAEMON_STATE_KEY, RULES_HMAC_KEY};
 use crate::paths::Paths;
@@ -126,6 +129,8 @@ pub struct Daemon {
     write: Mutex<()>,
     /// Serializes `ms stop` / `ms start` (memory flag and vault flag change together).
     flag: Mutex<()>,
+    /// Serializes `ProjectSave` (load, check, approve, save) (L31).
+    projects_write: Mutex<()>,
     /// Counts `ms stop`s, so a resume approved before a newer stop can't undo it.
     stops: std::sync::atomic::AtomicU64,
     /// The proxy CA in use (certificate PEM, hosts), when a host is bound.
@@ -319,6 +324,7 @@ impl Daemon {
             proxy_port,
             write: Mutex::new(()),
             flag: Mutex::new(()),
+            projects_write: Mutex::new(()),
             ca: Mutex::new(None),
             probes: Arc::default(),
             stops: std::sync::atomic::AtomicU64::new(0),
@@ -659,6 +665,17 @@ impl Daemon {
                 "morsec: ms scan can't run inside an agent session. Run it from your own terminal",
             ),
             RequestBody::Scan => self.scan(&session),
+            // Saving a project loosens its new keys' rules (after one approval) and writes its
+            // record: only from the user's own terminal (L31 SPEC D-2). Listing is read-only.
+            RequestBody::ProjectSave { .. } if in_agent => reply_err(
+                ErrorCode::Denied,
+                "morsec: projects can't be set up from inside an agent session. Run ms init in your own terminal",
+            ),
+            RequestBody::ProjectSave { record, rules } => {
+                self.project_save(&session, &record, &rules)
+            }
+            RequestBody::ProjectList => self.project_list(),
+            RequestBody::ProjectGet { slug } => self.project_get(&slug),
             RequestBody::DoctorProbe { nonce, report } => self.probes.handle(
                 match &caller {
                     Some(Caller::Agent(s)) => Some(s.clone()),
@@ -1401,6 +1418,7 @@ mod tests {
     use ms_approve::auth::fake::FakeAuthenticator;
     use ms_core::{Decision, Reason, Request};
     use ms_vault::memory::MemoryVault;
+    use std::path::PathBuf;
 
     const CANARY: &str = "sk_test_MSD_CANARY_5b1e";
 
@@ -2290,5 +2308,507 @@ mod tests {
             .unwrap();
         let h = restart(h);
         assert!(h.d.is_stopped());
+    }
+
+    // ---- L31 guided-init: ProjectSave / ProjectList / ProjectGet ----
+
+    const STRIPE_KEY: &str = "shop/stripe-secret-key";
+    const OPENAI_KEY: &str = "shop/openai-api-key";
+    const DB_KEY: &str = "shop/database-url";
+    const UNKNOWN_KEY: &str = "shop/session-secret";
+
+    /// A project root (canonical) and its record naming `keys` as (key, provider).
+    fn project(h: &H, keys: &[(&str, Option<&str>)]) -> ms_projects::record::ProjectRecord {
+        use ms_projects::record::*;
+        let root = h.dir.path().join("shop");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        ProjectRecord {
+            slug: "shop".into(),
+            display: "shop".into(),
+            root: root.display().to_string(),
+            created_unix_ms: 1,
+            scan: ScanRecord::default(),
+            files: vec![FileRecord {
+                path: ".env".into(),
+                git_history_commits: None,
+                secrets: keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (k, p))| SecretRecord {
+                        var: format!("VAR_{i}"),
+                        line: i as u64 + 1,
+                        key: KeyName::new(k).unwrap(),
+                        quote: Quote::None,
+                        action: SecretAction::Import,
+                        provider: p.map(str::to_owned),
+                    })
+                    .collect(),
+            }],
+            findings: Vec::new(),
+            hints: Vec::new(),
+        }
+    }
+
+    fn put_mode(h: &H, name: &str, mode: Mode, tier: Tier) {
+        let k = KeyName::new(name).unwrap();
+        let r = h.d.handle(
+            &peer(),
+            RequestBody::PutKey {
+                name: k.clone(),
+                meta: KeyMeta {
+                    name: k,
+                    mode,
+                    tier,
+                    created_unix_ms: 1,
+                },
+            },
+            Some(SecretBytes::new(CANARY.as_bytes().to_vec())),
+        );
+        assert!(is_ok(&r), "{r:?}");
+    }
+
+    /// The rules the CLI would propose for `rec` against the rules in force.
+    fn proposal(h: &H, rec: &ms_projects::record::ProjectRecord) -> Rules {
+        ms_projects::save::initial_rules(ms_import::catalog::Catalog::builtin(), rec, &h.d.rules())
+    }
+
+    fn save(h: &H, rec: &ms_projects::record::ProjectRecord, rules: &Rules) -> ResponseBody {
+        h.req(RequestBody::ProjectSave {
+            record: rec.to_toml(),
+            rules: ms_projects::save::canonical(rules),
+        })
+    }
+
+    /// The four keys of the fixture: two known swap keys, a run key and an unknown one.
+    fn shop(h: &H) -> ms_projects::record::ProjectRecord {
+        h.put(STRIPE_KEY, Tier::Test);
+        h.put(OPENAI_KEY, Tier::Test);
+        put_mode(h, DB_KEY, Mode::Run, Tier::Production);
+        h.put(UNKNOWN_KEY, Tier::Production);
+        project(
+            h,
+            &[
+                (STRIPE_KEY, Some("stripe")),
+                (OPENAI_KEY, Some("openai")),
+                (DB_KEY, Some("pg")),
+                (UNKNOWN_KEY, None),
+            ],
+        )
+    }
+
+    // protects=SPEC criterion 5 / design §8 "Agent drives ProjectInit": ProjectSave from an agent
+    // session is Denied and changes no rule and writes no record, while the read-only ProjectList
+    // and ProjectGet answer agents; fails_when=an agent's ProjectSave is applied or reaches the
+    // approver; no_claim=a detached same-user process (it is not an agent session: T-04)
+    #[test]
+    fn project_requests_refused_in_agent_session() {
+        let h = fresh();
+        let rec = shop(&h);
+        let rules = proposal(&h, &rec);
+        let r = save(h.as_(agent()), &rec, &rules);
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        assert!(msg(&r).contains("own terminal"), "{r:?}");
+        assert!(h.auth.reasons().is_empty(), "no approval was asked");
+        assert!(!h.dir.path().join(PROJECTS_FILE).exists());
+        assert!(matches!(
+            h.swap(STRIPE_KEY, "api.stripe.com"),
+            Decision::Deny { .. }
+        ));
+        assert!(matches!(
+            h.as_(agent()).req(RequestBody::ProjectList),
+            ResponseBody::Projects { .. }
+        ));
+    }
+
+    // protects=SPEC criterion 5 checks in msd: a key outside the slug, an existing key whose rule
+    // already allows something, a host on a run rule, an extra host, a key not in the vault and
+    // a non-canonical root are Invalid before any approval; refused while stopped;
+    // fails_when=any of them reaches the approver or is applied; no_claim=the checker's full
+    // table (ms-projects save_checks)
+    #[test]
+    fn project_save_checks() {
+        let h = fresh();
+        let rec = shop(&h);
+        let good = proposal(&h, &rec);
+        assert_eq!(good.keys.len(), 3, "{good:?}");
+
+        let mut outside = good.clone();
+        outside.keys.insert(
+            KeyName::new("other/k").unwrap(),
+            KeyRule::new(Mode::Swap, Tier::Test),
+        );
+        let mut run_host = good.clone();
+        run_host
+            .keys
+            .get_mut(&KeyName::new(DB_KEY).unwrap())
+            .unwrap()
+            .hosts = vec![ms_rules::HostPattern::parse("db.example.com").unwrap()];
+        let mut extra_host = good.clone();
+        extra_host
+            .keys
+            .get_mut(&KeyName::new(STRIPE_KEY).unwrap())
+            .unwrap()
+            .hosts
+            .push(ms_rules::HostPattern::parse("evil.example").unwrap());
+        let mut foreign_rec = rec.clone();
+        foreign_rec.files[0].secrets[0].key = KeyName::new("shop/not-stored").unwrap();
+        let mut relative_root = rec.clone();
+        relative_root.root = format!("{}/x/..", rec.root);
+        let mut linked_root = rec.clone();
+        let link = h.dir.path().join("link-to-shop");
+        std::os::unix::fs::symlink(&rec.root, &link).unwrap();
+        linked_root.root = link.display().to_string();
+        for (what, r, rules) in [
+            ("key outside the slug", &rec, &outside),
+            ("host on a run rule", &rec, &run_host),
+            ("extra host", &rec, &extra_host),
+            ("key not in the vault", &foreign_rec, &good),
+            ("not normalised root", &relative_root, &good),
+            ("symlinked root", &linked_root, &good),
+        ] {
+            let resp = save(h.as_(terminal()), r, rules);
+            assert_eq!(code(&resp), Some(ErrorCode::Invalid), "{what}: {resp:?}");
+        }
+        // An existing key with a non-empty rule: "use ms rules".
+        let r = h.approved(|| {
+            h.propose(
+                STRIPE_KEY,
+                Some("mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\"]\n"),
+                false,
+            )
+        });
+        assert!(is_ok(&r), "{r:?}");
+        let before = h.auth.reasons().len();
+        let r = save(&h, &rec, &good);
+        assert_eq!(code(&r), Some(ErrorCode::Invalid), "{r:?}");
+        assert!(msg(&r).contains("ms rules"), "{r:?}");
+        assert_eq!(h.auth.reasons().len(), before, "no approval was asked");
+
+        // Refused while stopped.
+        assert!(is_ok(&h.req(RequestBody::Stop)));
+        let r = save(&h, &rec, &Rules::default());
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        assert!(!h.dir.path().join(PROJECTS_FILE).exists());
+    }
+
+    // protects=SPEC D-2 / criterion 2: one Touch ID approves the first rules of every new key of
+    // the project at once; the approval lists each key with its hosts or root and is bound to the
+    // rules hash (a changed set is a different request and asks again); after it the known swap
+    // keys reach their catalog hosts, the run key gets only the root, the unknown key still allows
+    // nothing; a denial applies nothing and a re-run asks again; fails_when=more than one prompt
+    // for one save, a changed set reuses the approval, or anything applies on denial;
+    // no_claim=the real LAContext sheet (manual check)
+    #[test]
+    fn project_save_one_approval_bound_to_rules() {
+        let h = fresh();
+        let rec = shop(&h);
+        let rules = proposal(&h, &rec);
+
+        // Denied: nothing applied, no record.
+        let (r, _) = h.answered(APPROVER_PID, false, None, || save(&h, &rec, &rules));
+        assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
+        assert!(matches!(
+            h.swap(STRIPE_KEY, "api.stripe.com"),
+            Decision::Deny { .. }
+        ));
+        assert!(!h.dir.path().join(PROJECTS_FILE).exists());
+
+        // A smaller set is a different request: its argv (and hash) differ.
+        let mut smaller = rules.clone();
+        smaller.keys.remove(&KeyName::new(OPENAI_KEY).unwrap());
+        assert_ne!(
+            ms_projects::save::rules_hash(&smaller),
+            ms_projects::save::rules_hash(&rules)
+        );
+        let argv = ms_projects::save::approval_argv(&rec, &rules);
+        assert_ne!(
+            ms_rules::argv_hash(&argv),
+            ms_rules::argv_hash(&ms_projects::save::approval_argv(&rec, &smaller))
+        );
+
+        // Approved once: every rule applied with one Touch ID.
+        let seen = std::sync::Mutex::new(None);
+        let before = h.auth.reasons().len();
+        let out = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    if let ResponseBody::Approval { pending: Some(p) } =
+                        h.d.handle(&peer_pid(APPROVER_PID), RequestBody::ApprovalPending, None)
+                    {
+                        *lock(&seen) = Some(p.request.clone());
+                        let _ = h.d.handle(
+                            &peer_pid(APPROVER_PID),
+                            RequestBody::ApprovalDecide {
+                                id: p.id,
+                                approve: true,
+                                scope: None,
+                            },
+                            None,
+                        );
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            save(&h, &rec, &rules)
+        });
+        assert!(is_ok(&out), "{out:?}");
+        assert_eq!(h.auth.reasons().len(), before + 1, "exactly one Touch ID");
+        let req = lock(&seen).clone().expect("an approval was asked");
+        assert_eq!(req.argv_display, argv);
+        assert_eq!(req.argv_hash, ms_rules::argv_hash(&argv));
+        let shown = req.argv_display.join("\n");
+        for k in [STRIPE_KEY, OPENAI_KEY, DB_KEY] {
+            assert!(shown.contains(k), "{shown}");
+        }
+        assert!(
+            shown.contains("api.stripe.com") && shown.contains(&rec.root),
+            "{shown}"
+        );
+        assert!(shown.contains(&hex::encode(ms_projects::save::rules_hash(&rules))));
+        assert_eq!(h.swap(STRIPE_KEY, "api.stripe.com"), Decision::Allow);
+        assert_eq!(h.swap(OPENAI_KEY, "api.openai.com"), Decision::Allow);
+        assert!(matches!(
+            h.swap(STRIPE_KEY, "evil.example"),
+            Decision::Deny { .. }
+        ));
+        assert!(matches!(
+            h.swap(UNKNOWN_KEY, "api.stripe.com"),
+            Decision::Deny { .. }
+        ));
+        let live = h.d.rules();
+        let db = &live.keys[&KeyName::new(DB_KEY).unwrap()];
+        assert_eq!(db.roots, vec![PathBuf::from(&rec.root)]);
+        assert!(db.hosts.is_empty() && db.commands.is_empty());
+        assert!(h.receipts_text().contains("ms init: first rules"));
+
+        // The same proposal again: those keys are no longer fresh, so it is refused; an empty
+        // set saves the record with no approval.
+        assert_eq!(code(&save(&h, &rec, &rules)), Some(ErrorCode::Invalid));
+        let n = h.auth.reasons().len();
+        assert!(is_ok(&save(&h, &rec, &proposal(&h, &rec))));
+        assert_eq!(h.auth.reasons().len(), n, "nothing to approve");
+    }
+
+    // protects=SPEC ProjectList / ProjectGet: one line per project with protected / needs-you
+    // counts from the rules in force, the record back as TOML with each key's targets, an
+    // unknown slug Invalid, and no value anywhere in the replies; fails_when=counts ignore the
+    // rules or a value appears; no_claim=the CLI's rendering (ms-cli projects)
+    #[test]
+    fn project_list_and_get() {
+        let h = fresh();
+        let rec = shop(&h);
+        assert!(matches!(
+            h.req(RequestBody::ProjectList),
+            ResponseBody::Projects { projects } if projects.is_empty()
+        ));
+        let rules = proposal(&h, &rec);
+        assert!(is_ok(&h.approved(|| save(&h, &rec, &rules))));
+        match h.req(RequestBody::ProjectList) {
+            ResponseBody::Projects { projects } => {
+                assert_eq!(projects.len(), 1);
+                let p = &projects[0];
+                assert_eq!((p.slug.as_str(), p.protected, p.needs_you), ("shop", 2, 2));
+            }
+            other => panic!("{other:?}"),
+        }
+        match h.req(RequestBody::ProjectGet {
+            slug: "shop".into(),
+        }) {
+            ResponseBody::Project { record, keys } => {
+                assert_eq!(
+                    ms_projects::record::ProjectRecord::from_toml(&record).unwrap(),
+                    rec
+                );
+                let stripe = keys.iter().find(|k| k.key.as_str() == STRIPE_KEY).unwrap();
+                assert!(stripe.ready && stripe.stored);
+                assert!(stripe.targets.iter().any(|t| t == "api.stripe.com"));
+                let unknown = keys.iter().find(|k| k.key.as_str() == UNKNOWN_KEY).unwrap();
+                assert!(!unknown.ready && unknown.targets.is_empty());
+                assert!(!format!("{record}{keys:?}").contains(CANARY));
+            }
+            other => panic!("{other:?}"),
+        }
+        let r = h.req(RequestBody::ProjectGet {
+            slug: "nope".into(),
+        });
+        assert_eq!(code(&r), Some(ErrorCode::Invalid));
+    }
+
+    // protects=SPEC criterion 7: a byte flip in projects.toml, a file MAC'd with another key, an
+    // older valid file put back (rollback, floor kept in the vault across a restart) and a removed
+    // file make ProjectList / ProjectGet / ProjectSave Denied with "integrity check", while swaps
+    // for existing keys keep working; fails_when=a tampered record is served or saved over, or
+    // keys stop working; no_claim=the store's full tamper table (ms-projects store tests)
+    #[test]
+    fn projects_toml_tamper_fails_closed() {
+        let h = fresh();
+        let rec = shop(&h);
+        let rules = proposal(&h, &rec);
+        assert!(is_ok(&h.approved(|| save(&h, &rec, &rules))));
+        let file = h.dir.path().join(PROJECTS_FILE);
+        let mac = ms_rules::store::mac_path(&file);
+        let v1 = (std::fs::read(&file).unwrap(), std::fs::read(&mac).unwrap());
+        // A second save (version 2), so v1 is a rollback.
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        let v2 = (std::fs::read(&file).unwrap(), std::fs::read(&mac).unwrap());
+        let denied = |h: &H, what: &str| {
+            for r in [
+                h.req(RequestBody::ProjectList),
+                h.req(RequestBody::ProjectGet {
+                    slug: "shop".into(),
+                }),
+                save(h, &rec, &Rules::default()),
+            ] {
+                assert_eq!(code(&r), Some(ErrorCode::Denied), "{what}: {r:?}");
+                assert!(msg(&r).contains("integrity check"), "{what}: {r:?}");
+            }
+            assert_eq!(
+                h.swap(STRIPE_KEY, "api.stripe.com"),
+                Decision::Allow,
+                "{what}: keys keep working"
+            );
+        };
+
+        let mut flipped = v2.0.clone();
+        let i = flipped.len() / 3;
+        flipped[i] ^= 0x20;
+        std::fs::write(&file, &flipped).unwrap();
+        denied(&h, "byte flip");
+
+        std::fs::write(&file, &v1.0).unwrap();
+        std::fs::write(&mac, &v1.1).unwrap();
+        denied(&h, "rollback");
+        let h = restart(h);
+        // The floor survives a restart (it is in the vault, not in memory).
+        denied(&h, "rollback after restart");
+
+        let other = MemoryVault::new();
+        let k = KeyName::new(crate::backend::PROJECTS_HMAC_KEY).unwrap();
+        other
+            .put(
+                &k,
+                SecretBytes::new(vec![3; 32]),
+                KeyMeta {
+                    name: k.clone(),
+                    mode: Mode::Swap,
+                    tier: Tier::Production,
+                    created_unix_ms: 0,
+                },
+            )
+            .unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let foreign = ms_projects::store::ProjectsStore::new(d2.path().join("p.toml"), &other, k);
+        // Saved often enough that its version is above the floor: only the MAC is wrong.
+        let mut v = 0;
+        for _ in 0..5 {
+            v = foreign
+                .save(
+                    &ms_projects::record::ProjectsFile {
+                        version: 0,
+                        projects: vec![rec.clone()],
+                    },
+                    v,
+                )
+                .unwrap();
+        }
+        std::fs::copy(d2.path().join("p.toml"), &file).unwrap();
+        std::fs::copy(d2.path().join("p.toml.mac"), &mac).unwrap();
+        denied(&h, "foreign MAC");
+
+        std::fs::remove_file(&file).unwrap();
+        denied(&h, "removed");
+        // Put back the latest good file: served again.
+        std::fs::write(&file, &v2.0).unwrap();
+        std::fs::write(&mac, &v2.1).unwrap();
+        assert!(matches!(
+            h.req(RequestBody::ProjectList),
+            ResponseBody::Projects { .. }
+        ));
+    }
+
+    // protects=security review S1: with project records on disk, a missing rollback floor in the
+    // vault fails closed (an older, validly MAC'd file put back is not served), while a fresh
+    // install with no records and no floor works; fails_when=the floor's absence reads as 0 when
+    // records exist; no_claim=deleting a keychain item (only msd may; the memory vault stands in)
+    #[test]
+    fn missing_projects_floor_fails_closed() {
+        let h = fresh();
+        assert!(matches!(
+            h.req(RequestBody::ProjectList),
+            ResponseBody::Projects { .. }
+        ));
+        let rec = shop(&h);
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        let file = h.dir.path().join(PROJECTS_FILE);
+        let mac = ms_rules::store::mac_path(&file);
+        let v1 = (std::fs::read(&file).unwrap(), std::fs::read(&mac).unwrap());
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        let Backend::Memory(v) = &h.backend else {
+            panic!("tests use the memory vault")
+        };
+        v.delete(&KeyName::new(crate::backend::PROJECTS_STATE_KEY).unwrap())
+            .unwrap();
+        std::fs::write(&file, &v1.0).unwrap();
+        std::fs::write(&mac, &v1.1).unwrap();
+        let r = h.req(RequestBody::ProjectList);
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        let r = save(&h, &rec, &Rules::default());
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+    }
+
+    // protects=review R2: after `msd --init --force` replaces morsec/projects-hmac, the old
+    // records are moved aside and the floor reset, so the next ms init saves a fresh record and
+    // ProjectList answers (instead of Denied forever); the old file is kept, renamed;
+    // fails_when=project requests stay Denied after a reset, or the old file is deleted;
+    // no_claim=the keychain reset itself (ms-vault projects_internal_items)
+    #[test]
+    fn force_reset_moves_project_records_aside() {
+        let h = fresh();
+        let rec = shop(&h);
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        // What --init --force does to the projects key: a new random one.
+        let Backend::Memory(v) = &h.backend else {
+            panic!("tests use the memory vault")
+        };
+        let k = KeyName::new(crate::backend::PROJECTS_HMAC_KEY).unwrap();
+        v.put(
+            &k,
+            crate::backend::random_32().unwrap(),
+            KeyMeta {
+                name: k.clone(),
+                mode: Mode::Swap,
+                tier: Tier::Production,
+                created_unix_ms: 0,
+            },
+        )
+        .unwrap();
+        let h = restart(h);
+        assert_eq!(
+            code(&h.req(RequestBody::ProjectList)),
+            Some(ErrorCode::Denied),
+            "without the reset the old records can't verify"
+        );
+        reset_project_records(h.dir.path(), &h.backend, "old-1").unwrap();
+        let h = restart(h);
+        assert!(matches!(
+            h.req(RequestBody::ProjectList),
+            ResponseBody::Projects { projects } if projects.is_empty()
+        ));
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        assert!(matches!(
+            h.req(RequestBody::ProjectList),
+            ResponseBody::Projects { projects } if projects.len() == 1
+        ));
+        assert!(h.dir.path().join(format!("{PROJECTS_FILE}.old-1")).exists());
+        assert!(
+            h.dir
+                .path()
+                .join(format!("{PROJECTS_FILE}.mac.old-1"))
+                .exists()
+        );
     }
 }

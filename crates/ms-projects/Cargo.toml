@@ -1,0 +1,31 @@
+[package]
+name = "ms-projects"
+description = "Guided setup (L31): mode detection, project names, the deep scan, project-wide import naming, the MAC'd project records and the agent hint block."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ms-core = { workspace = true }
+ms-import = { workspace = true }
+ms-rules = { workspace = true }
+ms-approve = { workspace = true }
+ms-vault = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+tempfile = { workspace = true }
+libc = { workspace = true }
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

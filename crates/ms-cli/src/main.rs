@@ -13,8 +13,10 @@ mod connect;
 mod connect_codex;
 mod doctor;
 mod import;
+mod init_project;
 mod log;
 mod mcp;
+mod projects;
 mod run;
 mod service;
 mod stats;
@@ -49,7 +51,7 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create the vault and start the daemon.
+    /// Set up morsec: this Mac, and the project you run it in (secrets moved, agents connected).
     Init(service::InitArgs),
     /// Add a secret (hidden input, or --stdin from a pipe).
     Add(add::AddArgs),
@@ -81,6 +83,8 @@ enum Command {
     Scan(scan::ScanArgs),
     /// Prompts per session, blocks and approvals.
     Stats(stats::StatsArgs),
+    /// The projects ms init set up; with a name, that project in full.
+    Projects(projects::ProjectsArgs),
 }
 
 /// The name this binary was invoked as: `ms` or `mors` (or whatever the symlink is called).
@@ -136,7 +140,7 @@ async fn main() -> ExitCode {
     };
     match command {
         Command::Status => service::status().await,
-        Command::Init(a) => service::init(&a).await,
+        Command::Init(a) => on_own_thread(move || service::init(&a)),
         Command::Stop => service::stop().await,
         Command::Start => service::start().await,
         Command::Add(a) => on_own_thread(move || add::run(&a)),
@@ -151,6 +155,7 @@ async fn main() -> ExitCode {
         Command::Mcp(a) => mcp::run(&a, VERSION).await,
         Command::Approve(a) => on_own_thread(move || approve::run(&a)),
         Command::Doctor(a) => on_own_thread(move || doctor::run(&a)),
+        Command::Projects(a) => on_own_thread(move || projects::run(&a)),
     }
 }
 

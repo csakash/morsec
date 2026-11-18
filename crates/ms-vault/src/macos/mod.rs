@@ -82,8 +82,24 @@ pub const CA_PEM_KEY: &str = "morsec/ca";
 /// substitute them), written by msd with [`KeychainVault::put_internal`] (L07).
 pub const CA_CERT_KEY: &str = "morsec/ca-cert";
 
+/// HMAC key for the project records, `projects.toml` (L31). Created like the other two when
+/// missing; never listed, never writable through the trait.
+pub const PROJECTS_HMAC_KEY: &str = "morsec/projects-hmac";
+
+/// The project records' rollback floor (`v=<n>`), written by msd with
+/// [`KeychainVault::put_internal`] (L31).
+pub const PROJECTS_STATE_KEY: &str = "morsec/projects-state";
+
+/// The internal HMAC keys [`KeychainVault::ensure_internal_keys`] creates.
+pub const INTERNAL_HMAC_KEYS: [&str; 3] = [RECEIPTS_HMAC_KEY, RULES_HMAC_KEY, PROJECTS_HMAC_KEY];
+
 /// The only reserved names [`KeychainVault::put_internal`] writes.
-pub const INTERNAL_WRITABLE: [&str; 3] = [DAEMON_STATE_KEY, CA_PEM_KEY, CA_CERT_KEY];
+pub const INTERNAL_WRITABLE: [&str; 4] = [
+    DAEMON_STATE_KEY,
+    CA_PEM_KEY,
+    CA_CERT_KEY,
+    PROJECTS_STATE_KEY,
+];
 
 /// Length of each internal HMAC key, in bytes.
 pub const HMAC_KEY_LEN: usize = 32;
@@ -539,15 +555,15 @@ impl KeychainVault {
 
     // --- Internal keys and the CA key. ---
 
-    /// At startup: makes sure the internal HMAC keys ([`RECEIPTS_HMAC_KEY`], [`RULES_HMAC_KEY`])
-    /// exist, creating a missing one ([`HMAC_KEY_LEN`] bytes from `SecRandomCopyBytes`).
+    /// At startup: makes sure the internal HMAC keys ([`INTERNAL_HMAC_KEYS`]: receipts, rules,
+    /// projects) exist, creating a missing one ([`HMAC_KEY_LEN`] bytes from `SecRandomCopyBytes`).
     /// Existing keys are kept, never rotated: that would break every MAC made with them. A key
     /// of the wrong length, or one that fails its seal, is an error. Needs the seal key, so
     /// [`Self::reset_internal_keys`] (`ms init`) must have run.
     pub fn ensure_internal_keys(&self) -> Result<()> {
         let _q = quiet()?;
         let kc = login_keychain()?;
-        for raw in [RECEIPTS_HMAC_KEY, RULES_HMAC_KEY] {
+        for raw in INTERNAL_HMAC_KEYS {
             let name = KeyName::new(raw)?;
             match self.read_locked(&kc, &name) {
                 Ok(v) if v.value().len() == HMAC_KEY_LEN => continue,
@@ -575,14 +591,14 @@ impl KeychainVault {
     }
 
     /// For `ms init` on a new vault: creates and pins a fresh seal key and replaces both internal
-    /// HMAC keys, removing anything already stored under their names (including keys another
+    /// HMAC keys ([`INTERNAL_HMAC_KEYS`]), removing anything already stored under their names (including keys another
     /// process planted before morsec was set up). Fails closed if an existing item may not be
     /// deleted. Items sealed with the old seal key can no longer be read afterwards.
     pub fn reset_internal_keys(&self) -> Result<()> {
         let _q = quiet()?;
         let kc = login_keychain()?;
         self.reset_pinned_key(&kc, &self.seal_label(), SEAL_PIN)?;
-        for raw in [RECEIPTS_HMAC_KEY, RULES_HMAC_KEY] {
+        for raw in INTERNAL_HMAC_KEYS {
             let name = KeyName::new(raw)?;
             let (value, meta) = Self::new_hmac_value(&name)?;
             self.replace_locked(&kc, &name, &value, &meta)?;

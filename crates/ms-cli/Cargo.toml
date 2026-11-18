@@ -29,6 +29,7 @@ ms-session = { workspace = true }
 ms-run = { workspace = true }
 ms-mcp = { workspace = true }
 ms-approve = { workspace = true }
+ms-projects = { workspace = true }
 libc = { workspace = true }
 zeroize = { workspace = true }
 rustix = { version = "1", default-features = false, features = ["std", "termios", "process"] }

@@ -17,7 +17,8 @@ pub const REASON_MAX_CHARS: usize = 480;
 
 /// True for characters that change how text around them is displayed, or are invisible:
 /// bidi controls, zero-width and other format characters, line/paragraph separators, tags.
-fn is_invisible_or_bidi(c: char) -> bool {
+/// Public so stored text that later reaches an approval (L31 project records) can refuse them.
+pub fn is_invisible_or_bidi(c: char) -> bool {
     matches!(c,
         '\u{00ad}' | '\u{034f}' | '\u{061c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
         | '\u{180b}'..='\u{180f}'
