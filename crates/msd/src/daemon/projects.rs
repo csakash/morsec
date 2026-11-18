@@ -270,11 +270,11 @@ impl Daemon {
                 Ok(t) => Some(t),
                 Err(resp) => {
                     let v = self.rules_version();
-                    for k in proposed.keys.keys() {
+                    for (k, r) in &proposed.keys {
                         let _ = self.record(
                             session,
                             k,
-                            Mode::Swap,
+                            r.mode,
                             "ms init: first rules",
                             v,
                             ReceiptResult::Denied,

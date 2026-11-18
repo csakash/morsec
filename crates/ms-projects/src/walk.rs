@@ -429,7 +429,8 @@ fn read_regular(fd: &OwnedFd, limit: u64) -> Option<Zeroizing<Vec<u8>>> {
 /// Code findings in one source file: tokens that start with a catalog value prefix. The masked
 /// form shows only the catalog prefix and the length.
 pub fn find_keys(catalog: &Catalog, path: &str, bytes: &[u8]) -> Vec<CodeFinding> {
-    let token = |b: u8| b.is_ascii_alphanumeric() || b"_-./+=:".contains(&b);
+    // `=` and `:` end a token, so `KEY=sk_live_…` and `key: sk_live_…` are found too.
+    let token = |b: u8| b.is_ascii_alphanumeric() || b"_-./+".contains(&b);
     let mut out = Vec::new();
     for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
         let mut j = 0;
@@ -557,6 +558,21 @@ mod tests {
         );
         assert!(!format!("{scan:?}").contains(CANARY));
         assert!(!scan.stopped_early);
+    }
+
+    // protects=design §4.5 code findings: a key after `=`, `:` or a quote is found with its line
+    // and a masked form holding only the catalog prefix and the length; plain text and refs are
+    // not findings; fails_when=a key next to `=` is missed or any value byte past the prefix is
+    // in the finding; no_claim=keys of providers the catalog doesn't know
+    #[test]
+    fn code_findings_are_masked() {
+        let text = format!("a\nSTRIPE={CANARY}\nk: {CANARY}\nx = 'ms://shop/k'\nplain sk_live_\n");
+        let f = find_keys(cat(), "c.yml", text.as_bytes());
+        assert_eq!(f.iter().map(|f| f.line).collect::<Vec<_>>(), vec![2, 3]);
+        for x in &f {
+            assert_eq!(x.masked, format!("sk_live_… ({} bytes)", CANARY.len()));
+            assert!(!format!("{x:?}").contains(&CANARY[8..]));
+        }
     }
 
     // protects=design §4.5 symlinks: a symlinked env file, a symlinked directory and a directory
