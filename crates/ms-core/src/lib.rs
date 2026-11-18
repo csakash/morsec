@@ -7,6 +7,7 @@ mod error;
 mod key;
 mod secret;
 mod types;
+pub mod unusable;
 
 pub use error::{Error, Result};
 pub use key::{KeyName, MAX_KEY_NAME_LEN, MAX_SEGMENT_LEN, MAX_SEGMENTS, SecretRef};

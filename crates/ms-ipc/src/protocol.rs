@@ -357,6 +357,10 @@ pub enum ResponseBody {
         /// The hosts that CA may sign for (its name constraints) (L07).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ca_hosts: Vec<String>,
+        /// Keys another program (usually another morsec build) stored, which this msd may neither
+        /// use nor replace (vault-foreign-items). `ms add` checks it before asking for a value.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unusable: Vec<KeyName>,
     },
     /// Success; `message` is shown to people as is (L07).
     Ok {
@@ -482,6 +486,7 @@ impl ResponseBody {
             alerts: Vec::new(),
             ca_pem: None,
             ca_hosts: Vec::new(),
+            unusable: Vec::new(),
         }
     }
 

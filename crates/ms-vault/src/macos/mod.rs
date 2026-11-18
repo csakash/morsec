@@ -128,11 +128,16 @@ fn keychain_error(action: &str, name: &str, e: SfError) -> Error {
         // a listing can set the key aside instead of failing ([`KeychainVault::scan`]).
         let hint = match KeyName::new(name) {
             Ok(n) if !reserved(&n) => format!("access denied: {}", crate::unusable_hint(&n)),
-            _ => {
-                "access denied: another morsec build stored this item, and the keychain lets only \
-                  that build use it. Start over with: ms init --force"
-                    .to_owned()
-            }
+            // One of morsec's own items: ms init --force can't replace it either (deleting is
+            // refused the same way), so it has to go first.
+            Ok(n) => format!(
+                "access denied: another program (usually another morsec build) stored morsec's \
+                 own item {n}, and the keychain lets only that program use it. Remove it with: {} \
+                 (macOS asks for your login password), then run: ms init --force",
+                crate::removal_command(&n)
+            ),
+            // Nothing named (a search, or turning dialogs off): no guess about whose item it is.
+            Err(_) => "access denied by the keychain. Run: ms doctor".to_owned(),
         };
         let target = if name.is_empty() {
             String::new()
@@ -837,14 +842,23 @@ impl Vault for KeychainVault {
             });
         let mut out = crate::Listing::default();
         for name in names {
-            match self.read_locked(&kc, &name) {
-                Ok(opened) => out.keys.push(opened.meta.clone()),
+            // Only the keychain refusing this item's own read makes it unusable. Opening checks
+            // the seal, which reloads the seal key: a failure there (a seal key or pin replaced
+            // mid-scan) is an error, never a reason to call a real key someone else's.
+            let blob = match self.read_raw_locked(&kc, &name) {
+                Ok(blob) => blob,
                 Err(Error::Io { ref source, .. })
                     if source.kind() == std::io::ErrorKind::PermissionDenied =>
                 {
                     out.unusable.push(name);
+                    continue;
                 }
-                Err(Error::NoSuchKey(_)) => {}
+                Err(Error::NoSuchKey(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            match self.open(&kc, &name, blob) {
+                Ok(opened) => out.keys.push(opened.meta.clone()),
+                // Fails its seal: skipped, so one bad item can't hide the rest.
                 Err(Error::Io { ref source, .. })
                     if source.kind() == std::io::ErrorKind::InvalidData => {}
                 Err(e) => return Err(e),

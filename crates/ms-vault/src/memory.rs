@@ -33,6 +33,16 @@ impl MemoryVault {
             .insert(name);
     }
 
+    fn denied(name: &KeyName, action: &str) -> Error {
+        Error::io(
+            format!("{action} {name}"),
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("access denied: {}", crate::unusable_hint(name)),
+            ),
+        )
+    }
+
     fn is_unusable(&self, name: &KeyName) -> bool {
         self.unusable
             .lock()
@@ -48,19 +58,17 @@ impl MemoryVault {
 
 impl Vault for MemoryVault {
     fn put(&self, name: &KeyName, value: SecretBytes, meta: KeyMeta) -> Result<()> {
+        // The keychain refuses to replace another program's item (deleting it is denied).
+        if self.is_unusable(name) {
+            return Err(Self::denied(name, "replacing"));
+        }
         self.lock().insert(name.clone(), (value, meta));
         Ok(())
     }
 
     fn with_secret(&self, name: &KeyName, f: &mut dyn FnMut(&[u8])) -> Result<()> {
         if self.is_unusable(name) {
-            return Err(Error::io(
-                format!("reading {name}"),
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("access denied: {}", crate::unusable_hint(name)),
-                ),
-            ));
+            return Err(Self::denied(name, "reading"));
         }
         let map = self.lock();
         let (value, _) = map
@@ -71,6 +79,9 @@ impl Vault for MemoryVault {
     }
 
     fn delete(&self, name: &KeyName) -> Result<()> {
+        if self.is_unusable(name) {
+            return Err(Self::denied(name, "deleting"));
+        }
         // Dropping the removed SecretBytes zeroizes its buffer.
         self.lock()
             .remove(name)

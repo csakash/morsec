@@ -111,6 +111,10 @@ pub(crate) fn run(a: &AddArgs) -> ExitCode {
         Ok(k) => k,
         Err(e) => return fail(&e),
     };
+    // Ask before the value is typed: msd can't replace a key another program stored.
+    if store.unusable().contains(&a.name) {
+        return fail(&Error::Usage(ms_core::unusable::unusable_hint(&a.name)));
+    }
     if existing.iter().any(|m| m.name == a.name) {
         return fail(&Error::Usage(format!(
             "a key named {} already exists. Pick another name; replacing keys is not \

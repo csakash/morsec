@@ -84,6 +84,18 @@ impl IpcStore {
     async fn connect() -> ms_core::Result<Client> {
         Client::connect(&ms_ipc::default_socket_path()?).await
     }
+
+    /// Keys another program stored, which msd can neither use nor replace. Best effort: an older
+    /// msd, or any error, gives none, and msd refuses the store itself anyway.
+    pub(crate) fn unusable(&self) -> Vec<KeyName> {
+        let resp = self
+            .rt
+            .block_on(async { Self::connect().await?.request(RequestBody::Status).await });
+        match resp {
+            Ok(ResponseBody::Status { unusable, .. }) => unusable,
+            _ => Vec::new(),
+        }
+    }
 }
 
 fn store_err(e: ms_core::Error) -> Error {

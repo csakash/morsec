@@ -47,24 +47,9 @@ pub struct Listing {
     pub unusable: Vec<KeyName>,
 }
 
-/// Keychain service of every morsec item. The account is the key name.
-pub const KEYCHAIN_SERVICE: &str = "cc.morsec.vault";
-
-/// The command the user runs to remove a key another morsec build stored. macOS asks for the
-/// login password, because the item belongs to another program. Key names are `[a-z0-9-/]` only
-/// ([`KeyName`]), so the command needs no quoting.
-pub fn removal_command(name: &KeyName) -> String {
-    format!("security delete-generic-password -s {KEYCHAIN_SERVICE} -a {name}")
-}
-
-/// One line telling the user what to do about an unusable key.
-pub fn unusable_hint(name: &KeyName) -> String {
-    format!(
-        "{name} was stored by another morsec build, and the keychain lets only that build use it. \
-         Remove it with: {} (macOS asks for your login password), then add it again: ms add {name}",
-        removal_command(name)
-    )
-}
+pub use ms_core::unusable::{
+    KEYCHAIN_SERVICE, UNUSABLE_NAMED, removal_command, unusable_alert, unusable_hint,
+};
 
 /// Convenience methods for every [`Vault`], kept out of the trait so it stays object-safe.
 pub trait VaultExt: Vault {
