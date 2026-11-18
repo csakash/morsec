@@ -24,3 +24,6 @@ minisign.key
 *.cer
 .claude/settings.local.json
 .DS_Store
+
+# Wrangler local state and account cache
+.wrangler/
