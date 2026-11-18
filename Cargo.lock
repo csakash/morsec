@@ -864,6 +864,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-projects"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "libc",
+ "ms-core",
+ "ms-import",
+ "ms-rules",
+ "ms-vault",
+ "rustix",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "zeroize",
+]
+
+[[package]]
 name = "ms-proxy"
 version = "0.1.0"
 dependencies = [
