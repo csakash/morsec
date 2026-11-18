@@ -210,6 +210,8 @@ fn kind(r: &ResponseBody) -> &'static str {
         ResponseBody::RunOutput { .. } => "run output",
         ResponseBody::RunExit { .. } => "run exit",
         ResponseBody::RunResult { .. } => "run result",
+        ResponseBody::Projects { .. } => "projects",
+        ResponseBody::Project { .. } => "project",
         ResponseBody::Error { .. } => "error",
     }
 }

@@ -163,6 +163,23 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<ApprovalScope>,
     },
+    /// Save a project record and the first rules of its new keys (L31 guided-init, SPEC D-2).
+    /// Refused inside an agent session and while stopped. msd checks every rule against the
+    /// record and the catalog and asks one approval for the whole set, bound to the hash of its
+    /// canonical TOML. ms-ipc doesn't depend on ms-projects or ms-rules, so both travel as TOML.
+    ProjectSave {
+        /// The record, as `ms_projects::record::ProjectRecord::to_toml`.
+        record: String,
+        /// The proposed rules, in the `rules.toml` format (its `version` is ignored).
+        rules: String,
+    },
+    /// One line per project (L31). Read-only, no values.
+    ProjectList,
+    /// One project's record and the status of its keys (L31). Read-only, no values.
+    ProjectGet {
+        /// The project's slug.
+        slug: String,
+    },
 }
 
 /// What an approval covers (L11, PRD §7.2).
@@ -226,6 +243,9 @@ impl RequestBody {
             RequestBody::ApprovalPending | RequestBody::ApprovalDecide { .. } => {
                 "L11 approvals-macos"
             }
+            RequestBody::ProjectSave { .. }
+            | RequestBody::ProjectList
+            | RequestBody::ProjectGet { .. } => "L31 guided-init",
         }
     }
 }
@@ -323,6 +343,48 @@ pub struct ScanFinding {
     pub key: KeyName,
     /// How it appeared: `raw`, `json-escaped`, `url-encoded`, `hex`, `base64`, `base64url`.
     pub encoding: String,
+}
+
+/// One project, for `ms projects` (L31). Counts and names only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSummary {
+    /// Slug.
+    pub slug: String,
+    /// The folder's own name (render inert).
+    pub display: String,
+    /// Canonical root.
+    pub root: String,
+    /// Keys whose rule allows something.
+    pub protected: u32,
+    /// Keys whose rule still allows nothing.
+    pub needs_you: u32,
+    /// Keys written into code.
+    pub findings: u32,
+    /// The last scan stopped at a budget.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped_early: bool,
+}
+
+/// One key of a project (L31): its rule's targets, never its value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyStatus {
+    /// Key.
+    pub key: KeyName,
+    /// `swap`, `run` or `mint`; absent when the key has no rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ms_core::Mode>,
+    /// Its tier; absent when the key has no rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<ms_core::Tier>,
+    /// The rule allows something.
+    pub ready: bool,
+    /// Hosts (swap) or project roots (run) the rule names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    /// The key is in the vault.
+    pub stored: bool,
 }
 
 /// Responses from the daemon. No variant can hold a secret value.
@@ -459,6 +521,18 @@ pub enum ResponseBody {
         /// out.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         any_open: bool,
+    },
+    /// Every project (`ProjectList`, L31).
+    Projects {
+        /// One per project.
+        projects: Vec<ProjectSummary>,
+    },
+    /// One project (`ProjectGet`, L31).
+    Project {
+        /// The record, as `ms_projects::record::ProjectRecord::to_toml`. Never a value.
+        record: String,
+        /// Its keys.
+        keys: Vec<KeyStatus>,
     },
     /// An error; `message` is shown to people as is.
     Error {

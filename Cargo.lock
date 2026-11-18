@@ -1020,6 +1020,7 @@ dependencies = [
  "ms-import",
  "ms-ipc",
  "ms-mcp",
+ "ms-projects",
  "ms-proxy",
  "ms-receipts",
  "ms-rules",

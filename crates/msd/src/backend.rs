@@ -16,6 +16,12 @@ use ms_vault::memory::MemoryVault;
 pub const RECEIPTS_HMAC_KEY: &str = "morsec/receipts-hmac";
 /// Rules MAC key (L01 creates it under this name; SPEC D-B).
 pub const RULES_HMAC_KEY: &str = "morsec/rules-hmac";
+/// Project records MAC key (L31); created when missing, like the other two.
+pub const PROJECTS_HMAC_KEY: &str = ms_projects::store::PROJECTS_HMAC_KEY;
+/// The project records' rollback floor, `v=<n>` (L31).
+pub const PROJECTS_STATE_KEY: &str = "morsec/projects-state";
+/// The internal HMAC keys created when missing.
+const HMAC_KEYS: [&str; 3] = [RECEIPTS_HMAC_KEY, RULES_HMAC_KEY, PROJECTS_HMAC_KEY];
 /// The kill-switch flag (SPEC D-C).
 pub const DAEMON_STATE_KEY: &str = "morsec/daemon-state";
 /// The swap proxy CA private key, PEM (SPEC D-C, D-D).
@@ -85,7 +91,7 @@ impl Backend {
             #[cfg(target_os = "macos")]
             Backend::Keychain(v) => v.ensure_internal_keys(),
             Backend::Memory(v) => {
-                for raw in [RECEIPTS_HMAC_KEY, RULES_HMAC_KEY] {
+                for raw in HMAC_KEYS {
                     let k = KeyName::new(raw)?;
                     if v.list_names().contains(&k) {
                         continue;
@@ -103,7 +109,7 @@ impl Backend {
             #[cfg(target_os = "macos")]
             Backend::Keychain(v) => v.reset_internal_keys(),
             Backend::Memory(v) => {
-                for raw in [RECEIPTS_HMAC_KEY, RULES_HMAC_KEY] {
+                for raw in HMAC_KEYS {
                     let k = KeyName::new(raw)?;
                     v.put(&k, random_32()?, internal_meta(&k))?;
                 }
@@ -112,10 +118,18 @@ impl Backend {
         }
     }
 
-    /// Writes one of the daemon's own items ([`DAEMON_STATE_KEY`], [`CA_PEM_KEY`]). Every other
+    /// Writes one of the daemon's own items ([`DAEMON_STATE_KEY`], [`CA_PEM_KEY`],
+    /// [`CA_CERT_KEY`], [`PROJECTS_STATE_KEY`]). Every other
     /// write path refuses `morsec/` names.
     pub fn put_internal(&self, name: &KeyName, value: SecretBytes) -> Result<()> {
-        if ![DAEMON_STATE_KEY, CA_PEM_KEY, CA_CERT_KEY].contains(&name.as_str()) {
+        if ![
+            DAEMON_STATE_KEY,
+            CA_PEM_KEY,
+            CA_CERT_KEY,
+            PROJECTS_STATE_KEY,
+        ]
+        .contains(&name.as_str())
+        {
             return Err(Error::io(
                 format!("refusing to write {name}"),
                 std::io::Error::new(

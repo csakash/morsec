@@ -155,10 +155,13 @@ fn prepare_memory_state(paths: &Paths) -> Result<(), String> {
         ));
     }
     let marker = paths.state.join(DEV_MARKER);
+    let projects = paths.state.join(daemon::PROJECTS_FILE);
     let ours = [
         paths.rules.clone(),
         ms_rules::store::mac_path(&paths.rules),
         paths.ca_pem.clone(),
+        ms_rules::store::mac_path(&projects),
+        projects,
     ];
     if !marker.exists() {
         if ours.iter().any(|p| p.exists()) || paths.receipts.exists() {
