@@ -788,3 +788,31 @@ fn orphan_ref_gets_provider_only_by_its_generated_name() {
         "{detail}"
     );
 }
+
+// protects=security review S3 end to end: a project folder whose path has a bidi override
+// (U+202E) is refused before anything is read or moved (the .env is unchanged, no key stored),
+// and a --name with one is shown without it; fails_when=the folder is imported or the override
+// reaches the output; no_claim=homoglyphs (T-07)
+#[test]
+fn bidi_characters_never_reach_the_record() {
+    let fx = Fx::new();
+    let root = fx.base().join("sh\u{202e}op");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    let env = format!("STRIPE_SECRET_KEY={T_ROOT}\n");
+    std::fs::write(root.join(".env"), &env).unwrap();
+    let (code, out) = fx.init_plain(&root, "");
+    assert_ne!(code, 0, "{out}");
+    assert!(out.contains("can't show safely"), "{out}");
+    assert!(!out.contains('\u{202e}'), "{out:?}");
+    assert_eq!(read(&root.join(".env")), env);
+    assert!(!fx.audit().exists());
+
+    let plain = fx.base().join("shop");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("package.json"), "{}\n").unwrap();
+    let (code, out) = fx.init_plain(&plain, "--name \"$(printf 'my\\342\\200\\256shop')\"");
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("Project    myshop  ("), "{out}");
+    assert!(!out.contains('\u{202e}'), "{out:?}");
+}

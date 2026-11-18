@@ -132,6 +132,15 @@ fn secret_records(file: &EnvFile, plan: &Plan) -> Vec<SecretRecord> {
 
 /// Runs the project steps at `root` (canonical, checked by the caller).
 pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
+    // A root msd can't record (bidi or invisible characters, security review S3) is refused
+    // before anything is read or moved.
+    let root_text = root.to_str().unwrap_or("");
+    if root_text.is_empty() || root_text.chars().any(ms_projects::record::is_unsafe_char) {
+        return Err(
+            "morsec: this folder's path has characters morsec can't show safely (control, bidi or invisible). Move the project to a plain path, then run ms init"
+                .into(),
+        );
+    }
     let rt = runtime()?;
     let catalog = Catalog::builtin();
     let mut rep = Report {

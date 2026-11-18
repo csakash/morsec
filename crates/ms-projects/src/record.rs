@@ -167,10 +167,16 @@ pub fn check_text(s: &str, what: &str) -> Result<(), Error> {
     text_ok(s, what)
 }
 
+/// Control characters, and bidi, zero-width and other invisible format characters (security
+/// review S3): none may reach the approval text or a terminal from a record.
+pub fn is_unsafe_char(c: char) -> bool {
+    c.is_control() || ms_approve::render::is_invisible_or_bidi(c)
+}
+
 fn text_ok(s: &str, what: &str) -> Result<(), Error> {
-    if s.is_empty() || s.len() > MAX_FIELD || s.chars().any(char::is_control) {
+    if s.is_empty() || s.len() > MAX_FIELD || s.chars().any(is_unsafe_char) {
         return Err(bad(format!(
-            "{what} must be 1 to {MAX_FIELD} bytes without control characters"
+            "{what} must be 1 to {MAX_FIELD} bytes without control or invisible characters"
         )));
     }
     Ok(())
@@ -207,7 +213,7 @@ pub const HINT_RESERVE: usize = 64;
 /// [`MAX_FIELD`] bytes on a character boundary; `fallback` when nothing is left.
 pub fn display_name(s: &str, fallback: &str) -> String {
     let mut out = String::new();
-    for c in s.chars().filter(|c| !c.is_control()) {
+    for c in s.chars().filter(|c| !is_unsafe_char(*c)) {
         if out.len() + c.len_utf8() > MAX_FIELD {
             break;
         }
@@ -318,6 +324,11 @@ impl ProjectRecord {
         }
         text_ok(&self.display, "the display name")?;
         ms_rules::validate_root(Path::new(&self.root)).map_err(bad)?;
+        if self.root.chars().any(is_unsafe_char) {
+            return Err(bad(
+                "the project root has bidi or invisible characters; move the project to a plain path",
+            ));
+        }
         let secrets: usize = self.files.iter().map(|f| f.secrets.len()).sum();
         if secrets > MAX_SECRETS {
             return Err(bad(format!(
@@ -502,6 +513,30 @@ pub(crate) mod tests {
         r.validate().unwrap();
         let (kept, skipped) = fit_findings(vec![good.clone(); MAX_FINDINGS + 5], 0);
         assert_eq!((kept.len(), skipped), (MAX_FINDINGS, 5));
+    }
+
+    // protects=security review S3: a bidi override (U+202E) or a zero-width character in the root,
+    // a display name, a path or a variable name is refused by validate (so it never reaches the
+    // approval text), and the CLI's display_name drops it; fails_when=any of them validates;
+    // no_claim=homoglyphs (T-07)
+    #[test]
+    fn invisible_and_bidi_characters_refused() {
+        let mut r = sample();
+        r.root = "/Users/me/code/\u{202e}pohs".into();
+        assert!(r.validate().is_err());
+        let mut r = sample();
+        r.display = "shop\u{202e}gnp.exe".into();
+        assert!(r.validate().is_err());
+        let mut r = sample();
+        r.files[0].path = ".env\u{200b}".into();
+        assert!(r.validate().is_err());
+        let mut r = sample();
+        r.files[0].secrets[0].var = "A\u{2066}B".into();
+        assert!(r.validate().is_err());
+        assert_eq!(display_name("sh\u{202e}op\u{200b}", "x"), "shop");
+        let mut r = sample();
+        r.display = display_name("sh\u{202e}op", "x");
+        r.validate().unwrap();
     }
 
     // protects=design §5.2 limits and shapes: keys outside the slug, paths that leave the root,
