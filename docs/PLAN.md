@@ -946,6 +946,65 @@ wait for them.
 **v1.x gate** (PRD: 1Password/Bitwarden import, ARI-42 export): L26 and L27 merged. **Human:** 3
 startups use the export in a real customer security review.
 
+### Wave 7 (guided setup and local dashboard)
+
+Added 18 November 2026 so that someone who has never used a terminal much can protect a project
+with one command. Design and decisions D1 to D4: [docs/design/guided-setup-dashboard.md](design/guided-setup-dashboard.md).
+Order: L31, then L32 and L34 in parallel, then L33. The dashboard replaces L25's screen; every
+approval is still msd's Touch ID sheet, so there is still one approval surface.
+
+#### L31 `guided-init` · M
+- **Depends on:** L04, L07, L08, L13. **Owns:** `crates/ms-projects/` (new), `ms init` mode
+  detection in `crates/ms-cli/src/service.rs`, `ms projects`, `ProjectInit`/`ProjectList`/
+  `ProjectGet` in `ms-ipc` and msd, the deep scan in `crates/ms-import/src/walk.rs` (new).
+- **Build:** design §4 and §5: machine vs project mode with no prompt; project slug; deep scan with
+  budgets, no symlinks, one device; zero-question import into `<project>/<var>` keys with tier
+  raised by file name; code findings (report only); MAC'd `projects.toml`; agent hint block in an
+  existing `CLAUDE.md`/`AGENTS.md`; agents auto-connected; the plain-English summary. The dashboard
+  link is printed but not opened until L32.
+- **Verify:** `init_in_home_is_machine_mode`, `dotfiles_repo_in_home_is_machine_mode`,
+  `scan_never_follows_symlinks`, `scan_budget_stops_early`, `scan_skips_dependency_dirs`,
+  `import_raises_tier_from_file_name`, `same_var_two_values_gets_file_segment`,
+  `code_finding_never_stored_or_rewritten`, `project_requests_refused_in_agent_session`,
+  `projects_toml_tamper_fails_closed`, `reinit_is_idempotent`; canary: after `ms init` in a fixture
+  monorepo the canary is in no file, receipt or IPC frame; e2e on a fixture with 3 env files and a
+  hard-coded key.
+- **ARI-42:** INJ-5, GW-1, OUT-1, SDLC-4, LOG-1.
+
+#### L32 `dash-core` · M
+- **Depends on:** L31, L11. **Owns:** `crates/ms-dash/` (new: routes, assets, session, checks),
+  `crates/msd/src/dash.rs`, `ms dashboard`, `DashOpen`.
+- **Build:** design §6.1 to §6.5, read-only: msd-served loopback listener, process check per
+  connection, launch token in the URL fragment, cookie + CSRF, Host/Origin checks, headers, rate
+  limits; vendored fonts and the landing-page tokens; Home, Projects, Project, Secret (no value
+  actions), Activity, Agents, Scan screens; `ms init` opens it.
+- **Verify:** every L32 test in design §8; `dash_parity_covers_every_subcommand`; a browser QA pass
+  (`/browse`) at 1280 and 375 px in light and dark.
+- **ARI-42:** MCP-3, INJ-3, LOG-1, LOG-2, GW-2.
+
+#### L33 `dash-actions` · M
+- **Depends on:** L32. **Owns:** `KeyReveal`, `KeyCopy`, `KeyReplace`, `KeyDelete`, `ProjectUndo`
+  and their dashboard routes; `ms set`, `ms rm`, `ms undo`; the vault replace path; the pasteboard
+  writer in msd.
+- **Build:** design §6.4 actions, §6.6 to §6.8: Show and Copy behind Touch ID every time (accepted
+  exception, D1), Replace, Delete, Undo with root-relative `openat` checks, rules edits (loosen =
+  Touch ID), Stop/Start, Approve, Add project, Add secret, connect/disconnect.
+- **Verify:** every L33 test in design §8, plus `copy_never_sends_value_to_browser`,
+  `pasteboard_cleared_after_30s`, `replace_keeps_old_value_on_failure`,
+  `delete_refused_while_referenced`, `stop_needs_no_approval`, `dashboard_action_writes_receipt`;
+  manual Touch ID checks recorded in PROOF.md.
+- **ARI-42:** GW-1 and INJ-5 (exception), AUTH-3, AUTH-4, OUT-1, LOG-1.
+
+#### L34 `ms-dev` · S
+- **Depends on:** L31 (L32 for the copy button only). **Owns:** `ms dev`, `DevStart`, dev sessions
+  in `ms-session` and msd's proxy session lookup.
+- **Build:** design §7.
+- **Verify:** `dev_refused_in_agent_session`, `dev_refused_for_agent_binary`,
+  `dev_swaps_refs_for_child_tree`, `dev_session_ends_with_child`,
+  `dev_run_mode_values_only_for_project_keys`, `dev_production_needs_one_approval`; e2e: a fixture
+  Node 24 app calls a fake Stripe upstream with a ref and gets the canary swapped in.
+- **ARI-42:** AUTH-1, AUTH-3, INJ-4, GW-1.
+
 ---
 
 ## 6. Running it with gstack-loops
