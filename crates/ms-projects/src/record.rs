@@ -162,6 +162,11 @@ fn bad(why: impl Into<String>) -> Error {
     Error::Invalid(why.into())
 }
 
+/// A text field msd accepts: 1 to [`MAX_FIELD`] bytes without control characters.
+pub fn check_text(s: &str, what: &str) -> Result<(), Error> {
+    text_ok(s, what)
+}
+
 fn text_ok(s: &str, what: &str) -> Result<(), Error> {
     if s.is_empty() || s.len() > MAX_FIELD || s.chars().any(char::is_control) {
         return Err(bad(format!(
@@ -195,7 +200,94 @@ pub fn check_rel(p: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Room kept in a project's path budget for the hint files (`CLAUDE.md`, `AGENTS.md`).
+pub const HINT_RESERVE: usize = 64;
+
+/// A display name [`ProjectRecord::validate`] accepts: control characters dropped, cut to
+/// [`MAX_FIELD`] bytes on a character boundary; `fallback` when nothing is left.
+pub fn display_name(s: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > MAX_FIELD {
+            break;
+        }
+        out.push(c);
+    }
+    if out.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        out
+    }
+}
+
+/// Whether an env file can be added to a record that already holds `secrets_so_far` secrets and
+/// `path_bytes_so_far` bytes of paths: its path must be recordable and both limits must still
+/// hold. The CLI imports a file only when this passes, so no key exists without a record entry.
+pub fn admit_file(
+    rel: &str,
+    new_secrets: usize,
+    secrets_so_far: usize,
+    path_bytes_so_far: usize,
+) -> Result<(), Error> {
+    check_rel(rel)?;
+    if secrets_so_far + new_secrets > MAX_SECRETS {
+        return Err(bad(format!(
+            "the project would have more than {MAX_SECRETS} secrets"
+        )));
+    }
+    if path_bytes_so_far + rel.len() + HINT_RESERVE > MAX_PATH_BYTES {
+        return Err(bad(format!(
+            "the project's file list would be larger than {MAX_PATH_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn check_finding(f: &FindingRecord) -> Result<(), Error> {
+    check_rel(&f.path)?;
+    if KeyName::new(&f.provider).is_err() || f.provider.contains('/') {
+        return Err(bad("a provider id must be one key-name segment"));
+    }
+    // The catalog prefix (at most a few dozen bytes), "…" and the length: no room for a value.
+    if f.masked.len() > 80 || !f.masked.ends_with(" bytes)") || !f.masked.contains('…') {
+        return Err(bad("a code finding's masked form is not prefix… (N bytes)"));
+    }
+    Ok(())
+}
+
+/// The code findings a record with `path_bytes_used` bytes of paths can hold: each must pass
+/// the record's checks, at most [`MAX_FINDINGS`], within [`MAX_PATH_BYTES`]. Returns the kept
+/// findings and how many were left out.
+pub fn fit_findings(
+    findings: Vec<FindingRecord>,
+    path_bytes_used: usize,
+) -> (Vec<FindingRecord>, usize) {
+    let mut left = MAX_PATH_BYTES.saturating_sub(path_bytes_used + HINT_RESERVE);
+    let total = findings.len();
+    let mut kept = Vec::new();
+    for f in findings {
+        if kept.len() >= MAX_FINDINGS || check_finding(&f).is_err() || f.path.len() > left {
+            continue;
+        }
+        left -= f.path.len();
+        kept.push(f);
+    }
+    let skipped = total - kept.len();
+    (kept, skipped)
+}
+
 impl ProjectRecord {
+    /// Bytes of file and hint paths (findings excluded).
+    pub fn path_bytes(&self) -> usize {
+        self.files.iter().map(|f| f.path.len()).sum::<usize>()
+            + self.hints.iter().map(|h| h.path.len()).sum::<usize>()
+    }
+
+    /// Secret lines in the record.
+    pub fn secret_count(&self) -> usize {
+        self.files.iter().map(|f| f.secrets.len()).sum()
+    }
+
     /// Every key the record names, deduplicated, sorted.
     pub fn keys(&self) -> Vec<KeyName> {
         let mut k: Vec<KeyName> = self
@@ -256,16 +348,8 @@ impl ProjectRecord {
             }
         }
         for f in &self.findings {
-            check_rel(&f.path)?;
+            check_finding(f)?;
             bytes += f.path.len();
-            if KeyName::new(&f.provider).is_err() || f.provider.contains('/') {
-                return Err(bad("a provider id must be one key-name segment"));
-            }
-            // The catalog prefix (at most a few dozen bytes), "…" and the length: no room for a
-            // value.
-            if f.masked.len() > 80 || !f.masked.ends_with(" bytes)") || !f.masked.contains('…') {
-                return Err(bad("a code finding's masked form is not prefix… (N bytes)"));
-            }
         }
         for h in &self.hints {
             check_rel(&h.path)?;
@@ -382,6 +466,42 @@ pub(crate) mod tests {
         assert_eq!(ProjectsFile::from_toml(&f.to_toml()).unwrap(), f);
         let extra = text.replacen("slug = ", "value = \"x\"\nslug = ", 1);
         assert!(ProjectRecord::from_toml(&extra).is_err());
+    }
+
+    // protects=review R3: what the CLI builds from file-derived data always passes msd's checks:
+    // a control character or an oversized display name is cleaned; a file with an unrecordable
+    // name, one past the secret cap or past the path budget is not admitted (so it isn't
+    // imported); findings that fail the checks or overflow the path budget are left out and
+    // counted; fails_when=any of those produces a record validate() refuses, or drops a good
+    // finding while there is room; no_claim=the CLI's summary wording (ms-cli tests)
+    #[test]
+    fn client_side_fits_the_limits() {
+        assert_eq!(display_name("my\tshop\u{1b}[2J", "shop"), "myshop[2J");
+        assert_eq!(display_name("\u{7}\n", "shop"), "shop");
+        let long = display_name(&"é".repeat(MAX_FIELD), "x");
+        assert!(long.len() <= MAX_FIELD && check_text(&long, "d").is_ok());
+        assert!(admit_file(".env", 3, 0, 0).is_ok());
+        assert!(admit_file(".env.\u{1}x", 1, 0, 0).is_err());
+        assert!(admit_file("../.env", 1, 0, 0).is_err());
+        assert!(admit_file(".env", 2, MAX_SECRETS - 1, 0).is_err());
+        assert!(admit_file(".env", 1, 0, MAX_PATH_BYTES - 10).is_err());
+
+        let mut r = sample();
+        let good = r.findings[0].clone();
+        let mut bad_path = good.clone();
+        bad_path.path = "src/\u{1}.ts".into();
+        let mut many: Vec<FindingRecord> = vec![bad_path];
+        let mut big = good.clone();
+        big.path = format!("src/{}.ts", "a".repeat(900));
+        many.extend(std::iter::repeat_n(big, 100));
+        many.push(good.clone());
+        let (kept, skipped) = fit_findings(many, r.path_bytes());
+        assert_eq!(kept.len() + skipped, 102);
+        assert!(skipped > 1);
+        r.findings = kept;
+        r.validate().unwrap();
+        let (kept, skipped) = fit_findings(vec![good.clone(); MAX_FINDINGS + 5], 0);
+        assert_eq!((kept.len(), skipped), (MAX_FINDINGS, 5));
     }
 
     // protects=design §5.2 limits and shapes: keys outside the slug, paths that leave the root,
