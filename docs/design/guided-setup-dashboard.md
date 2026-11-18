@@ -108,6 +108,17 @@ Steps 3 to 5 run inside msd (request `ProjectInit`), not in the CLI. Values go f
 the vault without crossing the socket, and the dashboard's Add project uses the same code.
 `ProjectInit` is refused inside an agent session, like `Scan` and approvals.
 
+> **Refinement (L31 SPEC D-1, D-2).** L31 runs steps 2 to 5 in `ms init` itself, not in msd: the
+> logic lives in the library crate `crates/ms-projects` (walk, naming, record, MAC'd store), and
+> values reach the vault through the same `IpcStore` / `PutKey` path `ms import` uses, so they
+> cross the peer-verified socket exactly as they do today. There is no `ProjectInit` request;
+> instead `ProjectSave { record, rules }` (refused in agent sessions and while stopped) carries
+> the record and the first rules of the project's new keys, which msd checks against the catalog
+> and applies after **one** approval bound to the hash of their canonical TOML (`put_key` still
+> gives every new key a rule that allows nothing). L33's dashboard Add project calls the same
+> library inside msd with a direct vault `KeyStore`. The summary points at `ms projects` until
+> L32 and L34 land (SPEC D-3).
+
 ### 4.4 Project name
 
 - `slug(basename(root))`: lowercase, every run of characters outside `a-z0-9` becomes `-`, trimmed

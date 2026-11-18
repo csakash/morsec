@@ -24,7 +24,8 @@ const NM_CANARY: &str = "sk_test_51NODEMODULESCANARY000000000";
 /// The real values.
 const T_ROOT: &str = "sk_test_51ROOTvalueROOTvalueROOTvalue";
 const T_PROD: &str = "sk_test_51PRODvaluePRODvaluePRODvalue";
-const OAI: &str = "sk-proj-OAIvalueOAIvalueOAIvalueOAIvalue0123";
+// A fake OpenAI-shaped value, split so secret scanners don't take the source for a key.
+const OAI: &str = concat!("sk-", "proj-", "OAIvalueOAIvalueOAIvalueOAIvalue0123");
 const SESSION: &str = "f3a9c2e7b1d84f6a9c0e2b4d6f8a1c3e";
 
 fn ms() -> PathBuf {

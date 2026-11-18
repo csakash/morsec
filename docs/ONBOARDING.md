@@ -76,12 +76,36 @@ To check a download yourself, see [packaging/VERIFY.md](../packaging/VERIFY.md).
 
 ## 2. Set up
 
+The one-command start: run it inside your project.
+
 ```bash
+cd ~/code/shop
 ms init
 ```
 
-It creates the vault in your login keychain and starts `msd` as a LaunchAgent. `ms status`
-says whether morsec is on and how many secrets it protects.
+It creates the vault in your login keychain, starts `msd` as a LaunchAgent, and then protects
+the project: it finds the secrets in the project's `.env` files (`.env`, `.env.production`,
+`apps/web/.env` and so on; never `.env.example`, `node_modules` or anything behind a symlink),
+stores them in the vault, rewrites the files with `ms://` references, and asks you **once**
+(Touch ID) to let the keys it knows reach their services (Stripe keys reach `api.stripe.com`,
+and so on). It connects Claude Code and Codex if it finds them (`--no-connect` skips that), and
+ends with a short summary:
+
+```
+Project    shop  (~/code/shop)
+Found      14 secrets in 3 files
+Protected  12, ready to use
+Needs you  2 have no known service yet: ms rules shop/session-secret --add-host <host>
+In code    1 key written straight into src/lib/stripe.ts:4 (move it into .env, then ms init)
+```
+
+If you say no to the approval, the secrets are still safe in the vault and the files still hold
+references; run `ms init` again to approve. Running it again later is safe: it only picks up new
+values. `ms projects shop` shows everything it did. Run in your home folder (or with
+`--machine`), `ms init` only sets up this Mac. `ms status` says whether morsec is on and how
+many secrets it protects.
+
+The rest of this guide is for doing the same by hand, one key at a time.
 
 ## 3. Add your secrets
 
