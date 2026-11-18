@@ -14,7 +14,7 @@ use ms_import::KeyStore;
 use ms_import::catalog::Catalog;
 use ms_import::envfile::{self, EnvFile};
 use ms_import::plan::{Action, Plan};
-use ms_ipc::{Client, KeyStatus, RequestBody, ResponseBody};
+use ms_ipc::{Client, ErrorCode, KeyStatus, RequestBody, ResponseBody};
 use ms_projects::naming::{Source, plan_project};
 use ms_projects::record::{
     FileRecord, FindingRecord, HintRecord, ProjectRecord, Quote, ScanRecord, SecretAction,
@@ -52,6 +52,9 @@ pub(crate) struct Report {
     pub declined: Option<String>,
     /// The record could not be saved.
     pub save_error: Option<String>,
+    /// The record was saved but the keys' first rules were not, for a reason other than the
+    /// approval (an invalid proposal, the rules unreadable).
+    pub rules_error: Option<String>,
     pub stopped_early: Option<String>,
     pub too_large: Vec<String>,
     /// Keys an earlier run stored whose refs were found but which no record listed (review R1).
@@ -266,7 +269,15 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
             }
         };
         let rewrites = plan.rows.iter().filter(|r| r.action.rewrites()).count();
-        let adopted = adopt_refs(catalog, &rep.slug, file, &plan, &stored, previous.as_ref());
+        let adopted = adopt_refs(
+            catalog,
+            &rep.slug,
+            rel,
+            file,
+            &plan,
+            &stored,
+            previous.as_ref(),
+        );
         if rewrites == 0 && adopted.is_empty() {
             continue;
         }
@@ -432,7 +443,7 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
         }
         .map(|current| ms_projects::save::initial_rules(catalog, &record, &current));
         match proposed {
-            Err(e) => rep.declined = Some(terminal_safe(&e)),
+            Err(e) => rep.rules_error = Some(terminal_safe(&e)),
             Ok(p) if p.keys.is_empty() => {}
             Ok(p) => {
                 let _review = crate::approve::inline_review("ms init");
@@ -445,8 +456,14 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
                     Some(crate::approve::APPROVAL_WAIT),
                 ) {
                     Ok(ResponseBody::Ok { .. }) => {}
-                    Ok(ResponseBody::Error { message, .. }) => {
+                    Ok(ResponseBody::Error {
+                        code: ErrorCode::NeedsApproval | ErrorCode::Busy | ErrorCode::Denied,
+                        message,
+                    }) => {
                         rep.declined = Some(terminal_safe(&message));
+                    }
+                    Ok(ResponseBody::Error { message, .. }) => {
+                        rep.rules_error = Some(terminal_safe(&message));
                     }
                     Ok(_) => rep.declined = Some(UNEXPECTED.to_owned()),
                     Err(e) => rep.declined = Some(terminal_safe(&e)),
@@ -487,6 +504,7 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
 fn adopt_refs(
     catalog: &Catalog,
     slug: &str,
+    rel: &str,
     file: &EnvFile,
     plan: &Plan,
     stored: &BTreeSet<KeyName>,
@@ -501,16 +519,19 @@ fn adopt_refs(
             if !key.as_str().starts_with(&prefix) || !stored.contains(&key) {
                 return None;
             }
-            let provider = previous
-                .and_then(|p| p.provider_of(&key))
-                .map(str::to_owned)
-                .or_else(|| {
-                    catalog
-                        .providers
-                        .iter()
-                        .find(|p| p.matches_env_name(&r.var))
-                        .map(|p| p.id.clone())
-                });
+            // Review R7: the file (agent-writable) never chooses a key's hosts. A key the
+            // earlier record lists keeps exactly its recorded provider (None stays None); an
+            // orphan takes one from the variable name only when ms init would have given that
+            // variable this very name.
+            let provider = match previous.filter(|p| p.keys().contains(&key)) {
+                Some(p) => p.provider_of(&key).map(str::to_owned),
+                None if ms_projects::naming::is_generated_name(slug, rel, &r.var, &key) => catalog
+                    .providers
+                    .iter()
+                    .find(|p| p.matches_env_name(&r.var))
+                    .map(|p| p.id.clone()),
+                None => None,
+            };
             Some(SecretRecord {
                 var: r.var.clone(),
                 line: r.line as u64,
@@ -670,6 +691,12 @@ pub(crate) fn summary_rows(r: &Report, home: Option<&Path>) -> Vec<(String, Stri
         rows.push((
             "Scan".to_owned(),
             format!("stopped {why}; run ms init --project PATH on a subfolder to cover the rest"),
+        ));
+    }
+    if let Some(e) = &r.rules_error {
+        rows.push((
+            "Rules".to_owned(),
+            format!("not saved: {e}. The keys are recorded but can't be used yet"),
         ));
     }
     if let Some(e) = &r.save_error {

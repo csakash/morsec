@@ -703,3 +703,88 @@ fn unrecordable_file_is_left_untouched() {
     assert!(detail.contains("Project  my-shop (myshop)"), "{detail}");
     assert_eq!(detail.matches("swap").count(), 4, "{detail}");
 }
+
+// protects=review R7: an agent-written ref can't choose a key's service: after the first ms init
+// records SESSION_SECRET's key with no provider, renaming its line to
+// GITHUB_TOKEN=ms://shop/session-secret makes the next ms init propose no rule for it (no
+// approval asked) and the key stays "needs you"; fails_when=the key gets GitHub's hosts or an
+// approval is asked for them; no_claim=the msd-side check (ms-projects provider_is_fixed_once_recorded)
+#[test]
+fn adopted_ref_cannot_change_a_keys_provider() {
+    let fx = Fx::new();
+    let root = fx.base().join("shop");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    std::fs::write(root.join(".env"), format!("SESSION_SECRET={SESSION}\n")).unwrap();
+    let (code, out) = fx.init_plain(&root, "");
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        read(&root.join(".env")),
+        "SESSION_SECRET=ms://shop/session-secret\n"
+    );
+    std::fs::write(root.join(".env"), "GITHUB_TOKEN=ms://shop/session-secret\n").unwrap();
+    let started = Instant::now();
+    let (code, out) = fx.init_plain(&root, "");
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "an approval was asked: {out}"
+    );
+    assert!(!out.contains("needs your approval"), "{out}");
+    let (_, detail) = fx.ms(&["projects", "shop"]);
+    assert!(
+        detail.contains("shop/session-secret  swap  production  needs you  -"),
+        "{detail}"
+    );
+    assert!(!detail.contains("github.com"), "{detail}");
+    assert!(
+        detail.contains(".env  1  GITHUB_TOKEN  shop/session-secret"),
+        "{detail}"
+    );
+}
+
+// protects=review R7 for orphans (keys no record lists): a ref takes its provider from the
+// variable name only when the key is the name ms init would have generated for it; a key under
+// another name gets no provider (no rule, no approval) while shop/github-token is adopted as
+// GitHub's and approved once; fails_when=a mismatched name gets a provider's hosts, or the
+// generated name doesn't; no_claim=-
+#[test]
+fn orphan_ref_gets_provider_only_by_its_generated_name() {
+    let fx = Fx::new();
+    let root = fx.base().join("shop");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    let gh1 = "ghp_ORPHANone0123456789abcdefghijklmnopqrstu";
+    let gh2 = "ghp_ORPHANtwo0123456789abcdefghijklmnopqrstu";
+    std::fs::write(
+        root.join(".env"),
+        format!("GITHUB_TOKEN={gh1}\nGH_TOKEN={gh2}\n"),
+    )
+    .unwrap();
+    let (code, out) = fx.outside(
+        &root,
+        &format!(
+            "'{}' import --yes --name GITHUB_TOKEN=shop/github-token --name GH_TOKEN=shop/not-github .env",
+            ms().display()
+        ),
+    );
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = fx.init_answering(&root, "o", "");
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.matches("Approval request").count(), 1, "{out}");
+    assert!(
+        out.contains("shop/github-token may go to api.github.com"),
+        "{out}"
+    );
+    assert!(!out.contains("shop/not-github may go"), "{out}");
+    let (_, detail) = fx.ms(&["projects", "shop"]);
+    assert!(detail.contains("shop/github-token  swap"), "{detail}");
+    assert!(detail.contains("ready  api.github.com"), "{detail}");
+    assert!(detail.contains("shop/not-github  swap"), "{detail}");
+    assert!(
+        detail
+            .lines()
+            .any(|l| l.starts_with("shop/not-github") && l.ends_with("needs you  -")),
+        "{detail}"
+    );
+}

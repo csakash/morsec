@@ -83,6 +83,26 @@ pub fn file_segment(rel: &str) -> String {
     seg(&joined, "root")
 }
 
+/// True when `key` is a name `ms init` would have given variable `var` of file `rel` in project
+/// `slug`: `<slug>/<var>` or `<slug>/<file segment>/<var>`, with an optional `-N` suffix
+/// (review R7). Only such a key may take its provider from the variable name when it is adopted
+/// without a record; any other ref (an agent can write `GITHUB_TOKEN=ms://shop/session-secret`)
+/// gets no provider and so no hosts.
+pub fn is_generated_name(slug: &str, rel: &str, var: &str, key: &KeyName) -> bool {
+    let v = var_segment(var);
+    let bases = [
+        format!("{slug}/{v}"),
+        format!("{slug}/{}/{v}", file_segment(rel)),
+    ];
+    let k = key.as_str();
+    bases.iter().any(|b| {
+        k == b
+            || k.strip_prefix(b.as_str())
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+    })
+}
+
 fn key(s: &str) -> KeyName {
     KeyName::new(s).unwrap_or_else(|_| unreachable!("built from valid segments: {s}"))
 }
@@ -354,6 +374,45 @@ mod tests {
         assert_eq!(file_segment("prod.env"), "prod");
         assert_eq!(file_segment(".env"), "root");
         assert_eq!(file_segment(".dev.vars"), "dev-vars");
+    }
+
+    // protects=review R7: only a key named the way ms init names that variable counts as
+    // "generated" (plain, file segment, -N suffix); a ref to another key of the project under a
+    // provider's variable name does not; fails_when=GITHUB_TOKEN=ms://shop/session-secret is
+    // taken as a GitHub key; no_claim=keys with a recorded provider (the record wins)
+    #[test]
+    fn generated_names_only() {
+        let k = |s: &str| key(s);
+        assert!(is_generated_name(
+            "shop",
+            ".env",
+            "GITHUB_TOKEN",
+            &k("shop/github-token")
+        ));
+        assert!(is_generated_name(
+            "shop",
+            ".env",
+            "GITHUB_TOKEN",
+            &k("shop/github-token-2")
+        ));
+        assert!(is_generated_name(
+            "shop",
+            "apps/web/.env",
+            "GITHUB_TOKEN",
+            &k("shop/apps-web/github-token-3")
+        ));
+        for bad in [
+            "shop/session-secret",
+            "shop/github-token-x",
+            "shop/github-token-",
+            "other/github-token",
+            "shop/production/github-token",
+        ] {
+            assert!(
+                !is_generated_name("shop", ".env", "GITHUB_TOKEN", &k(bad)),
+                "{bad}"
+            );
+        }
     }
 
     // protects=design §4.6 tiers: a production-named file raises its keys to production (never

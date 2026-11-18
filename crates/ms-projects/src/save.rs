@@ -159,6 +159,29 @@ pub fn check(
         )));
     }
     let keys: BTreeSet<KeyName> = record.keys().into_iter().collect();
+    // Review R7: a key's provider decides its hosts, so it is fixed once recorded: every line of
+    // the record agrees, and a key the stored record already lists keeps exactly its provider
+    // there (an agent-written ref can't turn a key into another provider's key).
+    let earlier = projects.get(&record.slug);
+    for k in &keys {
+        let named: BTreeSet<Option<&str>> = record
+            .files
+            .iter()
+            .flat_map(|f| &f.secrets)
+            .filter(|s| &s.key == k)
+            .map(|s| s.provider.as_deref())
+            .collect();
+        if named.iter().flatten().count() > 1 || (named.len() > 1 && named.contains(&None)) {
+            return Err(bad(format!("{k} is recorded with different services")));
+        }
+        if let Some(e) = earlier.filter(|e| e.keys().contains(k))
+            && e.provider_of(k) != record.provider_of(k)
+        {
+            return Err(bad(format!(
+                "{k} was recorded for another service; its service can't change (use ms rules {k})"
+            )));
+        }
+    }
     for k in &keys {
         if !vault_keys.contains(k) {
             return Err(bad(format!("{k} is not in the vault")));
@@ -297,6 +320,43 @@ mod tests {
             projects: vec![other],
         };
         assert!(check(cat, &rec, &ok, &cur, &vault, &taken, Some(&root)).is_err());
+    }
+
+    // protects=review R7 at msd: a key the stored record lists can't change provider (None to
+    // github included), and lines naming one key with different providers are refused;
+    // fails_when=a re-labelled key gets another provider's hosts; no_claim=-
+    #[test]
+    fn provider_is_fixed_once_recorded() {
+        let cat = Catalog::builtin();
+        let mut old = sample();
+        old.files[0].secrets[0].provider = None;
+        let stored = ProjectsFile {
+            version: 1,
+            projects: vec![old.clone()],
+        };
+        let vault: BTreeSet<KeyName> = old.keys().into_iter().collect();
+        let root = PathBuf::from(&old.root);
+        let cur = current();
+        let none = Rules::default();
+        let mut relabelled = old.clone();
+        relabelled.files[0].secrets[0].provider = Some("github".into());
+        let rules = initial_rules(cat, &relabelled, &cur);
+        assert_eq!(
+            rules.keys.len(),
+            1,
+            "the CLI side alone would propose github hosts"
+        );
+        assert!(check(cat, &relabelled, &rules, &cur, &vault, &stored, Some(&root)).is_err());
+        assert!(check(cat, &relabelled, &none, &cur, &vault, &stored, Some(&root)).is_err());
+        let mut mixed = sample();
+        let mut line = mixed.files[0].secrets[0].clone();
+        line.var = "GITHUB_TOKEN".into();
+        line.provider = Some("github".into());
+        mixed.files[0].secrets.push(line);
+        let empty = ProjectsFile::default();
+        assert!(check(cat, &mixed, &none, &cur, &vault, &empty, Some(&root)).is_err());
+        // Unchanged provider: fine.
+        check(cat, &old, &none, &cur, &vault, &stored, Some(&root)).unwrap();
     }
 
     // protects=run-mode keys get only the project root (design §4.6), and unknown providers get
