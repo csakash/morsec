@@ -25,7 +25,7 @@ mod projects;
 mod run;
 mod ssh_git;
 
-pub use projects::PROJECTS_FILE;
+pub use projects::{PROJECTS_FILE, reset_project_records};
 
 use crate::backend::{Backend, DAEMON_STATE_KEY, RULES_HMAC_KEY};
 use crate::paths::Paths;
@@ -2727,5 +2727,58 @@ mod tests {
             h.req(RequestBody::ProjectList),
             ResponseBody::Projects { .. }
         ));
+    }
+
+    // protects=review R2: after `msd --init --force` replaces morsec/projects-hmac, the old
+    // records are moved aside and the floor reset, so the next ms init saves a fresh record and
+    // ProjectList answers (instead of Denied forever); the old file is kept, renamed;
+    // fails_when=project requests stay Denied after a reset, or the old file is deleted;
+    // no_claim=the keychain reset itself (ms-vault projects_internal_items)
+    #[test]
+    fn force_reset_moves_project_records_aside() {
+        let h = fresh();
+        let rec = shop(&h);
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        // What --init --force does to the projects key: a new random one.
+        let Backend::Memory(v) = &h.backend else {
+            panic!("tests use the memory vault")
+        };
+        let k = KeyName::new(crate::backend::PROJECTS_HMAC_KEY).unwrap();
+        v.put(
+            &k,
+            crate::backend::random_32().unwrap(),
+            KeyMeta {
+                name: k.clone(),
+                mode: Mode::Swap,
+                tier: Tier::Production,
+                created_unix_ms: 0,
+            },
+        )
+        .unwrap();
+        let h = restart(h);
+        assert_eq!(
+            code(&h.req(RequestBody::ProjectList)),
+            Some(ErrorCode::Denied),
+            "without the reset the old records can't verify"
+        );
+        reset_project_records(h.dir.path(), &h.backend, "old-1").unwrap();
+        let h = restart(h);
+        assert!(matches!(
+            h.req(RequestBody::ProjectList),
+            ResponseBody::Projects { projects } if projects.is_empty()
+        ));
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        assert!(matches!(
+            h.req(RequestBody::ProjectList),
+            ResponseBody::Projects { projects } if projects.len() == 1
+        ));
+        assert!(h.dir.path().join(format!("{PROJECTS_FILE}.old-1")).exists());
+        assert!(
+            h.dir
+                .path()
+                .join(format!("{PROJECTS_FILE}.mac.old-1"))
+                .exists()
+        );
     }
 }

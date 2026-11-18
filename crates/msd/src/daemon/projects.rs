@@ -25,6 +25,29 @@ use crate::backend::{PROJECTS_HMAC_KEY, PROJECTS_STATE_KEY};
 /// The project records file in msd's state directory.
 pub const PROJECTS_FILE: &str = "projects.toml";
 
+/// For `msd --init --force` (review R2): a reset replaces `morsec/projects-hmac`, so the old
+/// `projects.toml` can never verify again. It is moved aside (`<name>.<tag>`, kept for
+/// inspection, like the rules and receipts) and the rollback floor goes back to 0, so the next
+/// `ms init` starts a fresh record instead of every project request being `Denied`.
+pub fn reset_project_records(
+    state: &std::path::Path,
+    backend: &crate::backend::Backend,
+    tag: &str,
+) -> Result<(), String> {
+    let file = state.join(PROJECTS_FILE);
+    for p in [ms_rules::store::mac_path(&file), file] {
+        if p.exists() {
+            let mut to = p.as_os_str().to_owned();
+            to.push(format!(".{tag}"));
+            std::fs::rename(&p, PathBuf::from(&to))
+                .map_err(|e| format!("morsec: moving {} aside: {e}", p.display()))?;
+        }
+    }
+    backend
+        .put_internal(&key(PROJECTS_STATE_KEY), SecretBytes::new(b"v=0".to_vec()))
+        .map_err(|e| format!("morsec: resetting the project records version: {e}"))
+}
+
 const TAMPERED: &str = "morsec: the project records failed their integrity check, so they can't be shown or changed. Your keys and rules keep working. Inspect projects.toml in morsec's state directory";
 
 fn key(raw: &str) -> KeyName {

@@ -289,6 +289,10 @@ fn init(args: &Args) -> ExitCode {
             let _ = std::fs::remove_file(&paths.ca_pem);
         }
         b.reset().map_err(|e| e.to_string())?;
+        if existing {
+            // The reset replaced the projects MAC key: set the old records aside too (review R2).
+            daemon::reset_project_records(&paths.state, &b, &format!("old-{}", now_ms()))?;
+        }
         b.put_internal(
             &state_key,
             SecretBytes::new(daemon::encode_state(was_stopped, 1)),
