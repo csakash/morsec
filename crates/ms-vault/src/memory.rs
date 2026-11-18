@@ -1,7 +1,7 @@
 //! In-memory vault for tests and fakes. Not for real secrets: nothing persists and there is no
 //! access control beyond the process boundary.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use ms_core::{Error, KeyMeta, KeyName, Result, SecretBytes};
@@ -13,12 +13,31 @@ use crate::Vault;
 #[derive(Debug, Default)]
 pub struct MemoryVault {
     entries: Mutex<BTreeMap<KeyName, (SecretBytes, KeyMeta)>>,
+    /// Names standing in for keys another morsec build stored ([`MemoryVault::mark_unusable`]).
+    unusable: Mutex<BTreeSet<KeyName>>,
 }
 
 impl MemoryVault {
     /// An empty vault.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test stand-in for a key another morsec build stored: present, but this build may not
+    /// read, replace or delete it. It shows up in [`Vault::scan`] as unusable, and reading it
+    /// fails with access denied, as the keychain does.
+    pub fn mark_unusable(&self, name: KeyName) {
+        self.unusable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name);
+    }
+
+    fn is_unusable(&self, name: &KeyName) -> bool {
+        self.unusable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<KeyName, (SecretBytes, KeyMeta)>> {
@@ -34,6 +53,15 @@ impl Vault for MemoryVault {
     }
 
     fn with_secret(&self, name: &KeyName, f: &mut dyn FnMut(&[u8])) -> Result<()> {
+        if self.is_unusable(name) {
+            return Err(Error::io(
+                format!("reading {name}"),
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("access denied: {}", crate::unusable_hint(name)),
+                ),
+            ));
+        }
         let map = self.lock();
         let (value, _) = map
             .get(name)
@@ -52,6 +80,19 @@ impl Vault for MemoryVault {
 
     fn list(&self) -> Result<Vec<KeyMeta>> {
         Ok(self.lock().values().map(|(_, m)| m.clone()).collect())
+    }
+
+    fn scan(&self) -> Result<crate::Listing> {
+        Ok(crate::Listing {
+            keys: self.list()?,
+            unusable: self
+                .unusable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned()
+                .collect(),
+        })
     }
 }
 

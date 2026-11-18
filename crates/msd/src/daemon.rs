@@ -17,7 +17,7 @@ use ms_ipc::{ApprovalScope, ErrorCode, PeerInfo, PendingApproval, RequestBody, R
 use ms_receipts::{Alert, AlertAction, AlertHandler, ReceiptDetail, ReceiptStore, StoreConfig};
 use ms_rules::{Change, KeyRule, Rules, RulesError, RulesStore, is_reserved};
 use ms_session::Caller;
-use ms_vault::{Vault, VaultExt};
+use ms_vault::{Listing, Vault, VaultExt};
 use tokio::sync::watch;
 
 mod mcp;
@@ -777,20 +777,26 @@ impl Daemon {
     }
 
     fn list_keys(&self) -> ms_core::Result<Vec<KeyMeta>> {
-        Ok(self
-            .vault
-            .list()?
-            .into_iter()
-            .filter(|m| !is_reserved(&m.name))
-            .collect())
+        Ok(self.scan_keys()?.keys)
+    }
+
+    /// The vault's keys (morsec's own excluded), and the keys another morsec build stored.
+    fn scan_keys(&self) -> ms_core::Result<Listing> {
+        let mut l = self.vault.scan()?;
+        l.keys.retain(|m| !is_reserved(&m.name));
+        l.unusable.retain(|n| !is_reserved(n));
+        Ok(l)
     }
 
     fn status(&self) -> ResponseBody {
-        let keys = match self.list_keys() {
-            Ok(k) => Some(u32::try_from(k.len()).unwrap_or(u32::MAX)),
+        let (keys, unusable) = match self.scan_keys() {
+            Ok(l) => (
+                Some(u32::try_from(l.keys.len()).unwrap_or(u32::MAX)),
+                l.unusable,
+            ),
             Err(e) => {
                 self.alert(format!("the vault could not be listed: {e}"));
-                None
+                (None, Vec::new())
             }
         };
         let (running, tampered) = {
@@ -801,6 +807,8 @@ impl Daemon {
         if tampered && !alerts.iter().any(|a| a.contains("integrity")) {
             alerts.push("the rules failed their integrity check, so every key is denied".into());
         }
+        // Worked out on every status, never stored: it clears once the user removes the items.
+        alerts.extend(unusable.iter().map(ms_vault::unusable_hint));
         let (ca_pem, ca_hosts) = lock(&self.ca).clone().unzip();
         ResponseBody::Status {
             daemon: "msd".into(),
@@ -843,8 +851,16 @@ impl Daemon {
                 "morsec: the value is empty; nothing stored",
             );
         }
-        let exists = match self.vault.list() {
-            Ok(list) => list.iter().any(|m| m.name == name),
+        let exists = match self.scan_keys() {
+            Ok(l) if l.unusable.contains(&name) => {
+                // The keychain lets only the build that stored it delete it, so this msd can't
+                // replace it; say exactly what the user runs instead of failing on the listing.
+                return reply_err(
+                    ErrorCode::Denied,
+                    format!("morsec: {}", ms_vault::unusable_hint(&name)),
+                );
+            }
+            Ok(l) => l.keys.iter().any(|m| m.name == name),
             Err(e) => return reply_err(ErrorCode::Internal, e.to_string()),
         };
         // Replacing a key changes what morsec sends on the user's behalf. From inside an agent
@@ -1592,6 +1608,44 @@ mod tests {
             ResponseBody::Error { message, .. } | ResponseBody::Ok { message } => message.clone(),
             other => format!("{other:?}"),
         }
+    }
+
+    // protects=SPEC vault-foreign-items 2-4: a key another morsec build stored doesn't wedge the
+    // vault: status keeps a key count and names it with the removal command, ms add of that name
+    // says exactly what to run, ms add of another name still works; fails_when=status loses the
+    // count, the warning lacks the command, or a put fails on the listing; no_claim=the keychain
+    // itself (ms-vault foreign_items_are_unusable_not_fatal)
+    #[test]
+    fn unusable_keys_from_another_build() {
+        let h = fresh();
+        let Backend::Memory(v) = &h.backend else {
+            panic!("tests use the memory vault")
+        };
+        v.mark_unusable(KeyName::new("env/old-key").unwrap());
+        assert!(is_ok(&h.put("stripe/test", Tier::Test)));
+        match h.req(RequestBody::Status) {
+            ResponseBody::Status { keys, alerts, .. } => {
+                assert_eq!(keys, Some(1));
+                assert!(
+                    alerts.iter().any(|a| a.contains(
+                        "security delete-generic-password -s cc.morsec.vault -a env/old-key"
+                    ) && a.contains("ms add env/old-key")),
+                    "{alerts:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        match h.req(RequestBody::ListKeys) {
+            ResponseBody::Keys { keys } => assert_eq!(keys.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        let r = h.put("env/old-key", Tier::Test);
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        assert!(
+            msg(&r).contains("security delete-generic-password -s cc.morsec.vault -a env/old-key"),
+            "{r:?}"
+        );
+        assert!(is_ok(&h.put("stripe/other", Tier::Test)));
     }
 
     // protects=PutKey stores end to end (L04's missing reply): Ok, listed by ListKeys (never with a
