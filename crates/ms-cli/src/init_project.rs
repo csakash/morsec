@@ -14,7 +14,7 @@ use ms_import::KeyStore;
 use ms_import::catalog::Catalog;
 use ms_import::envfile::{self, EnvFile};
 use ms_import::plan::{Action, Plan};
-use ms_ipc::{Client, ErrorCode, KeyStatus, RequestBody, ResponseBody};
+use ms_ipc::{Client, KeyStatus, RequestBody, ResponseBody};
 use ms_projects::naming::{Source, plan_project};
 use ms_projects::record::{
     FileRecord, FindingRecord, HintRecord, ProjectRecord, Quote, ScanRecord, SecretAction,
@@ -54,6 +54,12 @@ pub(crate) struct Report {
     pub save_error: Option<String>,
     pub stopped_early: Option<String>,
     pub too_large: Vec<String>,
+    /// Keys an earlier run stored whose refs were found but which no record listed (review R1).
+    pub recovered: usize,
+    /// Keys an earlier record listed that are gone from the vault (review R4).
+    pub missing: Vec<KeyName>,
+    /// Code findings left out of the record (limits, unrecordable paths).
+    pub findings_skipped: usize,
     pub hints: Vec<String>,
 }
 
@@ -157,11 +163,12 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
             ms_projects::slug::choose(root, pairs.iter().map(|(s, r)| (s.as_str(), r.as_path())))
         }
     };
-    rep.display = name.map(str::to_owned).unwrap_or_else(|| {
+    let raw_display = name.map(str::to_owned).unwrap_or_else(|| {
         root.file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| rep.slug.clone())
+            .unwrap_or_default()
     });
+    rep.display = ms_projects::record::display_name(&raw_display, &rep.slug);
     let previous = match &mine {
         Some(s) => match ask(&rt, RequestBody::ProjectGet { slug: s.clone() }, None)? {
             ResponseBody::Project { record, .. } => {
@@ -229,9 +236,26 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
         .collect();
     let plans = plan_project(catalog, &rep.slug, &sources, &examples, &vault_keys);
 
-    // 5. Store and rewrite, file by file.
+    // 5. Store and rewrite, file by file. The base is the earlier record, without keys that are
+    // gone from the vault (they are listed, review R4). A file is imported only when the record
+    // can hold it (review R3), so no key exists without a record entry.
     let mut stored: BTreeSet<KeyName> = vault_keys.iter().map(|m| m.name.clone()).collect();
-    let mut new_files: BTreeMap<String, FileRecord> = BTreeMap::new();
+    let mut by_path: BTreeMap<String, FileRecord> = BTreeMap::new();
+    let mut known: BTreeSet<KeyName> = BTreeSet::new();
+    for f in previous.iter().flat_map(|p| p.files.iter()) {
+        let mut f = f.clone();
+        f.secrets.retain(|s| {
+            let here = stored.contains(&s.key);
+            if !here && !rep.missing.contains(&s.key) {
+                rep.missing.push(s.key.clone());
+            }
+            here
+        });
+        known.extend(f.secrets.iter().map(|s| s.key.clone()));
+        if !f.secrets.is_empty() {
+            by_path.insert(f.path.clone(), f);
+        }
+    }
     for ((rel, path, file), plan) in files.iter().zip(plans) {
         let plan = match plan {
             Ok(p) => p,
@@ -241,51 +265,100 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
                 continue;
             }
         };
-        if !plan.rows.iter().any(|r| r.action.rewrites()) {
+        let rewrites = plan.rows.iter().filter(|r| r.action.rewrites()).count();
+        let adopted = adopt_refs(catalog, &rep.slug, file, &plan, &stored, previous.as_ref());
+        if rewrites == 0 && adopted.is_empty() {
             continue;
         }
-        let own: BTreeSet<&KeyName> = plan.imports().filter_map(|r| r.key.as_ref()).collect();
-        if let Some(missing) = plan
-            .rows
+        let (others_secrets, others_bytes) = by_path
             .iter()
-            .filter(|r| r.action.rewrites())
-            .filter_map(|r| r.key.as_ref())
-            .find(|k| !own.contains(k) && !stored.contains(*k))
-        {
+            .filter(|(p, _)| *p != rel)
+            .fold((0, 0), |(n, b), (p, f)| (n + f.secrets.len(), b + p.len()));
+        let mine_before = by_path.get(rel).map_or(0, |f| f.secrets.len());
+        if let Err(e) = ms_projects::record::admit_file(
+            rel,
+            mine_before + rewrites + adopted.len(),
+            others_secrets,
+            others_bytes,
+        ) {
             rep.failed.push((
                 rel.clone(),
                 format!(
-                    "shares a value with a file that was not imported ({missing}); not changed"
+                    "can't be recorded ({}); not changed",
+                    terminal_safe(&e.to_string())
                 ),
             ));
             continue;
         }
-        match envfile::commit(file, &plan, &store, now_unix_ms()) {
-            Ok(done) => {
-                stored.extend(done.stored);
-                rep.found += done.rewritten;
-                rep.files += 1;
-                let commits = envfile::git_history(path).map(|n| n as u64);
-                if let Some(n) = commits.filter(|n| *n > 0) {
-                    rep.committed.push((rel.clone(), n));
-                }
-                new_files.insert(
+        let mut fresh: Vec<SecretRecord> = Vec::new();
+        let mut commits = None;
+        if rewrites > 0 {
+            let own: BTreeSet<&KeyName> = plan.imports().filter_map(|r| r.key.as_ref()).collect();
+            if let Some(missing) = plan
+                .rows
+                .iter()
+                .filter(|r| r.action.rewrites())
+                .filter_map(|r| r.key.as_ref())
+                .find(|k| !own.contains(k) && !stored.contains(*k))
+            {
+                rep.failed.push((
                     rel.clone(),
-                    FileRecord {
-                        path: rel.clone(),
-                        git_history_commits: commits,
-                        secrets: secret_records(file, &plan),
-                    },
-                );
+                    format!(
+                        "shares a value with a file that was not imported ({missing}); not changed"
+                    ),
+                ));
+                continue;
             }
-            Err(e) => rep
-                .failed
-                .push((rel.clone(), terminal_safe(&e.to_string()))),
+            match envfile::commit(file, &plan, &store, now_unix_ms()) {
+                Ok(done) => {
+                    stored.extend(done.stored);
+                    rep.found += done.rewritten;
+                    rep.files += 1;
+                    commits = envfile::git_history(path).map(|n| n as u64);
+                    if let Some(n) = commits.filter(|n| *n > 0) {
+                        rep.committed.push((rel.clone(), n));
+                    }
+                    fresh = secret_records(file, &plan);
+                }
+                Err(e) => {
+                    rep.failed
+                        .push((rel.clone(), terminal_safe(&e.to_string())));
+                    continue;
+                }
+            }
         }
+        for a in &adopted {
+            if !known.contains(&a.key) {
+                known.insert(a.key.clone());
+                rep.recovered += 1;
+            }
+        }
+        fresh.extend(adopted);
+        let entry = by_path.entry(rel.clone()).or_insert_with(|| FileRecord {
+            path: rel.clone(),
+            git_history_commits: None,
+            secrets: Vec::new(),
+        });
+        if commits.is_some() {
+            entry.git_history_commits = commits;
+        }
+        let vars: BTreeSet<String> = fresh.iter().map(|s| s.var.clone()).collect();
+        entry.secrets.retain(|s| !vars.contains(&s.var));
+        entry.secrets.extend(fresh);
+        entry.secrets.sort_by_key(|s| s.line);
     }
 
-    // 7. Agent hint block (before the record, which lists it).
-    rep.hints = ms_projects::hint::apply(root, &rep.slug).map_err(|e| e.to_string())?;
+    // 7. Agent hint block (before the record, which lists it). A failure is listed, not fatal.
+    rep.hints = match ms_projects::hint::apply(root, &rep.slug) {
+        Ok(h) => h,
+        Err(e) => {
+            rep.failed.push((
+                "CLAUDE.md / AGENTS.md".into(),
+                format!("hint block not added: {}", terminal_safe(&e.to_string())),
+            ));
+            Vec::new()
+        }
+    };
 
     // The record: earlier runs' files and hints, this run's scan and findings.
     let mut record = ProjectRecord {
@@ -300,11 +373,21 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
             stopped_early: scan.stopped_early,
             ms: scan.elapsed_ms,
         },
-        files: Vec::new(),
-        findings: scan
-            .findings
+        files: by_path.into_values().collect(),
+        findings: Vec::new(),
+        hints: previous
+            .as_ref()
+            .map(|p| p.hints.clone())
+            .unwrap_or_default(),
+    };
+    for h in &rep.hints {
+        if !record.hints.iter().any(|x| &x.path == h) {
+            record.hints.push(HintRecord { path: h.clone() });
+        }
+    }
+    let (findings, skipped) = ms_projects::record::fit_findings(
+        scan.findings
             .iter()
-            .take(ms_projects::record::MAX_FINDINGS)
             .map(|f| FindingRecord {
                 path: f.path.clone(),
                 line: f.line as u64,
@@ -312,77 +395,64 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
                 masked: f.masked.clone(),
             })
             .collect(),
-        hints: previous
-            .as_ref()
-            .map(|p| p.hints.clone())
-            .unwrap_or_default(),
-    };
-    let mut by_path: BTreeMap<String, FileRecord> = previous
-        .as_ref()
-        .map(|p| {
-            p.files
-                .iter()
-                .map(|f| (f.path.clone(), f.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    for (path, mut f) in new_files {
-        if let Some(old) = by_path.remove(&path) {
-            let vars: BTreeSet<&str> = f.secrets.iter().map(|s| s.var.as_str()).collect();
-            let kept: Vec<SecretRecord> = old
-                .secrets
-                .into_iter()
-                .filter(|s| !vars.contains(s.var.as_str()))
-                .collect();
-            f.secrets.splice(0..0, kept);
-        }
-        by_path.insert(path, f);
-    }
-    record.files = by_path.into_values().collect();
-    for h in &rep.hints {
-        if !record.hints.iter().any(|x| &x.path == h) {
-            record.hints.push(HintRecord { path: h.clone() });
-        }
-    }
+        record.path_bytes(),
+    );
+    record.findings = findings;
+    rep.findings_skipped = skipped;
     rep.findings = record.findings.clone();
 
-    // 6. One approval for the first rules of the new keys.
-    let current = match ask(&rt, RequestBody::RulesGet { key: None }, None)? {
-        ResponseBody::Rules { toml, .. } => {
-            Rules::from_toml(&toml, "the rules from msd").map_err(|e| e.to_string())?
-        }
-        other => return Err(as_error(other)),
-    };
-    let proposed = ms_projects::save::initial_rules(catalog, &record, &current);
-    let save = |rules: &Rules| {
-        ask(
+    // 6. Save the record first, with no rule change and no approval (review R1): whatever
+    // happens to the approval below (denied, timed out, stopped, Ctrl-C), the next ms init knows
+    // these keys and asks again.
+    let saved = match record.validate() {
+        Err(e) => Err(e.to_string()),
+        Ok(()) => match ask(
             &rt,
             RequestBody::ProjectSave {
                 record: record.to_toml(),
-                rules: ms_projects::save::canonical(rules),
+                rules: ms_projects::save::canonical(&Rules::default()),
             },
-            Some(crate::approve::APPROVAL_WAIT),
-        )
+            None,
+        ) {
+            Ok(ResponseBody::Ok { .. }) => Ok(()),
+            Ok(other) => Err(as_error(other)),
+            Err(e) => Err(e),
+        },
     };
-    let first = {
-        let _review = (!proposed.keys.is_empty()).then(|| crate::approve::inline_review("ms init"));
-        save(&proposed)?
-    };
-    match first {
-        ResponseBody::Ok { .. } => {}
-        ResponseBody::Error {
-            code: ErrorCode::NeedsApproval | ErrorCode::Busy,
-            message,
-        } => {
-            rep.declined = Some(terminal_safe(&message));
-            // The record still goes in (no rule changes, no approval), so the next ms init
-            // knows the keys and asks again.
-            match save(&Rules::default())? {
-                ResponseBody::Ok { .. } => {}
-                other => rep.save_error = Some(as_error(other)),
+    if let Err(e) = saved {
+        rep.save_error = Some(terminal_safe(&e));
+    } else {
+        // Then one approval for the first rules of the new keys.
+        let proposed = match ask(&rt, RequestBody::RulesGet { key: None }, None) {
+            Ok(ResponseBody::Rules { toml, .. }) => {
+                Rules::from_toml(&toml, "the rules from msd").map_err(|e| e.to_string())
+            }
+            Ok(other) => Err(as_error(other)),
+            Err(e) => Err(e),
+        }
+        .map(|current| ms_projects::save::initial_rules(catalog, &record, &current));
+        match proposed {
+            Err(e) => rep.declined = Some(terminal_safe(&e)),
+            Ok(p) if p.keys.is_empty() => {}
+            Ok(p) => {
+                let _review = crate::approve::inline_review("ms init");
+                match ask(
+                    &rt,
+                    RequestBody::ProjectSave {
+                        record: record.to_toml(),
+                        rules: ms_projects::save::canonical(&p),
+                    },
+                    Some(crate::approve::APPROVAL_WAIT),
+                ) {
+                    Ok(ResponseBody::Ok { .. }) => {}
+                    Ok(ResponseBody::Error { message, .. }) => {
+                        rep.declined = Some(terminal_safe(&message));
+                    }
+                    Ok(_) => rep.declined = Some(UNEXPECTED.to_owned()),
+                    Err(e) => rep.declined = Some(terminal_safe(&e)),
+                }
             }
         }
-        other => rep.save_error = Some(as_error(other)),
     }
 
     // The keys' state for the summary.
@@ -392,8 +462,8 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
             slug: rep.slug.clone(),
         },
         None,
-    )? {
-        ResponseBody::Project { keys, .. } => keys,
+    ) {
+        Ok(ResponseBody::Project { keys, .. }) => keys,
         _ => Vec::new(),
     };
     let ready: BTreeSet<&KeyName> = rep
@@ -408,6 +478,49 @@ pub(crate) fn run(root: &Path, name: Option<&str>) -> Result<Report, String> {
         .filter(|k| !ready.contains(k) && record.provider_of(k).is_none())
         .collect();
     Ok(rep)
+}
+
+/// Lines of `file` that already hold a ref to a key of this project that is in the vault
+/// (review R1): an earlier `ms init` that stored keys but died before its record was saved,
+/// or an `ms import --name <slug>/...`. They go into the record so the keys are not orphaned;
+/// the provider comes from the earlier record, else from the variable name in the catalog.
+fn adopt_refs(
+    catalog: &Catalog,
+    slug: &str,
+    file: &EnvFile,
+    plan: &Plan,
+    stored: &BTreeSet<KeyName>,
+    previous: Option<&ProjectRecord>,
+) -> Vec<SecretRecord> {
+    let prefix = format!("{slug}/");
+    plan.rows
+        .iter()
+        .filter(|r| r.action == Action::AlreadyRef)
+        .filter_map(|r| {
+            let key = KeyName::new(r.masked.strip_prefix("ms://")?).ok()?;
+            if !key.as_str().starts_with(&prefix) || !stored.contains(&key) {
+                return None;
+            }
+            let provider = previous
+                .and_then(|p| p.provider_of(&key))
+                .map(str::to_owned)
+                .or_else(|| {
+                    catalog
+                        .providers
+                        .iter()
+                        .find(|p| p.matches_env_name(&r.var))
+                        .map(|p| p.id.clone())
+                });
+            Some(SecretRecord {
+                var: r.var.clone(),
+                line: r.line as u64,
+                key,
+                quote: Quote::from(file.entries()[r.entry].quote),
+                action: SecretAction::Import,
+                provider,
+            })
+        })
+        .collect()
 }
 
 /// `~/code/shop` for a root under `home`.
@@ -441,18 +554,42 @@ pub(crate) fn summary_rows(r: &Report, home: Option<&Path>) -> Vec<(String, Stri
             ),
         ));
     } else if total > 0 {
+        let waiting = total - ready;
         rows.push((
             "Found".to_owned(),
-            format!(
-                "nothing new; {} already protected",
-                plural(total, "key", "keys")
-            ),
+            if waiting == 0 {
+                format!("nothing new; {ready} already protected")
+            } else {
+                format!(
+                    "nothing new; {ready} already protected, {waiting} still {} you",
+                    if waiting == 1 { "needs" } else { "need" }
+                )
+            },
         ));
     } else {
         rows.push(("Found".to_owned(), "no secrets in this project".to_owned()));
     }
     if total > 0 {
         rows.push(("Protected".to_owned(), format!("{ready}, ready to use")));
+    }
+    if r.recovered > 0 {
+        rows.push((
+            "Recovered".to_owned(),
+            format!(
+                "{} an earlier run stored but never recorded",
+                plural(r.recovered, "key", "keys")
+            ),
+        ));
+    }
+    if let Some(first) = r.missing.first() {
+        rows.push((
+            "Missing".to_owned(),
+            format!(
+                "{} no longer in the vault ({first}{}); its lines still hold the ref",
+                plural(r.missing.len(), "key is", "keys are"),
+                if r.missing.len() > 1 { " and more" } else { "" }
+            ),
+        ));
     }
     if let Some(why) = &r.declined {
         rows.push((
@@ -499,6 +636,15 @@ pub(crate) fn summary_rows(r: &Report, home: Option<&Path>) -> Vec<(String, Stri
                 } else {
                     ""
                 }
+            ),
+        ));
+    }
+    if r.findings_skipped > 0 {
+        rows.push((
+            "In code".to_owned(),
+            format!(
+                "{} more not recorded (too many, or a path morsec can't record)",
+                r.findings_skipped
             ),
         ));
     }
@@ -599,6 +745,9 @@ mod tests {
             .iter()
             .map(|(a, b)| format!("{a} {b}\n"))
             .collect();
-        assert!(text.contains("already protected"), "{text}");
+        assert!(
+            text.contains("nothing new; 1 already protected, 1 still needs you"),
+            "{text}"
+        );
     }
 }

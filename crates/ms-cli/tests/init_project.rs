@@ -513,7 +513,7 @@ fn reinit_is_idempotent() {
         "it waited for an approval"
     );
     assert!(
-        out.contains("nothing new; 4 keys already protected"),
+        out.contains("nothing new; 3 already protected, 1 still needs you"),
         "{out}"
     );
     assert!(!out.contains("needs your approval"), "{out}");
@@ -614,4 +614,92 @@ fn agent_session_cannot_init_a_project() {
     assert!(!fx.audit().exists());
     let (_, status) = fx.ms(&["status"]);
     assert!(status.contains("0 secrets protected"), "{status}");
+}
+
+// protects=review R1: keys stored by a run that never saved its record (here: `ms import --name
+// shop/...`, the same state a Ctrl-C at the approval leaves behind with no record) are found by
+// their refs on the next ms init, recorded with their provider from the variable name, and given
+// their services after one approval; and the record is saved before the approval is asked, so a
+// denial still leaves them listed; fails_when=the next ms init says it found nothing, or the keys
+// stay unrecorded or inert; no_claim=refs to keys outside the project's slug (never adopted)
+#[test]
+fn orphaned_keys_are_adopted_on_reinit() {
+    let fx = Fx::new();
+    let root = fx.base().join("shop");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    std::fs::write(
+        root.join(".env"),
+        format!("STRIPE_SECRET_KEY={T_ROOT}\nOPENAI_API_KEY={OAI}\nSESSION_SECRET={SESSION}\nOTHER=ms://other/key\n"),
+    )
+    .unwrap();
+    let (code, out) = fx.outside(
+        &root,
+        &format!(
+            "'{}' import --yes --name STRIPE_SECRET_KEY=shop/stripe-secret-key --name OPENAI_API_KEY=shop/openai-api-key --name SESSION_SECRET=shop/session-secret .env",
+            ms().display()
+        ),
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(read(&root.join(".env")).contains("ms://shop/stripe-secret-key"));
+
+    // Denied: the record is already saved, so the keys are listed (inert).
+    let (code, out) = fx.init_answering(&root, "d", "");
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("Recovered  3 keys an earlier run stored"),
+        "{out}"
+    );
+    assert!(out.contains("Run ms init again to approve"), "{out}");
+    let (_, detail) = fx.ms(&["projects", "shop"]);
+    assert!(
+        detail.contains("shop/stripe-secret-key  swap  test  needs you  -"),
+        "{detail}"
+    );
+    assert!(!detail.contains("other/key"), "{detail}");
+
+    let (code, out) = fx.init_answering(&root, "o", "");
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.matches("Approval request").count(), 1, "{out}");
+    assert!(
+        out.contains("nothing new; 2 already protected, 1 still needs you"),
+        "{out}"
+    );
+    let (_, detail) = fx.ms(&["projects", "shop"]);
+    for want in [
+        "shop/stripe-secret-key  swap  test  ready  api.stripe.com",
+        "shop/openai-api-key  swap  production  ready  api.openai.com",
+        "shop/session-secret  swap  production  needs you  -",
+    ] {
+        assert!(detail.contains(want), "missing {want:?}:\n{detail}");
+    }
+}
+
+// protects=review R3: file-derived names never make the record invalid: an env file whose name
+// has a control character is left byte-identical and listed as skipped (its secret stays out of
+// the vault, so no key exists without a record entry), a --name with control characters is
+// cleaned for display, and everything else is imported and approved once; fails_when=ProjectSave
+// is Invalid, the odd file is rewritten or its value stored, or a control character reaches the
+// terminal; no_claim=the path budget and secret cap (ms-projects client_side_fits_the_limits)
+#[test]
+fn unrecordable_file_is_left_untouched() {
+    let fx = Fx::new();
+    let root = fx.shop();
+    let odd = root.join(".env.\u{1}odd");
+    let odd_text = format!("STRIPE_SECRET_KEY={T_PROD}x\n");
+    std::fs::write(&odd, &odd_text).unwrap();
+    let (code, out) = fx.init_answering(&root, "o", "--name \"$(printf 'my\\tshop')\"");
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(read(&odd), odd_text);
+    assert!(
+        out.contains("Skipped    .env.odd: can't be recorded"),
+        "{out}"
+    );
+    assert!(!out.contains('\u{1}') && !out.contains('\t'), "{out:?}");
+    assert!(out.contains("Project    myshop  ("), "{out}");
+    assert!(out.contains("Protected  3, ready to use"), "{out}");
+    assert!(!out.contains("Record "), "{out}");
+    let (_, detail) = fx.ms(&["projects", "my-shop"]);
+    assert!(detail.contains("Project  my-shop (myshop)"), "{detail}");
+    assert_eq!(detail.matches("swap").count(), 4, "{detail}");
 }
