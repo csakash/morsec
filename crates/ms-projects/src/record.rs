@@ -561,9 +561,11 @@ pub(crate) mod tests {
             cases.push(r);
         }
         let mut r = sample();
-        r.findings[0].masked =
-            concat!("sk_live_", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef (99 bytes)")
-                .into();
+        r.findings[0].masked = concat!(
+            "sk_live_",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef (99 bytes)"
+        )
+        .into();
         cases.push(r);
         let mut r = sample();
         r.slug = "Shop".into();
