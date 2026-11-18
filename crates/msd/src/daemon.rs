@@ -2729,6 +2729,36 @@ mod tests {
         ));
     }
 
+    // protects=security review S1: with project records on disk, a missing rollback floor in the
+    // vault fails closed (an older, validly MAC'd file put back is not served), while a fresh
+    // install with no records and no floor works; fails_when=the floor's absence reads as 0 when
+    // records exist; no_claim=deleting a keychain item (only msd may; the memory vault stands in)
+    #[test]
+    fn missing_projects_floor_fails_closed() {
+        let h = fresh();
+        assert!(matches!(
+            h.req(RequestBody::ProjectList),
+            ResponseBody::Projects { .. }
+        ));
+        let rec = shop(&h);
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        let file = h.dir.path().join(PROJECTS_FILE);
+        let mac = ms_rules::store::mac_path(&file);
+        let v1 = (std::fs::read(&file).unwrap(), std::fs::read(&mac).unwrap());
+        assert!(is_ok(&save(&h, &rec, &Rules::default())));
+        let Backend::Memory(v) = &h.backend else {
+            panic!("tests use the memory vault")
+        };
+        v.delete(&KeyName::new(crate::backend::PROJECTS_STATE_KEY).unwrap())
+            .unwrap();
+        std::fs::write(&file, &v1.0).unwrap();
+        std::fs::write(&mac, &v1.1).unwrap();
+        let r = h.req(RequestBody::ProjectList);
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        let r = save(&h, &rec, &Rules::default());
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+    }
+
     // protects=review R2: after `msd --init --force` replaces morsec/projects-hmac, the old
     // records are moved aside and the floor reset, so the next ms init saves a fresh record and
     // ProjectList answers (instead of Denied forever); the old file is kept, renamed;

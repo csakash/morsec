@@ -81,7 +81,17 @@ impl Daemon {
                 .and_then(|s| s.strip_prefix("v="))
                 .and_then(|n| n.parse().ok())
                 .ok_or_else(|| "the saved version is unreadable".to_owned()),
-            Err(ms_core::Error::NoSuchKey(_)) => Ok(0),
+            // No floor and no records: nothing was ever saved. A floor that is gone while records
+            // exist fails closed (security review S1), like the rules floor: otherwise an older,
+            // validly MAC'd file would load.
+            Err(ms_core::Error::NoSuchKey(_)) => {
+                let file = self.paths.state.join(PROJECTS_FILE);
+                if file.exists() || ms_rules::store::mac_path(&file).exists() {
+                    Err("the saved version is missing while project records exist".to_owned())
+                } else {
+                    Ok(0)
+                }
+            }
             Err(e) => Err(e.to_string()),
         }
     }
