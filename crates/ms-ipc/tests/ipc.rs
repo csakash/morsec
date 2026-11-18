@@ -458,6 +458,7 @@ fn every_variant_round_trips() {
             alerts: vec!["drift".into()],
             ca_pem: Some("-----BEGIN CERTIFICATE-----".into()),
             ca_hosts: vec!["api.stripe.com".into()],
+            unusable: vec![KeyName::new("env/old-key").unwrap()],
         },
         ResponseBody::Ok {
             message: "stored".into(),

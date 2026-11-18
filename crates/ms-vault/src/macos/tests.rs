@@ -322,7 +322,26 @@ fn error_messages() {
         s.starts_with("morsec: reading stripe/test (OSStatus -25293)"),
         "{s}"
     );
-    assert!(s.contains("only the signed msd"), "{s}");
+    assert!(
+        s.contains("another morsec build")
+            && s.contains("security delete-generic-password -s cc.morsec.vault -a stripe/test")
+            && s.contains("ms add stripe/test"),
+        "{s}"
+    );
+    // Its own kind, so a listing sets the key aside instead of failing.
+    assert!(
+        matches!(&e, Error::Io { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    let s = keychain_error(
+        "reading",
+        "morsec/rules-hmac",
+        SfError::from_code(ERR_AUTH_FAILED),
+    )
+    .to_string();
+    assert!(
+        s.contains("ms init --force") && !s.contains("ms add"),
+        "{s}"
+    );
     let s = keychain_error("listing keys", "", SfError::from_code(-1)).to_string();
     assert!(s.contains("ms doctor"), "{s}");
 }
@@ -397,6 +416,12 @@ fn acl_child() {
             delete_keys_locked(&kc, &v.ca_label()).map(|()| "DELETED".to_owned())
         }
         "init" => v.reset_internal_keys().map(|()| "INIT".to_owned()),
+        // An item this (other) binary owns, unsealed: what a dev build's key looks like to a
+        // differently signed msd.
+        "addraw" => {
+            add_raw(&v.service, k.as_str(), CANARY.as_bytes());
+            Ok("ADDED".to_owned())
+        }
         // Removes everything this binary made under the service (its items and keys).
         "wipe" => {
             let _q = quiet().unwrap();
@@ -800,6 +825,60 @@ fn add_raw(service: &str, account: &str, data: &[u8]) {
         .set_account_name(account)
         .set_location(Location::FileKeychain(kc));
     add.add().unwrap();
+}
+
+// protects=SPEC 1, 4, 5 (vault-foreign-items): a key another build stored is set aside as unusable,
+// not listed and not fatal, a usable key next to it is still listed, and reading it names the
+// removal command; fails_when=scan errors, lists it as a key, or drops the usable key;
+// no_claim=removing it (the keychain lets only its owner delete it; the user does, with a prompt)
+#[test]
+fn foreign_items_are_unusable_not_fatal() {
+    if skip() {
+        return;
+    }
+    let t = TestVault::new();
+    let k = key("stripe/live");
+    t.vault
+        .put(
+            &k,
+            SecretBytes::from(CANARY.to_owned()),
+            meta(&k, Tier::Production),
+        )
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let other = signed_copy(dir.path(), "devbuild", "-", "cc.morsec.test.devbuild");
+    let old = key("env/old-key");
+    assert_eq!(
+        run_child(&other, &t.service, old.as_str(), "addraw"),
+        "ADDED"
+    );
+
+    let scanned = t.vault.scan();
+    // Remove the other build's item before asserting, so a failure leaves nothing behind.
+    let cleanup = run_child(&other, &t.service, old.as_str(), "del");
+    let l = scanned.unwrap();
+    assert_eq!(l.keys, vec![meta(&k, Tier::Production)]);
+    assert_eq!(l.unusable, vec![old.clone()]);
+    assert_eq!(cleanup, "DELETED");
+
+    // Read, again with the other build's item present.
+    assert_eq!(
+        run_child(&other, &t.service, old.as_str(), "addraw"),
+        "ADDED"
+    );
+    let read = t.vault.read_with(&old, <[u8]>::len);
+    let listed = t.vault.list();
+    assert_eq!(
+        run_child(&other, &t.service, old.as_str(), "del"),
+        "DELETED"
+    );
+    let e = read.unwrap_err().to_string();
+    assert!(
+        e.contains("security delete-generic-password -s cc.morsec.vault -a env/old-key")
+            && e.contains("ms add env/old-key"),
+        "{e}"
+    );
+    assert_eq!(listed.unwrap(), vec![meta(&k, Tier::Production)]);
 }
 
 // protects=a value never lands in an item someone else planted with an open ACL: put and

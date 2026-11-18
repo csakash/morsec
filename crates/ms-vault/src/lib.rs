@@ -23,7 +23,33 @@ pub trait Vault: Send + Sync {
 
     /// Metadata for every key. Never values.
     fn list(&self) -> Result<Vec<KeyMeta>>;
+
+    /// Every usable key, plus the names of keys this build may not use because another morsec
+    /// build stored them (see [`Listing::unusable`]). Added after L00 with a default, so backends
+    /// without per-binary access control need nothing: they have no unusable keys.
+    fn scan(&self) -> Result<Listing> {
+        Ok(Listing {
+            keys: self.list()?,
+            unusable: Vec::new(),
+        })
+    }
 }
+
+/// What [`Vault::scan`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// Metadata of every key this build can use, sorted by name.
+    pub keys: Vec<KeyMeta>,
+    /// Keys that exist but were stored by another morsec build (a dev build, or another
+    /// signature). The keychain lets only the build that stored an item read or delete it, so
+    /// msd can neither use nor remove these; only the user can (see [`removal_command`]).
+    /// Sorted by name.
+    pub unusable: Vec<KeyName>,
+}
+
+pub use ms_core::unusable::{
+    KEYCHAIN_SERVICE, UNUSABLE_NAMED, removal_command, unusable_alert, unusable_hint,
+};
 
 /// Convenience methods for every [`Vault`], kept out of the trait so it stays object-safe.
 pub trait VaultExt: Vault {

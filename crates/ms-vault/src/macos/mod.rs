@@ -53,7 +53,7 @@ use security_framework::random::SecRandom;
 use crate::Vault;
 
 /// Keychain service for every morsec item. The account is the key name.
-pub const SERVICE: &str = "cc.morsec.vault";
+pub const SERVICE: &str = crate::KEYCHAIN_SERVICE;
 
 /// Names under this prefix belong to morsec itself. The trait can't write, delete or list them.
 pub const RESERVED_PREFIX: &str = "morsec/";
@@ -123,11 +123,33 @@ fn quiet() -> Result<Quiet> {
 /// Never includes a value: only the action, the key name and the status code.
 fn keychain_error(action: &str, name: &str, e: SfError) -> Error {
     let code = e.code();
+    if matches!(code, ERR_AUTH_FAILED | ERR_USER_CANCELED) {
+        // Access control refused this binary: the item belongs to another build. Its own kind, so
+        // a listing can set the key aside instead of failing ([`KeychainVault::scan`]).
+        let hint = match KeyName::new(name) {
+            Ok(n) if !reserved(&n) => format!("access denied: {}", crate::unusable_hint(&n)),
+            // One of morsec's own items: ms init --force can't replace it either (deleting is
+            // refused the same way), so it has to go first.
+            Ok(n) => format!(
+                "access denied: another program (usually another morsec build) stored morsec's \
+                 own item {n}, and the keychain lets only that program use it. Remove it with: {} \
+                 (macOS asks for your login password), then run: ms init --force",
+                crate::removal_command(&n)
+            ),
+            // Nothing named (a search, or turning dialogs off): no guess about whose item it is.
+            Err(_) => "access denied by the keychain. Run: ms doctor".to_owned(),
+        };
+        let target = if name.is_empty() {
+            String::new()
+        } else {
+            format!(" {name}")
+        };
+        return Error::io(
+            format!("{action}{target} (OSStatus {code})"),
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, hint),
+        );
+    }
     let hint = match code {
-        ERR_AUTH_FAILED | ERR_USER_CANCELED => {
-            "access denied: only the signed msd that stored this key may use it. Run the signed msd \
-             (ms start), or re-add the key with: ms add"
-        }
         ERR_INTERACTION_NOT_ALLOWED => {
             "the login keychain is locked or the access needs approval. Unlock it (log in, or run: \
              security unlock-keychain) and run the signed msd (ms start)"
@@ -779,12 +801,20 @@ impl Vault for KeychainVault {
         }
     }
 
-    /// Metadata of every key, taken from inside each item's seal. The comment attribute is only
-    /// a display copy (any binary of the user can rewrite it), so it is never trusted. Each item
-    /// is read and checked, in `msd` only, and wiped right after. Items that fail (left by
-    /// another version, planted, or changed outside morsec) are skipped, so one bad item can't
-    /// hide the rest; reading such a key reports why.
+    /// Metadata of every key, taken from inside each item's seal. See [`Vault::scan`].
     fn list(&self) -> Result<Vec<KeyMeta>> {
+        Ok(self.scan()?.keys)
+    }
+
+    /// Every key, from inside each item's seal. The comment attribute is only a display copy
+    /// (any binary of the user can rewrite it), so it is never trusted. Each item is read and
+    /// checked, in `msd` only, and wiped right after. One bad item can't hide the rest:
+    /// - an item the keychain's access control refuses to this binary (stored by another morsec
+    ///   build) is set aside as [`crate::Listing::unusable`];
+    /// - an item that fails its seal, or vanished mid-list, is skipped (reading it says why).
+    ///
+    /// Anything else (locked keychain, missing seal key) is an error, not "no keys".
+    fn scan(&self) -> Result<crate::Listing> {
         let _q = quiet()?;
         let kc = login_keychain()?;
         // Attributes only, to find the names.
@@ -797,36 +827,46 @@ impl Vault for KeychainVault {
             .search();
         let items = match found {
             Ok(items) => items,
-            Err(e) if e.code() == ERR_NOT_FOUND => return Ok(Vec::new()),
+            Err(e) if e.code() == ERR_NOT_FOUND => return Ok(crate::Listing::default()),
             Err(e) => return Err(keychain_error("listing keys", "", e)),
         };
         // A missing or replaced seal key is an error ("run ms init"), not an empty list.
         self.seal_key_locked(&kc)?;
-        let mut out: Vec<KeyMeta> = items
+        let names = items
             .iter()
             .filter(|item| matches!(item, SearchResult::Dict(_)))
             .filter_map(|item| {
                 let attrs: HashMap<String, String> = item.simplify_dict()?;
                 let name = KeyName::new(attrs.get("acct")?).ok()?;
-                if reserved(&name) {
-                    return None;
-                }
-                Some(self.read_locked(&kc, &name).map(|o| o.meta.clone()))
-            })
-            .filter_map(|r| match r {
-                Ok(meta) => Some(Ok(meta)),
-                // Skip items that fail their seal or vanished mid-list; a bad item can't hide the
-                // rest. Anything else (locked keychain, missing seal key) is an error, not "no keys".
-                Err(Error::NoSuchKey(_)) => None,
+                (!reserved(&name)).then_some(name)
+            });
+        let mut out = crate::Listing::default();
+        for name in names {
+            // Only the keychain refusing this item's own read makes it unusable. Opening checks
+            // the seal, which reloads the seal key: a failure there (a seal key or pin replaced
+            // mid-scan) is an error, never a reason to call a real key someone else's.
+            let blob = match self.read_raw_locked(&kc, &name) {
+                Ok(blob) => blob,
                 Err(Error::Io { ref source, .. })
-                    if source.kind() == std::io::ErrorKind::InvalidData =>
+                    if source.kind() == std::io::ErrorKind::PermissionDenied =>
                 {
-                    None
+                    out.unusable.push(name);
+                    continue;
                 }
-                Err(e) => Some(Err(e)),
-            })
-            .collect::<Result<_>>()?;
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+                Err(Error::NoSuchKey(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            match self.open(&kc, &name, blob) {
+                Ok(opened) => out.keys.push(opened.meta.clone()),
+                // Fails its seal: skipped, so one bad item can't hide the rest.
+                Err(Error::Io { ref source, .. })
+                    if source.kind() == std::io::ErrorKind::InvalidData => {}
+                Err(e) => return Err(e),
+            }
+        }
+        out.keys.sort_by(|a, b| a.name.cmp(&b.name));
+        out.unusable.sort();
+        out.unusable.dedup();
         Ok(out)
     }
 }

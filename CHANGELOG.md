@@ -6,6 +6,13 @@ entries. Move the entries from Unreleased into it when you bump the version.
 
 ## [Unreleased]
 
+- Keys stored by another morsec build (for example a dev build, before you installed the signed
+  release) no longer break the vault. `ms doctor`, `ms status` and `ms init` list them by name
+  with the command that removes each one (`security delete-generic-password -s cc.morsec.vault
+  -a <name>`, which asks for your login password), and `ms add <name>` says the same instead of
+  failing. The keychain lets only the build that stored a key read or delete it, so morsec can't
+  remove them for you.
+
 ## [0.1.0] - 2026-11-17
 
 First public release. Apple silicon macOS 13 or later only (`aarch64-apple-darwin`).
