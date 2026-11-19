@@ -994,8 +994,15 @@ fn preview_view(p: &Prepared, command: String) -> ProjectPreviewView {
                 }
             }
         }
+        // Refs the earlier record already lists are not new: only orphans an earlier run left
+        // are shown (QA: a re-scan listed protected keys as needing a website).
+        let known: Vec<KeyName> = p
+            .previous
+            .as_ref()
+            .map(ProjectRecord::keys)
+            .unwrap_or_default();
         for a in p.adopted.get(i).into_iter().flatten() {
-            if seen.insert(a.key.clone()) {
+            if !known.contains(&a.key) && seen.insert(a.key.clone()) {
                 keys.push(key_view(p, &a.key, a.provider.clone(), None));
             }
         }
@@ -2044,6 +2051,7 @@ mod tests {
         let v = h.d.dash_project_preview(&actor(), path).unwrap();
         assert!(v.existing);
         assert_eq!(v.files[0].new_keys, 1, "{v:?}");
+        assert_eq!(v.keys.len(), 1, "only the new key is listed: {v:?}");
         let done = h.d.dash_project_add(&actor(), path, &v.plan).unwrap();
         assert!(
             done.rows
