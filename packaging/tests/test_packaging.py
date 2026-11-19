@@ -158,6 +158,26 @@ class SbomTests(unittest.TestCase):
         self.assertFalse({"proptest", "assert_cmd", "predicates"} & names)
         self.assertFalse({n.lower() for n in names} & sbom.UPDATER_CRATES)
 
+    def test_sbom_lists_fonts(self):
+        # L33 SPEC D-1: the fonts msd embeds are file components with OFL-1.1 and the SHA-256
+        # that SOURCES.txt (and ms-dash's fonts_are_pinned) pin.
+        files = sbom.font_components(ROOT)
+        md = _metadata(self.edges, self.pkgs, [self.app])
+        bom = sbom.build_sbom(md, _lock(*self.pkgs), ["app"], "0.1.0", "abcdef1", 0, files)
+        fonts = [c for c in bom["components"] if c["type"] == "file"]
+        self.assertEqual(len(fonts), 5)
+        with open(os.path.join(ROOT, sbom.FONTS_DIR, "SOURCES.txt"), encoding="utf-8") as f:
+            sources = f.read()
+        families = set()
+        for c in fonts:
+            self.assertEqual(c["licenses"], [{"license": {"id": "OFL-1.1"}}])
+            sha = c["hashes"][0]["content"]
+            self.assertIn(f"{sha}  {c['name']}", sources)
+            families |= {p["value"] for p in c["properties"] if p["name"] == "morsec:font-family"}
+        self.assertEqual(families, {"Archivo", "Instrument Serif", "IBM Plex Mono"})
+        with self.assertRaises(sbom.SbomError):
+            sbom.font_components(os.path.join(ROOT, "no-such-dir"))
+
 
 class ArchiveTests(unittest.TestCase):
     def setUp(self):

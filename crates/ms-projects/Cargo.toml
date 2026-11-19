@@ -29,3 +29,4 @@ rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+proptest = { workspace = true }

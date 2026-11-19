@@ -18,6 +18,7 @@
 //! 5. the security headers on every response ([`http::security_headers`]);
 //! 6. 20 requests/s per session.
 
+pub mod actions;
 pub mod api;
 pub mod assets;
 pub mod auth;
@@ -25,7 +26,9 @@ pub mod data;
 pub mod http;
 pub mod parity;
 pub mod server;
+pub mod shell;
 
+pub use actions::{Action, ActionCode, ActionError, ActionOk, Actor, DashActions, Revealed};
 pub use data::{ApiError, DashData, Refusal};
 pub use server::{Dash, DashConfig, Opened, valid_view};
 

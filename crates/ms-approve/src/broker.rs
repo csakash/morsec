@@ -34,6 +34,11 @@ pub struct Pending {
     pub requested_unix_ms: u64,
     /// When it times out, Unix ms.
     pub expires_unix_ms: u64,
+    /// msd built this request for one of its own actions (start, rules, scan, set, rm, undo,
+    /// init, ms dev, a dashboard action): tagged where it was created, never inferred from its
+    /// argv, which an agent controls for its own commands (L33 re-review SR1). Approved once
+    /// only.
+    pub admin: bool,
 }
 
 /// Why a decision was not taken.
@@ -56,9 +61,21 @@ pub enum DecideError {
     /// `ms stop` (or another answer) ended the request while Touch ID was up.
     #[error("the request was ended (ms stop) while Touch ID was up; nothing was approved")]
     Ended,
+    /// A session-scope answer to a request that changes morsec itself (L33 review S2).
+    #[error(
+        "this request changes morsec itself (a value, a rule, the kill switch), so it can only be approved once, never for the session"
+    )]
+    OnceOnly,
     /// The token could not be made (no randomness).
     #[error("could not issue the approval: {0}")]
     Internal(String),
+}
+
+/// True for morsec's own actions (the request's `admin` tag, set where msd created it): they
+/// may be approved once only. A session grant would let the same request run again with
+/// whatever it carries (a new value, another rule) without the person (L33 review S2, SR1).
+pub fn once_only(p: &Pending) -> bool {
+    p.admin
 }
 
 #[derive(Debug)]
@@ -78,6 +95,29 @@ struct State {
     /// Sessions whose last request was denied or timed out, and until when they may not ask
     /// again (rate limit, PLAN L11 / L05 S4).
     cooldown: Vec<(ms_core::SessionId, Instant)>,
+}
+
+/// Why a dashboard confirmation ([`HumanApprover::confirm`]) approved nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfirmError {
+    /// Another request holds the one approval slot.
+    #[error("another request is waiting for you; answer it first")]
+    Busy,
+    /// This session was refused less than [`COOLDOWN`] ago.
+    #[error("this was refused a moment ago; wait a few seconds and try again")]
+    CoolingDown,
+    /// Touch ID / password did not succeed.
+    #[error("Touch ID did not confirm ({0})")]
+    AuthFailed(String),
+    /// Touch ID was not answered in time.
+    #[error("Touch ID was not answered in time")]
+    Expired,
+    /// `ms stop` ended it while Touch ID was up.
+    #[error("morsec was stopped while Touch ID was up; nothing was approved")]
+    Ended,
+    /// No randomness for the id or the token.
+    #[error("could not issue the approval: {0}")]
+    Internal(String),
 }
 
 /// How long a session waits after a denial or timeout before it may ask again.
@@ -129,6 +169,93 @@ impl HumanApprover {
         self.lock().slot.as_ref().map(|s| s.pending.clone())
     }
 
+    /// The request waiting for a person and whether its Touch ID sheet is already up (a
+    /// dashboard confirmation, or an `ms approve` that is deciding it).
+    pub fn pending_state(&self) -> Option<(Pending, bool)> {
+        self.lock()
+            .slot
+            .as_ref()
+            .map(|s| (s.pending.clone(), s.deciding))
+    }
+
+    /// A person's own action, reviewed where they clicked it (L33 SPEC D-19: the dashboard's
+    /// confirm path). Takes the one approval slot (busy when another request holds it, so
+    /// `ms approve` and Home show what Touch ID is up for), raises Touch ID at once with `reason`
+    /// (built by the caller from the real action, inert), marked deciding so no other process can
+    /// answer it, and on success issues a **once** token bound to `req`. The caller verifies the
+    /// token against the same binding right before acting, which uses it up. `ms stop` during
+    /// the sheet ends it; a refusal starts the session's cooldown.
+    pub fn confirm(
+        &self,
+        req: &ApprovalRequest,
+        reason: &str,
+        timeout: Duration,
+    ) -> Result<ApprovalToken, ConfirmError> {
+        let now = now_ms();
+        let (id, deadline, epoch) = {
+            let mut st = self.lock();
+            let now_i = Instant::now();
+            st.cooldown.retain(|(_, until)| *until > now_i);
+            if st.cooldown.iter().any(|(s, _)| *s == req.session) {
+                return Err(ConfirmError::CoolingDown);
+            }
+            if st.slot.is_some() {
+                return Err(ConfirmError::Busy);
+            }
+            let id = match random_bytes::<16>() {
+                Ok(r) => format!("apr-{}", hex::encode(r)),
+                Err(e) => return Err(ConfirmError::Internal(e.to_string())),
+            };
+            st.slot = Some(Slot {
+                pending: Pending {
+                    id: id.clone(),
+                    request: req.clone(),
+                    requested_unix_ms: now,
+                    expires_unix_ms: now
+                        .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                    admin: true,
+                },
+                deciding: true,
+                answer: None,
+            });
+            self.changed.notify_all();
+            (id, now_i + timeout, st.epoch)
+        };
+        // Outside the lock, as in `decide`.
+        let outcome = self.auth.authenticate(reason, deadline);
+        let mut st = self.lock();
+        let ours = st.slot.as_ref().is_some_and(|s| s.pending.id == id);
+        let answered = if ours {
+            st.slot.take().and_then(|s| s.answer)
+        } else {
+            None
+        };
+        self.changed.notify_all();
+        let result = if st.epoch != epoch || !ours || answered.is_some() {
+            Err(ConfirmError::Ended)
+        } else if Instant::now() >= deadline {
+            Err(ConfirmError::Expired)
+        } else {
+            match outcome {
+                AuthOutcome::Approved => self
+                    .tokens
+                    .issue(&Binding::of(req), Scope::Once, now_ms())
+                    .map_err(|e| ConfirmError::Internal(e.to_string())),
+                AuthOutcome::TimedOut => Err(ConfirmError::Expired),
+                AuthOutcome::Denied(why) | AuthOutcome::Unavailable(why) => {
+                    Err(ConfirmError::AuthFailed(why))
+                }
+            }
+        };
+        if result.is_err() {
+            let d = *self.cooldown.lock().unwrap_or_else(|e| e.into_inner());
+            if !d.is_zero() {
+                st.cooldown.push((req.session.clone(), Instant::now() + d));
+            }
+        }
+        result
+    }
+
     /// True while a request is waiting (a new one would be refused).
     pub fn busy(&self) -> bool {
         self.lock().slot.is_some()
@@ -161,6 +288,9 @@ impl HumanApprover {
             };
             if slot.deciding {
                 return Err(DecideError::InProgress);
+            }
+            if approve && scope == Scope::Session && slot.pending.admin {
+                return Err(DecideError::OnceOnly);
             }
             if !approve {
                 slot.answer = Some(ApprovalOutcome::Denied);
@@ -264,6 +394,18 @@ impl HumanApprover {
 
 impl Approver for HumanApprover {
     fn ask(&self, req: &ApprovalRequest, timeout: Duration) -> ApprovalOutcome {
+        self.ask_with(req, timeout, false)
+    }
+}
+
+impl HumanApprover {
+    /// Like [`Approver::ask`] for a request msd built for one of its own actions: tagged
+    /// `admin`, so it is approved once only and shown as morsec's own (L33 SR1).
+    pub fn ask_admin(&self, req: &ApprovalRequest, timeout: Duration) -> ApprovalOutcome {
+        self.ask_with(req, timeout, true)
+    }
+
+    fn ask_with(&self, req: &ApprovalRequest, timeout: Duration, admin: bool) -> ApprovalOutcome {
         let now = now_ms();
         let b = Binding::of(req);
         let mut st = self.lock();
@@ -295,6 +437,7 @@ impl Approver for HumanApprover {
                 requested_unix_ms: now,
                 expires_unix_ms: now
                     .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                admin,
             },
             deciding: false,
             answer: None,
@@ -613,5 +756,117 @@ mod tests {
         a.revoke_all().unwrap();
         assert_eq!(h.join().unwrap(), ApprovalOutcome::Denied);
         assert!(a.decide(&p.id, true, Scope::Once).is_err());
+    }
+
+    // protects=L33 SPEC D-19: the dashboard's confirm path raises Touch ID at once with the
+    // caller's reason, holds the one slot while the sheet is up (marked deciding, so ms approve
+    // can't answer it and another request is Busy), issues a once token for exactly that request
+    // that verify uses up, refuses while another request waits, and approves nothing when Touch
+    // ID fails or ms stop runs during the sheet; fails_when=a confirm bypasses the slot, a token
+    // is reusable or bound to another request, or a stop is ignored; no_claim=the real sheet
+    #[test]
+    fn confirm_takes_the_slot_and_issues_a_once_token() {
+        let (a, auth) = approver(FakeAuthenticator::approve().after(Duration::from_millis(200)));
+        let a2 = a.clone();
+        let h = std::thread::spawn(move || {
+            a2.confirm(&req("show"), "show the value of x", Duration::from_secs(5))
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let (p, deciding) = a.pending_state().expect("the slot is held");
+        assert!(deciding);
+        assert_eq!(
+            a.decide(&p.id, true, Scope::Once),
+            Err(DecideError::InProgress)
+        );
+        assert_eq!(
+            a.ask(&req("other"), Duration::from_millis(50)),
+            ApprovalOutcome::Denied,
+            "one at a time"
+        );
+        let t = h.join().unwrap().unwrap();
+        assert_eq!(auth.reasons(), ["show the value of x"]);
+        assert!(a.pending_state().is_none());
+        assert!(a.verify(&t, &Binding::of(&req("other"))).is_err());
+        assert_eq!(a.verify(&t, &Binding::of(&req("show"))), Ok(Scope::Once));
+        assert_eq!(
+            a.verify(&t, &Binding::of(&req("show"))),
+            Err(TokenError::Used)
+        );
+
+        // Busy while ms approve's request waits.
+        let (hb, p) = ask_bg(&a, req("x"), Duration::from_secs(10));
+        assert_eq!(
+            a.confirm(&req("show"), "r", Duration::from_secs(1)),
+            Err(ConfirmError::Busy)
+        );
+        a.decide(&p.id, false, Scope::Once).unwrap();
+        hb.join().unwrap();
+
+        // Touch ID refused, and ms stop during the sheet.
+        let (a, _) = approver(FakeAuthenticator::deny("cancelled"));
+        assert!(matches!(
+            a.confirm(&req("show"), "r", Duration::from_secs(1)),
+            Err(ConfirmError::AuthFailed(_))
+        ));
+        let (a, _) = approver(FakeAuthenticator::approve().after(Duration::from_millis(200)));
+        let a2 = a.clone();
+        let h = std::thread::spawn(move || a2.confirm(&req("show"), "r", Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(50));
+        a.revoke_all().unwrap();
+        assert_eq!(h.join().unwrap(), Err(ConfirmError::Ended));
+        assert!(a.pending_state().is_none());
+    }
+
+    // protects=L33 review S2 and re-review SR1: a request msd built for its own action (asked
+    // with ask_admin, or a dashboard confirm) can't be approved for the session; the tag comes
+    // from where the request was made, never from its argv, so an agent command whose argv
+    // reads `ms set …` or `dashboard show …` is an ordinary request with the normal scopes;
+    // fails_when=a session answer approves an admin request, or an agent's argv makes its
+    // request look like morsec's own; no_claim=-
+    #[test]
+    fn admin_requests_are_once_only() {
+        let (a, auth) = approver(FakeAuthenticator::approve());
+        let mut admin = req("x");
+        admin.argv_display = vec!["ms".into(), "set".into(), "k/x".into()];
+        let a2 = a.clone();
+        let r2 = admin.clone();
+        let h = std::thread::spawn(move || a2.ask_admin(&r2, Duration::from_secs(10)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let p = loop {
+            if let Some(p) = a.pending() {
+                break p;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(once_only(&p));
+        assert_eq!(
+            a.decide(&p.id, true, Scope::Session),
+            Err(DecideError::OnceOnly)
+        );
+        assert!(auth.reasons().is_empty(), "no sheet for a refused scope");
+        assert!(matches!(
+            a.decide(&p.id, true, Scope::Once),
+            Ok(ApprovalOutcome::Approved(_))
+        ));
+        h.join().unwrap();
+        // The same argv from an agent's own command is not admin: session scope is offered.
+        for (arg, argv) in [
+            ("y", vec!["ms".to_owned(), "set".into(), "k/x".into()]),
+            (
+                "z",
+                vec!["dashboard".to_owned(), "show".into(), "k/x".into()],
+            ),
+        ] {
+            let mut agent = req(arg);
+            agent.argv_display = argv;
+            let (h, p) = ask_bg(&a, agent, Duration::from_secs(10));
+            assert!(!once_only(&p));
+            assert!(matches!(
+                a.decide(&p.id, true, Scope::Session),
+                Ok(ApprovalOutcome::Approved(_))
+            ));
+            h.join().unwrap();
+        }
     }
 }

@@ -117,9 +117,8 @@ pub(crate) fn run(a: &AddArgs) -> ExitCode {
     }
     if existing.iter().any(|m| m.name == a.name) {
         return fail(&Error::Usage(format!(
-            "a key named {} already exists. Pick another name; replacing keys is not \
-             supported yet",
-            a.name
+            "a key named {} already exists. Replace it with: ms set {}",
+            a.name, a.name
         )));
     }
     let value = match piped {

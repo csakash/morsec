@@ -526,7 +526,7 @@ impl Daemon {
         };
         // Review F2: one run, one approval. A session-scope token (answered `s`) would stretch the
         // production window (D-4b) to hours, so it is refused.
-        let approval = match self.approve_exact(&req) {
+        let approval = match self.approve_admin(&req) {
             Ok(t) if ms_approve::Scope::of_id(&t.id) == Some(ms_approve::Scope::Once) => t,
             Ok(_) => {
                 let _ = self.record(

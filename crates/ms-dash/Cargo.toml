@@ -20,6 +20,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+zeroize = { workspace = true }
 # The same HTTP stack and versions ms-proxy already locks (design §3, SPEC D-2).
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }

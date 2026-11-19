@@ -16,6 +16,7 @@ mod dev;
 mod doctor;
 mod import;
 mod init_project;
+mod keys;
 mod log;
 mod mcp;
 mod projects;
@@ -57,6 +58,12 @@ enum Command {
     Init(service::InitArgs),
     /// Add a secret (hidden input, or --stdin from a pipe).
     Add(add::AddArgs),
+    /// Replace a secret's value (hidden input or --stdin; Touch ID).
+    Set(keys::SetArgs),
+    /// Delete a secret and its rule (Touch ID).
+    Rm(keys::RmArgs),
+    /// Write a project's values back into its .env files and drop the keys (Touch ID).
+    Undo(keys::UndoArgs),
     /// Move a .env into the vault and rewrite it with references.
     Import(import::ImportArgs),
     /// Set up a coding agent (claude-code, codex, cursor, gemini).
@@ -87,7 +94,7 @@ enum Command {
     Stats(stats::StatsArgs),
     /// The projects ms init set up; with a name, that project in full.
     Projects(projects::ProjectsArgs),
-    /// Open the local dashboard in your browser (read-only).
+    /// Open the local dashboard in your browser.
     Dashboard(dashboard::DashboardArgs),
     /// Run your own command (e.g. npm run dev) with your project's keys working through morsec.
     Dev(dev::DevArgs),
@@ -150,6 +157,9 @@ async fn main() -> ExitCode {
         Command::Stop => service::stop().await,
         Command::Start => service::start().await,
         Command::Add(a) => on_own_thread(move || add::run(&a)),
+        Command::Set(a) => on_own_thread(move || keys::set(&a)),
+        Command::Rm(a) => on_own_thread(move || keys::rm(&a)),
+        Command::Undo(a) => on_own_thread(move || keys::undo(&a)),
         Command::Import(a) => on_own_thread(move || import::run(&a)),
         Command::Rules(a) => on_own_thread(move || rules::run(a)),
         Command::Log(args) => log::run(&args),
@@ -182,8 +192,8 @@ mod tests {
         assert!(safe.starts_with("0.0.0"));
     }
 
-    // protects=design §6.5 CLI parity: every ms subcommand has a dashboard screen or an exemption
-    // with its reason (L33-owned actions exempt as L33 until it lands); fails_when=a subcommand is
+    // protects=design §6.5 and L33 D-26 CLI parity: every ms subcommand (ms set, rm and undo
+    // included) has a dashboard screen or an exemption with its reason; fails_when=a subcommand is
     // added with neither; no_claim=that a screen shows everything its command does (browser pass)
     #[test]
     fn dash_parity_covers_every_subcommand() {
@@ -193,7 +203,14 @@ mod tests {
             .get_subcommands()
             .map(|c| c.get_name().to_owned())
             .collect();
-        assert!(names.len() >= 18, "{names:?}");
+        assert!(names.len() >= 21, "{names:?}");
+        for l33 in ["set", "rm", "undo"] {
+            assert!(names.iter().any(|n| n == l33), "{l33}");
+            assert!(matches!(
+                ms_dash::parity::lookup(l33),
+                Some(ms_dash::parity::Parity::Screen(_))
+            ));
+        }
         names.push("help".into());
         for n in &names {
             match ms_dash::parity::lookup(n) {

@@ -62,7 +62,7 @@ pub(super) fn targets(rule: &KeyRule) -> Vec<String> {
 }
 
 impl Daemon {
-    fn projects_store(&self) -> ProjectsStore<'_> {
+    pub(super) fn projects_store(&self) -> ProjectsStore<'_> {
         ProjectsStore::new(
             self.paths.state.join(PROJECTS_FILE),
             &*self.vault,
@@ -107,7 +107,7 @@ impl Daemon {
             Ok(f) => Ok((f, floor)),
             Err(e) => {
                 tracing::error!(error = %e, "project records failed to load");
-                self.alert("the project records failed their integrity check (ms projects is refused; keys and rules keep working)");
+                self.alert(super::AlertKind::ProjectsUnreadable, "the project records failed their integrity check (ms projects is refused; keys and rules keep working)");
                 Err(reply_err(ErrorCode::Denied, TAMPERED))
             }
         }
@@ -244,9 +244,10 @@ impl Daemon {
             let _f = lock(&self.flag);
             if let Err(e) = self.persist_state(self.is_stopped()) {
                 tracing::error!(error = %e, "could not save the rules floor in the vault");
-                self.alert(format!(
-                    "the rules version could not be saved in the vault ({e})"
-                ));
+                self.alert(
+                    super::AlertKind::FloorNotSaved,
+                    format!("the rules version could not be saved in the vault ({e})"),
+                );
             }
         }
         self.rebuild_proxy();
@@ -353,7 +354,7 @@ impl Daemon {
                     adopted.len()
                 )),
             };
-            match self.approve_exact(&req) {
+            match self.approve_admin(&req) {
                 Ok(t) => Some(t),
                 Err(resp) => {
                     let v = self.rules_version();
@@ -446,9 +447,10 @@ impl Daemon {
             SecretBytes::new(format!("v={saved}").into_bytes()),
         ) {
             tracing::error!(error = %e, "could not save the project records floor");
-            self.alert(format!(
-                "the project records version could not be saved in the vault ({e})"
-            ));
+            self.alert(
+                super::AlertKind::FloorNotSaved,
+                format!("the project records version could not be saved in the vault ({e})"),
+            );
         }
         if let Some(t) = &token {
             for k in &adopted {

@@ -204,6 +204,64 @@ pub enum RequestBody {
         /// The session id from `DevStarted`.
         session: String,
     },
+    /// Replace an existing key's value (`ms set`, L33 dash-actions SPEC D-13). The new value
+    /// follows in the next frame, raw ([`RequestBody::carries_value`]). Refused inside an agent
+    /// session, from a sandboxed caller and while stopped; msd asks the person (Touch ID) and puts
+    /// the old value back if storing the new one fails.
+    KeyReplace {
+        /// Key name.
+        key: KeyName,
+    },
+    /// Delete a key's value and its rule (`ms rm`, L33). Touch ID. Refused while a project
+    /// record still refers to the key unless `force`; refused inside an agent session, from a
+    /// sandboxed caller and while stopped.
+    KeyDelete {
+        /// Key name.
+        key: KeyName,
+        /// Delete even while a project file refers to it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
+    },
+    /// Undo a project's import (`ms undo`, L33 SPEC D-21): write the values back into the
+    /// recorded env file lines and delete keys nothing else uses. Touch ID. Answered with
+    /// [`ResponseBody::Undone`]; values never come back over the socket.
+    ProjectUndo {
+        /// The project's slug.
+        slug: String,
+        /// Only these keys; absent for the whole project.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys: Option<Vec<KeyName>>,
+    },
+}
+
+/// A line Undo wrote a value back into (L33). Names and places only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoLine {
+    /// Project slug.
+    pub project: String,
+    /// File, relative to the project root.
+    pub file: String,
+    /// 1-based line.
+    pub line: u64,
+    /// Variable name.
+    pub var: String,
+}
+
+/// A line Undo left as it was, and why (L33).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoSkip {
+    /// Project slug.
+    pub project: String,
+    /// File, relative to the project root.
+    pub file: String,
+    /// 1-based line.
+    pub line: u64,
+    /// Variable name.
+    pub var: String,
+    /// Why, for people.
+    pub reason: String,
 }
 
 /// What an approval covers (L11, PRD §7.2).
@@ -229,6 +287,10 @@ pub struct PendingApproval {
     pub requested_unix_ms: u64,
     /// When it times out, Unix ms.
     pub expires_unix_ms: u64,
+    /// msd built it for one of its own actions: approved once only (L33). Absent from older
+    /// daemons.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
 }
 
 impl RequestBody {
@@ -245,7 +307,10 @@ impl RequestBody {
 
     /// True when a raw value frame follows this request.
     pub fn carries_value(&self) -> bool {
-        matches!(self, RequestBody::PutKey { .. })
+        matches!(
+            self,
+            RequestBody::PutKey { .. } | RequestBody::KeyReplace { .. }
+        )
     }
 
     /// True when raw value frames may follow this request's reply (L34 `DevStart`): one per name
@@ -279,6 +344,9 @@ impl RequestBody {
             | RequestBody::ProjectGet { .. } => "L31 guided-init",
             RequestBody::DashOpen { .. } => "L32 dash-core",
             RequestBody::DevStart { .. } | RequestBody::DevEnd { .. } => "L34 ms-dev",
+            RequestBody::KeyReplace { .. }
+            | RequestBody::KeyDelete { .. }
+            | RequestBody::ProjectUndo { .. } => "L33 dash-actions",
         }
     }
 }
@@ -609,6 +677,16 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         notes: Vec<String>,
     },
+    /// What an Undo did (`ProjectUndo`, L33). Paths, lines, variable names and reasons; no
+    /// value.
+    Undone {
+        /// Lines that got their value back.
+        restored: Vec<UndoLine>,
+        /// Lines left as they were.
+        skipped: Vec<UndoSkip>,
+        /// Keys deleted (value and rule) because nothing refers to them any more.
+        deleted_keys: Vec<KeyName>,
+    },
 }
 
 impl ResponseBody {
@@ -679,4 +757,92 @@ pub fn decode<T: DeserializeOwned>(
             format!("morsec: malformed message: {e}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // protects=L33 SPEC D-24: the three requests and the Undone answer round-trip through the
+    // v1 envelope with PROTOCOL_VERSION still 1, KeyReplace carries a value frame (PutKey too)
+    // and the others don't, and each names L33 as its owner; fails_when=a variant doesn't
+    // round-trip, the version moves, or KeyReplace's value would go through serde;
+    // no_claim=the server's framing (ipc.rs key_replace_carries_value_frame)
+    #[test]
+    fn l33_requests_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 1);
+        let k = KeyName::new("shop/stripe").unwrap();
+        let reqs = [
+            RequestBody::KeyReplace { key: k.clone() },
+            RequestBody::KeyDelete {
+                key: k.clone(),
+                force: true,
+            },
+            RequestBody::KeyDelete {
+                key: k.clone(),
+                force: false,
+            },
+            RequestBody::ProjectUndo {
+                slug: "shop".into(),
+                keys: Some(vec![k.clone()]),
+            },
+            RequestBody::ProjectUndo {
+                slug: "shop".into(),
+                keys: None,
+            },
+        ];
+        for r in reqs {
+            let bytes = encode(7, &r).unwrap();
+            let back: Envelope<RequestBody> = decode(&bytes).unwrap();
+            assert_eq!(back.body, r);
+            assert_eq!(back.v, 1);
+            assert_eq!(r.owner_loop(), "L33 dash-actions");
+            assert_eq!(
+                r.carries_value(),
+                matches!(r, RequestBody::KeyReplace { .. })
+            );
+        }
+        let text = String::from_utf8(
+            encode(
+                1,
+                &RequestBody::KeyDelete {
+                    key: k.clone(),
+                    force: false,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!text.contains("force"), "the default is left out: {text}");
+        let undone = ResponseBody::Undone {
+            restored: vec![UndoLine {
+                project: "shop".into(),
+                file: ".env".into(),
+                line: 2,
+                var: "A".into(),
+            }],
+            skipped: vec![UndoSkip {
+                project: "shop".into(),
+                file: ".env".into(),
+                line: 3,
+                var: "B".into(),
+                reason: "changed".into(),
+            }],
+            deleted_keys: vec![k],
+        };
+        let back: Envelope<ResponseBody> = decode(&encode(2, &undone).unwrap()).unwrap();
+        assert_eq!(back.body, undone);
+        assert!(
+            RequestBody::PutKey {
+                name: KeyName::new("a/b").unwrap(),
+                meta: ms_core::KeyMeta {
+                    name: KeyName::new("a/b").unwrap(),
+                    mode: ms_core::Mode::Swap,
+                    tier: ms_core::Tier::Test,
+                    created_unix_ms: 0,
+                },
+            }
+            .carries_value()
+        );
+    }
 }

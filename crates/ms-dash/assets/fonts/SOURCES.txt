@@ -1,0 +1,38 @@
+morsec dashboard fonts (L33 dash-actions, SPEC D-1). Vendored 2026-11-19 with the user's
+authorization; nothing is fetched at run time. The same files the landing page loads
+(site/src/index.html): the `/* latin */` blocks of
+
+  https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..700&family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap
+
+as served to a desktop Chrome User-Agent (woff2).
+
+Fonts (SIL Open Font License 1.1):
+
+  archivo-latin-var.woff2                  Archivo, variable wdth 62..125, wght 300..700, normal
+    https://fonts.gstatic.com/s/archivo/v25/k3kQo8UDI-1M0wlSfdnoLmvDIaI.woff2
+  instrument-serif-latin-400.woff2         Instrument Serif 400, normal
+    https://fonts.gstatic.com/s/instrumentserif/v5/jizBRFtNs2ka5fXjeivQ4LroWlx-6zUTjnTLgNs.woff2
+  instrument-serif-latin-400-italic.woff2  Instrument Serif 400, italic
+    https://fonts.gstatic.com/s/instrumentserif/v5/jizHRFtNs2ka5fXjeivQ4LroWlx-6zAjjH7Motmp5g.woff2
+  ibm-plex-mono-latin-400.woff2            IBM Plex Mono 400, normal
+    https://fonts.gstatic.com/s/ibmplexmono/v23/-F63fjptAgt5VM-kVkqdyU8n1i8q131nj-o.woff2
+  ibm-plex-mono-latin-500.woff2            IBM Plex Mono 500, normal
+    https://fonts.gstatic.com/s/ibmplexmono/v23/-F6qfjptAgt5VM-kVkqdyU8n3twJwlBFgsAXHNk.woff2
+
+Licences, from github.com/google/fonts at commit 5bd87dfc525c8a0d1d8529d3684716e00c3fc59a
+(the tip of main on 2026-11-19, resolved with `git ls-remote`):
+
+  OFL-Archivo.txt          https://raw.githubusercontent.com/google/fonts/5bd87dfc525c8a0d1d8529d3684716e00c3fc59a/ofl/archivo/OFL.txt
+  OFL-InstrumentSerif.txt  https://raw.githubusercontent.com/google/fonts/5bd87dfc525c8a0d1d8529d3684716e00c3fc59a/ofl/instrumentserif/OFL.txt
+  OFL-IBMPlexMono.txt      https://raw.githubusercontent.com/google/fonts/5bd87dfc525c8a0d1d8529d3684716e00c3fc59a/ofl/ibmplexmono/OFL.txt
+
+SHA-256 (pinned in crates/ms-dash/src/assets.rs::fonts_are_pinned and in the release SBOM):
+
+  4c98b9d490d1698ec95f2ff17a6c7d0e72691864c0c5d7bc2a2c161b45afe5ad  archivo-latin-var.woff2
+  60c06664b5a95c7de6cc3e00d1f9034d78bd1e40b564016b241674449a067d4d  instrument-serif-latin-400.woff2
+  6ee678c33f388dd7ba59700ebea635deb98821baafd817b09891f7927177f702  instrument-serif-latin-400-italic.woff2
+  52de70091213c9eab340e2a7ac59e7b6b2b94e089bf69ef38479b22cfde4274c  ibm-plex-mono-latin-400.woff2
+  f17f51948d10b67d907393ccbac551912f2c2bd2c5af19be3aabe2f456f8fe54  ibm-plex-mono-latin-500.woff2
+  108b4e57c9c796d3d38d0428ca7ee39de47ad93187302718d9b2d8864b9b716b  OFL-Archivo.txt
+  129ed7618959716959f2941fdd5b49e0ad6e6c1d78726761786a00253d865521  OFL-InstrumentSerif.txt
+  7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da  OFL-IBMPlexMono.txt

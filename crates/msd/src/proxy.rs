@@ -351,10 +351,16 @@ pub(crate) fn ensure_ca(d: &Daemon, hosts: &BTreeSet<String>) -> Result<Ca, Stri
         .put_internal(&cert_name, ms_core::SecretBytes::new(json))
         .map_err(|e| e.to_string())?;
     export_pem(d, ca.cert_pem());
-    d.alert(format!(
-        "the morsec CA was issued for {} host(s); tools that use the system trust store need it trusted again: ms init --trust",
-        hosts.len()
-    ));
+    d.alert(
+        crate::daemon::AlertKind::CaReissued {
+            hosts: hosts.len(),
+            cert: hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(ca.cert_pem().as_bytes())[..8]),
+        },
+        format!(
+            "the morsec CA was issued for {} host(s); tools that use the system trust store need it trusted again: ms init --trust",
+            hosts.len()
+        ),
+    );
     Ok(ca)
 }
 
@@ -433,7 +439,11 @@ pub fn build(d: &Arc<Daemon>, listen: SocketAddr) -> Result<(ProxyConfig, Deps),
     let (binds, skipped) = bindings_with(&rules, &d.project_providers());
     for s in skipped {
         tracing::warn!("{s}");
-        d.alert(s);
+        let key = s
+            .split_once(':')
+            .and_then(|(k, _)| ms_core::KeyName::new(k).ok());
+        let reason = crate::daemon::dash_actions::SkipReason::of(&s);
+        d.alert(crate::daemon::AlertKind::BindingSkipped { key, reason }, s);
     }
     let hosts: BTreeSet<String> = binds.iter().flat_map(|b| b.hosts.iter().cloned()).collect();
     let ca = Arc::new(ensure_ca(d, &hosts)?);
@@ -516,7 +526,10 @@ pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>, test
             }
             Err(e) => {
                 tracing::error!(error = %e, "swap proxy is not running");
-                d.alert(format!("the swap proxy is not running: {e}"));
+                d.alert(
+                    crate::daemon::AlertKind::ProxyDown,
+                    format!("the swap proxy is not running: {e}"),
+                );
                 // Retry on a change, on shutdown, or after a pause (port briefly in use).
                 tokio::select! {
                     _ = changes.changed() => {},

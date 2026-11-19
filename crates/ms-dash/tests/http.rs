@@ -634,7 +634,8 @@ fn refused_connection_gets_no_bytes() {
     assert_eq!(refused[0].session.agent, AgentKind::ClaudeCode);
 }
 
-// protects=criterion 9, each API route answers its view as JSON; keys with `/` are percent-encoded
+// protects=criterion 9 (L32) and L33 criterion 4 (the new fields), each API route answers its
+// view as JSON; keys with `/` are percent-encoded
 // in the path; exports come as attachments with a cleaned file name; fails_when=a route is
 // missing or a key path is mis-parsed; no_claim=msd's views (msd tests)
 #[test]
@@ -648,7 +649,14 @@ fn api_views_round_trip() {
         assert_eq!(r.h("content-type"), Some("application/json"), "{p}");
         serde_json::from_str::<serde_json::Value>(&r.body).unwrap()
     };
-    assert_eq!(ok("/api/home")["keys"], 3);
+    let home = ok("/api/home");
+    assert_eq!(home["keys"], 3);
+    // L33: the warnings, the keys not usable yet and the pending request's shape.
+    assert!(home["warnings"].is_array() && home["not_usable"].is_array());
+    assert!(home["pending"].is_null());
+    assert_eq!(ok("/api/scan")["running"], false);
+    assert!(ok("/api/agents")["warnings"].is_array());
+    assert!(ok("/api/activity")["projects"].is_array());
     ok("/api/projects");
     assert_eq!(ok("/api/projects/shop")["slug"], "shop");
     assert_eq!(get(port, "/api/projects/nope", &a).status, 404);
@@ -716,4 +724,36 @@ fn slow_body_times_out() {
     let n = s.read(&mut buf).unwrap();
     assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 408"));
     assert!(started.elapsed() < Duration::from_secs(8));
+}
+
+// protects=L33 SPEC D-1 and criterion 1: the vendored fonts and their licences are served at
+// /fonts/<file> without a session, with font/woff2 or text/plain and every security header, the
+// exact bytes msd embeds; anything else under /fonts/ is a 404; fails_when=a font is missing, has
+// another type or lacks a header, or a path outside the list is served; no_claim=the bytes'
+// provenance (assets::fonts_are_pinned)
+#[test]
+fn fonts_served_with_headers() {
+    let t = setup(|_| {});
+    let o = t.dash.open().unwrap();
+    for (name, ctype, bytes, _) in ms_dash::assets::FONTS {
+        let r = get(o.port, &format!("/fonts/{name}"), "");
+        assert_eq!(r.status, 200, "{name}");
+        assert_eq!(r.h("content-type"), Some(*ctype), "{name}");
+        assert_eq!(
+            r.h("content-length"),
+            Some(bytes.len().to_string().as_str()),
+            "{name}"
+        );
+        for (k, v) in HEADERS {
+            assert_eq!(r.h(k), Some(v), "{k} on {name}");
+        }
+    }
+    for bad in [
+        "/fonts/",
+        "/fonts/SOURCES.txt",
+        "/fonts/../dash.js",
+        "/fonts/x.woff2",
+    ] {
+        assert_eq!(get(o.port, bad, "").status, 404, "{bad}");
+    }
 }

@@ -102,7 +102,8 @@ pub(crate) fn once_only(a: Answer) -> Answer {
 /// Shows `p` on `tty` and reads the answer from it. Typeahead is discarded first, so keys
 /// pressed before the request appeared can't answer it.
 fn review(tty: &mut File, p: &PendingApproval) -> std::io::Result<Answer> {
-    review_with(tty, p, false)
+    // morsec's own actions are approved once only (L33 review S2).
+    review_with(tty, p, p.admin)
 }
 
 fn review_with(tty: &mut File, p: &PendingApproval, once: bool) -> std::io::Result<Answer> {
@@ -252,7 +253,7 @@ pub(crate) fn inline_review_once_only(what: &'static str) -> InlineReview {
     inline(what, true)
 }
 
-fn inline(what: &'static str, once: bool) -> InlineReview {
+fn inline(what: &'static str, once_flag: bool) -> InlineReview {
     let done = Arc::new(AtomicBool::new(false));
     let d = done.clone();
     std::thread::spawn(move || {
@@ -283,6 +284,7 @@ fn inline(what: &'static str, once: bool) -> InlineReview {
                     return;
                 };
                 let _ = writeln!(tty, "{what} needs your approval.");
+                let once = once_flag || p.admin;
                 let Ok(answer) = review_with(tty, &p, once) else {
                     return;
                 };
@@ -373,6 +375,7 @@ mod tests {
             },
             requested_unix_ms: 0,
             expires_unix_ms: 60_000,
+            admin: false,
         };
         let text = screen(&p, 0).join("\n");
         assert!(

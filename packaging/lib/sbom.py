@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
+import os
 import re
 import sys
 import tomllib
@@ -46,6 +48,17 @@ UPDATER_CRATES = frozenset(
 SHIPPED_KINDS = frozenset({None, "normal", "build"})
 
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
+
+# Fonts msd embeds in the dashboard (L33 SPEC D-1): (file, family). SIL OFL 1.1; their licence
+# texts ship in the binary too and are served at /fonts/OFL-*.txt.
+FONTS_DIR = os.path.join("crates", "ms-dash", "assets", "fonts")
+FONT_FILES = (
+    ("archivo-latin-var.woff2", "Archivo"),
+    ("instrument-serif-latin-400.woff2", "Instrument Serif"),
+    ("instrument-serif-latin-400-italic.woff2", "Instrument Serif"),
+    ("ibm-plex-mono-latin-400.woff2", "IBM Plex Mono"),
+    ("ibm-plex-mono-latin-500.woff2", "IBM Plex Mono"),
+)
 
 
 class SbomError(Exception):
@@ -107,6 +120,33 @@ def deny_updaters(pkgs: list[dict]) -> None:
         )
 
 
+def font_components(repo_root: str) -> list[dict]:
+    """The vendored fonts as CycloneDX file components: name, family, OFL-1.1, SHA-256."""
+    out = []
+    for name, family in FONT_FILES:
+        path = os.path.join(repo_root, FONTS_DIR, name)
+        try:
+            with open(path, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+        except OSError as e:
+            raise SbomError(f"vendored font {name} is missing: {e}") from e
+        out.append(
+            {
+                "type": "file",
+                "bom-ref": f"font:{name}",
+                "name": name,
+                "scope": "required",
+                "licenses": [{"license": {"id": "OFL-1.1"}}],
+                "hashes": [{"alg": "SHA-256", "content": digest}],
+                "properties": [
+                    {"name": "morsec:font-family", "value": family},
+                    {"name": "morsec:embedded-in", "value": "msd (ms-dash)"},
+                ],
+            }
+        )
+    return out
+
+
 def build_sbom(
     metadata: dict,
     lock_text: str,
@@ -114,6 +154,7 @@ def build_sbom(
     version: str,
     commit: str,
     epoch: int,
+    files: list[dict] | None = None,
 ) -> dict:
     if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
         raise SbomError(f"commit {commit!r} is not a git SHA")
@@ -148,6 +189,7 @@ def build_sbom(
             # check.sh's cargo deny allows crates.io only; anything else is a supply-chain change.
             raise SbomError(f"{_ref(p)} comes from {source!r}, not crates.io")
         components.append(c)
+    components.extend(files or [])
 
     ref_of = {p["id"]: _ref(p) for p in pkgs}
     dependencies = []
@@ -202,7 +244,10 @@ def main(argv: list[str]) -> int:
         metadata = json.load(sys.stdin)
         with open(a.lock, encoding="utf-8") as f:
             lock_text = f.read()
-        bom = build_sbom(metadata, lock_text, a.root, a.version, a.commit, a.epoch)
+        repo_root = os.path.dirname(os.path.abspath(a.lock))
+        bom = build_sbom(
+            metadata, lock_text, a.root, a.version, a.commit, a.epoch, font_components(repo_root)
+        )
     except (SbomError, ValueError, KeyError, OSError) as e:
         print(f"sbom.py: {e}", file=sys.stderr)
         return 1

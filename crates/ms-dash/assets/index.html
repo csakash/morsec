@@ -12,23 +12,49 @@
 </head>
 <body>
 <header class="top">
-  <div class="bar">
-    <a class="brand" href="#/"><span class="mk" aria-hidden="true"><i class="d"></i><i class="l"></i><i class="d"></i></span>MORSEC</a>
-    <nav class="nav" id="nav" aria-label="Screens">
-      <a href="#/" data-route="/">Home</a>
-      <a href="#/projects" data-route="/projects">Projects</a>
-      <a href="#/activity" data-route="/activity">Activity</a>
-      <a href="#/agents" data-route="/agents">Agents</a>
-      <a href="#/scan" data-route="/scan">Scan</a>
-    </nav>
-    <span class="pill" id="pill" aria-live="polite"></span>
+  <div class="wrap">
+    <div class="row">
+      <a class="brand" href="#/" aria-label="morsec dashboard, Home"><span class="mk" aria-hidden="true"><i class="d"></i><i class="l"></i><i class="d"></i></span>MORSEC</a>
+      <div class="nav"><span class="lbl">Dashboard</span><span class="num" id="host"></span></div>
+      <div class="act">
+        <button class="theme" type="button" id="theme" aria-label="Switch light or dark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/></svg>
+        </button>
+        <div class="state" id="state"></div>
+      </div>
+    </div>
   </div>
+  <div class="vh" id="live" role="status" aria-live="polite"><p></p></div>
 </header>
-<main class="wrap" id="main" tabindex="-1">
-  <p class="muted">Loading…</p>
-</main>
-<footer class="wrap foot">
-  <p class="muted">Local to this Mac. Values never reach this page. Read-only.</p>
+<div class="wrap shell">
+  <nav class="rail" id="nav" aria-label="Screens">
+    <ol class="scrs">
+      <li><a class="scr" href="#/" data-route="/"><span class="num">01</span><span class="t">Home</span><span class="c" id="c-home"></span></a></li>
+      <li><a class="scr" href="#/projects" data-route="/projects"><span class="num">02</span><span class="t">Projects</span><span class="c" id="c-projects"></span></a><ol class="sub" id="sub-projects"></ol></li>
+      <li><a class="scr" href="#/activity" data-route="/activity"><span class="num">03</span><span class="t">Activity</span><span class="c" id="c-activity"></span></a></li>
+      <li><a class="scr" href="#/agents" data-route="/agents"><span class="num">04</span><span class="t">Agents</span><span class="c" id="c-agents"></span></a></li>
+      <li><a class="scr" href="#/scan" data-route="/scan"><span class="num">05</span><span class="t">Scan</span><span class="c" id="c-scan"></span></a></li>
+    </ol>
+  </nav>
+  <main id="main" tabindex="-1">
+    <p class="muted loading">Loading…</p>
+  </main>
+</div>
+<footer class="foot">
+  <div class="wrap">
+    <div class="row">
+      <div class="big" aria-hidden="true">Morsec</div>
+      <div class="links">
+        <nav aria-label="Fonts (SIL Open Font License 1.1)">
+          <a href="/fonts/OFL-Archivo.txt">Archivo · OFL</a>
+          <a href="/fonts/OFL-InstrumentSerif.txt">Instrument Serif · OFL</a>
+          <a href="/fonts/OFL-IBMPlexMono.txt">IBM Plex Mono · OFL</a>
+        </nav>
+        <small>Local to this Mac. Values are shown only after Touch ID, and hidden again after 15 seconds. <span id="ver"></span></small>
+      </div>
+    </div>
+  </div>
 </footer>
+<template id="t-arrow"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M4 12 12 4M5.5 4H12v6.5"/></svg></template>
 </body>
 </html>

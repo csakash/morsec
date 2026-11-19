@@ -5,10 +5,12 @@
 //! - [`store`]: the rules file MAC'd with a vault key; anything that fails verification fails
 //!   closed.
 //! - [`project`]: a project's `.morsec.toml`, merged so it can only tighten.
+//! - [`edit`]: one rule edit, shared by `ms rules` and the dashboard (L33).
 //! - [`change`]: classifies a rules change as tightening or loosening (loosening needs approval).
 //! - [`decide`] (frozen signature) and [`decide_run`]: the pure policy function.
 
 pub mod change;
+pub mod edit;
 mod error;
 pub mod model;
 pub mod pattern;

@@ -18,6 +18,7 @@ mod dash;
 mod doctor;
 mod drift;
 mod open;
+mod pasteboard;
 mod paths;
 mod proxy;
 mod scan;
@@ -103,9 +104,38 @@ struct Args {
     /// FILE instead of opening a browser.
     #[arg(long, value_name = "FILE", hide = true)]
     test_open_to: Option<PathBuf>,
+    /// Tests only (debug builds, with --vault memory): the dashboard's Copy writes a line per
+    /// copy and clear to FILE (length, short hash, markers; never the value) instead of the
+    /// pasteboard.
+    #[arg(long, value_name = "FILE", hide = true)]
+    test_pasteboard_to: Option<PathBuf>,
     /// Tests only: the CA (PEM) that verifies the test upstreams.
     #[arg(long, value_name = "FILE", hide = true)]
     test_upstream_ca: Option<PathBuf>,
+}
+
+/// The pasteboard the dashboard's Copy writes: the system one, or with `--test-pasteboard-to`
+/// (a debug build with the memory vault only) a file that records each copy without the value.
+fn clipboard_for(
+    test_to: Option<PathBuf>,
+    memory_vault: bool,
+) -> Result<Option<std::sync::Arc<dyn pasteboard::Clipboard>>, String> {
+    match test_to {
+        None => Ok(None),
+        Some(_) if !cfg!(debug_assertions) => {
+            Err("morsec: --test-pasteboard-to exists only in debug builds".into())
+        }
+        Some(_) if !memory_vault => Err(
+            "morsec: --test-pasteboard-to only works with --vault memory (an ephemeral dev vault)"
+                .into(),
+        ),
+        Some(file) => {
+            tracing::warn!("TEST BUILD: the dashboard's Copy goes to --test-pasteboard-to");
+            Ok(Some(std::sync::Arc::new(pasteboard::Marked(
+                pasteboard::FilePasteboard::new(file),
+            ))))
+        }
+    }
 }
 
 fn socket_path(args: &Args) -> ms_core::Result<PathBuf> {
@@ -415,6 +445,13 @@ async fn serve(args: Args) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    let clipboard = match clipboard_for(args.test_pasteboard_to.clone(), b.is_memory()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
     let approvals = match approve::approver(args.test_touch_id, b.is_memory()) {
         Ok(a) => a,
         Err(e) => {
@@ -466,6 +503,9 @@ async fn serve(args: Args) -> ExitCode {
         .dash_port
         .or_else(|| args.port.and_then(|p| p.checked_add(2)))
         .unwrap_or(ms_dash::DEFAULT_PORT);
+    if let Some(c) = clipboard {
+        d.set_clipboard(c);
+    }
     // Not listening until the first DashOpen (design §6.1).
     dash::install(&d, ms_dash::DashConfig::new(dash_port), uid, opener);
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -489,6 +529,8 @@ async fn serve(args: Args) -> ExitCode {
             shutdown_signal(),
         )
         .await;
+    // A copy still within its 30 s leaves the pasteboard with msd (review N4).
+    pasteboard::clear_pending_now();
     if let Some(dash) = d.dash() {
         dash.shutdown();
     }
@@ -546,5 +588,21 @@ async fn reap_dev_sessions(d: std::sync::Arc<daemon::Daemon>, mut stop: watch::R
             })
         })
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // protects=SPEC D-20: the file pasteboard (a test stand-in) is refused with the keychain
+    // vault, so a real msd always writes the system pasteboard; fails_when=--test-pasteboard-to
+    // is accepted with the keychain vault; no_claim=the release-build branch (tests run debug)
+    #[test]
+    fn test_pasteboard_to_needs_the_memory_vault() {
+        let f = PathBuf::from("/tmp/x");
+        assert!(clipboard_for(Some(f.clone()), false).is_err());
+        assert!(clipboard_for(Some(f), true).unwrap().is_some());
+        assert!(clipboard_for(None, false).unwrap().is_none());
     }
 }

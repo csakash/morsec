@@ -16,7 +16,7 @@ pub mod macos;
 pub mod render;
 pub mod token;
 
-pub use broker::{DecideError, HumanApprover, Pending};
+pub use broker::{ConfirmError, DecideError, HumanApprover, Pending};
 pub use token::{Binding, Scope, TokenError};
 
 use ms_core::ApprovalRequest;

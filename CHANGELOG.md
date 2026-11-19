@@ -6,6 +6,25 @@ entries. Move the entries from Unreleased into it when you bump the version.
 
 ## [Unreleased]
 
+- The dashboard (`ms dashboard`) now looks like morsec's site, with its fonts bundled in msd
+  (nothing is fetched): one ruled sheet, a numbered rail of the five screens (with what's
+  waiting, your projects and the open project's keys), breadcrumbs, rows that open what they
+  name, and the site's light/dark switch, works in light and dark from phone width up, and can act, not only show.
+  From Home you approve or deny the request an agent is waiting on, see each warning in plain
+  words with its fix, and stop or start morsec. On a key's page you can show its value or copy
+  it (Touch ID every time; a shown value hides after 15 seconds and the clipboard is cleared
+  after 30, and clipboard managers are told to skip it), replace or delete it, give it a website
+  or a command (adding one needs Touch ID, taking one away doesn't), and undo its import. A
+  project can be undone as a whole. The leak scan runs from the Scan screen; Agents re-checks
+  msd's view of your agents. Connecting an agent and setting up a project stay in Terminal: the
+  page gives the exact command to copy. Every action, done or refused, is in Activity.
+- New commands with the same effect in Terminal: `ms set <key>` replaces a value, `ms rm <key>`
+  deletes a key and its rule, `ms undo <project> [--key <key>]` writes the values back into the
+  project's `.env` files. Each asks for Touch ID and refuses inside an agent session.
+- `ms` and `msd` ship together: an older `ms approve` can't read a request from this msd that
+  morsec made for its own actions (it is marked so it can be approved once only). Update both.
+- `ms add` no longer replaces a key that exists (it never did from the CLI; a direct request to
+  msd could, without asking). Replacing is `ms set`, with Touch ID.
 - `ms init` now sets up the project you run it in, in one command. In a project folder it finds
   the secrets in every `.env` file (as deep as the project goes, skipping `node_modules` and other
   dependency folders, never following symlinks), moves them into the vault, rewrites the files

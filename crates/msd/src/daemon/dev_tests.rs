@@ -527,9 +527,10 @@ fn dev_refuses_a_session_scope_approval() {
         Some(ApprovalScope::Session),
         || dev_start_raw(h.as_(terminal()), &["npm", "run", "dev"], &root).0,
     );
-    assert!(is_ok(&decision), "{decision:?}");
+    // From L33 (review S2) the broker itself refuses a session answer to morsec's own
+    // requests (argv `ms …`), before any Touch ID; ms dev's own check stays behind it.
+    assert!(msg(&decision).contains("approved once"), "{decision:?}");
     assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
-    assert!(msg(&r).contains("answer o"), "{r:?}");
     assert_eq!(h.d.dev.len(), 0);
 }
 

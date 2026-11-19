@@ -33,6 +33,8 @@ const MAX_ROWS: usize = 1000;
 const DASH_OPEN_GAP: std::time::Duration = std::time::Duration::from_secs(3);
 /// Uses shown on the Secret screen.
 const SECRET_USES: usize = 20;
+/// Keys not usable yet that Home lists ("and N more" links to Projects).
+const HOME_NOT_USABLE: usize = 5;
 
 fn key(raw: &str) -> KeyName {
     KeyName::new(raw).unwrap_or_else(|_| unreachable!("constant key name is valid"))
@@ -95,6 +97,15 @@ fn row(r: &StoredRecord) -> Option<ActivityRow> {
             reason: None,
         }),
         Entry::Checkpoint(_) => None,
+    }
+}
+
+/// An agent the Activity filter has no name for.
+fn is_other_agent(a: &ms_core::AgentKind) -> bool {
+    match a {
+        ms_core::AgentKind::Other(n) => !matches!(n.as_str(), "terminal" | "dashboard" | "ms-dev"),
+        ms_core::AgentKind::Cursor | ms_core::AgentKind::GeminiCli => true,
+        _ => false,
     }
 }
 
@@ -206,7 +217,7 @@ impl Daemon {
     }
 
     /// The project records, or why they can't be shown (fails closed, like `ms projects`).
-    fn dash_projects(&self) -> Result<ProjectsFile, String> {
+    pub(super) fn dash_projects(&self) -> Result<ProjectsFile, String> {
         self.load_projects().map(|(f, _)| f).map_err(|r| match r {
             ResponseBody::Error { message, .. } => message,
             _ => "morsec: the project records can't be read".into(),
@@ -282,6 +293,12 @@ impl Daemon {
                 sessions,
                 blocked,
                 last_seen_unix_ms: last_seen(id),
+                command: (installed || connected).then(|| {
+                    format!(
+                        "ms {} {id}",
+                        if connected { "disconnect" } else { "connect" }
+                    )
+                }),
             }
         })
         .collect()
@@ -310,10 +327,12 @@ impl Daemon {
             ),
             None => None,
         };
+        // "other": any session that is none of the named ones (SPEC D-15).
+        let other = q.agent.as_deref() == Some("other");
         let query = Query {
             since,
             until: None,
-            agent: q.agent.as_deref().map(parse_agent),
+            agent: q.agent.as_deref().filter(|_| !other).map(parse_agent),
             key,
             result,
             pid: None,
@@ -329,6 +348,14 @@ impl Daemon {
                 (None, _) => true,
                 (Some(p), Entry::Receipt(x)) => x.key.as_str().starts_with(p.as_str()),
                 (Some(_), _) => false,
+            })
+            .filter(|r| {
+                !other
+                    || match &r.rec.entry {
+                        Entry::Receipt(x) => is_other_agent(&x.session.agent),
+                        Entry::Alert(a) => is_other_agent(&a.session.agent),
+                        Entry::Checkpoint(_) => false,
+                    }
             })
             .collect();
         Ok((rows, total))
@@ -347,14 +374,20 @@ impl Daemon {
             return Err(ApiError::internal("morsec: status unavailable"));
         };
         let stored = self.stored_keys();
-        let (protected, needs) = {
+        let (protected, needs, not_ready) = {
             let live = self.read_live();
-            let protected = stored
+            let not_ready: Vec<KeyName> = stored
                 .keys()
-                .filter(|k| ready(live.rules.keys.get(*k), live.rules.tampered))
-                .count();
-            (protected, stored.len() - protected)
+                .filter(|k| !ready(live.rules.keys.get(*k), live.rules.tampered))
+                .cloned()
+                .collect();
+            (stored.len() - not_ready.len(), not_ready.len(), not_ready)
         };
+        let not_usable = not_ready
+            .iter()
+            .take(HOME_NOT_USABLE)
+            .map(|k| self.key_row(k, &stored))
+            .collect();
         let records = self.receipts_all()?;
         let day_ago = now_ms().saturating_sub(24 * 3600 * 1000);
         let blocked_24h = records
@@ -374,18 +407,184 @@ impl Daemon {
             protected: u32_of(protected),
             needs_website: u32_of(needs),
             blocked_24h,
+            warnings: self.warnings_for(&alerts),
             alerts,
-            pending: self.approvals.pending().map(|p| PendingView {
-                agent: agent_label(&p.request.session.agent),
-                key: p.request.key.to_string(),
-                tier: tier_str(p.request.tier).into(),
-                command: p.request.argv_display.clone(),
-                cwd: p.request.cwd.display().to_string(),
-                expires_unix_ms: p.expires_unix_ms,
+            not_usable,
+            pending: self.approvals.pending_state().map(|(p, deciding)| {
+                // Rendered here, as ms approve shows it: inert, quoted, never cut (SPEC D-11).
+                let r = &p.request;
+                let from_agent = !matches!(r.session.agent, ms_core::AgentKind::Other(_));
+                let admin = p.admin;
+                PendingView {
+                    summary: self.pending_summary(r, from_agent, admin),
+                    from_agent,
+                    // Who asked, as recorded when the request was made (N6): msd's own
+                    // requests carry it in their argv; any other names the recorded process.
+                    requester: (!from_agent).then(|| {
+                        r.argv_display
+                            .iter()
+                            .find(|a| admin && a.starts_with("requested by "))
+                            .map(|a| ms_approve::render::inert(a))
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "pid {} (started {}), not an agent session",
+                                    r.session.pid,
+                                    ms_approve::render::utc(r.session.started_unix_ms)
+                                )
+                            })
+                    }),
+                    once_only: admin,
+                    expand: !admin,
+                    id: p.id,
+                    agent: ms_approve::render::agent_name(&r.session.agent),
+                    key: ms_approve::render::inert(r.key.as_str()),
+                    tier: tier_str(r.tier).into(),
+                    command: r
+                        .argv_display
+                        .iter()
+                        .map(|a| ms_approve::render::quoted(a))
+                        .collect(),
+                    // Inert, without quotes (V6).
+                    cwd: ms_approve::render::inert(&r.cwd.to_string_lossy()),
+                    effect: r.effect.as_deref().map(ms_approve::render::quoted),
+                    expires_unix_ms: p.expires_unix_ms,
+                    deciding,
+                }
             }),
             agents: self.agent_views(&records),
             projects_unreadable: projects.is_err(),
         })
+    }
+
+    /// What a waiting request asks, in plain words (review Q1). Every part from the request is
+    /// rendered inert.
+    pub(super) fn pending_summary(
+        &self,
+        r: &ms_core::ApprovalRequest,
+        from_agent: bool,
+        admin: bool,
+    ) -> String {
+        use ms_approve::render::{agent_name, inert, quoted};
+        let who = if from_agent {
+            agent_name(&r.session.agent)
+        } else {
+            "a program outside any agent session".to_owned()
+        };
+        let key = inert(r.key.as_str());
+        let a: Vec<&str> = r.argv_display.iter().map(String::as_str).collect();
+        // An agent's (or any other process's) own command: its exact words, never a reading of
+        // them, whatever they look like (L33 re-review SR1). Only requests msd tagged as its own
+        // get the plain-words wording below.
+        let generic = || {
+            let cmd: Vec<String> = a.iter().map(|x| quoted(x)).collect();
+            format!("Let {who} use {key} to run {}", cmd.join(" "))
+        };
+        if !admin {
+            return generic();
+        }
+        match a.as_slice() {
+            ["ms", "rules", k, toml, ..] => {
+                let k = inert(k);
+                let next = ms_rules::Rules::from_toml(toml, "the request")
+                    .ok()
+                    .and_then(|x| x.keys.into_iter().next().map(|(_, v)| v));
+                let cur = self.read_live().rules.keys.get(&r.key).cloned();
+                let Some(n) = next else {
+                    return format!("Let {who} change what {k} may do");
+                };
+                let mut adds: Vec<String> = Vec::new();
+                for h in n.hosts.iter().map(ToString::to_string) {
+                    let had = cur
+                        .as_ref()
+                        .is_some_and(|c| c.hosts.iter().any(|x| x.to_string() == h));
+                    if !had {
+                        adds.push(inert(&h));
+                    }
+                }
+                for cmd in &n.commands {
+                    if !cur.as_ref().is_some_and(|c| c.commands.contains(cmd)) {
+                        adds.push(format!("the command {}", inert(&cmd.to_string())));
+                    }
+                }
+                // Everything that can loosen a rule is named (re-review F3). With no rule yet,
+                // everything in the new one is new (N8).
+                if let Some(c) = cur.as_ref().filter(|c| c.mode != n.mode) {
+                    adds.push(format!(
+                        "a change from {} to {}",
+                        mode_str(c.mode),
+                        mode_str(n.mode)
+                    ));
+                }
+                if cur.is_none() {
+                    adds.push(format!("{} tier", tier_str(n.tier)));
+                    adds.push(format!("approvals that last {} s", n.session_ttl_secs));
+                    if !n.read_only {
+                        adds.push("write access".to_owned());
+                    }
+                }
+                for root in &n.roots {
+                    if !cur.as_ref().is_some_and(|c| c.roots.contains(root)) {
+                        adds.push(format!("the folder {}", inert(&root.display().to_string())));
+                    }
+                }
+                for v in &n.env {
+                    if !cur.as_ref().is_some_and(|c| c.env.contains(v)) {
+                        adds.push(format!("the variable {}", inert(v)));
+                    }
+                }
+                for g in &n.git_hosts {
+                    if !cur.as_ref().is_some_and(|c| c.git_hosts.contains(g)) {
+                        adds.push(format!("git over {}", inert(g)));
+                    }
+                }
+                for kh in &n.ssh_host_keys {
+                    if !cur.as_ref().is_some_and(|c| c.ssh_host_keys.contains(kh)) {
+                        adds.push(format!("the SSH host key {}", inert(&kh.to_string())));
+                    }
+                }
+                for m in &n.mint_scopes {
+                    if !cur.as_ref().is_some_and(|c| c.mint_scopes.contains(m)) {
+                        adds.push(format!("the scope {}", inert(m)));
+                    }
+                }
+                if !n.read_only && cur.as_ref().is_some_and(|c| c.read_only) {
+                    adds.push("write access (it was read-only)".to_owned());
+                }
+                if cur
+                    .as_ref()
+                    .is_some_and(|c| n.session_ttl_secs > c.session_ttl_secs)
+                {
+                    adds.push(format!("approvals that last {} s", n.session_ttl_secs));
+                }
+                if cur.as_ref().is_some_and(|c| c.tier != n.tier) {
+                    adds.push(format!("{} tier", tier_str(n.tier)));
+                }
+                if adds.is_empty() {
+                    format!("Let {who} change what {k} may do")
+                } else {
+                    format!("Let {who} give {k} access to {}", adds.join(", "))
+                }
+            }
+            // The rules diff above is built from msd's own parse of the proposal, so it is
+            // shown for an agent's ask too; every other wording only for a person's own ask.
+            _ if from_agent => generic(),
+            ["ms", "start", ..] => format!("Start morsec again (asked by {who})"),
+            ["ms", "scan", ..] => {
+                format!("Run the leak scan: it reads every value (asked by {who})")
+            }
+            ["ms", "set", k, ..] => format!("Replace the value of {} (asked by {who})", inert(k)),
+            ["ms", "rm", k, ..] => format!("Delete {} and its rule (asked by {who})", inert(k)),
+            ["ms", "undo", slug, ..] => format!(
+                "Write values back into project {}'s files (asked by {who})",
+                inert(slug)
+            ),
+            ["ms", "init", slug, ..] => format!(
+                "Set up project {}: its new keys may reach their services (asked by {who})",
+                inert(slug)
+            ),
+            ["dashboard", action, ..] => format!("{} {key}, from the dashboard", inert(action)),
+            _ => generic(),
+        }
     }
 
     pub(crate) fn dash_projects_view(&self) -> Result<ProjectsView, ApiError> {
@@ -503,6 +702,9 @@ impl Daemon {
                 })
                 .collect(),
             hints: p.hints.iter().map(|h| h.path.clone()).collect(),
+            not_usable: u32_of(statuses.values().filter(|k| !k.ready).count()),
+            dev_command: ms_dash::shell::in_folder(&p.root, "ms dev -- npm run dev"),
+            rescan_command: ms_dash::shell::in_folder(&p.root, "ms init"),
         })
     }
 
@@ -563,6 +765,9 @@ impl Daemon {
             commands: r
                 .map(|r| r.commands.iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
+            command_words: r
+                .map(|r| r.commands.iter().map(|c| c.to_strings()).collect())
+                .unwrap_or_default(),
             roots: r
                 .map(|r| r.roots.iter().map(|p| p.display().to_string()).collect())
                 .unwrap_or_default(),
@@ -581,6 +786,10 @@ impl Daemon {
             rows: rows.iter().rev().filter_map(row).take(limit).collect(),
             matched,
             total,
+            projects: self
+                .dash_projects()
+                .map(|f| f.projects.iter().map(|p| p.slug.clone()).collect())
+                .unwrap_or_default(),
         })
     }
 
@@ -622,7 +831,7 @@ impl Daemon {
 
     pub(crate) fn dash_agents(&self) -> Result<AgentsView, ApiError> {
         let records = self.receipts_all()?;
-        let alerts = lock(&self.alerts).clone();
+        let alerts = self.alert_texts();
         let (tampered, stopped) = {
             let l = self.read_live();
             (l.rules.tampered, l.rules.stopped)
@@ -652,17 +861,22 @@ impl Daemon {
         match lock(&self.ca).as_ref() {
             Some((_, hosts)) => checks.push(CheckView {
                 ok: true,
-                text: format!("proxy CA issued for {} hosts", hosts.len()),
+                text: format!(
+                    "proxy CA issued for {} host{}",
+                    hosts.len(),
+                    if hosts.len() == 1 { "" } else { "s" }
+                ),
             }),
             None => checks.push(CheckView {
                 ok: true,
                 text: "no host bound yet, so no proxy CA in use".into(),
             }),
         }
-        checks.extend(alerts.into_iter().map(|a| CheckView { ok: false, text: a }));
+        // The alerts themselves are the Warnings section, not checks again (review Q17).
         Ok(AgentsView {
             agents: self.agent_views(&records),
             checks,
+            warnings: self.warnings_for(&alerts),
         })
     }
 
@@ -696,7 +910,12 @@ impl Daemon {
             }),
             _ => None,
         });
-        ScanView { last }
+        let (running, error) = self.dash_scan_state();
+        ScanView {
+            last,
+            running,
+            error,
+        }
     }
 }
 
@@ -726,7 +945,7 @@ impl DashSource {
         }
     }
 
-    fn d(&self) -> Result<Arc<Daemon>, ApiError> {
+    pub(super) fn d(&self) -> Result<Arc<Daemon>, ApiError> {
         self.d
             .upgrade()
             .ok_or_else(|| ApiError::unavailable("morsec: msd is stopping"))

@@ -18,6 +18,7 @@ pub mod record;
 pub mod save;
 pub mod slug;
 pub mod store;
+pub mod undo;
 pub mod walk;
 
 /// Errors from this crate. Messages carry paths, key and variable names, never values.
