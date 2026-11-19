@@ -27,6 +27,9 @@ read it first: download `install.sh`, check it against the release's `SHA256SUMS
 ms init
 ```
 
+Run inside a project, `ms init` moves its `.env` secrets into the vault and leaves `ms://`
+references. Run your app through morsec so they still work: `ms dev -- npm run dev`.
+
 Then add a key, say where it may go, and connect your agent:
 
 ```bash

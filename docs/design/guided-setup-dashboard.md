@@ -416,6 +416,14 @@ ms dev -- npm run dev
    that is itself an agent is classified as an agent session by the existing walk.
 5. The session ends when the child exits.
 
+> **Refinement (L34 SPEC D-1, D-3, D-7).** The dev session is bound to the `ms dev` process
+> itself (the kernel peer of `DevStart`: PID and start time), which is the child's parent: the
+> same tree, with no second request naming a PID. The proxy serves the credential only to a
+> process with that `ms dev` process on its parent chain and no agent above it. Run-mode values
+> reach `ms dev` as raw frames after the `DevStarted` reply (names only in JSON). Dev sessions
+> use only their project's keys, and may tunnel to hosts no key is bound to (the user's own
+> process is not sandboxed); agents are unchanged.
+
 Residuals, recorded in L34's PROOF: run-mode values in the dev process environment can be read by
 any same-user process (as for run mode before L23), and a child the user starts from the dev
 server inherits them. Node older than 24 does not read `HTTPS_PROXY` by itself: `ms dev` warns

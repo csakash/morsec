@@ -16,6 +16,14 @@ entries. Move the entries from Unreleased into it when you bump the version.
   `--project [PATH]`, `--name`, `--no-connect`. It also connects Claude Code and Codex when it
   finds them.
 - `ms projects [NAME]` lists the projects `ms init` set up, or shows one in full (no values).
+- `ms dev -- <command>` runs your own app (for example `npm run dev`) so the `ms://` references
+  `ms init` left in your `.env` work: requests to your keys' services go through morsec, which
+  swaps the real key in, and database URLs are put in the command's environment. Only processes
+  started by that `ms dev` can use its session; it ends when your command exits. Touch ID once per
+  run when the project has a production key. Refused inside an agent session and for agent
+  programs. Node 24 or later is needed for Node apps (older versions are warned about).
+- Keys `ms init` set up for a project (`shop/stripe-secret-key`) are now swapped by the proxy;
+  before, the proxy didn't know where their credential goes and skipped them.
 - An existing `CLAUDE.md` or `AGENTS.md` gets a short note telling agents to keep `ms://`
   references as they are. morsec never creates those files.
 

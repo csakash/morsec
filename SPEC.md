@@ -51,8 +51,9 @@ ms dev -- npm run dev
 - **D-3 Run-mode values reach `ms` as raw value frames (Refinement of §5.3).** The reply
   `DevStarted` lists only variable **names**; each value follows as its own raw frame (the
   `PutKey` frame format, in the other direction), read straight into `SecretBytes`. No JSON
-  variant holds a value. Only values of run-mode keys of **this** project, whose rule is ready and
-  names a root containing the canonical cwd, are sent; the variable names come from the project
+  variant holds a value. Only values of run-mode keys of **this** project whose rule names a root
+  containing the canonical cwd are sent (L31 gives a database URL the project root and no
+  commands, so "names a root" is the test, not "allows a command"); the variable names come from the project
   record (`var → key`). A variable recorded with two different keys takes the root `.env`'s key,
   else it is skipped with a note. ms-ipc gets an additive `Handler::handle_with_values` (default:
   no values) and `Client::request_with_values`; the server sends values only after a `DevStarted`
@@ -89,6 +90,14 @@ ms dev -- npm run dev
   `pnpm` or `yarn`, `ms dev` runs `node --version` (2 s budget) and warns when it is older than
   24 or unknown (best effort).
 
+- **D-11 Inline review (build).** Like `ms init` and `ms start`, `ms dev` reviews its own
+  approval on the terminal it runs in (`approve::inline_review`); `ms approve` works too.
+- **D-12 Project keys must be bound by the proxy (found while building).** msd's proxy found a
+  key's credential location only through catalog key names (`stripe/test`) or a first segment
+  that is a provider id, so L31's project keys (`shop/stripe-secret-key`) were never swapped. The
+  proxy now takes the provider from the MAC'd project record (`bindings_with`), and a project save
+  rebuilds the proxy. Test `crates/msd/src/proxy.rs::project_keys_bind_with_their_recorded_provider`.
+
 ## Behaviour
 
 `ms dev [--] <cmd> [args…]`
@@ -117,13 +126,13 @@ ms dev -- npm run dev
 
 | # | Criterion | Test(s) |
 |---|---|---|
-| 1 | `DevStart` is refused (no value, no session, no approval asked) from an agent session; `ms dev` refuses inside an agent session before contacting msd | `crates/msd/src/daemon/dev.rs::dev_refused_in_agent_session`, `crates/ms-cli/tests/dev_cli.rs::dev_refused_in_agent_session` |
-| 2 | `ms dev` and msd refuse when `argv[0]` is an agent binary (`claude`, `codex`, `cursor-agent`, `gemini`; by name, path or symlink) | `crates/ms-cli/src/dev.rs::dev_refused_for_agent_binary`, `crates/msd/src/daemon/dev.rs::dev_refused_for_agent_binary` |
+| 1 | `DevStart` is refused (no value, no session, no approval asked) from an agent session; `ms dev` refuses inside an agent session before contacting msd | `crates/msd/src/daemon/dev_tests.rs::dev_refused_in_agent_session`, `crates/ms-cli/tests/dev_cli.rs::dev_refused_in_agent_session` |
+| 2 | `ms dev` and msd refuse when `argv[0]` is an agent binary (`claude`, `codex`, `cursor-agent`, `gemini`; by name, path or symlink) | `crates/ms-cli/src/dev.rs::dev_refused_for_agent_binary`, `crates/msd/src/daemon/dev_tests.rs::dev_refused_for_agent_binary` |
 | 3 | A connection from the `ms dev` tree with the credential is a dev session; the credential from outside the tree, the tree without the credential, a dead `ms dev` or a reused PID are refused; an agent inside the tree stays an agent session | `crates/msd/src/proxy.rs::dev_swaps_refs_for_child_tree`, `crates/ms-session/src/walk.rs::within_checks_the_chain` |
-| 4 | Dev sessions swap only their project's keys, to the keys' hosts, with receipts | `crates/msd/src/daemon/dev.rs::dev_swaps_refs_for_child_tree` |
-| 5 | The session ends when the child exits (`DevEnd`, reaper), on `ms stop` and on msd restart | `crates/msd/src/daemon/dev.rs::dev_session_ends_with_child` |
-| 6 | Values are returned only for run-mode keys of the cwd's project whose rule is ready and whose root holds the cwd; never for swap keys, other projects' keys or outside a project; never in a JSON frame | `crates/msd/src/daemon/dev.rs::dev_run_mode_values_only_for_project_keys`, `crates/ms-ipc/tests/ipc.rs::values_follow_dev_started_as_raw_frames` |
-| 7 | A project with a production key asks one Touch ID per `ms dev` run, bound to the command; every production swap of that run uses it without another prompt; denial starts nothing | `crates/msd/src/daemon/dev.rs::dev_production_needs_one_approval` |
+| 4 | Dev sessions swap only their project's keys, to the keys' hosts, with receipts | `crates/msd/src/daemon/dev_tests.rs::dev_swaps_refs_for_child_tree` |
+| 5 | The session ends when the child exits (`DevEnd`, reaper), on `ms stop` and on msd restart | `crates/msd/src/daemon/dev_tests.rs::dev_session_ends_with_child` |
+| 6 | Values are returned only for run-mode keys of the cwd's project whose rule is ready and whose root holds the cwd; never for swap keys, other projects' keys or outside a project; never in a JSON frame | `crates/msd/src/daemon/dev_tests.rs::dev_run_mode_values_only_for_project_keys`, `crates/ms-ipc/tests/ipc.rs::values_follow_dev_started_as_raw_frames` |
+| 7 | A project with a production key asks one Touch ID per `ms dev` run, bound to the command; every production swap of that run uses it without another prompt; denial starts nothing | `crates/msd/src/daemon/dev_tests.rs::dev_production_needs_one_approval` |
 | 8 | End to end: a child of `ms dev` calls a fake Stripe upstream over HTTPS with an `ms://` ref through `HTTPS_PROXY`, and the upstream receives the canary; the child gets the run-mode value in its environment; the canary is in none of `ms dev`'s output, receipts, msd's log or IPC replies; after `ms dev` exits its credential is refused | `tests/e2e/tests/canary.rs::dev_swaps_for_the_users_own_command` |
 | 9 | Node older than 24 is warned about; env names and output never carry a value | `crates/ms-cli/src/dev.rs::node_version_warning`, `crates/ms-cli/src/dev.rs::child_env_is_built_from_names` |
 | 10 | Dev sessions may tunnel to unbound hosts; agents still can't | `crates/ms-proxy/src/itests.rs::open_egress_only_for_sessions_that_have_it` |

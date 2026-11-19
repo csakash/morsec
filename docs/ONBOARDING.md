@@ -105,6 +105,19 @@ values. `ms projects shop` shows everything it did. Run in your home folder (or 
 `--machine`), `ms init` only sets up this Mac. `ms status` says whether morsec is on and how
 many secrets it protects.
 
+To run your app yourself after that (its `.env` now holds references), start it through morsec:
+
+```bash
+ms dev -- npm run dev
+```
+
+`ms dev` runs your command in your terminal with `HTTPS_PROXY` pointing at morsec, so requests to
+your keys' services get the real key swapped in, and puts the real database URLs (run-mode keys
+of this project) in its environment. A project with a production key asks for Touch ID once per
+run. Node needs version 24 or later to send its requests through a proxy (`ms dev` sets
+`NODE_USE_ENV_PROXY=1` and warns about older versions). It refuses to start a coding agent, and
+it doesn't run inside one.
+
 The rest of this guide is for doing the same by hand, one key at a time.
 
 ## 3. Add your secrets
