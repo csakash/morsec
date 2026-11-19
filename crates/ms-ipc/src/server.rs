@@ -123,6 +123,21 @@ pub trait Handler: Send + Sync + 'static {
         value: Option<SecretBytes>,
     ) -> impl Future<Output = ResponseBody> + Send;
 
+    /// Produces the response to a request whose reply may be followed by raw value frames
+    /// ([`RequestBody::returns_values`], L34 `DevStart`). The server sends the values only after a
+    /// [`ResponseBody::DevStarted`] whose `env` has exactly as many names; any other reply goes
+    /// out alone and the values are dropped. The default answers through [`Handler::handle`] and
+    /// returns no values.
+    fn handle_with_values(
+        &self,
+        peer: &PeerInfo,
+        request: RequestBody,
+        value: Option<SecretBytes>,
+    ) -> impl Future<Output = (ResponseBody, Vec<SecretBytes>)> + Send {
+        let f = self.handle(peer, request, value);
+        async move { (f.await, Vec::new()) }
+    }
+
     /// Serves a streaming request (`RunStream`, L12). Chunks sent on `io.output` reach the
     /// client as they come; the returned body is the stream's last frame, after which the
     /// connection closes. The future is dropped (cancelled) when the client goes away or the
@@ -630,9 +645,57 @@ async fn conn_body<H: Handler, P: PeerCheck>(
             serve_stream(stream, &*handler, &peer, env.id, env.body).await;
             return;
         }
+        if env.body.returns_values() {
+            let (response, values) = handler.handle_with_values(&peer, env.body, value).await;
+            if !send_with_values(stream, env.id, response, values).await {
+                return;
+            }
+            continue;
+        }
         let response = handler.handle(&peer, env.body, value).await;
         if !send(stream, env.id, &response).await {
             return;
+        }
+    }
+}
+
+/// Sends `response`, then each value as a raw frame, but only when the reply is a `DevStarted`
+/// naming exactly that many variables (L34). A mismatch is a handler bug: nothing is sent but an
+/// internal error, so a client never pairs a value with the wrong name.
+async fn send_with_values(
+    stream: &mut UnixStream,
+    id: u64,
+    response: ResponseBody,
+    values: Vec<SecretBytes>,
+) -> bool {
+    let named = match &response {
+        ResponseBody::DevStarted { env, .. } => Some(env.len()),
+        _ => None,
+    };
+    match named {
+        Some(n) if n == values.len() => {
+            if !send(stream, id, &response).await {
+                return false;
+            }
+            for v in values {
+                if write_frame(stream, v.expose()).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        }
+        None if values.is_empty() => send(stream, id, &response).await,
+        _ => {
+            drop(values);
+            send(
+                stream,
+                id,
+                &ResponseBody::error(
+                    ErrorCode::Internal,
+                    "morsec: the daemon built an inconsistent reply; nothing was sent",
+                ),
+            )
+            .await
         }
     }
 }

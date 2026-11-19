@@ -470,6 +470,7 @@ async fn serve(args: Args) -> ExitCode {
     dash::install(&d, ms_dash::DashConfig::new(dash_port), uid, opener);
     let (stop_tx, stop_rx) = watch::channel(false);
     let proxy_task = tokio::spawn(proxy::supervise(d.clone(), stop_rx.clone(), test_hook));
+    tokio::spawn(reap_dev_sessions(d.clone(), stop_rx.clone()));
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         tokio::spawn(drift::watch_loop(d.clone(), PathBuf::from(home), stop_rx));
     }
@@ -525,4 +526,25 @@ fn main() -> ExitCode {
         }
     };
     rt.block_on(serve(args))
+}
+
+/// Drops `ms dev` sessions whose `ms dev` process is gone (L34 SPEC D-6), every 2 s, so a
+/// session ends with its child even when `ms dev` was killed before it could say so.
+async fn reap_dev_sessions(d: std::sync::Arc<daemon::Daemon>, mut stop: watch::Receiver<bool>) {
+    use ms_session::ProcessTable;
+    loop {
+        tokio::select! {
+            _ = stop.changed() => return,
+            () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+        }
+        let dd = d.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            dd.reap_dev(|pid, started| {
+                ms_session::OsProcessTable
+                    .info(pid)
+                    .is_ok_and(|i| i.started_unix_ms == started)
+            })
+        })
+        .await;
+    }
 }

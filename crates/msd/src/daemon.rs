@@ -21,6 +21,7 @@ use ms_vault::{Listing, Vault, VaultExt};
 use tokio::sync::watch;
 
 mod dash_data;
+pub mod dev;
 mod mcp;
 mod projects;
 mod run;
@@ -153,6 +154,10 @@ pub struct Daemon {
     dash_receipts: Mutex<Option<(u64, Arc<Vec<ms_receipts::StoredRecord>>)>>,
     /// When `DashOpen` last opened a browser tab (fix round 2, F2).
     dash_last_open: Mutex<Option<std::time::Instant>>,
+    /// Running `ms dev` sessions (L34), memory only.
+    dev: dev::DevSessions,
+    /// Is this PID sandboxed (L34 review D-A)? `ms_session::is_sandboxed`, failing closed.
+    sandbox_probe: Mutex<fn(u32) -> bool>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -344,6 +349,8 @@ impl Daemon {
             last_scan: Mutex::new(None),
             dash_receipts: Mutex::new(None),
             dash_last_open: Mutex::new(None),
+            dev: dev::DevSessions::default(),
+            sandbox_probe: Mutex::new(|pid| ms_session::is_sandboxed(pid).unwrap_or(true)),
             stops: std::sync::atomic::AtomicU64::new(0),
         }))
     }
@@ -371,7 +378,10 @@ impl Daemon {
     /// The approver for the swap proxy: asks a person, then checks the token against the exact
     /// request before the proxy acts on it (L11 SPEC D-6).
     pub fn approver(&self) -> Arc<dyn Approver> {
-        Arc::new(VerifyingApprover(self.approvals.clone()))
+        Arc::new(DevAwareApprover {
+            daemon: self.me.clone(),
+            inner: VerifyingApprover(self.approvals.clone()),
+        })
     }
 
     /// Changes how long a request waits for a person (tests; production uses [`APPROVAL_TIMEOUT`]).
@@ -538,6 +548,14 @@ impl Daemon {
                 live.rules.version,
             );
         }
+        let key = match req {
+            ms_core::Request::Swap { key, .. }
+            | ms_core::Request::Run { key, .. }
+            | ms_core::Request::Mint { key, .. } => key,
+        };
+        if let Some(reason) = self.dev_refusal(s, key) {
+            return (ms_core::Decision::Deny { reason }, live.rules.version);
+        }
         (ms_rules::decide(&live.rules, s, req), live.rules.version)
     }
 
@@ -688,10 +706,26 @@ impl Daemon {
                 ErrorCode::Denied,
                 "morsec: projects can't be set up from inside an agent session. Run ms init in your own terminal",
             ),
+            // L34 review F3: an agent command that double-forked out of its tree is still in the
+            // agent's sandbox.
+            RequestBody::ProjectSave { .. } if self.caller_sandboxed(caller.as_ref()) => reply_err(
+                ErrorCode::Denied,
+                "morsec: projects can't be set up from a sandboxed process (an agent's command sandbox). Run ms init in your own terminal",
+            ),
             RequestBody::ProjectSave { record, rules } => {
                 self.project_save(&session, &record, &rules)
             }
             RequestBody::ProjectList => self.project_list(),
+            // Values follow a DevStart reply, so it is served only by `handle_values` (L34).
+            RequestBody::DevStart { .. } => reply_err(
+                ErrorCode::Protocol,
+                "morsec: DevStart must be sent with Client::request_with_values",
+            ),
+            RequestBody::DevEnd { .. } if in_agent => reply_err(
+                ErrorCode::Denied,
+                "morsec: ms dev sessions can't be changed from inside an agent session",
+            ),
+            RequestBody::DevEnd { session } => self.dev_end(caller.as_ref(), &session),
             RequestBody::ProjectGet { slug } => self.project_get(&slug),
             // The launch token signs a browser in: only the user's own terminal may mint one
             // (L32, design §6.2.2). The page is read-only, so a stopped msd still serves it.
@@ -732,6 +766,31 @@ impl Daemon {
                 ),
             ),
         }
+    }
+
+    /// Handles a request whose reply may be followed by raw value frames (L34 `DevStart`).
+    /// Blocking (vault, approvals): run it off the reactor. Anything else goes to `handle`.
+    pub fn handle_values(
+        &self,
+        peer: &PeerInfo,
+        request: RequestBody,
+        value: Option<SecretBytes>,
+    ) -> (ResponseBody, Vec<SecretBytes>) {
+        let RequestBody::DevStart { argv, cwd } = request else {
+            return (self.handle(peer, request, value), Vec::new());
+        };
+        let caller = self.caller(peer);
+        let session = session_of(caller.as_ref(), peer);
+        if self.session_stopped(&session) {
+            return (
+                reply_err(
+                    ErrorCode::Denied,
+                    "morsec: this session was stopped after repeated blocked attempts (LOG-2)",
+                ),
+                Vec::new(),
+            );
+        }
+        self.dev_start(caller.as_ref(), &argv, &cwd)
     }
 
     /// `ms scan` from outside an agent session (L09). Refused while stopped: the kill switch
@@ -1196,6 +1255,8 @@ impl Daemon {
             l.rules.stopped = true;
             l.rules.version
         };
+        // Every ms dev session ends too (L34): its credential stops working at once.
+        self.end_all_dev();
         // Every approval token and session grant ends now; a request waiting for a person is
         // denied (L11).
         if let Err(e) = self.approvals.revoke_all() {
@@ -1344,6 +1405,23 @@ impl Approver for VerifyingApprover {
     }
 }
 
+/// The proxy's approver with the L34 hook: a production key of an `ms dev` session's project,
+/// covered by that run's one approval, is answered with that approval's token (its id goes on
+/// the receipt); everything else asks a person.
+struct DevAwareApprover {
+    daemon: std::sync::Weak<Daemon>,
+    inner: VerifyingApprover,
+}
+
+impl Approver for DevAwareApprover {
+    fn ask(&self, req: &ApprovalRequest, timeout: Duration) -> ApprovalOutcome {
+        if let Some(t) = self.daemon.upgrade().and_then(|d| d.dev_approval(req)) {
+            return ApprovalOutcome::Approved(t);
+        }
+        self.inner.ask(req, timeout)
+    }
+}
+
 /// The session to record for a caller. An unattributed caller (a terminal, or a detached
 /// process) is recorded as `other("terminal")` with its own PID.
 fn session_of(caller: Option<&Caller>, peer: &PeerInfo) -> SessionId {
@@ -1400,6 +1478,28 @@ impl ms_ipc::Handler for IpcHandler {
                 reply_err(
                     ErrorCode::Internal,
                     "morsec: the daemon failed handling this request",
+                )
+            })
+    }
+
+    async fn handle_with_values(
+        &self,
+        peer: &PeerInfo,
+        request: RequestBody,
+        value: Option<SecretBytes>,
+    ) -> (ResponseBody, Vec<SecretBytes>) {
+        let d = self.0.clone();
+        let peer = *peer;
+        tokio::task::spawn_blocking(move || d.handle_values(&peer, request, value))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "request handler failed");
+                (
+                    reply_err(
+                        ErrorCode::Internal,
+                        "morsec: the daemon failed handling this request",
+                    ),
+                    Vec::new(),
                 )
             })
     }
@@ -1524,6 +1624,7 @@ mod tests {
         )
         .unwrap();
         d.set_approval_timeout(Duration::from_millis(300));
+        d.set_sandbox_probe(|_| false);
         H {
             d,
             auth,
@@ -3274,5 +3375,11 @@ mod tests {
             !all.contains(&CANARY[8..]),
             "part of a value reached a view"
         );
+    }
+
+    // ---- L34 ms-dev ----
+    mod dev_tests {
+        use super::*;
+        include!("daemon/dev_tests.rs");
     }
 }

@@ -48,6 +48,10 @@ const TESTS: &[Test] = &[
         "init_project_never_leaks_a_canary",
         init_project_never_leaks_a_canary,
     ),
+    (
+        "dev_swaps_for_the_users_own_command",
+        dev_swaps_for_the_users_own_command,
+    ),
 ];
 
 fn main() -> ExitCode {
@@ -177,6 +181,11 @@ static RUNS: AtomicU32 = AtomicU32::new(0);
 
 impl World {
     fn new() -> Self {
+        Self::with_msd_args(&[])
+    }
+
+    /// Like [`World::new`], with extra msd arguments (L34: `--test-upstream`).
+    fn with_msd_args(extra: &[String]) -> Self {
         // /tmp keeps the socket path short.
         let dir = tempfile::Builder::new()
             .prefix("mscanary")
@@ -200,6 +209,7 @@ impl World {
             // L11: ms scan needs a person's approval. The review in ms (on a pseudo-terminal)
             // is real; only the Touch ID sheet is stood in for (debug build, memory vault only).
             .args(["--test-touch-id", "allow"])
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(log);
         base_env(&mut cmd, dir.path(), &home, &sock);
@@ -380,7 +390,11 @@ impl World {
                 let text = std::fs::read_to_string(&out).unwrap_or_default();
                 return (code.trim().parse().unwrap_or(-1), drop_dev_warning(&text));
             }
-            assert!(Instant::now() < deadline, "detached command never finished");
+            assert!(
+                Instant::now() < deadline,
+                "detached command never finished: {command}\n{}",
+                std::fs::read_to_string(&out).unwrap_or_default()
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -1272,4 +1286,206 @@ fn drop_dev_warning(text: &str) -> String {
         .filter(|l| !l.starts_with("morsec: DEV BUILD:"))
         .map(|l| format!("{l}\n"))
         .collect()
+}
+
+/// A fake HTTPS upstream for `hosts` on loopback: records every request head it is sent and
+/// answers 200. Returns (port, the CA certificate PEM that verifies it, what it received).
+fn tls_upstream(hosts: &[&str]) -> (u16, String, Arc<Mutex<Vec<u8>>>) {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca = CertificateParams::default();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca.self_signed(&ca_key).unwrap();
+    let ca_pem = ca_cert.pem();
+    let issuer = Issuer::new(ca, ca_key);
+    let key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>())
+        .unwrap()
+        .signed_by(&key, &issuer)
+        .unwrap();
+    let chain: Vec<CertificateDer<'static>> = vec![leaf.der().clone()];
+    let pk = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(chain, pk)
+    .unwrap();
+    let cfg = Arc::new(cfg);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let g = got.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(tcp) = s else { continue };
+            let _ = tcp.set_read_timeout(Some(Duration::from_secs(5)));
+            let Ok(conn) = rustls::ServerConnection::new(cfg.clone()) else {
+                continue;
+            };
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let mut buf = [0u8; 8192];
+            let mut req = Vec::new();
+            while let Ok(n) = tls.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            g.lock().unwrap().extend_from_slice(&req);
+            let _ = tls.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
+            );
+            let _ = tls.flush();
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        }
+    });
+    (port, ca_pem, got)
+}
+
+// protects=L34 SPEC criterion 8 (design §7, GW-1 for the user's own app): after ms init, the
+// user's own command run with `ms dev` (here a shell running curl, which reads HTTPS_PROXY and
+// the CA variable ms dev sets; no Node 24 in the gate) calls a fake api.stripe.com over HTTPS
+// with an ms:// ref and the upstream receives the real canary in the bound header; the child gets
+// the run-mode database URL in its environment; the credential from a process that left the
+// tree (double fork) is refused while the session runs, the session's end is recorded when the
+// command exits, and the credential is refused from anywhere afterwards; no
+// canary, in any encoding ms-scan knows, is in ms dev's output, msd's log, the receipts, the
+// state directory or msd's IPC replies; fails_when=the swap doesn't happen, the value appears in
+// any of those places, or a copied credential works outside the tree; no_claim=Node's own proxy
+// support (manual, PROOF), the Touch ID sheet (stood in by --test-touch-id)
+fn dev_swaps_for_the_users_own_command() {
+    let (up_port, up_ca, got) = tls_upstream(&["api.stripe.com"]);
+    let ca_file = std::env::temp_dir().join(format!("msdev-up-ca-{}.pem", std::process::id()));
+    std::fs::write(&ca_file, &up_ca).unwrap();
+    let w = World::with_msd_args(&[
+        "--test-upstream".into(),
+        format!("api.stripe.com=127.0.0.1:{up_port}"),
+        "--test-upstream-ca".into(),
+        ca_file.display().to_string(),
+    ]);
+    let [stripe, db] = [&w.canaries[0], &w.canaries[1]];
+    let proj = std::fs::canonicalize(w.dir.path()).unwrap().join("shop");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("package.json"), "{}\n").unwrap();
+    std::fs::write(
+        proj.join(".env"),
+        format!("{}={}\n{}={}\n", stripe.var, stripe.value, db.var, db.value),
+    )
+    .unwrap();
+    let (code, out) = w.outside(&format!(
+        "cd '{}' && (i=0; while [ $i -lt 200 ]; do printf 'o\\n'; sleep 0.3; i=$((i+1)); done) | script -q /dev/null ms init --no-connect",
+        proj.display()
+    ));
+    assert_eq!(code, 0, "{out}");
+    w.assert_clean("ms init output", out.as_bytes());
+
+    // The proxy rebuilds with the new binding (and its CA) shortly after the rules change.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let ResponseBody::Status { ca_hosts, .. } = ipc(&w.sock, RequestBody::Status)
+            && ca_hosts.iter().any(|h| h == "api.stripe.com")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the proxy never bound api.stripe.com: {:?} {out}",
+            ipc(&w.sock, RequestBody::Status)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let d = w.dir.path().display().to_string();
+    let child = format!(
+        r#"echo "$HTTPS_PROXY" > '{d}/dev.proxy'
+printf '%s' "$DATABASE_URL" > '{d}/dev.db'
+code=$(curl -s -m 20 --cacert "$CURL_CA_BUNDLE" -o '{d}/dev.body' -w '%{{http_code}}' -H 'Authorization: Bearer ms://shop/stripe-secret-key' https://api.stripe.com/v1/charges)
+echo "child: stripe answered $code"
+/bin/sh -c '(sleep 1; curl -s -m 10 -o /dev/null -w "%{{http_connect}}" --cacert "$CURL_CA_BUNDLE" -H "Authorization: Bearer ms://shop/stripe-secret-key" https://api.stripe.com/v1/stolen > "{d}/dev.stolen" 2>&1) &'
+sleep 4
+exit 3"#
+    );
+    std::fs::write(w.dir.path().join("dev-child.sh"), &child).unwrap();
+    let (code, out) = w.outside(&format!(
+        "cd '{}' && (i=0; while [ $i -lt 100 ]; do printf 'o\\n'; sleep 0.3; i=$((i+1)); done) | script -q /dev/null ms dev -- /bin/sh '{d}/dev-child.sh'",
+        proj.display()
+    ));
+    let out = out.replace("\r\n", "\n");
+    assert_eq!(code, 3, "the child's own exit code: {out}");
+    assert!(out.contains("child: stripe answered 200"), "{out}");
+    assert!(out.contains("morsec dev: project shop"), "{out}");
+    assert!(
+        out.contains("values in the environment: DATABASE_URL"),
+        "{out}"
+    );
+    w.assert_clean("ms dev output", out.as_bytes());
+
+    // The upstream got the real value, in the bound header.
+    let received = String::from_utf8_lossy(&got.lock().unwrap()).into_owned();
+    assert!(
+        received.contains(&format!("authorization: Bearer {}", stripe.value))
+            || received.contains(&format!("Authorization: Bearer {}", stripe.value)),
+        "the swap did not happen: {received}"
+    );
+    assert!(!received.contains("/v1/stolen"), "{received}");
+    // The run-mode value reached the child's environment.
+    assert_eq!(
+        std::fs::read_to_string(w.dir.path().join("dev.db")).unwrap(),
+        db.value
+    );
+    // The copy outside the tree was refused at CONNECT.
+    let stolen = std::fs::read_to_string(w.dir.path().join("dev.stolen")).unwrap_or_default();
+    assert!(stolen.starts_with("403"), "outside the tree: {stolen:?}");
+
+    // Review R5: the session really ended when the command exited: ms dev's DevEnd left its
+    // receipt (a refusal from outside the tree, below, would hold even for a live session).
+    let ended = World::files_under(&w.dir.path().join("state/receipts"))
+        .into_iter()
+        .flat_map(|(_, b)| b)
+        .collect::<Vec<u8>>();
+    assert!(
+        String::from_utf8_lossy(&ended).contains("ms dev: project shop ended (the command exited)"),
+        "no end receipt"
+    );
+    // Once ms dev exited, its credential is refused from anywhere.
+    let proxy = std::fs::read_to_string(w.dir.path().join("dev.proxy")).unwrap();
+    let proxy = proxy.trim();
+    assert!(proxy.contains("@127.0.0.1:"), "{proxy}");
+    let (_, after) = w.outside(&format!(
+        "curl -s -m 10 -o /dev/null -w '%{{http_connect}}' -x '{proxy}' https://api.stripe.com/v1/after"
+    ));
+    assert!(after.starts_with("403"), "after exit: {after:?}");
+    assert!(!String::from_utf8_lossy(&got.lock().unwrap()).contains("/v1/after"));
+
+    // No canary in msd's log, receipts, state or IPC replies.
+    let log = std::fs::read(w.dir.path().join("msd.log")).unwrap_or_default();
+    w.assert_clean("msd's log", &log);
+    for (p, bytes) in World::files_under(&w.dir.path().join("state")) {
+        w.assert_clean(&p.display().to_string(), &bytes);
+    }
+    for req in [
+        RequestBody::Status,
+        RequestBody::ListKeys,
+        RequestBody::ProjectList,
+        RequestBody::ProjectGet {
+            slug: "shop".into(),
+        },
+        RequestBody::LogQuery { limit: 200 },
+    ] {
+        let r = serde_json::to_vec(&ipc(&w.sock, req)).unwrap();
+        w.assert_clean("an IPC reply", &r);
+    }
+    let receipts = World::files_under(&w.dir.path().join("state/receipts"));
+    let all: Vec<u8> = receipts.into_iter().flat_map(|(_, b)| b).collect();
+    let text = String::from_utf8_lossy(&all);
+    assert!(text.contains("ms-dev"), "dev receipts missing");
+    let _ = std::fs::remove_file(&ca_file);
 }

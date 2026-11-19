@@ -87,18 +87,35 @@ pub(crate) fn screen(p: &PendingApproval, now_ms: u64) -> Vec<String> {
 
 const PROMPT: &str = "Approve? [o] this exact command, once   [s] this exact command for this agent session   [d] deny   (anything else denies): ";
 
+/// The prompt for a command that takes a once approval only (L34 `ms dev`, review round 2 F2).
+const PROMPT_ONCE: &str =
+    "Approve? [o] this exact command, once   [d] deny   (anything else denies): ";
+
+/// The answer for a once-only review: `s` is not offered, so it denies like anything else.
+pub(crate) fn once_only(a: Answer) -> Answer {
+    match a {
+        Answer::Approve(ApprovalScope::Once) => a,
+        _ => Answer::Deny,
+    }
+}
+
 /// Shows `p` on `tty` and reads the answer from it. Typeahead is discarded first, so keys
 /// pressed before the request appeared can't answer it.
 fn review(tty: &mut File, p: &PendingApproval) -> std::io::Result<Answer> {
+    review_with(tty, p, false)
+}
+
+fn review_with(tty: &mut File, p: &PendingApproval, once: bool) -> std::io::Result<Answer> {
     for line in screen(p, now_ms()) {
         writeln!(tty, "{line}")?;
     }
     let _ = rustix::termios::tcflush(tty.as_fd(), rustix::termios::QueueSelector::IFlush);
-    write!(tty, "{PROMPT}")?;
+    write!(tty, "{}", if once { PROMPT_ONCE } else { PROMPT })?;
     tty.flush()?;
     let mut line = String::new();
     BufReader::new((&*tty).take(32)).read_line(&mut line)?;
-    Ok(parse_answer(&line))
+    let a = parse_answer(&line);
+    Ok(if once { once_only(a) } else { a })
 }
 
 fn open_tty() -> std::io::Result<File> {
@@ -227,6 +244,15 @@ impl Drop for InlineReview {
 /// terminal, the request this process creates. Without a terminal it says to use `ms approve`
 /// elsewhere. Keep the guard alive while the request is in flight.
 pub(crate) fn inline_review(what: &'static str) -> InlineReview {
+    inline(what, false)
+}
+
+/// Like [`inline_review`], offering only "once" (L34 `ms dev`: one approval per run).
+pub(crate) fn inline_review_once_only(what: &'static str) -> InlineReview {
+    inline(what, true)
+}
+
+fn inline(what: &'static str, once: bool) -> InlineReview {
     let done = Arc::new(AtomicBool::new(false));
     let d = done.clone();
     std::thread::spawn(move || {
@@ -257,7 +283,9 @@ pub(crate) fn inline_review(what: &'static str) -> InlineReview {
                     return;
                 };
                 let _ = writeln!(tty, "{what} needs your approval.");
-                let Ok(answer) = review(tty, &p) else { return };
+                let Ok(answer) = review_with(tty, &p, once) else {
+                    return;
+                };
                 if d.load(Ordering::SeqCst) {
                     return;
                 }
@@ -296,6 +324,20 @@ pub(crate) async fn status_hint() -> Option<String> {
 mod tests {
     use super::*;
     use ms_core::{ApprovalRequest, KeyName, SessionId, Tier};
+
+    // protects=L34 round 2 F2: a once-only review (ms dev) turns `s` into a denial and keeps `o`;
+    // fails_when=`s` approves at ms dev's review; no_claim=msd's own refusal of a session token
+    // (daemon dev_refuses_a_session_scope_approval)
+    #[test]
+    fn once_only_review_never_approves_a_session() {
+        assert_eq!(once_only(parse_answer("s")), Answer::Deny);
+        assert_eq!(once_only(parse_answer("session")), Answer::Deny);
+        assert_eq!(
+            once_only(parse_answer("o")),
+            Answer::Approve(ApprovalScope::Once)
+        );
+        assert!(!PROMPT_ONCE.contains("[s]"));
+    }
 
     // protects=only an explicit o/once or s/session approves; Enter, typos and anything else
     // deny; fails_when=an unclear answer approves; no_claim=-

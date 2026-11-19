@@ -12,6 +12,7 @@ mod brew;
 mod connect;
 mod connect_codex;
 mod dashboard;
+mod dev;
 mod doctor;
 mod import;
 mod init_project;
@@ -88,6 +89,8 @@ enum Command {
     Projects(projects::ProjectsArgs),
     /// Open the local dashboard in your browser (read-only).
     Dashboard(dashboard::DashboardArgs),
+    /// Run your own command (e.g. npm run dev) with your project's keys working through morsec.
+    Dev(dev::DevArgs),
 }
 
 /// The name this binary was invoked as: `ms` or `mors` (or whatever the symlink is called).
@@ -160,6 +163,7 @@ async fn main() -> ExitCode {
         Command::Doctor(a) => on_own_thread(move || doctor::run(&a)),
         Command::Projects(a) => on_own_thread(move || projects::run(&a)),
         Command::Dashboard(a) => on_own_thread(move || dashboard::run(&a)),
+        Command::Dev(a) => on_own_thread(move || dev::run(&a)),
     }
 }
 

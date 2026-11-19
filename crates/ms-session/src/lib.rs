@@ -34,6 +34,8 @@ pub mod walk;
 pub use error::SessionError;
 pub use peer::{SessionPeerCheck, resolve_peer};
 pub use port::PortResolver;
-pub use proxy::{agent_for_proxy_user, cross_check, proxy_user_for};
-pub use table::{OsProcessTable, ProcInfo, ProcessTable, SocketTable, exe_path};
-pub use walk::{Caller, MAX_DEPTH, Resolver, agent_kind};
+pub use proxy::{
+    DEV_PROXY_USER_PREFIX, agent_for_proxy_user, cross_check, is_dev_proxy_user, proxy_user_for,
+};
+pub use table::{OsProcessTable, ProcInfo, ProcessTable, SocketTable, exe_path, is_sandboxed};
+pub use walk::{Caller, MAX_DEPTH, Resolver, agent_install_path, agent_kind};

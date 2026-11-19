@@ -14,7 +14,9 @@ use ms_proxy::{
     BasicField, Binding, Ca, Deps, Location, Policy, Proxy, ProxyConfig, SessionResolver,
 };
 use ms_rules::{HostPattern, Rules, is_reserved};
-use ms_session::{OsProcessTable, PortResolver, cross_check};
+use ms_session::{
+    Caller, OsProcessTable, PortResolver, ProcessTable, Resolver, cross_check, is_dev_proxy_user,
+};
 use tokio::sync::watch;
 
 use crate::backend::{CA_CERT_KEY, CA_PEM_KEY, CaKeyWriter};
@@ -99,20 +101,58 @@ impl SessionResolver for Sessions {
         if self.daemon.is_stopped() {
             return None;
         }
-        let caller = {
-            let _g = self.gate.enter();
-            self.ports.resolve(peer, local).ok()?
-        };
-        let session = match proxy_user {
-            Some(u) => cross_check(&caller, u).ok()?.clone(),
-            // Without a username the process tree alone decides; an unattributed caller has no
-            // session, so it is refused.
-            None => caller.session()?.clone(),
-        };
+        let _g = self.gate.enter();
+        let caller = self.ports.resolve(peer, local).ok()?;
+        let session = session_for(
+            &caller,
+            proxy_user,
+            |c| self.daemon.dev_by_credential(c),
+            self.ports.resolver(),
+        )?;
         if self.daemon.session_stopped(&session) {
             return None;
         }
         Some(session)
+    }
+
+    fn open_egress(&self, session: &SessionId) -> bool {
+        self.daemon.dev_session(session).is_some()
+    }
+}
+
+/// The session a proxy connection is served as (L06, L34 SPEC D-1/D-2):
+///
+/// - an agent anywhere on the chain: that agent's session. Its username is cross-checked,
+///   except that an `ms dev` credential is ignored (an agent inside a dev tree stays an agent);
+/// - no agent, an `ms dev` credential that `dev` knows, and the dev session's `ms dev` process
+///   (same start time) on the caller's parent chain: the dev session;
+/// - anything else (no username, an unknown or copied credential, a process outside the tree):
+///   none, so the connection is refused.
+pub fn session_for<T: ProcessTable>(
+    caller: &Caller,
+    proxy_user: Option<&str>,
+    dev: impl Fn(&str) -> Option<SessionId>,
+    tree: &Resolver<T>,
+) -> Option<SessionId> {
+    match (caller, proxy_user) {
+        (Caller::Agent(s), Some(u)) if is_dev_proxy_user(u) => Some(s.clone()),
+        (_, Some(u)) if !is_dev_proxy_user(u) => cross_check(caller, u).ok().cloned(),
+        (
+            Caller::Unattributed {
+                pid,
+                started_unix_ms,
+            },
+            Some(u),
+        ) => {
+            let d = dev(u)?;
+            tree.within(*pid, *started_unix_ms, d.pid, d.started_unix_ms)
+                .ok()?
+                .then_some(d)
+        }
+        // Without a username the process tree alone decides; an unattributed caller has no
+        // session, so it is refused.
+        (_, None) => caller.session().cloned(),
+        (Caller::Agent(_), Some(_)) => None,
     }
 }
 
@@ -135,10 +175,31 @@ fn location(l: &ms_import::catalog::Location) -> Option<Location> {
     }
 }
 
-/// The catalog provider for a key: one whose default key name is this key, else one whose id
-/// is the key's first segment.
-fn provider_for(key: &KeyName) -> Option<&'static ms_import::catalog::Provider> {
+/// The catalog provider for a key: the one its project record names (L31 keys are
+/// `<project>/<var>`, so only the MAC'd record knows their provider), else one whose default key
+/// name is this key, else one whose id is the key's first segment.
+///
+/// A recorded provider counts only when every host of the key's rule is one of that provider's
+/// catalog hosts (review N1): the record says where the credential goes in a request, never
+/// where it may be sent, so a record can't make a hand-made key's hosts get another provider's
+/// header.
+fn provider_for(
+    key: &KeyName,
+    rule: &ms_rules::KeyRule,
+    recorded: &BTreeMap<KeyName, Option<String>>,
+) -> Option<&'static ms_import::catalog::Provider> {
     let cat = ms_import::catalog::Catalog::builtin();
+    // Review round 2: a key a project record lists gets only the provider that record names
+    // (when its hosts cover the rule), never the first-segment guess below: a project slug such
+    // as `stripe` must not lend Stripe's location to the project's other keys.
+    if let Some(named) = recorded.get(key) {
+        return named.as_deref().and_then(|p| cat.get(p)).filter(|p| {
+            rule.hosts.iter().all(|h| {
+                let h = h.to_string();
+                p.hosts.iter().any(|c| c.eq_ignore_ascii_case(&h))
+            })
+        });
+    }
     cat.providers
         .iter()
         .find(|p| p.key_name(Tier::Test) == *key || p.key_name(Tier::Production) == *key)
@@ -148,8 +209,18 @@ fn provider_for(key: &KeyName) -> Option<&'static ms_import::catalog::Provider> 
         })
 }
 
-/// Swap bindings from the rules: swap keys with exact DNS hosts and a catalog location.
+/// Swap bindings from the rules alone (no project records).
+#[cfg(test)]
 pub fn bindings(rules: &Rules) -> (Vec<Binding>, Vec<String>) {
+    bindings_with(rules, &BTreeMap::new())
+}
+
+/// Swap bindings from the rules: swap keys with exact DNS hosts and a catalog location, the
+/// provider of a project key coming from its project record (`recorded`).
+pub fn bindings_with(
+    rules: &Rules,
+    recorded: &BTreeMap<KeyName, Option<String>>,
+) -> (Vec<Binding>, Vec<String>) {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     if rules.tampered {
@@ -191,7 +262,8 @@ pub fn bindings(rules: &Rules) -> (Vec<Binding>, Vec<String>) {
         if hosts.is_empty() {
             continue;
         }
-        let Some(loc) = provider_for(key).and_then(|p| location(&p.location)) else {
+        let Some(loc) = provider_for(key, rule, recorded).and_then(|p| location(&p.location))
+        else {
             skipped.push(format!(
                 "{key}: no catalog entry says where its credential goes in a request, so it is not swapped"
             ));
@@ -358,7 +430,7 @@ impl TestHook {
 /// Builds a proxy config and its dependencies from the daemon's current state.
 pub fn build(d: &Arc<Daemon>, listen: SocketAddr) -> Result<(ProxyConfig, Deps), String> {
     let rules = d.rules();
-    let (binds, skipped) = bindings(&rules);
+    let (binds, skipped) = bindings_with(&rules, &d.project_providers());
     for s in skipped {
         tracing::warn!("{s}");
         d.alert(s);
@@ -435,7 +507,7 @@ pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>, test
                                 r = c.changed() => if r.is_err() { return },
                                 _ = s.changed() => return,
                             }
-                            if bindings(&dd.rules()).0 != current {
+                            if bindings_with(&dd.rules(), &dd.project_providers()).0 != current {
                                 return;
                             }
                         }
@@ -459,6 +531,83 @@ pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>, test
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ms_core::AgentKind;
+    use ms_session::ProcInfo;
+    use std::collections::HashMap;
+
+    /// A fixed process table: pid → (ppid, start, name).
+    struct Table(HashMap<u32, (u32, u64, &'static str)>);
+
+    impl ProcessTable for Table {
+        fn info(&self, pid: u32) -> std::io::Result<ProcInfo> {
+            let (ppid, started, name) = *self
+                .0
+                .get(&pid)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+            Ok(ProcInfo {
+                pid,
+                ppid,
+                uid: 501,
+                started_unix_ms: started,
+                name: name.into(),
+            })
+        }
+    }
+
+    // protects=L34 SPEC D-1/D-2 (design §7.4): a proxy client under the ms dev process that
+    // presents the session's credential is served as the dev session; the same credential from a
+    // process outside the tree, from a tree whose ms dev restarted (new start time), an unknown
+    // credential, and the tree without a credential are refused; an agent inside the tree stays
+    // that agent's session whatever it presents, and agent usernames are still cross-checked;
+    // fails_when=a copied credential works outside the tree, or a dev credential turns an agent
+    // connection into a dev session; no_claim=the live port→PID lookup (ms-session live tests) and
+    // the swap itself (e2e dev_swaps_for_the_users_own_command)
+    #[test]
+    fn dev_swaps_refs_for_child_tree() {
+        let t = Resolver::new(Table(HashMap::from([
+            (1, (0, 1, "launchd")),
+            (60, (1, 10, "zsh")),
+            (70, (60, 20, "ms")),
+            (80, (70, 30, "node")),
+            (90, (80, 40, "node")),
+            (95, (90, 50, "claude")),
+            (96, (95, 60, "curl")),
+            (200, (60, 25, "python3")),
+        ])));
+        let cred = format!("ms-dev-{}", "ab".repeat(32));
+        let dev = crate::daemon::dev::dev_session_id(70, 20);
+        let known = |c: &str| (c == cred).then(|| dev.clone());
+        let un = |pid, started_unix_ms| Caller::Unattributed {
+            pid,
+            started_unix_ms,
+        };
+        assert_eq!(
+            session_for(&un(90, 40), Some(&cred), known, &t),
+            Some(dev.clone())
+        );
+        assert_eq!(session_for(&un(200, 25), Some(&cred), known, &t), None);
+        assert_eq!(session_for(&un(90, 40), None, known, &t), None);
+        let other = format!("ms-dev-{}", "cd".repeat(32));
+        assert_eq!(session_for(&un(90, 40), Some(&other), known, &t), None);
+        let restarted = crate::daemon::dev::dev_session_id(70, 21);
+        assert_eq!(
+            session_for(&un(90, 40), Some(&cred), |_| Some(restarted.clone()), &t),
+            None
+        );
+        let agent = SessionId {
+            agent: AgentKind::ClaudeCode,
+            pid: 95,
+            started_unix_ms: 50,
+        };
+        let a = Caller::Agent(agent.clone());
+        assert_eq!(session_for(&a, Some(&cred), known, &t), Some(agent.clone()));
+        assert_eq!(
+            session_for(&a, Some("claude-code"), known, &t),
+            Some(agent.clone())
+        );
+        assert_eq!(session_for(&a, Some("codex"), known, &t), None);
+        assert_eq!(session_for(&a, None, known, &t), Some(agent));
+    }
 
     fn rules(text: &str) -> Rules {
         Rules::from_toml(text, "test").unwrap()
@@ -501,6 +650,69 @@ commands = [["psql", "**"]]
         let mut t = r.clone();
         t.tampered = true;
         assert!(bindings(&t).0.is_empty());
+    }
+
+    // protects=L34 (found building ms dev): a project key (`shop/stripe-secret-key`) is swapped
+    // with the location of the provider its project record names; without a record it is skipped
+    // with a note (fails closed); a recorded provider whose catalog hosts don't cover the rule's
+    // hosts is not used (review N1), and a recorded key never falls back to the first-segment
+    // guess (round 2);
+    // fails_when=project keys are never bound, or bound with another provider's location;
+    // no_claim=the records' MAC (ms-projects store tests)
+    #[test]
+    fn project_keys_bind_with_their_recorded_provider() {
+        let r = rules(
+            r#"
+version = 3
+[keys."shop/stripe-secret-key"]
+mode = "swap"
+tier = "test"
+hosts = ["api.stripe.com"]
+"#,
+        );
+        let key = KeyName::new("shop/stripe-secret-key").unwrap();
+        let (none, skipped) = bindings(&r);
+        assert!(none.is_empty() && skipped.len() == 1, "{skipped:?}");
+        let recorded = BTreeMap::from([(key.clone(), Some("stripe".to_string()))]);
+        let (b, skipped) = bindings_with(&r, &recorded);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].hosts, ["api.stripe.com"]);
+        assert!(
+            matches!(&b[0].location, Location::Header { name, .. } if name.eq_ignore_ascii_case("authorization"))
+        );
+        // A recorded provider whose catalog hosts don't cover the rule's hosts is ignored: the
+        // key falls back to the old lookup, which finds nothing for `shop/…` (fails closed).
+        let other = rules(
+            r#"
+version = 3
+[keys."shop/stripe-secret-key"]
+mode = "swap"
+tier = "test"
+hosts = ["api.stripe.com", "evil.example"]
+"#,
+        );
+        let (b, skipped) = bindings_with(&other, &recorded);
+        assert!(b.is_empty() && skipped.len() == 1, "{b:?} {skipped:?}");
+        let openai = BTreeMap::from([(key.clone(), Some("openai".to_string()))]);
+        let (b, _) = bindings_with(&r, &openai);
+        assert!(b.is_empty(), "openai's header for a stripe host: {b:?}");
+        // Review round 2: a project slugged like a provider (`stripe`) doesn't lend that
+        // provider's location to a recorded key without one; unrecorded, the old lookup holds.
+        let slugged = rules(
+            r#"
+version = 3
+[keys."stripe/session-secret"]
+mode = "swap"
+tier = "test"
+hosts = ["api.stripe.com"]
+"#,
+        );
+        let k2 = KeyName::new("stripe/session-secret").unwrap();
+        let (b, _) = bindings_with(&slugged, &BTreeMap::from([(k2.clone(), None)]));
+        assert!(b.is_empty(), "{b:?}");
+        let (b, _) = bindings_with(&slugged, &BTreeMap::new());
+        assert_eq!(b.len(), 1);
     }
 
     // protects=L30 D2 a key's git hosts get their own Basic-password binding and its other hosts

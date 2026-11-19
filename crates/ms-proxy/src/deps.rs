@@ -34,6 +34,15 @@ pub trait SessionResolver: Send + Sync + std::fmt::Debug {
         local: SocketAddr,
         proxy_user: Option<&str>,
     ) -> Option<SessionId>;
+
+    /// Whether `session` may reach hosts no key is bound to and no allowlist names, through a
+    /// plain tunnel (no TLS interception; the SSRF guard still applies). Agent sessions never
+    /// may (the default). msd says yes only for an `ms dev` session (L34 SPEC D-7): the user's own
+    /// process, which is not sandboxed and could connect directly anyway.
+    fn open_egress(&self, session: &SessionId) -> bool {
+        let _ = session;
+        false
+    }
 }
 
 /// Why a connection or request was refused without a key in sight.

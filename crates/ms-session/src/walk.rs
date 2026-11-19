@@ -52,6 +52,26 @@ pub fn agent_kind(name: &str) -> Option<AgentKind> {
     }
 }
 
+/// The agent a program path belongs to by where agents install themselves (L34 `ms dev`), for
+/// binaries whose own name says nothing: Claude Code's native build lives at
+/// `~/.local/share/claude/versions/<version>`, npm installs keep the package path. A check on
+/// paths only: the session walk still goes by process name, so such a binary started by its
+/// versioned path is not an agent session there (SPEC residual).
+pub fn agent_install_path(path: &str) -> Option<AgentKind> {
+    const KNOWN: [(&str, AgentKind); 6] = [
+        ("/claude/versions/", AgentKind::ClaudeCode),
+        ("/@anthropic-ai/claude-code/", AgentKind::ClaudeCode),
+        ("/@openai/codex/", AgentKind::Codex),
+        ("/codex/bin/", AgentKind::Codex),
+        ("/@google/gemini-cli/", AgentKind::GeminiCli),
+        ("/cursor-agent/", AgentKind::Cursor),
+    ];
+    KNOWN
+        .into_iter()
+        .find(|(p, _)| path.contains(p))
+        .map(|(_, k)| k)
+}
+
 /// Maps a PID to its [`Caller`] using a [`ProcessTable`].
 #[derive(Debug, Clone, Default)]
 pub struct Resolver<T> {
@@ -91,6 +111,50 @@ impl<T: ProcessTable> Resolver<T> {
     pub fn resolve(&self, pid: u32) -> Result<Caller, SessionError> {
         let leaf = self.info(pid)?;
         self.resolve_from(leaf)
+    }
+
+    /// True when the process `pid` (which must still have start time `started_unix_ms`) has the
+    /// process `root_pid` started at `root_started_unix_ms` on its parent chain, itself included
+    /// (L34 `ms dev`: is this proxy client inside the dev tree?). The chain is walked with the
+    /// same rules as [`Resolver::resolve`]: a parent that started after its child is a reused PID
+    /// and ends the chain, an unreadable parent is an error, and the walk is bounded.
+    pub fn within(
+        &self,
+        pid: u32,
+        started_unix_ms: u64,
+        root_pid: u32,
+        root_started_unix_ms: u64,
+    ) -> Result<bool, SessionError> {
+        let mut cur = self.info(pid)?;
+        if cur.started_unix_ms != started_unix_ms {
+            return Ok(false);
+        }
+        for _ in 0..=MAX_DEPTH {
+            if cur.pid == root_pid {
+                return Ok(cur.started_unix_ms == root_started_unix_ms);
+            }
+            if cur.pid <= 1 || cur.ppid == 0 || cur.ppid == cur.pid {
+                return Ok(false);
+            }
+            let parent = match self.table.info(cur.ppid) {
+                Ok(p) => p,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(source) => {
+                    return Err(SessionError::Unreadable {
+                        pid: cur.ppid,
+                        source,
+                    });
+                }
+            };
+            if parent.pid != cur.ppid || parent.started_unix_ms > cur.started_unix_ms {
+                return Ok(false);
+            }
+            cur = parent;
+        }
+        Err(SessionError::TooDeep {
+            pid,
+            max: MAX_DEPTH,
+        })
     }
 
     /// Like [`Resolver::resolve`], starting from an already-read process.
@@ -365,6 +429,68 @@ mod tests {
         t.put(n + 1, 2, 100, "sh"); // cycle back
         let r = Resolver::new(t);
         assert!(matches!(r.resolve(2), Err(SessionError::TooDeep { .. })));
+    }
+
+    // protects=L34 D-1 the dev tree check: a descendant of the ms dev process (same start time)
+    // is within, the root itself is within, a sibling, an orphan whose old parent PID was reused
+    // by a later process, a wrong root start time and a leaf whose PID was reused are not, and an
+    // unreadable parent fails closed; fails_when=a process outside the tree (or a reused PID)
+    // counts as inside; no_claim=live process reads (msd e2e)
+    #[test]
+    fn within_checks_the_chain() {
+        let t = FakeTable::with(&[
+            (1, 0, 10, "launchd"),
+            (60, 1, 30, "zsh"),
+            (70, 60, 40, "ms"),
+            (80, 70, 50, "node"),
+            (90, 80, 60, "node"),
+            (95, 60, 45, "curl"),
+            (300, 1, 5000, "ms"),
+            (301, 300, 200, "orphan"),
+        ]);
+        let r = Resolver::new(t);
+        assert!(r.within(90, 60, 70, 40).unwrap());
+        assert!(r.within(80, 50, 70, 40).unwrap());
+        assert!(r.within(70, 40, 70, 40).unwrap());
+        assert!(!r.within(95, 45, 70, 40).unwrap(), "sibling");
+        assert!(!r.within(90, 60, 70, 41).unwrap(), "root restarted");
+        assert!(!r.within(90, 61, 70, 40).unwrap(), "leaf pid reused");
+        assert!(!r.within(301, 200, 300, 5000).unwrap(), "reused parent pid");
+        r.table().1.lock().unwrap().push(80);
+        assert!(matches!(
+            r.within(90, 60, 70, 40),
+            Err(SessionError::Unreadable { pid: 80, .. })
+        ));
+    }
+
+    // protects=L34 N2 agents found by install path (native versioned Claude Code, npm packages);
+    // fails_when=a versioned claude binary or an agent npm package path is not recognised, or an
+    // ordinary path is; no_claim=custom install locations
+    #[test]
+    fn install_paths() {
+        for (p, k) in [
+            (
+                "/Users/a/.local/share/claude/versions/2.0.5",
+                AgentKind::ClaudeCode,
+            ),
+            (
+                "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                AgentKind::ClaudeCode,
+            ),
+            (
+                "/usr/local/lib/node_modules/@openai/codex/bin/codex.js",
+                AgentKind::Codex,
+            ),
+            (
+                "/x/node_modules/@google/gemini-cli/dist/index.js",
+                AgentKind::GeminiCli,
+            ),
+        ] {
+            assert_eq!(agent_install_path(p), Some(k), "{p}");
+        }
+        for p in ["/usr/bin/node", "/Users/a/code/claude-notes/run.sh", ""] {
+            assert_eq!(agent_install_path(p), None, "{p}");
+        }
     }
 
     // protects=exact name matching; fails_when=host apps or lookalikes classify as agents;

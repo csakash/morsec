@@ -68,7 +68,11 @@ impl Policy for FakePolicy {
 }
 
 #[derive(Debug)]
-struct FixedSession(Option<SessionId>, Mutex<Vec<Option<String>>>);
+struct FixedSession(
+    Option<SessionId>,
+    Mutex<Vec<Option<String>>>,
+    std::sync::atomic::AtomicBool,
+);
 impl SessionResolver for FixedSession {
     fn resolve(
         &self,
@@ -79,6 +83,9 @@ impl SessionResolver for FixedSession {
         assert!(peer.ip().is_loopback() && local.ip().is_loopback());
         self.1.lock().unwrap().push(user.map(str::to_owned));
         self.0.clone()
+    }
+    fn open_egress(&self, _: &SessionId) -> bool {
+        self.2.load(Ordering::SeqCst)
     }
 }
 
@@ -386,7 +393,11 @@ async fn harness(o: Opts) -> H {
     let receipts = Arc::new(MemorySink::new());
     let egress = Arc::new(Egress::default());
     let policy = Arc::new(FakePolicy(Mutex::new(Decision::Allow)));
-    let sessions = Arc::new(FixedSession(o.session, Mutex::default()));
+    let sessions = Arc::new(FixedSession(
+        o.session,
+        Mutex::default(),
+        std::sync::atomic::AtomicBool::new(false),
+    ));
     let mut cfg = ProxyConfig::new("127.0.0.1:0".parse().unwrap());
     cfg.bindings = bindings(up.port);
     cfg.allow = vec![
@@ -1911,4 +1922,41 @@ proptest::proptest! {
         no_value_recorded(h)?;
         still_alive(h)?;
     }
+}
+
+// protects=L34 SPEC D-7: a session the resolver marks open (an `ms dev` session) gets a plain
+// tunnel to a host no key is bound to and no allowlist names, while the same request from an
+// agent session (the default) is refused with a NotAllowed block; plain http follows the same
+// rule; fails_when=an agent session reaches an unbound host, or the open session is refused;
+// no_claim=which sessions msd marks open (msd proxy::dev_swaps_refs_for_child_tree)
+#[tokio::test]
+async fn open_egress_only_for_sessions_that_have_it() {
+    let h = harness(Opts {
+        extra_names: vec![("open.example.net", IpAddr::from([127, 0, 0, 1]))],
+        ..Opts::default()
+    })
+    .await;
+    let target = format!("open.example.net:{}", h.up.port);
+    let (code, msg, _) = connect(h.proxy, &target, "").await;
+    assert_eq!(code, 403, "{msg}");
+    assert!(
+        h.egress
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| b.host == "open.example.net" && b.kind == BlockKind::NotAllowed)
+    );
+    let plain = format!(
+        "GET http://open.example.net:{}/ HTTP/1.1\r\nHost: open.example.net\r\nConnection: close\r\n\r\n",
+        h.up.port
+    );
+    let resp = raw(h.proxy, plain.as_bytes()).await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+
+    h.sessions.2.store(true, Ordering::SeqCst);
+    let (code, msg, _) = connect(h.proxy, &target, "").await;
+    assert_eq!(code, 200, "{msg}");
+    let resp = raw(h.proxy, plain.as_bytes()).await;
+    assert!(!resp.starts_with("HTTP/1.1 403"), "{resp}");
 }

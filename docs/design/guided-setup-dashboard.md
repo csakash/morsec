@@ -261,7 +261,7 @@ agent session, except `ProjectList` and `KeyInfo` (read-only, no values).
 | `KeyReveal { key }` | Touch ID every time | returns the value to the dashboard only (§6.6) |
 | `KeyCopy { key }` | Touch ID every time | msd puts the value on the pasteboard itself (§6.6) |
 | `DashOpen` | none | starts the dashboard listener if needed, returns `{ port, launch_token }` |
-| `DevStart { argv, cwd }` | production keys: Touch ID once per run | L34, §7 |
+| `DevStart { argv, cwd }` | Touch ID once per run, every tier (L34 review) | L34, §7 |
 
 ## 6. The dashboard
 
@@ -415,6 +415,14 @@ ms dev -- npm run dev
    tree are served under the same rules as agents (hosts, tiers, receipts). A process inside it
    that is itself an agent is classified as an agent session by the existing walk.
 5. The session ends when the child exits.
+
+> **Refinement (L34 SPEC D-1, D-3, D-7).** The dev session is bound to the `ms dev` process
+> itself (the kernel peer of `DevStart`: PID and start time), which is the child's parent: the
+> same tree, with no second request naming a PID. The proxy serves the credential only to a
+> process with that `ms dev` process on its parent chain and no agent above it. Run-mode values
+> reach `ms dev` as raw frames after the `DevStarted` reply (names only in JSON). Dev sessions
+> use only their project's keys, and may tunnel to hosts no key is bound to (the user's own
+> process is not sandboxed); agents are unchanged.
 
 Residuals, recorded in L34's PROOF: run-mode values in the dev process environment can be read by
 any same-user process (as for run mode before L23), and a child the user starts from the dev

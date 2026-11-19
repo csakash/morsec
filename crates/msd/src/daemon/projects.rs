@@ -136,6 +136,30 @@ impl Daemon {
             .collect()
     }
 
+    /// Every key a project record lists, with the provider it names, if any (for the proxy's
+    /// credential location, L34). Empty when the records can't be read: project keys are then
+    /// not swapped (fails closed).
+    pub fn project_providers(&self) -> BTreeMap<KeyName, Option<String>> {
+        let Ok(floor) = self.projects_floor() else {
+            return BTreeMap::new();
+        };
+        let Ok(file) = self.projects_store().load(floor) else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for p in &file.projects {
+            for f in &p.files {
+                for s in &f.secrets {
+                    let e = out.entry(s.key.clone()).or_insert(None);
+                    if e.is_none() {
+                        e.clone_from(&s.provider);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// `ProjectList`.
     pub(super) fn project_list(&self) -> ResponseBody {
         let (file, _) = match self.load_projects() {
@@ -280,12 +304,41 @@ impl Daemon {
             return reply_err(ErrorCode::Invalid, e.to_string());
         }
 
-        // One approval for the whole set, bound to the hash of its canonical TOML.
+        // L34 review S2: a key in the record decides what `ms dev` hands out and which keys a
+        // dev session may use, so adopting a key that already allows something (one the stored
+        // record didn't list: made by hand, or by another tool) needs the person too. Keys that
+        // still allow nothing join without a prompt (ms init's own new keys of unknown services
+        // are such keys); re-saving the same keys asks nothing. Residual (round 2 F3, T-82): a
+        // key can join while it allows nothing and be loosened later with ms rules; that
+        // loosening needs its own approval, and every ms dev run's sheet lists the key again.
+        let earlier: BTreeSet<KeyName> = file
+            .get(&record.slug)
+            .map(|p| p.keys().into_iter().collect())
+            .unwrap_or_default();
+        let adopted: Vec<KeyName> = record
+            .keys()
+            .into_iter()
+            .filter(|k| !earlier.contains(k) && !proposed.keys.contains_key(k))
+            .filter(|k| {
+                current
+                    .keys
+                    .get(k)
+                    .is_some_and(|r| !ms_projects::save::is_fresh(r))
+            })
+            .collect();
+
+        // One approval for the whole set, bound to the hash of its canonical TOML and to the
+        // adopted keys.
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
-        let token = if proposed.keys.is_empty() {
+        let token = if proposed.keys.is_empty() && adopted.is_empty() {
             None
         } else {
-            let argv = ms_projects::save::approval_argv(&record, &proposed);
+            let mut argv = ms_projects::save::approval_argv(&record, &proposed);
+            argv.extend(
+                adopted
+                    .iter()
+                    .map(|k| format!("{k} joins the project (its rule already allows something)")),
+            );
             let req = ApprovalRequest {
                 session: session.clone(),
                 key: daemon_key(),
@@ -294,9 +347,10 @@ impl Daemon {
                 argv_display: argv,
                 cwd: PathBuf::from(&record.root),
                 effect: Some(format!(
-                    "{} new key(s) of project {} may reach the services listed",
+                    "{} new key(s) of project {} may reach the services listed; {} existing key(s) join it",
                     proposed.keys.len(),
-                    record.slug
+                    record.slug,
+                    adopted.len()
                 )),
             };
             match self.approve_exact(&req) {
@@ -384,6 +438,9 @@ impl Daemon {
                 );
             }
         };
+        // The proxy takes project keys' providers from the records (L34): rebuild it now that
+        // they are saved, not only when the rules changed (which came first).
+        self.rebuild_proxy();
         if let Err(e) = self.backend.put_internal(
             &key(PROJECTS_STATE_KEY),
             SecretBytes::new(format!("v={saved}").into_bytes()),
@@ -392,6 +449,21 @@ impl Daemon {
             self.alert(format!(
                 "the project records version could not be saved in the vault ({e})"
             ));
+        }
+        if let Some(t) = &token {
+            for k in &adopted {
+                let mode = current.keys.get(k).map_or(Mode::Swap, |r| r.mode);
+                if let Err(e) = self.record_approved(
+                    session,
+                    k,
+                    mode,
+                    &format!("ms init: joins project {}", record.slug),
+                    version,
+                    t,
+                ) {
+                    tracing::error!(error = %e, "could not record a key joining a project");
+                }
+            }
         }
         if let Err(e) = self.record(
             session,
