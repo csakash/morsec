@@ -6,6 +6,8 @@ entries. Move the entries from Unreleased into it when you bump the version.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-19
+
 - The dashboard (`ms dashboard`) now looks like morsec's site, with its fonts bundled in msd
   (nothing is fetched): one ruled sheet, a numbered rail of the five screens (with what's
   waiting, your projects and the open project's keys), breadcrumbs, rows that open what they
@@ -45,7 +47,6 @@ entries. Move the entries from Unreleased into it when you bump the version.
   before, the proxy didn't know where their credential goes and skipped them.
 - An existing `CLAUDE.md` or `AGENTS.md` gets a short note telling agents to keep `ms://`
   references as they are. morsec never creates those files.
-
 - Keys stored by another morsec build (for example a dev build, before you installed the signed
   release) no longer break the vault. `ms doctor`, `ms status` and `ms init` list them by name
   with the command that removes each one (`security delete-generic-password -s cc.morsec.vault
