@@ -251,8 +251,12 @@ pub fn commit(
 }
 
 /// Number of commits, on any branch, that touched `path`; `None` outside a git repository or
-/// when git is unavailable. Runs git without a pager, fsmonitor or signature checks so a
-/// repository's config can't make it run other programs.
+/// when git is unavailable. Runs git without a pager, fsmonitor or signature checks, with no
+/// transport at all (`protocol.allow=never`, `GIT_NO_LAZY_FETCH`: a partial clone's missing
+/// object would otherwise run the promisor remote's `uploadpack` or `core.sshCommand`, L35
+/// security review S1), no replace objects and no system config, so a repository's config
+/// (agent-writable) can't make it run other programs. msd runs this for the dashboard's Add
+/// project, outside every sandbox.
 pub fn git_history(path: &Path) -> Option<usize> {
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d,
@@ -270,6 +274,9 @@ pub fn git_history(path: &Path) -> Option<usize> {
             "log.showSignature=false",
             "-c",
             "core.pager=cat",
+            "-c",
+            "protocol.allow=never",
+            "--no-replace-objects",
             "log",
             "--all",
             "--no-color",
@@ -278,6 +285,13 @@ pub fn git_history(path: &Path) -> Option<usize> {
         ])
         .arg(name)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_SSH")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -542,5 +556,56 @@ mod tests {
         git(d.path(), &["rm", "-q", "--cached", ".env"]);
         git(d.path(), &["commit", "-q", "-m", "remove"]);
         assert_eq!(git_history(&p), Some(2));
+    }
+
+    // protects=L35 security review S1 / T-110: an agent-writable repository made a partial
+    // clone with a missing tree and a promisor remote whose uploadpack (or core.sshCommand) is a
+    // command can't make git_history run it: no transport, no lazy fetch; fails_when=the marker
+    // file appears; no_claim=git versions without GIT_NO_LAZY_FETCH (protocol.allow=never covers
+    // them)
+    #[test]
+    fn git_history_runs_no_configured_program() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("r");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join(".env"), "A=1\n").unwrap();
+        git(&repo, &["add", ".env"]);
+        git(&repo, &["commit", "-q", "-m", "one"]);
+        let tree = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let tree = tree.trim();
+        fs::remove_file(repo.join(".git/objects").join(&tree[..2]).join(&tree[2..])).unwrap();
+        let marker = d.path().join("PWNED");
+        let mut cfg = fs::read_to_string(repo.join(".git/config")).unwrap();
+        cfg = cfg.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+        cfg.push_str(&format!(
+            "[extensions]\n\tpartialClone = origin\n[remote \"origin\"]\n\turl = {}\n\tpromisor = true\n\tuploadpack = touch '{}' && false\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n[core]\n\tsshCommand = touch '{}' && false\n",
+            d.path().join("nowhere").display(),
+            marker.display(),
+            marker.display()
+        ));
+        fs::write(repo.join(".git/config"), cfg).unwrap();
+        let _ = git_history(&repo.join(".env"));
+        assert!(!marker.exists(), "git ran a configured program");
+        // The same repository under plain `git log` does run it (the test's setup is live).
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["log", "--all", "--format=%h", "--", ".env"])
+            .env_remove("GIT_NO_LAZY_FETCH")
+            .output();
+        assert!(
+            marker.exists(),
+            "the fixture no longer triggers a lazy fetch"
+        );
     }
 }

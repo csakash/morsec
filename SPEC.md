@@ -276,7 +276,7 @@ folder-access prompt for msd on `~/Documents`.
 | T-107 | A value of the user's (a token in an agent settings env entry) reaches the page through the preview | The terminal's redaction (`display_safe`, `redact`) on every line; the full content only in the digest | `preview_redacts_user_values`, `dash_connect_never_leaks_canary` | mitigated |
 | T-108 | An agent makes msd import a folder and loosen new keys' rules without the person | Touch ID naming the folder, files and every host; refused while stopped; first rules bound to the previewed rules hash; adoption of loose keys refused | `add_project_needs_touch_id`, `add_project_rules_bound_to_preview`, `add_project_refuses_adoption`, `add_project_refused_while_stopped` | partial (as T-104) |
 | T-109 | The folder changes between preview and import (a swapped env file, a new file) | Plan digest re-checked before the sheet; `execute` runs the digested `Prepared`; `envfile::commit` refuses a file changed since it was read; per-component `openat(O_NOFOLLOW)` walk | `add_project_refuses_changed_plan`, `prepare_reads_only`, `digest_changes_with_plan` | mitigated |
-| T-110 | msd, outside every sandbox, runs `git` in an agent-writable repository (Add project's history check) | Runs only after Touch ID; `core.fsmonitor=false`, no pager, no signatures, no prompts, `log` only | `crates/ms-import/src/envfile.rs::git_history_*` (existing) | partial (a repository's git config is the agent's; `git log` with these flags runs no configured program known to us) |
+| T-110 | msd, outside every sandbox, runs `git` in an agent-writable repository (Add project's history check) | Runs only after Touch ID; `core.fsmonitor=false`, no pager, no signatures, no prompts, no transport or lazy fetch (`protocol.allow=never`, `GIT_NO_LAZY_FETCH`), no replace objects, no system config | `git_history_detects_commits`, `git_history_runs_no_configured_program` | mitigated (security review S1) |
 | T-111 | msd's own settings write hides a later malicious edit (drift alert suppressed) | Only the exact fingerprint msd wrote is skipped, once | `own_writes_are_not_drift` | mitigated |
 
 ## ARI-42 (`ARI42.md`)
@@ -311,7 +311,7 @@ folder-access prompt for msd on `~/Documents`.
 - T-69 / T-104 / T-108: an agent the user has given Automation over the browser can cause a sheet;
   each names the agent or folder and every host.
 - macOS folder-access prompts for msd; a refusal makes the preview fail with the terminal fallback.
-- msd runs `git log` in the project folder after Touch ID (T-110).
+- msd runs `git log` in the project folder after Touch ID, with no transport, lazy fetch, replace objects or system config (T-110, security review S1).
 - A terminal connect with `CLAUDE_CONFIG_DIR` before this loop left a state without `config_dir`:
   msd reads it as the default directory.
 

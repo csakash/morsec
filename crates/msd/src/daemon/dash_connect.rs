@@ -613,12 +613,12 @@ impl Daemon {
         };
         {
             let mut w = lock(&self.dash_acts.conn.own_writes);
+            // Keep an entry only while it is still there (a poll may have used it already,
+            // re-review N1) and the file holds exactly what msd wrote, even after a partial
+            // write (N2).
             for (p, fp) in &expected {
-                w.retain(|(q, _)| q != p);
                 let now = crate::drift::fingerprint(p);
-                if partly.is_ok() && now == *fp {
-                    w.push((p.clone(), now));
-                }
+                w.retain(|(q, f)| q != p || (f == fp && now == *fp));
             }
         }
         match partly {
@@ -1111,6 +1111,15 @@ fn add_view(r: &setup::Report, slug: &str, keys: &[ms_ipc::KeyStatus]) -> Projec
     if total > 0 {
         rows.push(("Protected".into(), format!("{ready}, ready to use")));
     }
+    if r.recovered > 0 {
+        rows.push((
+            "Recovered".into(),
+            format!(
+                "{} an earlier run stored but never recorded",
+                plural(r.recovered, "key", "keys")
+            ),
+        ));
+    }
     if let Some(first) = r.missing.first() {
         rows.push((
             "Missing".into(),
@@ -1121,11 +1130,18 @@ fn add_view(r: &setup::Report, slug: &str, keys: &[ms_ipc::KeyStatus]) -> Projec
             ),
         ));
     }
+    if let Some(why) = &r.declined {
+        rows.push((
+            "Approval".into(),
+            format!(
+                "not given, so these keys are stored but can't be used yet. Re-scan to approve ({why})"
+            ),
+        ));
+    }
     let unknown: Vec<&ms_ipc::KeyStatus> = keys
         .iter()
         .filter(|k| {
             !k.ready
-                && k.mode != Some(Mode::Run)
                 && r.record
                     .as_ref()
                     .is_some_and(|rec| rec.provider_of(&k.key).is_none())
@@ -1155,21 +1171,7 @@ fn add_view(r: &setup::Report, slug: &str, keys: &[ms_ipc::KeyStatus]) -> Projec
             ),
         ));
     }
-    if r.recovered > 0 {
-        rows.push((
-            "Recovered".into(),
-            format!(
-                "{} an earlier run stored but never recorded",
-                plural(r.recovered, "key", "keys")
-            ),
-        ));
-    }
-    if let Some(why) = &r.declined {
-        rows.push((
-            "Rules".into(),
-            format!("not saved, so the new keys can't be used yet ({why})"),
-        ));
-    }
+
     if let Some(e) = &r.rules_error {
         rows.push(("Rules".into(), format!("not saved: {e}")));
     }
