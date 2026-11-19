@@ -33,6 +33,23 @@ fn msd() -> PathBuf {
     p
 }
 
+/// A port below the ephemeral range (macOS: 49152 and up), where client sockets of parallel
+/// tests keep landing and leave ports in TIME_WAIT. Bound and returned held.
+fn quiet_listener() -> std::net::TcpListener {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    loop {
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let seed = std::process::id()
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(n * 7919);
+        let port = 20_000 + u16::try_from(seed % 25_000).unwrap();
+        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            return l;
+        }
+    }
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -84,7 +101,7 @@ impl Fx {
             .mode(0o700)
             .create(base.join("run"))
             .unwrap();
-        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let squatter = quiet_listener();
         let dash_port = squatter.local_addr().unwrap().port();
         let socket = base.join("run/msd.sock");
         let child = Command::new(msd())

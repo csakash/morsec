@@ -103,12 +103,21 @@ struct T {
     fake: Arc<Fake>,
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A port below the ephemeral range (macOS: 49152 and up), where client sockets of parallel
+/// tests keep landing and leave ports in TIME_WAIT. Bound and returned held.
+fn quiet_listener() -> TcpListener {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    loop {
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let seed = std::process::id()
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(n * 7919);
+        let port = 20_000 + u16::try_from(seed % 25_000).unwrap();
+        if let Ok(l) = TcpListener::bind(("127.0.0.1", port)) {
+            return l;
+        }
+    }
 }
 
 fn setup(f: impl FnOnce(&mut DashConfig)) -> T {
@@ -117,7 +126,7 @@ fn setup(f: impl FnOnce(&mut DashConfig)) -> T {
         .enable_all()
         .build()
         .unwrap();
-    let mut cfg = DashConfig::new(free_port());
+    let mut cfg = DashConfig::new(quiet_listener().local_addr().unwrap().port());
     f(&mut cfg);
     let fake = Arc::new(Fake::default());
     let dash = Dash::new(cfg, fake.clone(), rt.handle().clone());
@@ -239,7 +248,7 @@ const HEADERS: [(&str, &str); 7] = [
 // nothing of ours listens there; no_claim=what the CLI opens (ms-cli dashboard.rs)
 #[test]
 fn dash_open_reports_bound_port() {
-    let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+    let squatter = quiet_listener();
     let base = squatter.local_addr().unwrap().port();
     let t = setup(|c| c.first_port = base);
     let o = t.dash.open().unwrap();
@@ -263,7 +272,7 @@ fn dash_open_reports_bound_port() {
 #[test]
 fn dash_open_fails_when_range_is_full() {
     let (base, _a, _b) = loop {
-        let base = free_port();
+        let base = quiet_listener().local_addr().unwrap().port();
         if let (Ok(a), Ok(b)) = (
             TcpListener::bind(("127.0.0.1", base)),
             TcpListener::bind(("127.0.0.1", base + 1)),

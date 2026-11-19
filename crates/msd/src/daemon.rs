@@ -2840,11 +2840,17 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Below the ephemeral range, where parallel tests' client sockets don't land.
+        let port = (0u16..)
+            .map(|i| {
+                20_000
+                    + ((std::process::id() as u16)
+                        .wrapping_mul(31)
+                        .wrapping_add(i * 97))
+                        % 25_000
+            })
+            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+            .unwrap();
         let _g = rt.enter();
         crate::dash::install_with(&h.d, ms_dash::DashConfig::new(port), check);
         drop(_g);
