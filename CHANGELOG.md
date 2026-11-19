@@ -6,6 +6,14 @@ entries. Move the entries from Unreleased into it when you bump the version.
 
 ## [Unreleased]
 
+- The dashboard connects and disconnects Claude Code and Codex, and sets up or re-scans a
+  project folder, itself. Each shows exactly what will change first (the same redacted diff
+  `ms connect` prints; the files, secrets and websites `ms init` would touch), then asks Touch ID
+  once, and does precisely what was shown or nothing. A key's page can now add and remove git
+  hosts, variables and SSH host keys.
+- Security: the git-history check `ms init` runs (and now msd, for Add project) can no longer be
+  made to run a program from a repository's own git config (a partial clone's lazy fetch).
+
 ## [0.2.0] - 2026-11-19
 
 - The dashboard (`ms dashboard`) now looks like morsec's site, with its fonts bundled in msd
