@@ -211,6 +211,9 @@ with `HTTPS_PROXY` (no Node 24 in the gate; noted in PROOF).
   in the dev tree gets the run-mode values in its environment and, if not named like an agent,
   is served as the dev session.
 - At most 64 dev sessions at once (global); filling them needs an approval per session (review N3).
+- The sandbox probe checks the caller's pid without its start time; a pid reused between send and
+  probe could pass it, but the session binds to (pid, start time) and the per-run approval still
+  applies (review F6).
 - Two-step adoption: a key can join a project's record while it allows nothing (no prompt) and be
   loosened later with `ms rules` (its own approval); each `ms dev` sheet then lists it.
 
