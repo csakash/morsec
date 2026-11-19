@@ -62,7 +62,7 @@ pub(super) fn targets(rule: &KeyRule) -> Vec<String> {
 }
 
 impl Daemon {
-    fn projects_store(&self) -> ProjectsStore<'_> {
+    pub(super) fn projects_store(&self) -> ProjectsStore<'_> {
         ProjectsStore::new(
             self.paths.state.join(PROJECTS_FILE),
             &*self.vault,

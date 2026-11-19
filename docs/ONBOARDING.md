@@ -137,6 +137,7 @@ file; values already in git history stay readable there:
 ms import .env
 ```
 
+`ms add` only adds new keys; to change a value, use `ms set stripe/test` (Touch ID).
 `ms add` keys are `production` tier unless you say otherwise; `ms import` proposes a tier per
 variable. A production key asks you (Touch ID) before use, once or for the agent session as you
 choose; `test` keys never prompt.
@@ -199,6 +200,10 @@ also starts each agent headless and checks from inside its sandbox (it spends to
 | Look for leaked values in transcripts | `ms scan` |
 | Prompts per session, blocks, approvals | `ms stats` |
 | Your run commands as MCP tools | `ms connect claude-code --with-mcp` |
+| Replace a key's value (rotated at the provider) | `ms set stripe/test` (hidden input, or `--stdin` from a pipe; Touch ID) |
+| Delete a key and its rule | `ms rm stripe/test` (Touch ID; refused while a project's `.env` still refers to it, unless `--force`) |
+| Put a project's values back into its `.env` files | `ms undo shop` (or `--key shop/stripe-secret-key` for one; Touch ID). It writes each value back into the line `ms init` replaced, in its quote style, and deletes the keys nothing else uses. A line you edited since is left alone and listed |
+| Do all of this in the browser | `ms dashboard`: Show and Copy a value, Replace, Delete, Undo, change a key's websites and commands, approve or deny a waiting request, Stop and Start, run the leak scan. Every value action asks for Touch ID on this Mac; a shown value hides after 15 seconds, a copied one leaves the clipboard after 30 |
 
 ## Upgrading from a dev install (before 1.0)
 

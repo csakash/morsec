@@ -386,6 +386,59 @@ async fn value_crosses_the_wire_only_as_raw_frame() {
     r.shutdown().await;
 }
 
+// protects=L33 SPEC D-24 and T-99: a KeyReplace's new value crosses the real wire exactly
+// once, as its own raw frame right after the request's JSON, the handler gets it intact, and the
+// stream stays in sync after it; request() refuses to send KeyReplace without its frame;
+// fails_when=the value appears in a JSON frame or the frame is missing; no_claim=memory wiping
+#[tokio::test]
+async fn key_replace_carries_value_frame() {
+    let r = start().await;
+    let relay_dir = tmpdir();
+    let relay_path = relay_dir.path().join("relay.sock");
+    let wire: Wire = Arc::default();
+    let relay_task = relay(&relay_path, r.path.clone(), wire.clone());
+    let key = KeyName::new("stripe/live").unwrap();
+    let mut c = Client::connect(&relay_path).await.unwrap();
+    assert!(
+        c.request(RequestBody::KeyReplace { key: key.clone() })
+            .await
+            .is_err(),
+        "KeyReplace needs its value frame"
+    );
+    let resp = c
+        .request_with_value(
+            RequestBody::KeyReplace { key },
+            SecretBytes::from(CANARY.to_owned()),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(resp, ResponseBody::Error { .. }));
+    assert!(matches!(
+        c.request(RequestBody::Status).await.unwrap(),
+        ResponseBody::Status { .. }
+    ));
+    drop(c);
+    relay_task.await.unwrap();
+    assert_eq!(
+        r.handler.values.lock().unwrap().as_slice(),
+        [CANARY.as_bytes().to_vec()]
+    );
+    let frames = wire.lock().unwrap().clone();
+    assert_eq!(
+        frames.iter().map(|(up, _)| *up).collect::<Vec<_>>(),
+        [true, true, false, true, false]
+    );
+    for (i, (_, bytes)) in frames.iter().enumerate() {
+        if i == 1 {
+            assert_eq!(bytes.as_slice(), CANARY.as_bytes());
+            continue;
+        }
+        assert!(!contains(bytes, b"CANARY"), "value in frame {i}");
+    }
+    r.shutdown().await;
+}
+
 // protects=every Request and Response variant round-trips through encode/decode; fails_when=a
 // variant fails to encode, decode or changes; no_claim=that secrets can't enter a message (that is
 // a type guarantee: SecretBytes has no Serialize) or what goes over a socket (see the relay test)
@@ -445,6 +498,15 @@ fn every_variant_round_trips() {
                 detail: "x".into(),
             }),
         },
+        RequestBody::KeyReplace { key: name.clone() },
+        RequestBody::KeyDelete {
+            key: name.clone(),
+            force: true,
+        },
+        RequestBody::ProjectUndo {
+            slug: "shop".into(),
+            keys: Some(vec![name.clone()]),
+        },
     ];
     let all_responses = [
         ResponseBody::status("msd", "0", "dev-stub"),
@@ -503,6 +565,16 @@ fn every_variant_round_trips() {
                 },
             )],
             any_open: true,
+        },
+        ResponseBody::Undone {
+            restored: vec![ms_ipc::UndoLine {
+                project: "shop".into(),
+                file: ".env".into(),
+                line: 1,
+                var: "A".into(),
+            }],
+            skipped: vec![],
+            deleted_keys: vec![name.clone()],
         },
     ];
     for (i, b) in all_requests.iter().enumerate() {

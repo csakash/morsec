@@ -27,6 +27,7 @@ mod mcp;
 mod projects;
 mod run;
 mod ssh_git;
+mod undo;
 
 pub use dash_actions::{AlertKind, Clipboard};
 pub use dash_data::{ConnChecker, DashSource};
@@ -752,6 +753,39 @@ impl Daemon {
                 "morsec: the dashboard can't be opened from inside an agent session. Ask the user to run ms dashboard in their own terminal",
             ),
             RequestBody::DashOpen { view } => self.dash_open(view.as_deref()),
+            // Replacing, deleting and undoing change what morsec holds or write values into
+            // files: only from the user's own terminal (L33 SPEC D-24).
+            RequestBody::KeyReplace { .. }
+            | RequestBody::KeyDelete { .. }
+            | RequestBody::ProjectUndo { .. }
+                if in_agent =>
+            {
+                reply_err(
+                    ErrorCode::Denied,
+                    "morsec: keys can't be replaced, deleted or undone from inside an agent session. Ask the user to run it in their own terminal",
+                )
+            }
+            RequestBody::KeyReplace { .. }
+            | RequestBody::KeyDelete { .. }
+            | RequestBody::ProjectUndo { .. }
+                if self.caller_sandboxed(caller.as_ref()) =>
+            {
+                reply_err(
+                    ErrorCode::Denied,
+                    "morsec: keys can't be replaced, deleted or undone from a sandboxed process (an agent's command sandbox). Run it in your own terminal",
+                )
+            }
+            RequestBody::KeyReplace { key } => match value {
+                Some(v) => self.key_replace(&session, &key, v),
+                None => reply_err(
+                    ErrorCode::Protocol,
+                    "morsec: KeyReplace came without a value",
+                ),
+            },
+            RequestBody::KeyDelete { key, force } => self.key_delete(&session, &key, force),
+            RequestBody::ProjectUndo { slug, keys } => {
+                self.project_undo(&session, &slug, keys.as_deref())
+            }
             RequestBody::DoctorProbe { nonce, report } => self.probes.handle(
                 match &caller {
                     Some(Caller::Agent(s)) => Some(s.clone()),
@@ -1726,6 +1760,9 @@ mod tests {
         }
         pub(super) fn req(&self, r: RequestBody) -> ResponseBody {
             self.d.handle(&peer(), r, None)
+        }
+        pub(super) fn req_value(&self, r: RequestBody, v: Option<SecretBytes>) -> ResponseBody {
+            self.d.handle(&peer(), r, v)
         }
         pub(super) fn put(&self, name: &str, tier: Tier) -> ResponseBody {
             let k = KeyName::new(name).unwrap();
@@ -3484,9 +3521,11 @@ mod tests {
         );
     }
 
-    // protects=SPEC D-3 and criterion 10: no dashboard view (Home, Projects, Project, every
-    // Secret, Activity, export JSON and CSV, Verify, Agents, Scan) carries a vault value: the
-    // fixture's keys all hold the canary; fails_when=the canary appears in any serialized view;
+    // protects=SPEC D-3 and criterion 10, L33 criterion 22: no dashboard view (Home, Projects,
+    // Project, every Secret, Activity, export JSON and CSV, Verify, Agents, Scan) and no action's
+    // answer but Show's (Copy, Re-check, check-path, rules, Replace, Delete, Undo, Stop, Start),
+    // nor any receipt, carries a vault value: the fixture's keys all hold the canary;
+    // fails_when=the canary appears in any serialized view, answer or receipt;
     // no_claim=the HTTP layer (it serializes these same views; ms-cli dashboard.rs fetches them)
     #[test]
     pub(super) fn dashboard_never_serves_a_canary() {
@@ -3514,6 +3553,49 @@ mod tests {
         out.push(serde_json::to_string(&h.d.dash_verify().unwrap()).unwrap());
         out.push(serde_json::to_string(&h.d.dash_agents().unwrap()).unwrap());
         out.push(serde_json::to_string(&h.d.dash_scan()).unwrap());
+        // L33: every action's answer but Show's (which is the value, behind Touch ID).
+        let a = ms_dash::Actor {
+            session: SessionId {
+                agent: AgentKind::Other("dashboard".into()),
+                pid: 7,
+                started_unix_ms: 1,
+            },
+            peer: "127.0.0.1:50000".parse().unwrap(),
+            local: "127.0.0.1:7311".parse().unwrap(),
+        };
+        let paste = Arc::new(crate::pasteboard::fake::Fake::default());
+        h.d.set_clipboard(Arc::new(crate::pasteboard::Marked(paste.clone())));
+        let k = KeyName::new(STRIPE_KEY).unwrap();
+        out.push(format!("{:?}", h.d.dash_copy(&a, &k)));
+        out.push(format!("{:?}", h.d.dash_recheck()));
+        out.push(format!("{:?}", h.d.dash_check_path("/")));
+        out.push(format!(
+            "{:?}",
+            h.d.dash_rules(
+                &a,
+                &k,
+                &ms_dash::actions::RuleEdit::AddHost("files.stripe.com".into())
+            )
+        ));
+        out.push(format!(
+            "{:?}",
+            h.d.dash_replace(
+                &a,
+                &KeyName::new("loose/key").unwrap(),
+                SecretBytes::new(CANARY.as_bytes().to_vec())
+            )
+        ));
+        out.push(format!("{:?}", h.d.dash_delete(&a, &k, false)));
+        out.push(format!("{:?}", h.d.dash_undo(&a, Some("shop"), None)));
+        out.push(format!("{:?}", h.d.dash_stop(&a)));
+        out.push(format!("{:?}", h.d.dash_start(&a)));
+        out.push(serde_json::to_string(&h.d.dash_home().unwrap()).unwrap());
+        out.push(h.receipts_text());
+        assert_eq!(
+            paste.text().as_deref(),
+            Some(CANARY),
+            "Copy went to the pasteboard"
+        );
         let all = out.join("\n");
         assert!(all.contains(STRIPE_KEY), "the views were built");
         assert!(!all.contains(CANARY), "a value reached a view");

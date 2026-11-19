@@ -44,7 +44,10 @@ The agent only ever sees `ms://stripe/test`; `msd` swaps the real key in on requ
 `brew upgrade morsec`, `npm install -g morsec@latest` or the curl installer again, then restart
 msd with `launchctl kickstart -k gui/$(id -u)/cc.morsec.msd` (after a curl upgrade, also
 `ms run --link-shims`). For commands that need a value (`psql`,
-`ssh`, `git`, deploy scripts), use run mode; `ms stop` cuts every agent off at once. The whole
+`ssh`, `git`, deploy scripts), use run mode; `ms stop` cuts every agent off at once.
+`ms set` replaces a value, `ms rm` deletes a key and `ms undo <project>` writes a project's
+values back into its `.env` files (each with Touch ID); `ms dashboard` does the same in your
+browser. The whole
 walk-through, including Codex and run mode, is [docs/ONBOARDING.md](docs/ONBOARDING.md).
 
 ## Status

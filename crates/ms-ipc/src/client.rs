@@ -66,7 +66,8 @@ impl Client {
     pub async fn request(&mut self, body: RequestBody) -> Result<ResponseBody> {
         if body.carries_value() {
             return Err(Error::Protocol(
-                "PutKey must be sent with Client::put_key".into(),
+                "PutKey and KeyReplace must be sent with Client::put_key or request_with_value"
+                    .into(),
             ));
         }
         self.request_within(body, RESPONSE_TIMEOUT).await
@@ -81,7 +82,8 @@ impl Client {
     ) -> Result<ResponseBody> {
         if body.carries_value() {
             return Err(Error::Protocol(
-                "PutKey must be sent with Client::put_key".into(),
+                "PutKey and KeyReplace must be sent with Client::put_key or request_with_value"
+                    .into(),
             ));
         }
         let id = self.send(&body).await?;
@@ -128,6 +130,25 @@ impl Client {
         write_frame(&mut self.stream, value.expose()).await?;
         drop(value);
         self.receive(id, RESPONSE_TIMEOUT).await
+    }
+
+    /// Sends a request whose value follows in its own raw frame (`PutKey`, `KeyReplace`), never
+    /// through serde, and waits up to `timeout` (a replace waits for a person's approval).
+    pub async fn request_with_value(
+        &mut self,
+        body: RequestBody,
+        value: SecretBytes,
+        timeout: Duration,
+    ) -> Result<ResponseBody> {
+        if !body.carries_value() {
+            return Err(Error::Protocol(
+                "request_with_value needs PutKey or KeyReplace".into(),
+            ));
+        }
+        let id = self.send(&body).await?;
+        write_frame(&mut self.stream, value.expose()).await?;
+        drop(value);
+        self.receive(id, timeout).await
     }
 
     /// Runs a command as a stream (`RunStream`, L12): once the daemon answers `RunStarted`,

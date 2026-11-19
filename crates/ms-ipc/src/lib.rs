@@ -18,7 +18,8 @@ pub use client::Client;
 pub use paths::default_socket_path;
 pub use protocol::{
     ApprovalScope, ErrorCode, KeyStatus, OutStream, PROTOCOL_VERSION, PendingApproval, ProbeReport,
-    ProbeSighting, ProjectSummary, RequestBody, ResponseBody, RunEnv, ScanFinding,
+    ProbeSighting, ProjectSummary, RequestBody, ResponseBody, RunEnv, ScanFinding, UndoLine,
+    UndoSkip,
 };
 pub use server::{
     Handler, PeerCheck, PeerInfo, SameUid, Server, ServerLimits, StdinEvent, StreamIo, now_unix_ms,

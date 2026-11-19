@@ -1252,13 +1252,21 @@ impl Daemon {
         project: Option<&str>,
         key: Option<&KeyName>,
     ) -> Result<UndoView, ActionError> {
-        let _ = (project, key);
-        Err(self.refuse(
-            a,
-            &daemon_key(),
-            "undo",
-            err(ActionCode::Internal, "morsec: undo is not built yet"),
-        ))
+        let keys: Option<Vec<KeyName>> = key.map(|k| vec![k.clone()]);
+        let confirm = |req: &ApprovalRequest, reason: &str| {
+            self.dash_confirm(req, &format!("{reason} (from the dashboard)"))
+        };
+        let receipt = |k: &KeyName, r: ReceiptResult, t: Option<&ApprovalToken>| {
+            self.dash_receipt(a, k, "undo", r, t);
+        };
+        self.undo_run(
+            &a.session,
+            project,
+            keys.as_deref(),
+            &confirm,
+            &receipt,
+            "dashboard",
+        )
     }
 }
 
@@ -1427,7 +1435,8 @@ mod tests {
     use ms_approve::auth::fake::FakeAuthenticator;
     use ms_core::{AgentKind, SecretBytes, SessionId};
     use ms_dash::actions::TierArg;
-    use ms_ipc::{PeerInfo, RequestBody};
+    use ms_ipc::{ErrorCode, PeerInfo, RequestBody};
+    use std::collections::BTreeSet;
 
     fn actor() -> Actor {
         Actor {
@@ -2300,4 +2309,233 @@ mod tests {
     }
 
     const DAEMON_KEY_NAME: &str = crate::daemon::DAEMON_KEY;
+
+    /// Writes each recorded line of `rec` into its file under the root, as ms init left it.
+    fn write_refs(rec: &ms_projects::record::ProjectRecord) {
+        for f in &rec.files {
+            let mut text = String::new();
+            let max = f.secrets.iter().map(|s| s.line).max().unwrap_or(0);
+            for n in 1..=max {
+                match f.secrets.iter().find(|s| s.line == n) {
+                    Some(s) => text.push_str(&format!("{}=ms://{}\n", s.var, s.key)),
+                    None => text.push_str("# other\n"),
+                }
+            }
+            let path = Path::new(&rec.root).join(&f.path);
+            std::fs::write(path, text).unwrap();
+        }
+    }
+
+    /// The shop fixture saved, its .env written; returns the record.
+    fn saved_shop(h: &H) -> ms_projects::record::ProjectRecord {
+        let rec = shop(h);
+        let rules = proposal(h, &rec);
+        let r = h.approved(|| save(h, &rec, &rules));
+        assert!(matches!(r, ResponseBody::Ok { .. }), "{r:?}");
+        write_refs(&rec);
+        rec
+    }
+
+    // protects=SPEC D-21 and T-94: with a tampered projects.toml, Undo fails closed before any
+    // Touch ID sheet and writes nothing; fails_when=a forged record drives Undo;
+    // no_claim=the MAC itself (ms-projects store tests)
+    #[test]
+    fn undo_refuses_tampered_record() {
+        let h = fresh();
+        let rec = saved_shop(&h);
+        let env = Path::new(&rec.root).join(".env");
+        let before = std::fs::read_to_string(&env).unwrap();
+        let file = h.dir.path().join(crate::daemon::PROJECTS_FILE);
+        let mut t = std::fs::read_to_string(&file).unwrap();
+        t.push_str("\n# edited\n");
+        std::fs::write(&file, t).unwrap();
+        let n = h.auth.reasons().len();
+        let e = h.d.dash_undo(&actor(), Some("shop"), None).unwrap_err();
+        assert_eq!(e.code, ActionCode::Refused);
+        assert!(e.message.contains("integrity"), "{}", e.message);
+        assert_eq!(h.auth.reasons().len(), n, "no sheet");
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), before);
+    }
+
+    // protects=SPEC D-21: Undo of a whole project writes every value back, deletes (value and
+    // rule) the keys no other project refers to, keeps a key another project still uses, drops
+    // the record, and never puts a value in its answer or a receipt; per-key Undo restores just
+    // that key; fails_when=a key still used elsewhere is deleted, a restored key stays, or a value
+    // leaks; no_claim=the file checks (ms-projects undo tests)
+    #[test]
+    fn undo_deletes_only_unreferenced_keys() {
+        let h = fresh();
+        let mut rec = shop(&h);
+        // The Stripe key is also on a line of .env.local (the same value, reused).
+        let mut local = rec.files[0].clone();
+        local.path = ".env.local".into();
+        local.secrets.truncate(1);
+        local.secrets[0].var = "LOCAL_STRIPE".into();
+        local.secrets[0].action = ms_projects::record::SecretAction::Reuse;
+        rec.files.push(local);
+        let rules = proposal(&h, &rec);
+        assert!(matches!(
+            h.approved(|| save(&h, &rec, &rules)),
+            ResponseBody::Ok { .. }
+        ));
+        write_refs(&rec);
+
+        // One key first, from the Secret screen: its line comes back and the key goes.
+        let v =
+            h.d.dash_undo(&actor(), Some("shop"), Some(&k(OPENAI_KEY)))
+                .unwrap();
+        assert_eq!(v.restored.len(), 1);
+        assert_eq!(v.deleted_keys, [OPENAI_KEY]);
+        assert!(value(&h, OPENAI_KEY).is_none());
+
+        // The person edited .env.local meanwhile: that line is skipped, so the Stripe key, still
+        // referred to there, stays; the keys whose every line came back go.
+        let local_path = Path::new(&rec.root).join(".env.local");
+        std::fs::write(&local_path, "LOCAL_STRIPE=edited\n").unwrap();
+        let v = h.d.dash_undo(&actor(), Some("shop"), None).unwrap();
+        assert_eq!(v.restored.len(), 3, "{v:?}");
+        assert_eq!(v.skipped.len(), 1, "{v:?}");
+        let deleted: BTreeSet<String> = v.deleted_keys.iter().cloned().collect();
+        assert!(
+            deleted.contains(DB_KEY) && deleted.contains(UNKNOWN_KEY),
+            "{deleted:?}"
+        );
+        assert!(
+            !deleted.contains(STRIPE_KEY),
+            "still referred to by .env.local"
+        );
+        assert!(value(&h, STRIPE_KEY).is_some());
+        assert!(h.d.rules().keys.contains_key(&k(STRIPE_KEY)));
+        assert!(!h.d.rules().keys.contains_key(&k(DB_KEY)));
+        let env = std::fs::read_to_string(Path::new(&rec.root).join(".env")).unwrap();
+        assert_eq!(env.matches(CANARY).count(), 4, "{env}");
+        // The record keeps only the skipped line.
+        let file = h.d.dash_projects().unwrap();
+        let p = file.get("shop").unwrap();
+        assert_eq!(p.files.len(), 1);
+        assert_eq!(p.files[0].path, ".env.local");
+
+        // Put the ref back and undo the rest: now the key goes too, and the record with it.
+        std::fs::write(&local_path, format!("LOCAL_STRIPE=ms://{STRIPE_KEY}\n")).unwrap();
+        let v = h.d.dash_undo(&actor(), Some("shop"), None).unwrap();
+        assert_eq!(v.deleted_keys, [STRIPE_KEY]);
+        assert!(h.d.dash_projects().unwrap().get("shop").is_none());
+        let all = format!("{v:?}{}", h.receipts_text());
+        assert!(!all.contains(CANARY));
+        assert!(h.receipts_text().contains("dashboard: undo"));
+    }
+
+    // protects=SPEC D-21: the Touch ID reason names every file that will receive a value and how
+    // many values; fails_when=a file is missing from the sheet; no_claim=the real sheet
+    #[test]
+    fn undo_reason_names_every_file() {
+        let h = fresh();
+        let mut rec = shop(&h);
+        let mut local = rec.files[0].clone();
+        local.path = ".env.local".into();
+        local.secrets.truncate(1);
+        local.secrets[0].var = "LOCAL_STRIPE".into();
+        rec.files[0].secrets.remove(0);
+        rec.files.push(local);
+        let rules = proposal(&h, &rec);
+        assert!(matches!(
+            h.approved(|| save(&h, &rec, &rules)),
+            ResponseBody::Ok { .. }
+        ));
+        write_refs(&rec);
+        let v = h.d.dash_undo(&actor(), Some("shop"), None).unwrap();
+        assert_eq!(v.restored.len(), 4, "{v:?}");
+        let reason = h.auth.reasons().pop().unwrap();
+        assert!(reason.contains("write 4 values back into"), "{reason}");
+        assert!(
+            reason.contains("shop/.env") && reason.contains("shop/.env.local"),
+            "{reason}"
+        );
+    }
+
+    // protects=SPEC D-24 and T-96: KeyReplace, KeyDelete and ProjectUndo are refused inside an
+    // agent session, from a sandboxed caller and while stopped; from the user's terminal they
+    // go through the person's approval; fails_when=an agent or its sandbox replaces, deletes or
+    // undoes anything; no_claim=the CLI's own refusal (set_rm_undo.rs)
+    #[test]
+    fn key_requests_refused_in_agent_session() {
+        let h = fresh();
+        h.put("stripe/test", Tier::Test);
+        let key = k("stripe/test");
+        let reqs = || {
+            vec![
+                (RequestBody::KeyReplace { key: key.clone() }, true),
+                (
+                    RequestBody::KeyDelete {
+                        key: key.clone(),
+                        force: true,
+                    },
+                    false,
+                ),
+                (
+                    RequestBody::ProjectUndo {
+                        slug: "shop".into(),
+                        keys: None,
+                    },
+                    false,
+                ),
+            ]
+        };
+        let send = |h: &H, r: RequestBody, v: bool| {
+            h.req_value(r, v.then(|| SecretBytes::new(b"new".to_vec())))
+        };
+        for (r, v) in reqs() {
+            let out = send(h.as_(agent()), r, v);
+            assert!(
+                matches!(&out, ResponseBody::Error { code: ErrorCode::Denied, message } if message.contains("agent session")),
+                "{out:?}"
+            );
+        }
+        h.as_(terminal());
+        h.d.set_sandbox_probe(|_| true);
+        for (r, v) in reqs() {
+            let out = send(&h, r, v);
+            assert!(
+                matches!(&out, ResponseBody::Error { code: ErrorCode::Denied, message } if message.contains("sandboxed")),
+                "{out:?}"
+            );
+        }
+        h.d.set_sandbox_probe(|_| false);
+        h.d.dash_stop(&actor()).unwrap();
+        for (r, v) in reqs() {
+            let out = send(&h, r, v);
+            assert!(
+                matches!(&out, ResponseBody::Error { message, .. } if message.contains("stopped")),
+                "{out:?}"
+            );
+        }
+        assert_eq!(value(&h, "stripe/test").unwrap(), CANARY.as_bytes());
+        assert!(h.auth.reasons().is_empty());
+        // From the user's terminal, with the person's approval.
+        let h = fresh();
+        h.put("stripe/test", Tier::Test);
+        let r = h.approved(|| {
+            send(
+                &h,
+                RequestBody::KeyReplace {
+                    key: k("stripe/test"),
+                },
+                true,
+            )
+        });
+        assert!(matches!(r, ResponseBody::Ok { .. }), "{r:?}");
+        assert_eq!(value(&h, "stripe/test").unwrap(), b"new");
+        let r = h.approved(|| {
+            send(
+                &h,
+                RequestBody::KeyDelete {
+                    key: k("stripe/test"),
+                    force: false,
+                },
+                false,
+            )
+        });
+        assert!(matches!(r, ResponseBody::Ok { .. }), "{r:?}");
+        assert!(value(&h, "stripe/test").is_none());
+    }
 }

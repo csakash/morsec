@@ -66,6 +66,12 @@ page, in light and dark, from 375 px to wide screens, with no horizontal page sc
   the three fonts as file components with `OFL-1.1` and their hashes
   (`packaging/lib/sbom.py`), so the licence travels with the binary. No new crate, no npm.
 
+  *Settled 2026-11-19 (orchestrator):* the user asked for the landing page's fonts; the builder
+  downloads them as above. Done: the gstatic URLs, the google/fonts commit
+  (`5bd87dfc525c8a0d1d8529d3684716e00c3fc59a`, the tip of `main` that day, resolved with
+  `git ls-remote https://github.com/google/fonts`, the one extra host touched, read-only) and
+  the eight SHA-256 are in `SOURCES.txt` and `assets::fonts_are_pinned`.
+
 - **D-2 Theme.** Tokens copied unchanged from `site/src/shared.css` (paper, paper-2, ink, ink-2,
   muted, rule, faint, signal, deny, and their dark values), dark mode by `prefers-color-scheme`
   only (no toggle: the page holds no preference). Vocabulary from the landing page:
@@ -218,6 +224,8 @@ page, in light and dark, from 375 px to wide screens, with no horizontal page sc
     `KeyReplace` (Touch ID). L31's import never puts an existing key (plan refuses duplicates;
     `reuse` rows put nothing), so `ms init` / `ms import` are unaffected; the builder confirms with
     the existing tests.
+  - *Settled 2026-11-19 (orchestrator):* close the gap: replacing a value needs `KeyReplace`
+    with Touch ID; `PutKey` refuses an existing key for every caller (T-95).
   - **Delete** (`POST /api/keys/{key}/delete {"force": bool}`; CLI `ms rm <key> [--force]`): Touch
     ID ("delete `<key>` and its rule; this can't be undone"). Refused (409) while a project record
     still has a line holding its ref, naming each `project file:line`, unless `force`. Deletes the
@@ -262,6 +270,8 @@ page, in light and dark, from 375 px to wide screens, with no horizontal page sc
     re-test that its proxy port accepts a connection, and clear a SettingsChanged alert whose file
     is unchanged since it was raised plus re-checked; answers the fresh `AgentsView`. For the full
     check it shows `ms doctor` with Copy (`ms doctor` static checks stay in the CLI).
+  - *Settled 2026-11-19 (orchestrator):* Connect / Disconnect stay copyable commands in L33;
+    running them from msd is the follow-up loop L35 `dash-connect`.
 
 - **D-17 Add project stays `ms init` in the terminal; the page builds the command.** Running the
   import from msd would move L31's scan and value reading out of the user's terminal process into
@@ -273,6 +283,8 @@ page, in light and dark, from 375 px to wide screens, with no horizontal page sc
   (`ms_projects::mode::detect` / `refused_root`: "That is your home folder; pick the project
   folder"), says whether it is already a project, and answers the shell-quoted command
   `cd '<path>' && ms init` with Copy. Re-scan on the Project screen is the same command.
+  *Settled 2026-11-19 (orchestrator):* Add project stays a copyable command in L33; running the
+  import from msd is the follow-up loop L35 `dash-connect`.
 
 - **D-18 Run scan.** `POST /api/scan/run` → Touch ID (the same `["ms", "scan"]` approval as today,
   through the confirm path) → `202 {"started": true}`; the scan runs on a blocking thread; `GET
@@ -400,6 +412,32 @@ page, in light and dark, from 375 px to wide screens, with no horizontal page sc
   project check), (3) value actions (show, copy, replace, add, delete) and the pasteboard, (4) undo
   and the CLI. The minimum the user asked for is all of (1) to (4); only the items under
   "Deferred" move out.
+
+### Builder's notes (L33 build, 2026-11-19)
+
+Where the build chose within the decisions above, or departed from their letter:
+
+- **B-1 FFI module.** The pasteboard's Objective-C calls are in `crates/msd/src/pasteboard/ffi.rs`
+  (module-level `#![allow(unsafe_code)]`, a `// SAFETY:` per block, AppKit linked there);
+  `pasteboard.rs` holds the logic (markers, the 30 s clear), the `Clipboard` trait, the fakes
+  and the named tests. REVIEW.md wants the unsafe module to hold nothing else.
+- **B-2 Delete while stopped** is refused (409 `stopped`), like Replace, Undo and the IPC
+  requests (D-24); D-13 did not say.
+- **B-3 Check-path and Re-check write no receipt**: neither changes anything (D-16 says so for
+  Re-check; Add project's check only reads the folder's own entries).
+- **B-4 Two more answer codes** than D-23 lists: `refused` (the process re-check, a missing
+  `Sec-Fetch-Site`, a refused caller; 403) and `unavailable` (no pasteboard without a desktop
+  session; 503).
+- **B-5 Undo of one key from the Secret screen** (`POST /api/keys/{key}/undo`) undoes that key in
+  every project whose record holds it; the Project screen's row uses
+  `POST /api/projects/{slug}/undo {"key"}`. `ms undo` exits 3 when a line was skipped.
+- **B-6 The agent hint block** is removed when a whole-project Undo drops the record (nothing
+  skipped); a per-key Undo leaves it.
+- **B-7 "No other project refers to it":** `ms init` names keys after their project
+  (`shop/…`), and the record check refuses a key of another project, so the case is a key whose
+  other lines in the same project were skipped; the test covers that.
+- **B-8 Activity's "other" agent** is any session that is none of Claude Code, Codex,
+  Terminal, Dashboard and ms dev.
 
 ## Acceptance criteria
 

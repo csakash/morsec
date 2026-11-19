@@ -39,6 +39,7 @@ hex = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 libc = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # LaunchServices: msd opens the dashboard itself (L32 SPEC D-12). Already locked through ms-ipc.

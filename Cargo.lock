@@ -900,6 +900,7 @@ dependencies = [
  "ms-import",
  "ms-rules",
  "ms-vault",
+ "proptest",
  "rustix",
  "serde",
  "sha2",
@@ -1066,6 +1067,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
