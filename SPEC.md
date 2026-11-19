@@ -34,9 +34,12 @@ so it can be reviewed on its own.
   `ms_dash`. The CSRF token lives only in page memory, so a leaked cookie alone reads nothing. A
   custom header also makes every API call need a CORS preflight, which msd never answers.
   Consequence: reloading the page signs it out ("open it again with `ms dashboard`"); the token is
-  never put in storage.
-- **D-5 `DashOpen` is additive.** New `RequestBody::DashOpen` and `ResponseBody::Dash { port,
-  launch_token }`, appended at the end of each enum; `PROTOCOL_VERSION` stays 1 (as L31 did with
+  never put in storage. Review R1: signing in again from the same browser (a second
+  `ms dashboard`, which sends the existing cookie with the new launch token) joins that session and
+  adds a CSRF token (up to 4 per session), so the first tab keeps working; a tab whose token was
+  dropped treats the 403 as "opened again in another tab".
+- **D-5 `DashOpen` is additive.** New `RequestBody::DashOpen { view? }` and `ResponseBody::Dash {
+  port, opened }` (no token: D-12), appended at the end of each enum; `PROTOCOL_VERSION` stays 1 (as L31 did with
   `ProjectSave`). Refused inside an agent session (`Denied`) like `Scan` and approvals. Allowed while
   stopped (the page shows "stopped").
 - **D-6 Scan stays in the CLI.** Running a scan reads every value and needs Touch ID (L11), which is
@@ -50,22 +53,44 @@ so it can be reviewed on its own.
   moves the range to N..N+9 (dev and tests); with `--port P` (dev daemon) the range starts at P+2.
   msd binds before it answers `DashOpen`, and returns the port it holds.
 - **D-9 Receipts for refusals.** A refused connection (agent process tree, other uid, owner not
-  identifiable) and a refused request (Host, Origin, Sec-Fetch-Site, CSRF, cookie, token, body,
-  rate) write a receipt: key `morsec/dashboard`, mode `run`, result `blocked` (reason
+  identifiable) and a refused request whose caller is probing (Host, Origin, launch token, body
+  size) write a receipt: key `morsec/dashboard`, mode `run`, result `blocked` (reason
   `host_not_allowed`: the dashboard is a host that caller may not reach; `ms-core`'s reasons are
   frozen), target `dashboard: <why>`, session = the caller's agent session when there is one (so it
   counts towards that session's LOG-2 alert), else `other("dashboard")` with the owner's PID.
-  At most 30 refusal receipts per session per minute (an agent looping `curl` can't fill the disk);
-  the rest are counted in the log.
+  At most 30 refusal receipts per agent session per minute, and 30 a minute for every other caller
+  together (review S3: those are keyed by PID, which a loop changes). A browser's own cross-site
+  fetch (`Sec-Fetch-Site`), a stale tab's CSRF token, a missing session and a rate limit get a log
+  line only (reviews R1, S4): every caller at that point passed the process check. Log lines are
+  written once per caller and reason per minute, then as a count (review R3: msd's log is not
+  rotated).
 - **D-10 Unauthenticated surface.** Without a session only `GET /`, `/dash.css`, `/dash.js`,
   `/favicon.svg` (static, no data) and `POST /api/session` are served; they share one 20 req/s
-  bucket. Everything else under `/api/` needs the cookie and the CSRF header.
-- **D-11 Opening the browser.** The CLI runs `/usr/bin/open http://127.0.0.1:<port>/#t=<token>[&v=<view>]`.
+  bucket, and so do cookie-less API requests before their 401 (review R3). Everything else under
+  `/api/` needs the cookie and the CSRF header. Request bodies must arrive within 5 s (review S2).
+- **D-11 Opening the browser.** The sign-in URL is `http://127.0.0.1:<port>/#t=<token>[&v=<view>]`.
   The token is in the fragment, so it never reaches a request line, a log or a `Referer`; the page
-  removes it from the address bar with `history.replaceState` before posting it. Debug builds only:
-  `MORSEC_TEST_OPEN=<program>` replaces `open` (tests capture the URL). `ms init` opens it only in
-  project mode, when stdout is a terminal and `--no-open` is not given; otherwise it prints
-  `Dashboard  ms dashboard`. The printed line never contains the token.
+  removes it from the address bar with `history.replaceState` before posting it. `ms init` asks
+  for it only in project mode, when stdout is a terminal and `--no-open` is not given; otherwise it
+  prints `Dashboard  ms dashboard`. Nothing the CLI prints contains a token (it never has one).
+- **D-12 msd opens the browser itself (security review S1; replaces "the CLI runs open(1)").** A
+  prompt-injected agent can run `( prog & )`: prog is reparented to launchd and is no agent session
+  for either the IPC or the TCP check, so a token returned over IPC would let it sign in and read
+  every route. So `DashOpen` never returns the token: msd mints it and hands the URL to
+  LaunchServices (`LSOpenCFURLRef`, `crates/msd/src/open.rs`, CoreFoundation through the
+  already-locked `core-foundation-sys`), and answers `{ port, opened }`. A detached caller can only
+  make the user's own browser sign in. No child process, so the token is in no argv either (the
+  T-71 `open(1)` exposure is gone). msd runs as a LaunchAgent in the user's GUI session; without one
+  LaunchServices fails, msd answers `opened: false` and the CLI prints a plain hint (exit 1).
+  `ms dashboard`, `ms status --open` and `ms init` only send `DashOpen` and print the port. Test
+  hook: `msd --test-open-to FILE` appends the URL to FILE instead; refused unless the build is a
+  debug build and the vault is the memory vault, and the file writer is not compiled into release
+  builds. The view is checked in msd (`project/<a-z0-9->`).
+- **D-13 Activity and receipt reads (reviews R2, R8, S6).** An Activity key filter that is not a
+  valid key name matches nothing; any other filter error shows under the form, which stays
+  usable. msd reads the receipt files for the dashboard once per new record (a cache keyed by the
+  store's next sequence number) and one dashboard request at a time; Verify always reads the
+  files.
 
 ## Acceptance criteria
 
@@ -80,7 +105,9 @@ so it can be reviewed on its own.
    another uid, or an owner that can't be identified gets the connection closed before any byte is
    read or written, plus a `blocked` receipt (D-9).
 4. **`DashOpen`.** Refused with `Denied` inside an agent session. Otherwise starts the listener if
-   needed and returns `{ port, launch_token }`: 32 random bytes (hex), single use, valid 60 s.
+   needed, mints a launch token (32 random bytes, hex, single use, valid 60 s), opens the sign-in
+   URL in the user's browser itself and returns `{ port, opened }`; the token never crosses IPC
+   (D-12).
 5. **Session.** `POST /api/session` with `{"token": "<launch token>"}` (and the request checks of 6)
    answers `Set-Cookie: ms_dash=<32 random bytes>; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`
    and `{"csrf": "<32 random bytes>"}`. A used, expired or unknown token gets 403. Sessions live in
@@ -110,9 +137,10 @@ so it can be reviewed on its own.
     `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval`, `new Function` or string
     `setTimeout`.
 12. **No external URLs.** Assets reference nothing outside the page's own origin (D-1).
-13. **CLI.** `ms dashboard [PROJECT]` asks `DashOpen` and opens the URL with `open(1)`; `ms status
-    --open` does the same after printing status; `ms init` in project mode opens the project's page
-    (D-11). Inside an agent session each says the dashboard can't be opened from there.
+13. **CLI.** `ms dashboard [PROJECT]` sends `DashOpen` and prints the port and whether msd opened
+    it; `ms status --open` does the same after printing status; `ms init` in project mode asks for
+    the project's page (D-11, D-12). Inside an agent session each says the dashboard can't be opened
+    from there and msd opens nothing.
 14. **Parity.** Every clap subcommand of `ms` has a dashboard screen or an entry in the exemption
     list with its reason (L33-owned actions listed as exempt with reason naming L33).
 15. **Docs.** Threat-model rows for the §8 L32 threats naming their tests; `ARI42.md` MCP-3, INJ-3,
@@ -123,18 +151,18 @@ so it can be reviewed on its own.
 | # | Tests |
 |---|---|
 | 1 | `crates/ms-dash/tests/http.rs::dash_open_reports_bound_port`, `crates/ms-dash/tests/http.rs::dash_open_fails_when_range_is_full`, `crates/ms-cli/tests/dashboard.rs::dashboard_opens_the_port_msd_bound` |
-| 2 | `crates/ms-dash/tests/http.rs::dash_closes_when_idle`, `crates/ms-dash/tests/http.rs::dash_shutdown_drops_sessions` |
+| 2 | `crates/ms-dash/tests/http.rs::dash_closes_when_idle`, `crates/ms-dash/tests/http.rs::dash_shutdown_drops_sessions`, `crates/ms-dash/tests/http.rs::dash_closes_when_idle` (a held keep-alive connection closes too) |
 | 3 | `crates/ms-cli/tests/dashboard.rs::dash_refuses_agent_process_tree` (real fake-agent `claude` running `curl`), `crates/msd/src/dash.rs::conn_check_refuses_agent_other_uid_and_unknown`, `crates/msd/src/daemon.rs::refused_connection_writes_blocked_receipt`, `crates/ms-dash/tests/http.rs::refused_connection_gets_no_bytes` |
-| 4 | `crates/msd/src/daemon.rs::dash_open_refused_in_agent_session`, `crates/ms-dash/tests/http.rs::launch_token_single_use`, `crates/ms-dash/tests/http.rs::launch_token_expires` |
-| 5 | `crates/ms-dash/tests/http.rs::session_cookie_attributes`, `crates/ms-dash/tests/http.rs::launch_token_single_use` |
-| 6 | `crates/ms-dash/tests/http.rs::dash_rejects_foreign_host_header`, `crates/ms-dash/tests/http.rs::dash_rejects_cross_origin_post`, `crates/ms-dash/tests/http.rs::api_needs_cookie_and_csrf`, `crates/ms-dash/tests/http.rs::body_limit_and_methods` |
+| 4 | `crates/msd/src/daemon.rs::dash_open_refused_in_agent_session`, `crates/ms-dash/tests/http.rs::launch_token_single_use`, `crates/ms-dash/tests/http.rs::launch_token_expires`, `crates/msd/src/daemon.rs::dash_open_never_returns_token`, `crates/ms-cli/tests/dashboard.rs::detached_process_gets_no_token`, `crates/msd/src/open.rs::test_open_to_needs_the_memory_vault` |
+| 5 | `crates/ms-dash/tests/http.rs::session_cookie_attributes`, `crates/ms-dash/tests/http.rs::launch_token_single_use`, `crates/ms-dash/tests/http.rs::second_open_keeps_the_first_tab`, `crates/ms-dash/src/auth.rs::second_sign_in_joins_the_session` |
+| 6 | `crates/ms-dash/tests/http.rs::dash_rejects_foreign_host_header`, `crates/ms-dash/tests/http.rs::dash_rejects_cross_origin_post`, `crates/ms-dash/tests/http.rs::api_needs_cookie_and_csrf`, `crates/ms-dash/tests/http.rs::body_limit_and_methods`, `crates/ms-dash/tests/http.rs::slow_body_times_out` |
 | 7 | `crates/ms-dash/tests/http.rs::dash_csp_on_every_response` |
-| 8 | `crates/ms-dash/tests/http.rs::rate_limited_per_session` |
+| 8 | `crates/ms-dash/tests/http.rs::rate_limited_per_session`, `crates/ms-dash/src/auth.rs::refusal_throttle`, `crates/ms-dash/src/auth.rs::refusal_log_is_rate_limited` |
 | 9 | `crates/ms-dash/tests/http.rs::api_views_round_trip`, `crates/msd/src/daemon.rs::dashboard_views_from_records`, `crates/ms-dash/src/assets.rs::no_value_action_controls`; browser pass (PROOF, screenshots) |
 | 10 | `crates/msd/src/daemon.rs::dashboard_never_serves_a_canary`, `crates/ms-cli/tests/dashboard.rs::dashboard_end_to_end` (real `ms init` of a fixture with canary values, every API route fetched with curl from outside the agent tree) |
 | 11 | `crates/ms-dash/src/assets.rs::dash_assets_have_no_html_sinks` |
 | 12 | `crates/ms-dash/src/assets.rs::dash_assets_have_no_external_urls` |
-| 13 | `crates/ms-cli/tests/dashboard.rs::dashboard_opens_the_port_msd_bound`, `crates/ms-cli/tests/dashboard.rs::dash_refuses_agent_process_tree` (its `ms dashboard` part), `crates/ms-cli/src/dashboard.rs::url_keeps_token_in_fragment`, `crates/ms-cli/tests/dashboard.rs::dashboard_end_to_end` (`ms init` prints `Dashboard  ms dashboard` with `--no-open`) |
+| 13 | `crates/ms-cli/tests/dashboard.rs::dashboard_opens_the_port_msd_bound`, `crates/ms-cli/tests/dashboard.rs::dash_refuses_agent_process_tree` (its `ms dashboard` part), `crates/ms-cli/tests/dashboard.rs::dashboard_end_to_end` (`ms init` prints `Dashboard  ms dashboard` with `--no-open`), `crates/ms-cli/tests/dashboard.rs::status_open_and_agent_refusals`, `crates/ms-cli/src/dashboard.rs::view_and_line` |
 | 14 | `crates/ms-cli/src/main.rs::dash_parity_covers_every_subcommand`, `crates/ms-dash/src/parity.rs::parity_routes_exist` |
 | 15 | `scripts/threat_model_check.py` (gate), ARI-42 scan (gate) |
 
