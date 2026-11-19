@@ -168,7 +168,7 @@ impl Inner {
 
     /// Logs a refusal: the first per caller and reason per minute, then a count (review R3).
     pub(crate) fn log_refusal(&self, r: &Refusal, receipt: bool) {
-        let key = format!("{:?}/{}:{}", r.session.agent, r.session.pid, r.why);
+        let key = crate::auth::log_key(&r.session, &r.why);
         if let Some(quiet) = lock(&self.state).log.allow(&key, Instant::now()) {
             tracing::warn!(
                 pid = r.session.pid,
@@ -270,6 +270,14 @@ impl Dash {
             .mint_launch(now, inner.cfg.token_ttl)
             .map_err(|e| format!("morsec: no randomness for a launch token: {e}"))?;
         Ok(Opened { port, token })
+    }
+
+    /// The port it listens on and whether a launch token from an earlier open is still unused
+    /// and valid (fix round 2, F2).
+    pub fn pending(&self) -> Option<(u16, bool)> {
+        let mut st = lock(&self.inner.state);
+        let port = st.running.as_ref()?.port;
+        Some((port, st.auth.launch_pending(Instant::now())))
     }
 
     /// The port it listens on, if it does.

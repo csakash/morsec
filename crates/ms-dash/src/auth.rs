@@ -213,6 +213,13 @@ impl Auth {
         self.anon.take(now)
     }
 
+    /// A launch token minted and not yet used is still valid (`DashOpen` then opens no second
+    /// tab: fix round 2, F2).
+    pub fn launch_pending(&mut self, now: Instant) -> bool {
+        self.launch.retain(|_, exp| *exp > now);
+        !self.launch.is_empty()
+    }
+
     /// Drops every token and session (idle close, shutdown).
     pub fn clear(&mut self) {
         self.launch.clear();
@@ -234,8 +241,8 @@ pub struct Throttle {
     seen: HashMap<SessionId, (Instant, u32)>,
 }
 
-/// The key all non-agent refusals share.
-fn family(s: &SessionId) -> SessionId {
+/// The key all non-agent refusals share; an agent session keeps its own.
+pub fn family(s: &SessionId) -> SessionId {
     match &s.agent {
         ms_core::AgentKind::Other(_) => SessionId {
             agent: ms_core::AgentKind::Other("dashboard".into()),
@@ -267,6 +274,13 @@ impl Throttle {
         e.1 += 1;
         true
     }
+}
+
+/// The log-throttle key of a refusal: its [`family`] and reason, so a loop that changes PID with
+/// every request (`while :; do curl …; done`) still shares one key (fix round 2, F1).
+pub fn log_key(session: &SessionId, why: &str) -> String {
+    let f = family(session);
+    format!("{:?}/{}/{}:{why}", f.agent, f.pid, f.started_unix_ms)
 }
 
 /// Log lines for refusals: the first per key per minute, then one count of the rest when the
@@ -393,6 +407,45 @@ mod tests {
         assert!((0..50).all(|_| l.allow("k", now).is_none()));
         assert_eq!(l.allow("other", now), Some(0));
         assert_eq!(l.allow("k", now + Duration::from_secs(61)), Some(50));
+    }
+
+    // protects=fix round 2 F1: refusals from 100 different PIDs outside agent sessions share one
+    // log key, so a curl loop writes one line a minute plus a count; agent sessions keep their own
+    // key; fails_when=a new PID gets its own line; no_claim=-
+    #[test]
+    fn log_key_groups_non_agent_pids() {
+        let mut l = RateLog::default();
+        let now = Instant::now();
+        let lines = (0..100u32)
+            .filter(|i| {
+                let s = SessionId {
+                    agent: AgentKind::Other("dashboard".into()),
+                    pid: 5000 + i,
+                    started_unix_ms: u64::from(*i),
+                };
+                l.allow(&log_key(&s, "the Host header is not this dashboard"), now)
+                    .is_some()
+            })
+            .count();
+        assert_eq!(lines, 1);
+        let any = SessionId {
+            agent: AgentKind::Other("dashboard".into()),
+            pid: 1,
+            started_unix_ms: 1,
+        };
+        assert_eq!(
+            l.allow(
+                &log_key(&any, "the Host header is not this dashboard"),
+                now + Duration::from_secs(61)
+            ),
+            Some(99)
+        );
+        let a = |pid| SessionId {
+            agent: AgentKind::ClaudeCode,
+            pid,
+            started_unix_ms: 1,
+        };
+        assert_ne!(log_key(&a(1), "x"), log_key(&a(2), "x"));
     }
 
     // protects=SPEC D-9, an agent looping requests can't write more than 30 refusal receipts a
