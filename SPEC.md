@@ -60,9 +60,14 @@ ms dev -- npm run dev
   whose name list has the same length.
 - **D-4 One Touch ID for every run (§7.2; review D-A, stricter than the design).** Every
   `DevStart` calls `approve_exact` once, whatever the tiers. The request is bound to the argv
-  `["ms","dev","--project",<slug>,"--root",<root>,"--swap",<swap keys…>,"--env",<VAR=key…>,
-  "--production",<production keys…>,"--other-websites","allowed","--",<argv…>]` and the
-  canonical cwd, so the sheet shows the real command, the keys it may use, each variable that will
+  `["ms","dev","--project",<slug>,"--command(<n> args)",<argv…>,"--root",<root>,"--swap",<swap
+  keys…>,"--env",<VAR=key…>,"--production",<production keys…>,"--other-websites","allowed"]` and
+  the canonical cwd. The command comes right after the project because the Touch ID reason is
+  capped at 480 characters (round 2 F1); a command longer than about 160 sheet characters is cut
+  there with "…(command cut: N more characters)" and the argv ends with
+  `--full-command-sha256 <hex>`, so the approval still binds it exactly. Only a once-scope token
+  is accepted (round 2 F2): `ms dev`'s inline review offers only "once", and an `s` answered in
+  `ms approve` is refused, so the production window (D-4b) stays at the once token's 60 s. so the sheet shows the real command, the keys it may use, each variable that will
   get a value and that other websites are reachable. Values go out only for keys whose rule is
   still exactly the one the sheet was built from (review R1). Why every run: a prompt-injected,
   sandboxed agent can double-fork out of its tree; msd then sees an unattributed process, and
@@ -117,14 +122,21 @@ ms dev -- npm run dev
   that is a provider id, so L31's project keys (`shop/stripe-secret-key`) were never swapped. The
   proxy now takes the provider from the MAC'd project record (`bindings_with`), and a project save
   rebuilds the proxy. A recorded provider counts only when its catalog hosts cover every host of
-  the key's rule (review N1); otherwise the old lookup applies (fails closed for `shop/…`). Test
+  the key's rule (review N1); a key any project record lists never falls back to the
+  first-segment guess (round 2), so a project slugged `stripe` lends Stripe's location to none of
+  its keys; keys in no record keep the old lookup. Test
   `crates/msd/src/proxy.rs::project_keys_bind_with_their_recorded_provider`.
 - **D-13 What ms dev hands out depends on the record and the rule's shape (review S2).** Run
   values go out only for rules shaped exactly as `ms init` makes a database URL's: the project
   root as the only root, no commands, not read-only, no `env` names or the variable among them;
   any other run rule is skipped with a note. `ProjectSave` asks the person when the record adds a
   key that the stored record didn't list and whose rule already allows something (a key made by
-  hand being adopted); the sheet names it ("joins the project"). Fresh keys (allowing nothing)
+  hand being adopted); the sheet names it ("joins the project") and each adopted key gets an
+  approved receipt. `ProjectSave` from a sandboxed process is refused like `DevStart` (round 2
+  F3). Adoption is decided by the key's current rule, not by record membership: deciding by
+  membership would make every new key of an unknown service ask (L31's no-prompt cases), so the
+  two-step case stays a residual (a key joins while it allows nothing, then is loosened with
+  `ms rules`, which needs its own approval; every `ms dev` sheet then lists it again). Fresh keys (allowing nothing)
   join without a prompt; re-saving the same keys asks nothing, so `reinit_is_idempotent` is
   unchanged, and `orphaned_keys_are_adopted_on_reinit` is unchanged too (orphans are fresh and get
   their first rules in the same approval).
@@ -133,6 +145,8 @@ ms dev -- npm run dev
   oversized value is skipped with a note; `ms dev` lists only variables it really set; signals are
   forwarded only to a child that is not reaped (polled with `try_wait`); value receipts carry the
   rules version in force after the approval. A session's end (`DevEnd`, reaper) leaves a receipt.
+  Round 2: a stop check also runs right after the approval, before any value is read (F4); the
+  reaper decides liveness once per session, so each removed session gets its end receipt (F5).
 
 ## Behaviour
 
@@ -170,7 +184,8 @@ ms dev -- npm run dev
 | 6 | Values are returned only for run-mode keys of the cwd's project whose rule is shaped as `ms init` makes it; never for swap keys, other projects' keys, hand-changed run rules, empty values or outside a project; never in a JSON frame | `crates/msd/src/daemon/dev_tests.rs::dev_run_mode_values_only_for_project_keys`, `crates/ms-ipc/tests/ipc.rs::values_follow_dev_started_as_raw_frames` |
 | 7 | Every `ms dev` run asks one Touch ID, bound to the command, keys, variables and open egress; production swaps of that run use it without another prompt only while it is live and within the key's session length; a key outside the project is denied; denial starts nothing | `crates/msd/src/daemon/dev_tests.rs::dev_production_needs_one_approval`, `crates/ms-approve/src/broker.rs::is_live_after_use_until_revoked` |
 | 7b | A key whose rule changes while the sheet is up gets no value | `crates/msd/src/daemon/dev_tests.rs::dev_values_follow_the_rules_the_person_saw` |
-| 7c | `ProjectSave` asks the person to adopt a key that already allows something | `crates/msd/src/daemon/dev_tests.rs::project_save_asks_to_adopt_a_key_that_allows_something` |
+| 7d | The sheet shows the command first, a huge command cut with a marker and bound by its hash; a session-scope (`s`) approval starts nothing | `crates/msd/src/daemon/dev_tests.rs::dev_sheet_shows_the_command_first`, `crates/msd/src/daemon/dev_tests.rs::dev_refuses_a_session_scope_approval`, `crates/ms-cli/src/approve.rs::once_only_review_never_approves_a_session` |
+| 7c | `ProjectSave` asks the person to adopt a key that already allows something; refused from a sandboxed process | `crates/msd/src/daemon/dev_tests.rs::project_save_asks_to_adopt_a_key_that_allows_something` |
 | 8 | End to end: a child of `ms dev` calls a fake Stripe upstream over HTTPS with an `ms://` ref through `HTTPS_PROXY`, and the upstream receives the canary; the child gets the run-mode value in its environment; the canary is in none of `ms dev`'s output, receipts, msd's log or IPC replies; the session's end is recorded when the command exits and its credential is refused afterwards | `tests/e2e/tests/canary.rs::dev_swaps_for_the_users_own_command` |
 | 9 | Node older than 24 is warned about; env names and output never carry a value | `crates/ms-cli/src/dev.rs::node_version_warning`, `crates/ms-cli/src/dev.rs::child_env_is_built_from_names` |
 | 10 | Dev sessions may tunnel to unbound hosts; agents still can't | `crates/ms-proxy/src/itests.rs::open_egress_only_for_sessions_that_have_it` |
@@ -196,6 +211,8 @@ with `HTTPS_PROXY` (no Node 24 in the gate; noted in PROOF).
   in the dev tree gets the run-mode values in its environment and, if not named like an agent,
   is served as the dev session.
 - At most 64 dev sessions at once (global); filling them needs an approval per session (review N3).
+- Two-step adoption: a key can join a project's record while it allows nothing (no prompt) and be
+  loosened later with `ms rules` (its own approval); each `ms dev` sheet then lists it.
 
 ## Out of scope
 
