@@ -970,6 +970,15 @@ fn preview_view(p: &Prepared, command: String) -> ProjectPreviewView {
     let mut keys: Vec<ProjectKeyView> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut files = Vec::new();
+    // Refs the earlier record already lists are not new: only orphans an earlier run left are
+    // shown (QA: a re-scan listed protected keys as needing a website).
+    let known: std::collections::BTreeSet<KeyName> = p
+        .previous
+        .as_ref()
+        .map(ProjectRecord::keys)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     for (i, f) in p.files.iter().enumerate() {
         let mut v = ProjectFileView {
             path: setup::safe_text(&f.rel),
@@ -994,13 +1003,6 @@ fn preview_view(p: &Prepared, command: String) -> ProjectPreviewView {
                 }
             }
         }
-        // Refs the earlier record already lists are not new: only orphans an earlier run left
-        // are shown (QA: a re-scan listed protected keys as needing a website).
-        let known: Vec<KeyName> = p
-            .previous
-            .as_ref()
-            .map(ProjectRecord::keys)
-            .unwrap_or_default();
         for a in p.adopted.get(i).into_iter().flatten() {
             if !known.contains(&a.key) && seen.insert(a.key.clone()) {
                 keys.push(key_view(p, &a.key, a.provider.clone(), None));
