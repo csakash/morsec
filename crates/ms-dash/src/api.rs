@@ -98,6 +98,8 @@ pub struct KeyRow {
     pub ready: bool,
     /// The key is in the vault.
     pub stored: bool,
+    /// `protected`, `needs a website`, `needs a command`, `not stored`.
+    pub status: String,
     /// Hosts (swap) or roots (run).
     pub targets: Vec<String>,
 }
@@ -146,7 +148,7 @@ pub struct SecretRow {
     pub tier: Option<String>,
     /// Mode, when the key has a rule.
     pub mode: Option<String>,
-    /// `protected`, `needs a website`, `not stored`.
+    /// `protected`, `needs a website`, `needs a command`, `not stored`.
     pub status: String,
     /// The last receipt for the key, Unix ms.
     pub last_use_unix_ms: Option<u64>,
@@ -192,6 +194,8 @@ pub struct SecretView {
     pub stored: bool,
     /// The rule allows something.
     pub ready: bool,
+    /// `protected`, `needs a website`, `needs a command`, `not stored`.
+    pub status: String,
     /// Swap hosts.
     pub hosts: Vec<String>,
     /// Git hosts (Basic password).

@@ -180,6 +180,10 @@ pub enum RequestBody {
         /// The project's slug.
         slug: String,
     },
+    /// Start the local dashboard if it is not listening, and mint a single-use launch token for
+    /// it (L32 dash-core, design §5.3 and §6.2.2). Refused inside an agent session. Answered with
+    /// [`ResponseBody::Dash`].
+    DashOpen,
 }
 
 /// What an approval covers (L11, PRD §7.2).
@@ -246,6 +250,7 @@ impl RequestBody {
             RequestBody::ProjectSave { .. }
             | RequestBody::ProjectList
             | RequestBody::ProjectGet { .. } => "L31 guided-init",
+            RequestBody::DashOpen => "L32 dash-core",
         }
     }
 }
@@ -540,6 +545,15 @@ pub enum ResponseBody {
         code: ErrorCode,
         /// Text, including the fix.
         message: String,
+    },
+    /// The dashboard is listening (`DashOpen`, L32). The CLI opens
+    /// `http://127.0.0.1:<port>/#t=<launch_token>`: the token stays in the URL fragment.
+    Dash {
+        /// The port msd holds on 127.0.0.1.
+        port: u16,
+        /// Single use, valid 60 s; 64 hex characters. Not a secret value: it opens a read-only
+        /// page, and only once.
+        launch_token: String,
     },
 }
 

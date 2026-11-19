@@ -74,7 +74,7 @@
   }
   function badge(s, kind) { return txt('span', 'badge' + (kind ? ' ' + kind : ''), s); }
   function status(s) {
-    const cls = s === 'protected' ? 'st-protected' : s === 'needs a website' ? 'st-needs' : '';
+    const cls = s === 'protected' ? 'st-protected' : /^needs |^not stored/.test(String(s)) ? 'st-needs' : '';
     return txt('span', cls, s);
   }
   function result(s) { return txt('span', 'st-' + String(s).replace(/[^a-z]/g, ''), s); }
@@ -225,7 +225,7 @@
     } else {
       out.appendChild(table(['Key', 'Mode', 'Tier', 'Status', 'Hosts or folders'], v.loose.map(function (k) {
         return [link('/secret/' + enc(k.key), k.key, 'mono'), k.mode || '', k.tier || '',
-          status(!k.stored ? 'not stored' : k.ready ? 'protected' : 'needs a website'), k.targets.join(', ')];
+          status(k.status), k.targets.join(', ')];
       })));
     }
     return out;
@@ -248,8 +248,8 @@
         return [mono(r.var), mono(r.file + ':' + r.line), link('/secret/' + enc(r.key), r.key, 'mono'),
           r.provider || '', r.tier || '', r.mode || '', status(r.status), when(r.last_use_unix_ms)];
       })));
-      if (p.rows.some(function (r) { return r.status === 'needs a website'; })) {
-        out.appendChild(el('p', 'muted', 'A key that needs a website is never sent anywhere until you add its host: ', cmd('ms rules KEY --add-host HOST')));
+      if (p.rows.some(function (r) { return /^needs /.test(r.status); })) {
+        out.appendChild(el('p', 'muted', 'A key that needs a website or a command is never used until you add one: ', cmd('ms rules KEY --add-host HOST')));
       }
     }
     out.appendChild(txt('h2', null, 'Keys written into code'));
@@ -283,7 +283,7 @@
       ['Tier', s.tier || 'no rule'],
       ['Mode', s.mode || 'no rule'],
       ['Value', txt('span', 'muted', s.stored ? 'hidden (never sent to this page)' : 'not in the vault')],
-      ['Status', status(!s.stored ? 'not stored' : s.ready ? 'protected' : 'needs a website')],
+      ['Status', status(s.status)],
       ['Added', when(s.created_unix_ms)],
       ['Hosts', s.hosts.length ? mono(s.hosts.join(', ')) : txt('span', 'muted', 'none')],
       ['Git hosts', s.git_hosts.length ? mono(s.git_hosts.join(', ')) : txt('span', 'muted', 'none')],

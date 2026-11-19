@@ -28,6 +28,8 @@ ms-scan = { workspace = true }
 ms-projects = { workspace = true }
 ms-run = { workspace = true }
 ms-mcp = { workspace = true }
+ms-dash = { workspace = true }
+ms-connect = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

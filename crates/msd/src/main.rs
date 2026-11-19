@@ -14,6 +14,7 @@
 mod approve;
 mod backend;
 mod daemon;
+mod dash;
 mod doctor;
 mod drift;
 mod paths;
@@ -76,6 +77,10 @@ struct Args {
     /// Swap proxy port on 127.0.0.1.
     #[arg(long)]
     proxy_port: Option<u16>,
+    /// First port the dashboard tries on 127.0.0.1 (it tries ten). Default 7311; with --port P,
+    /// P+2 (L32).
+    #[arg(long)]
+    dash_port: Option<u16>,
     /// Vault backend.
     #[arg(long, value_enum)]
     vault: Option<VaultKind>,
@@ -445,6 +450,12 @@ async fn serve(args: Args) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let dash_port = args
+        .dash_port
+        .or_else(|| args.port.and_then(|p| p.checked_add(2)))
+        .unwrap_or(ms_dash::DEFAULT_PORT);
+    // Not listening until the first DashOpen (design §6.1).
+    dash::install(&d, ms_dash::DashConfig::new(dash_port), uid);
     let (stop_tx, stop_rx) = watch::channel(false);
     let proxy_task = tokio::spawn(proxy::supervise(d.clone(), stop_rx.clone(), test_hook));
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
@@ -460,11 +471,14 @@ async fn serve(args: Args) -> ExitCode {
     );
     server
         .serve(
-            Arc::new(IpcHandler(d)),
+            Arc::new(IpcHandler(d.clone())),
             Arc::new(SessionPeerCheck::new(uid)),
             shutdown_signal(),
         )
         .await;
+    if let Some(dash) = d.dash() {
+        dash.shutdown();
+    }
     let _ = stop_tx.send(true);
     let _ = proxy_task.await;
     ExitCode::SUCCESS

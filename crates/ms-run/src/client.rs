@@ -213,6 +213,7 @@ fn kind(r: &ResponseBody) -> &'static str {
         ResponseBody::Projects { .. } => "projects",
         ResponseBody::Project { .. } => "project",
         ResponseBody::Error { .. } => "error",
+        ResponseBody::Dash { .. } => "dashboard",
     }
 }
 
