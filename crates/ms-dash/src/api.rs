@@ -22,12 +22,17 @@ pub struct HomeView {
     pub projects: u32,
     /// Keys whose rule allows something.
     pub protected: u32,
-    /// Keys whose rule still allows nothing (no known service yet).
+    /// Keys that are not usable yet: their rule allows nothing (they need a website or a
+    /// command), shown as "Not usable yet" (SPEC D-7).
     pub needs_website: u32,
+    /// The first few of them, for Home's "Needs you" (SPEC D-6).
+    pub not_usable: Vec<KeyRow>,
     /// Blocked receipts in the last 24 h.
     pub blocked_24h: u64,
-    /// Things to look at (tampered rules, settings drift…).
+    /// Things to look at (tampered rules, settings drift…), as `ms status` prints them.
     pub alerts: Vec<String>,
+    /// The same alerts in plain words, each with its fix (SPEC D-10).
+    pub warnings: Vec<WarningView>,
     /// The request waiting for a person, if any.
     pub pending: Option<PendingView>,
     /// Supported agents.
@@ -36,21 +41,57 @@ pub struct HomeView {
     pub projects_unreadable: bool,
 }
 
-/// The approval waiting for a person. Shown, never answered here (L33).
+/// A warning in plain words with what fixes it (SPEC D-10).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WarningView {
+    /// Stable for one alert: a hash of its kind and text.
+    pub id: String,
+    /// One line.
+    pub title: String,
+    /// What it means.
+    pub detail: String,
+    /// What fixes it, in order: buttons the page can press, then commands to copy.
+    pub fix: Vec<FixView>,
+    /// It is informational, so Dismiss is offered.
+    pub dismiss: bool,
+}
+
+/// One fix: an action route with its label, or a shell command to copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FixView {
+    /// An action route (`/api/agents/recheck`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// The button's label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// A command to copy (`ms doctor`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// The approval waiting for a person (SPEC D-11). Every string is rendered inert by msd, as
+/// `ms approve` shows it, and never cut.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PendingView {
+    /// The id a decision must name.
+    pub id: String,
     /// Agent label.
     pub agent: String,
     /// Key.
     pub key: String,
     /// `test` or `production`.
     pub tier: String,
-    /// The exact command, one element per argument.
+    /// The exact command, one quoted argument per element.
     pub command: Vec<String>,
-    /// Working directory.
+    /// Working directory, quoted.
     pub cwd: String,
+    /// What it will do, when the request says.
+    pub effect: Option<String>,
     /// When it times out, Unix ms.
     pub expires_unix_ms: u64,
+    /// A Touch ID sheet is already up for it (a dashboard action, or `ms approve` deciding).
+    pub deciding: bool,
 }
 
 /// Projects (`GET /api/projects`).
@@ -129,6 +170,13 @@ pub struct ProjectView {
     pub committed: Vec<CommittedView>,
     /// Agent hint blocks written (`CLAUDE.md`, `AGENTS.md`).
     pub hints: Vec<String>,
+    /// Secrets whose key is not usable yet.
+    pub not_usable: u32,
+    /// `cd '<root>' && ms dev -- npm run dev`, quoted by msd (absent when the root can't be
+    /// quoted safely).
+    pub dev_command: Option<String>,
+    /// `cd '<root>' && ms init`, the re-scan.
+    pub rescan_command: Option<String>,
 }
 
 /// One variable of a project's env file.
@@ -262,6 +310,8 @@ pub struct ActivityView {
     pub matched: usize,
     /// Records in all.
     pub total: usize,
+    /// Project slugs, for the Project filter.
+    pub projects: Vec<String>,
 }
 
 /// One receipt or alert, as `ms log` shows it (targets are redacted before they are written).
@@ -311,6 +361,8 @@ pub struct AgentsView {
     pub agents: Vec<AgentView>,
     /// msd's own checks.
     pub checks: Vec<CheckView>,
+    /// msd's warnings, with their fixes (SPEC D-10).
+    pub warnings: Vec<WarningView>,
 }
 
 /// One supported agent.
@@ -330,6 +382,8 @@ pub struct AgentView {
     pub blocked: u64,
     /// Its last receipt, Unix ms.
     pub last_seen_unix_ms: Option<u64>,
+    /// `ms connect <id>` or `ms disconnect <id>`, for the page to copy (SPEC D-16).
+    pub command: String,
 }
 
 /// One check.
@@ -346,6 +400,10 @@ pub struct CheckView {
 pub struct ScanView {
     /// The last scan msd ran since it started, if any.
     pub last: Option<ScanSnapshot>,
+    /// A scan the dashboard started is running (SPEC D-18).
+    pub running: bool,
+    /// Why the last scan the dashboard started failed, if it did.
+    pub error: Option<String>,
 }
 
 /// A transcript leak scan's result: where values were found, never the values.

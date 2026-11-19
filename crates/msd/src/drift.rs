@@ -95,10 +95,20 @@ pub async fn watch_loop(d: Arc<Daemon>, home: PathBuf, mut shutdown: watch::Rece
         };
         for p in checked {
             tracing::warn!(path = %p.display(), "connector settings changed");
-            d.alert(format!(
-                "{} changed while morsec was running; check that the agent still routes through morsec (ms doctor)",
-                p.display()
-            ));
+            let fingerprint = seen
+                .iter()
+                .find(|(q, _)| *q == p)
+                .and_then(|(_, f)| f.clone());
+            d.alert(
+                crate::daemon::AlertKind::SettingsChanged {
+                    path: p.clone(),
+                    fingerprint,
+                },
+                format!(
+                    "{} changed while morsec was running; check that the agent still routes through morsec (ms doctor)",
+                    p.display()
+                ),
+            );
         }
     }
 }

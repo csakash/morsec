@@ -107,9 +107,14 @@ pub fn install_with(
     check: crate::daemon::ConnChecker,
     opener: crate::open::Opener,
 ) {
-    let source = DashSource::new(d, check);
+    let source = Arc::new(DashSource::new(d, check));
     d.set_dash(
-        Dash::new(cfg, Arc::new(source), tokio::runtime::Handle::current()),
+        Dash::with_actions(
+            cfg,
+            source.clone(),
+            Some(source),
+            tokio::runtime::Handle::current(),
+        ),
         opener,
     );
 }

@@ -1,6 +1,7 @@
 //! One HTTP request: the checks of design §6.2.4 in order, then the route. Every response, the
 //! refusals included, goes through [`finish`], which sets the headers of §6.2.5.
 
+use std::net::SocketAddr;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -11,6 +12,10 @@ use hyper::body::Incoming;
 use ms_core::{KeyName, SessionId};
 use serde::Deserialize;
 
+use crate::actions::{
+    Action, ActionCode, ActionError, ActionOk, Actor, ModeArg, NewKey, Revealed, RuleEdit, TierArg,
+    match_route, valid_id, valid_slug,
+};
 use crate::api::{ExportFormat, parse_activity_query};
 use crate::assets;
 use crate::auth::Access;
@@ -175,13 +180,25 @@ async fn refuse(inner: &Inner, who: &SessionId, status: StatusCode, why: &str) -
     json_error(status, &format!("morsec: refused: {why}"))
 }
 
+/// The connection a request came on.
+#[derive(Debug, Clone, Copy)]
+pub struct Conn {
+    /// The port the dashboard holds.
+    pub port: u16,
+    /// The client's address.
+    pub peer: SocketAddr,
+    /// The listener's address.
+    pub local: SocketAddr,
+}
+
 /// Handles one request on a connection that passed the process check.
 pub async fn handle(
     inner: &Inner,
-    port: u16,
+    conn: Conn,
     who: &SessionId,
     req: hyper::Request<Incoming>,
 ) -> Resp {
+    let port = conn.port;
     let (parts, body) = req.into_parts();
     let h = &parts.headers;
     if !host_ok(h, port) {
@@ -364,10 +381,416 @@ pub async fn handle(
         }
     }
     if post {
-        // L32 is read-only: no action exists (SPEC D-3).
-        return json_error(StatusCode::NOT_FOUND, "morsec: no such action");
+        let Some(cookie) = cookie else {
+            return json_error(StatusCode::UNAUTHORIZED, "morsec: no dashboard session");
+        };
+        return route_action(inner, conn, who, h, path, &cookie, body_bytes, now).await;
     }
     route_get(inner, path, query).await
+}
+
+/// An action that did not happen, as `{"error", "code"}` with the code's status.
+fn action_error(e: &ActionError) -> Resp {
+    let body = serde_json::json!({ "error": e.message, "code": e.code })
+        .to_string()
+        .into_bytes();
+    finish(
+        StatusCode::from_u16(e.code.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        "application/json",
+        body,
+    )
+}
+
+/// `{"ok": true, "message", <extra>}`.
+fn action_ok(ok: &ActionOk, extra: Option<(&str, serde_json::Value)>) -> Resp {
+    let mut v = serde_json::json!({ "ok": true, "message": ok.message });
+    if let (Some((k, x)), Some(m)) = (extra, v.as_object_mut()) {
+        m.insert(k.to_owned(), x);
+    }
+    finish(
+        StatusCode::OK,
+        "application/json",
+        v.to_string().into_bytes(),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Empty {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveReq {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathReq {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RulesReq {
+    edit: RuleEdit,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValueReq {
+    value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddReq {
+    key: String,
+    value: String,
+    mode: ModeArg,
+    tier: TierArg,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteReq {
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UndoReq {
+    #[serde(default)]
+    key: Option<String>,
+}
+
+/// A parsed action request: the route's parameter and body, checked.
+enum Call {
+    Stop,
+    Start,
+    Approve(String, bool),
+    Deny(String),
+    Dismiss(String),
+    Recheck,
+    ScanRun,
+    CheckPath(String),
+    Rules(KeyName, RuleEdit),
+    Show(KeyName),
+    Copy(KeyName),
+    Replace(KeyName, ms_core::SecretBytes),
+    Add(NewKey),
+    Delete(KeyName, bool),
+    UndoKey(KeyName),
+    UndoProject(String, Option<KeyName>),
+}
+
+fn key_param(raw: Option<&str>) -> Option<KeyName> {
+    raw.and_then(crate::api::percent_decode)
+        .and_then(|s| KeyName::new(&s).ok())
+}
+
+/// The key the request names, for receipts of refusals.
+fn key_of(action: Action, raw: Option<&str>) -> Option<KeyName> {
+    match action {
+        Action::Rules
+        | Action::Show
+        | Action::Copy
+        | Action::Replace
+        | Action::Delete
+        | Action::UndoKey => key_param(raw),
+        _ => None,
+    }
+}
+
+fn parse_call(action: Action, raw: Option<&str>, body: &[u8]) -> Result<Call, String> {
+    fn body_of<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, String> {
+        serde_json::from_slice(b)
+            .map_err(|e| format!("morsec: the request body is not as expected ({e})"))
+    }
+    let key = || key_param(raw).ok_or_else(|| "morsec: that is not a key name".to_owned());
+    let id = || {
+        raw.filter(|i| valid_id(i))
+            .map(str::to_owned)
+            .ok_or_else(|| "morsec: that is not a request id".to_owned())
+    };
+    Ok(match action {
+        Action::Stop => body_of::<Empty>(body).map(|_| Call::Stop)?,
+        Action::Start => body_of::<Empty>(body).map(|_| Call::Start)?,
+        Action::Approve => {
+            let r: ApproveReq = body_of(body)?;
+            let session = match r.scope.as_deref() {
+                None | Some("once") => false,
+                Some("session") => true,
+                Some(_) => return Err("morsec: scope is once or session".into()),
+            };
+            Call::Approve(id()?, session)
+        }
+        Action::Deny => body_of::<Empty>(body).and_then(|_| Ok(Call::Deny(id()?)))?,
+        Action::Dismiss => body_of::<Empty>(body).and_then(|_| Ok(Call::Dismiss(id()?)))?,
+        Action::Recheck => body_of::<Empty>(body).map(|_| Call::Recheck)?,
+        Action::ScanRun => body_of::<Empty>(body).map(|_| Call::ScanRun)?,
+        Action::CheckPath => {
+            let r: PathReq = body_of(body)?;
+            if r.path.is_empty() || r.path.len() > 4096 {
+                return Err("morsec: give the folder's full path".into());
+            }
+            Call::CheckPath(r.path)
+        }
+        Action::Rules => {
+            let r: RulesReq = body_of(body)?;
+            Call::Rules(key()?, r.edit)
+        }
+        Action::Show => body_of::<Empty>(body).and_then(|_| Ok(Call::Show(key()?)))?,
+        Action::Copy => body_of::<Empty>(body).and_then(|_| Ok(Call::Copy(key()?)))?,
+        Action::Replace => {
+            let r: ValueReq = body_of(body)?;
+            Call::Replace(key()?, ms_core::SecretBytes::new(r.value.into_bytes()))
+        }
+        Action::AddKey => {
+            let r: AddReq = body_of(body)?;
+            let key = KeyName::new(&r.key).map_err(|e| format!("morsec: {e}"))?;
+            Call::Add(NewKey {
+                key,
+                value: ms_core::SecretBytes::new(r.value.into_bytes()),
+                mode: r.mode.into(),
+                tier: r.tier.into(),
+            })
+        }
+        Action::Delete => {
+            let r: DeleteReq = body_of(body)?;
+            Call::Delete(key()?, r.force)
+        }
+        Action::UndoKey => body_of::<Empty>(body).and_then(|_| Ok(Call::UndoKey(key()?)))?,
+        Action::UndoProject => {
+            let r: UndoReq = body_of(body)?;
+            let slug = raw
+                .filter(|s| valid_slug(s))
+                .ok_or_else(|| "morsec: that is not a project name".to_owned())?;
+            let k = match r.key {
+                Some(k) => Some(KeyName::new(&k).map_err(|e| format!("morsec: {e}"))?),
+                None => None,
+            };
+            Call::UndoProject(slug.to_owned(), k)
+        }
+    })
+}
+
+/// An action request that passed the envelope (L33 SPEC D-22): the action bucket, the
+/// `Sec-Fetch-Site` requirement for value and destructive routes, the request-time process
+/// re-check, then the call itself on a blocking thread.
+#[allow(clippy::too_many_arguments)]
+async fn route_action(
+    inner: &Inner,
+    conn: Conn,
+    who: &SessionId,
+    h: &HeaderMap,
+    path: &str,
+    cookie: &str,
+    body: Bytes,
+    now: Instant,
+) -> Resp {
+    let Some((action, raw)) = match_route(path) else {
+        return json_error(StatusCode::NOT_FOUND, "morsec: no such action");
+    };
+    let Some(acts) = inner.actions() else {
+        return json_error(StatusCode::NOT_FOUND, "morsec: no such action");
+    };
+    let actor = Actor {
+        session: who.clone(),
+        peer: conn.peer,
+        local: conn.local,
+    };
+    let key = key_of(action, raw.as_deref());
+    if !inner.take_action(cookie, now) {
+        inner
+            .refused_action(&actor, action, key, "over 30 actions a minute")
+            .await;
+        return action_error(&ActionError::new(
+            ActionCode::RateLimited,
+            "morsec: over 30 actions a minute. Wait a minute and try again",
+        ));
+    }
+    if action.sensitive() && header(h, "sec-fetch-site") != Some("same-origin") {
+        inner
+            .refused_action(
+                &actor,
+                action,
+                key,
+                "Sec-Fetch-Site: same-origin is missing",
+            )
+            .await;
+        return action_error(&ActionError::new(
+            ActionCode::Refused,
+            "morsec: refused: this action is only taken from the dashboard page in a browser",
+        ));
+    }
+    // The connection's process, checked again now (SPEC D-22): an agent that took over the
+    // browser's connection, or a reused port, is refused before anything happens.
+    let data = inner.data();
+    let (peer, local) = (conn.peer, conn.local);
+    let again = tokio::task::spawn_blocking(move || data.check_connection(peer, local)).await;
+    match again {
+        Ok(Ok(now_who))
+            if now_who.pid == who.pid && now_who.started_unix_ms == who.started_unix_ms => {}
+        Ok(Ok(_)) => {
+            return refuse(
+                inner,
+                who,
+                StatusCode::FORBIDDEN,
+                "the connection's process changed since it connected",
+            )
+            .await;
+        }
+        Ok(Err(r)) => {
+            let why = r.why.clone();
+            inner.refused(r).await;
+            return json_error(StatusCode::FORBIDDEN, &format!("morsec: refused: {why}"));
+        }
+        Err(_) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "morsec: the dashboard failed handling this request",
+            );
+        }
+    }
+    let call = match parse_call(action, raw.as_deref(), &body) {
+        Ok(c) => c,
+        Err(m) => {
+            inner
+                .refused_action(&actor, action, key, "invalid request")
+                .await;
+            return action_error(&ActionError::new(ActionCode::Invalid, m));
+        }
+    };
+    drop(body);
+    let out = tokio::task::spawn_blocking(move || -> Resp {
+        let done = |r: Result<ActionOk, ActionError>| match r {
+            Ok(ok) => action_ok(&ok, None),
+            Err(e) => action_error(&e),
+        };
+        let a = &actor;
+        match call {
+            Call::Stop => done(acts.stop(a)),
+            Call::Start => done(acts.start(a)),
+            Call::Approve(id, session) => done(acts.approve(a, &id, session)),
+            Call::Deny(id) => done(acts.deny(a, &id)),
+            Call::Dismiss(id) => done(acts.dismiss(a, &id)),
+            Call::Recheck => match acts.recheck(a) {
+                Ok(v) => action_ok(
+                    &ActionOk::new("checked again"),
+                    serde_json::to_value(&v).ok().map(|v| ("agents", v)),
+                ),
+                Err(e) => action_error(&e),
+            },
+            Call::ScanRun => match acts.scan_run(a) {
+                Ok(ok) => {
+                    let mut r = action_ok(&ok, Some(("started", serde_json::Value::Bool(true))));
+                    *r.status_mut() = StatusCode::ACCEPTED;
+                    r
+                }
+                Err(e) => action_error(&e),
+            },
+            Call::CheckPath(p) => match acts.check_path(a, &p) {
+                Ok(c) => action_ok(
+                    &ActionOk::new(if c.ok { "checked" } else { "refused" }),
+                    serde_json::to_value(&c).ok().map(|v| ("check", v)),
+                ),
+                Err(e) => action_error(&e),
+            },
+            Call::Rules(k, e) => done(acts.rules(a, &k, &e)),
+            Call::Show(k) => match acts.show(a, &k) {
+                Ok(v) => reveal_response(&k, v),
+                Err(e) => action_error(&e),
+            },
+            Call::Copy(k) => done(acts.copy(a, &k)),
+            Call::Replace(k, v) => done(acts.replace(a, &k, v)),
+            Call::Add(n) => done(acts.add_key(a, n)),
+            Call::Delete(k, force) => done(acts.delete(a, &k, force)),
+            Call::UndoKey(k) => undo_answer(acts.undo(a, None, Some(&k))),
+            Call::UndoProject(slug, k) => undo_answer(acts.undo(a, Some(&slug), k.as_ref())),
+        }
+    })
+    .await;
+    out.unwrap_or_else(|_| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "morsec: the dashboard failed handling this request",
+        )
+    })
+}
+
+fn undo_answer(r: Result<crate::actions::UndoView, ActionError>) -> Resp {
+    match r {
+        Ok(v) => action_ok(
+            &ActionOk::new(v.message.clone()),
+            serde_json::to_value(&v).ok().map(|v| ("undo", v)),
+        ),
+        Err(e) => action_error(&e),
+    }
+}
+
+/// Appends `s` to `out` as the inside of a JSON string.
+fn push_json_str(out: &mut Vec<u8>, s: &str) {
+    for c in s.chars() {
+        match c {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => {
+                let code = c as u32;
+                let hex = b"0123456789abcdef";
+                out.extend_from_slice(b"\\u");
+                for shift in [12, 8, 4, 0] {
+                    out.push(hex[((code >> shift) & 0xf) as usize]);
+                }
+            }
+            c => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+}
+
+/// Owns the response body of a Show and wipes it when hyper drops the body.
+struct WipedBody(zeroize::Zeroizing<Vec<u8>>);
+
+impl AsRef<[u8]> for WipedBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// The one place a value is written into a response (SPEC D-12, D-23): `{"key", "value",
+/// "hide_after_ms": 15000}`, built by hand into a buffer that is zeroized when hyper drops the
+/// body (reserved up front so it never reallocates and leaves a copy behind), with
+/// `Cache-Control: no-store` like every response. A value that is not UTF-8 is refused (409).
+pub fn reveal_response(key: &KeyName, v: Revealed) -> Resp {
+    let Ok(text) = std::str::from_utf8(v.0.expose()) else {
+        return action_error(&ActionError::new(
+            ActionCode::NotText,
+            "morsec: this value is not text, so it can't be shown. Use it through morsec as it is",
+        ));
+    };
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(
+        text.len() * 6 + key.as_str().len() * 6 + 64,
+    ));
+    out.extend_from_slice(b"{\"key\":\"");
+    push_json_str(&mut out, key.as_str());
+    out.extend_from_slice(b"\",\"value\":\"");
+    push_json_str(&mut out, text);
+    out.extend_from_slice(b"\",\"hide_after_ms\":15000}");
+    drop(v);
+    let body = Bytes::from_owner(WipedBody(out));
+    let mut r = Response::new(Full::new(body));
+    *r.status_mut() = StatusCode::OK;
+    let h = r.headers_mut();
+    for (k, v) in security_headers() {
+        h.insert(k, HeaderValue::from_static(v));
+    }
+    h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    r
 }
 
 /// The read-only API.

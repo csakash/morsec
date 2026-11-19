@@ -33,6 +33,8 @@ const MAX_ROWS: usize = 1000;
 const DASH_OPEN_GAP: std::time::Duration = std::time::Duration::from_secs(3);
 /// Uses shown on the Secret screen.
 const SECRET_USES: usize = 20;
+/// Keys not usable yet that Home lists ("and N more" links to Projects).
+const HOME_NOT_USABLE: usize = 5;
 
 fn key(raw: &str) -> KeyName {
     KeyName::new(raw).unwrap_or_else(|_| unreachable!("constant key name is valid"))
@@ -95,6 +97,15 @@ fn row(r: &StoredRecord) -> Option<ActivityRow> {
             reason: None,
         }),
         Entry::Checkpoint(_) => None,
+    }
+}
+
+/// An agent the Activity filter has no name for.
+fn is_other_agent(a: &ms_core::AgentKind) -> bool {
+    match a {
+        ms_core::AgentKind::Other(n) => !matches!(n.as_str(), "terminal" | "dashboard" | "ms-dev"),
+        ms_core::AgentKind::Cursor | ms_core::AgentKind::GeminiCli => true,
+        _ => false,
     }
 }
 
@@ -206,7 +217,7 @@ impl Daemon {
     }
 
     /// The project records, or why they can't be shown (fails closed, like `ms projects`).
-    fn dash_projects(&self) -> Result<ProjectsFile, String> {
+    pub(super) fn dash_projects(&self) -> Result<ProjectsFile, String> {
         self.load_projects().map(|(f, _)| f).map_err(|r| match r {
             ResponseBody::Error { message, .. } => message,
             _ => "morsec: the project records can't be read".into(),
@@ -282,6 +293,10 @@ impl Daemon {
                 sessions,
                 blocked,
                 last_seen_unix_ms: last_seen(id),
+                command: format!(
+                    "ms {} {id}",
+                    if connected { "disconnect" } else { "connect" }
+                ),
             }
         })
         .collect()
@@ -310,10 +325,12 @@ impl Daemon {
             ),
             None => None,
         };
+        // "other": any session that is none of the named ones (SPEC D-15).
+        let other = q.agent.as_deref() == Some("other");
         let query = Query {
             since,
             until: None,
-            agent: q.agent.as_deref().map(parse_agent),
+            agent: q.agent.as_deref().filter(|_| !other).map(parse_agent),
             key,
             result,
             pid: None,
@@ -329,6 +346,14 @@ impl Daemon {
                 (None, _) => true,
                 (Some(p), Entry::Receipt(x)) => x.key.as_str().starts_with(p.as_str()),
                 (Some(_), _) => false,
+            })
+            .filter(|r| {
+                !other
+                    || match &r.rec.entry {
+                        Entry::Receipt(x) => is_other_agent(&x.session.agent),
+                        Entry::Alert(a) => is_other_agent(&a.session.agent),
+                        Entry::Checkpoint(_) => false,
+                    }
             })
             .collect();
         Ok((rows, total))
@@ -347,14 +372,20 @@ impl Daemon {
             return Err(ApiError::internal("morsec: status unavailable"));
         };
         let stored = self.stored_keys();
-        let (protected, needs) = {
+        let (protected, needs, not_ready) = {
             let live = self.read_live();
-            let protected = stored
+            let not_ready: Vec<KeyName> = stored
                 .keys()
-                .filter(|k| ready(live.rules.keys.get(*k), live.rules.tampered))
-                .count();
-            (protected, stored.len() - protected)
+                .filter(|k| !ready(live.rules.keys.get(*k), live.rules.tampered))
+                .cloned()
+                .collect();
+            (stored.len() - not_ready.len(), not_ready.len(), not_ready)
         };
+        let not_usable = not_ready
+            .iter()
+            .take(HOME_NOT_USABLE)
+            .map(|k| self.key_row(k, &stored))
+            .collect();
         let records = self.receipts_all()?;
         let day_ago = now_ms().saturating_sub(24 * 3600 * 1000);
         let blocked_24h = records
@@ -374,14 +405,31 @@ impl Daemon {
             protected: u32_of(protected),
             needs_website: u32_of(needs),
             blocked_24h,
+            warnings: self.warnings_for(&alerts),
             alerts,
-            pending: self.approvals.pending().map(|p| PendingView {
-                agent: agent_label(&p.request.session.agent),
-                key: p.request.key.to_string(),
-                tier: tier_str(p.request.tier).into(),
-                command: p.request.argv_display.clone(),
-                cwd: p.request.cwd.display().to_string(),
-                expires_unix_ms: p.expires_unix_ms,
+            not_usable,
+            pending: self.approvals.pending_state().map(|(p, deciding)| {
+                // Rendered here, as ms approve shows it: inert, quoted, never cut (SPEC D-11).
+                let r = &p.request;
+                PendingView {
+                    id: p.id,
+                    agent: ms_approve::render::agent_name(&r.session.agent),
+                    key: ms_approve::render::inert(r.key.as_str()),
+                    tier: tier_str(r.tier).into(),
+                    command: r
+                        .argv_display
+                        .iter()
+                        .map(|a| ms_approve::render::quoted(a))
+                        .collect(),
+                    cwd: if r.cwd.as_os_str().is_empty() {
+                        String::new()
+                    } else {
+                        ms_approve::render::quoted(&r.cwd.to_string_lossy())
+                    },
+                    effect: r.effect.as_deref().map(ms_approve::render::quoted),
+                    expires_unix_ms: p.expires_unix_ms,
+                    deciding,
+                }
             }),
             agents: self.agent_views(&records),
             projects_unreadable: projects.is_err(),
@@ -503,6 +551,9 @@ impl Daemon {
                 })
                 .collect(),
             hints: p.hints.iter().map(|h| h.path.clone()).collect(),
+            not_usable: u32_of(statuses.values().filter(|k| !k.ready).count()),
+            dev_command: ms_dash::shell::in_folder(&p.root, "ms dev -- npm run dev"),
+            rescan_command: ms_dash::shell::in_folder(&p.root, "ms init"),
         })
     }
 
@@ -581,6 +632,10 @@ impl Daemon {
             rows: rows.iter().rev().filter_map(row).take(limit).collect(),
             matched,
             total,
+            projects: self
+                .dash_projects()
+                .map(|f| f.projects.iter().map(|p| p.slug.clone()).collect())
+                .unwrap_or_default(),
         })
     }
 
@@ -622,7 +677,7 @@ impl Daemon {
 
     pub(crate) fn dash_agents(&self) -> Result<AgentsView, ApiError> {
         let records = self.receipts_all()?;
-        let alerts = lock(&self.alerts).clone();
+        let alerts = self.alert_texts();
         let (tampered, stopped) = {
             let l = self.read_live();
             (l.rules.tampered, l.rules.stopped)
@@ -659,10 +714,14 @@ impl Daemon {
                 text: "no host bound yet, so no proxy CA in use".into(),
             }),
         }
-        checks.extend(alerts.into_iter().map(|a| CheckView { ok: false, text: a }));
+        checks.extend(alerts.iter().map(|a| CheckView {
+            ok: false,
+            text: a.clone(),
+        }));
         Ok(AgentsView {
             agents: self.agent_views(&records),
             checks,
+            warnings: self.warnings_for(&alerts),
         })
     }
 
@@ -696,7 +755,12 @@ impl Daemon {
             }),
             _ => None,
         });
-        ScanView { last }
+        let (running, error) = self.dash_scan_state();
+        ScanView {
+            last,
+            running,
+            error,
+        }
     }
 }
 
@@ -726,7 +790,7 @@ impl DashSource {
         }
     }
 
-    fn d(&self) -> Result<Arc<Daemon>, ApiError> {
+    pub(super) fn d(&self) -> Result<Arc<Daemon>, ApiError> {
         self.d
             .upgrade()
             .ok_or_else(|| ApiError::unavailable("morsec: msd is stopping"))

@@ -80,6 +80,29 @@ struct State {
     cooldown: Vec<(ms_core::SessionId, Instant)>,
 }
 
+/// Why a dashboard confirmation ([`HumanApprover::confirm`]) approved nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfirmError {
+    /// Another request holds the one approval slot.
+    #[error("another request is waiting for you; answer it first")]
+    Busy,
+    /// This session was refused less than [`COOLDOWN`] ago.
+    #[error("this was refused a moment ago; wait a few seconds and try again")]
+    CoolingDown,
+    /// Touch ID / password did not succeed.
+    #[error("Touch ID did not confirm ({0})")]
+    AuthFailed(String),
+    /// Touch ID was not answered in time.
+    #[error("Touch ID was not answered in time")]
+    Expired,
+    /// `ms stop` ended it while Touch ID was up.
+    #[error("morsec was stopped while Touch ID was up; nothing was approved")]
+    Ended,
+    /// No randomness for the id or the token.
+    #[error("could not issue the approval: {0}")]
+    Internal(String),
+}
+
 /// How long a session waits after a denial or timeout before it may ask again.
 pub const COOLDOWN: Duration = Duration::from_secs(10);
 
@@ -127,6 +150,92 @@ impl HumanApprover {
     /// The request waiting for a person, if any.
     pub fn pending(&self) -> Option<Pending> {
         self.lock().slot.as_ref().map(|s| s.pending.clone())
+    }
+
+    /// The request waiting for a person and whether its Touch ID sheet is already up (a
+    /// dashboard confirmation, or an `ms approve` that is deciding it).
+    pub fn pending_state(&self) -> Option<(Pending, bool)> {
+        self.lock()
+            .slot
+            .as_ref()
+            .map(|s| (s.pending.clone(), s.deciding))
+    }
+
+    /// A person's own action, reviewed where they clicked it (L33 SPEC D-19: the dashboard's
+    /// confirm path). Takes the one approval slot (busy when another request holds it, so
+    /// `ms approve` and Home show what Touch ID is up for), raises Touch ID at once with `reason`
+    /// (built by the caller from the real action, inert), marked deciding so no other process can
+    /// answer it, and on success issues a **once** token bound to `req`. The caller verifies the
+    /// token against the same binding right before acting, which uses it up. `ms stop` during
+    /// the sheet ends it; a refusal starts the session's cooldown.
+    pub fn confirm(
+        &self,
+        req: &ApprovalRequest,
+        reason: &str,
+        timeout: Duration,
+    ) -> Result<ApprovalToken, ConfirmError> {
+        let now = now_ms();
+        let (id, deadline, epoch) = {
+            let mut st = self.lock();
+            let now_i = Instant::now();
+            st.cooldown.retain(|(_, until)| *until > now_i);
+            if st.cooldown.iter().any(|(s, _)| *s == req.session) {
+                return Err(ConfirmError::CoolingDown);
+            }
+            if st.slot.is_some() {
+                return Err(ConfirmError::Busy);
+            }
+            let id = match random_bytes::<16>() {
+                Ok(r) => format!("apr-{}", hex::encode(r)),
+                Err(e) => return Err(ConfirmError::Internal(e.to_string())),
+            };
+            st.slot = Some(Slot {
+                pending: Pending {
+                    id: id.clone(),
+                    request: req.clone(),
+                    requested_unix_ms: now,
+                    expires_unix_ms: now
+                        .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                },
+                deciding: true,
+                answer: None,
+            });
+            self.changed.notify_all();
+            (id, now_i + timeout, st.epoch)
+        };
+        // Outside the lock, as in `decide`.
+        let outcome = self.auth.authenticate(reason, deadline);
+        let mut st = self.lock();
+        let ours = st.slot.as_ref().is_some_and(|s| s.pending.id == id);
+        let answered = if ours {
+            st.slot.take().and_then(|s| s.answer)
+        } else {
+            None
+        };
+        self.changed.notify_all();
+        let result = if st.epoch != epoch || !ours || answered.is_some() {
+            Err(ConfirmError::Ended)
+        } else if Instant::now() >= deadline {
+            Err(ConfirmError::Expired)
+        } else {
+            match outcome {
+                AuthOutcome::Approved => self
+                    .tokens
+                    .issue(&Binding::of(req), Scope::Once, now_ms())
+                    .map_err(|e| ConfirmError::Internal(e.to_string())),
+                AuthOutcome::TimedOut => Err(ConfirmError::Expired),
+                AuthOutcome::Denied(why) | AuthOutcome::Unavailable(why) => {
+                    Err(ConfirmError::AuthFailed(why))
+                }
+            }
+        };
+        if result.is_err() {
+            let d = *self.cooldown.lock().unwrap_or_else(|e| e.into_inner());
+            if !d.is_zero() {
+                st.cooldown.push((req.session.clone(), Instant::now() + d));
+            }
+        }
+        result
     }
 
     /// True while a request is waiting (a new one would be refused).
@@ -613,5 +722,64 @@ mod tests {
         a.revoke_all().unwrap();
         assert_eq!(h.join().unwrap(), ApprovalOutcome::Denied);
         assert!(a.decide(&p.id, true, Scope::Once).is_err());
+    }
+
+    // protects=L33 SPEC D-19: the dashboard's confirm path raises Touch ID at once with the
+    // caller's reason, holds the one slot while the sheet is up (marked deciding, so ms approve
+    // can't answer it and another request is Busy), issues a once token for exactly that request
+    // that verify uses up, refuses while another request waits, and approves nothing when Touch
+    // ID fails or ms stop runs during the sheet; fails_when=a confirm bypasses the slot, a token
+    // is reusable or bound to another request, or a stop is ignored; no_claim=the real sheet
+    #[test]
+    fn confirm_takes_the_slot_and_issues_a_once_token() {
+        let (a, auth) = approver(FakeAuthenticator::approve().after(Duration::from_millis(200)));
+        let a2 = a.clone();
+        let h = std::thread::spawn(move || {
+            a2.confirm(&req("show"), "show the value of x", Duration::from_secs(5))
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let (p, deciding) = a.pending_state().expect("the slot is held");
+        assert!(deciding);
+        assert_eq!(
+            a.decide(&p.id, true, Scope::Once),
+            Err(DecideError::InProgress)
+        );
+        assert_eq!(
+            a.ask(&req("other"), Duration::from_millis(50)),
+            ApprovalOutcome::Denied,
+            "one at a time"
+        );
+        let t = h.join().unwrap().unwrap();
+        assert_eq!(auth.reasons(), ["show the value of x"]);
+        assert!(a.pending_state().is_none());
+        assert!(a.verify(&t, &Binding::of(&req("other"))).is_err());
+        assert_eq!(a.verify(&t, &Binding::of(&req("show"))), Ok(Scope::Once));
+        assert_eq!(
+            a.verify(&t, &Binding::of(&req("show"))),
+            Err(TokenError::Used)
+        );
+
+        // Busy while ms approve's request waits.
+        let (hb, p) = ask_bg(&a, req("x"), Duration::from_secs(10));
+        assert_eq!(
+            a.confirm(&req("show"), "r", Duration::from_secs(1)),
+            Err(ConfirmError::Busy)
+        );
+        a.decide(&p.id, false, Scope::Once).unwrap();
+        hb.join().unwrap();
+
+        // Touch ID refused, and ms stop during the sheet.
+        let (a, _) = approver(FakeAuthenticator::deny("cancelled"));
+        assert!(matches!(
+            a.confirm(&req("show"), "r", Duration::from_secs(1)),
+            Err(ConfirmError::AuthFailed(_))
+        ));
+        let (a, _) = approver(FakeAuthenticator::approve().after(Duration::from_millis(200)));
+        let a2 = a.clone();
+        let h = std::thread::spawn(move || a2.confirm(&req("show"), "r", Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(50));
+        a.revoke_all().unwrap();
+        assert_eq!(h.join().unwrap(), Err(ConfirmError::Ended));
+        assert!(a.pending_state().is_none());
     }
 }

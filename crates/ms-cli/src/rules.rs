@@ -12,9 +12,7 @@ use std::process::ExitCode;
 use clap::Args;
 use ms_core::{KeyName, Tier};
 use ms_rules::store::read_limited;
-use ms_rules::{
-    Change, CommandPattern, HostPattern, KeyRule, PROJECT_FILE, ProjectRules, Rules, classify_rule,
-};
+use ms_rules::{Change, KeyRule, PROJECT_FILE, ProjectRules, Rules, classify_rule};
 
 use ms_ipc::{Client, ErrorCode, RequestBody, ResponseBody};
 
@@ -551,13 +549,12 @@ fn show(name: &KeyName, r: &KeyRule) {
     }
 }
 
-fn parse_command(json: &str) -> Result<CommandPattern, String> {
-    let argv: Vec<String> = serde_json::from_str(json).map_err(|_| {
+fn parse_command(json: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str(json).map_err(|_| {
         format!(
             "morsec: --add-command/--remove-command takes a JSON array of strings, e.g. '[\"psql\", \"-c\", \"*\"]', not {json:?}"
         )
-    })?;
-    CommandPattern::parse(&argv).map_err(|e| format!("morsec: {e}"))
+    })
 }
 
 /// A root as given on the command line: made absolute against the current directory and
@@ -576,56 +573,25 @@ fn root_arg(d: &Path) -> Result<PathBuf, String> {
 }
 
 fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRule, String> {
-    let mut r = current.clone();
-    for h in &a.add_host {
-        r.hosts
-            .push(HostPattern::parse(h).map_err(|e| format!("morsec: {e}"))?);
-    }
-    for h in &a.remove_host {
-        let p = HostPattern::parse(h).map_err(|e| format!("morsec: {e}"))?;
-        r.hosts.retain(|x| *x != p);
-        r.git_hosts.retain(|g| HostPattern::Exact(g.clone()) != p);
-    }
-    let removed: Vec<HostPattern> = a
-        .remove_host
-        .iter()
-        .chain(&a.remove_git_host)
-        .filter_map(|h| HostPattern::parse(h).ok())
-        .collect();
-    for h in &a.add_git_host {
-        let p = HostPattern::parse(h).map_err(|e| format!("morsec: {e}"))?;
-        let HostPattern::Exact(name) = &p else {
-            return Err(format!(
-                "morsec: a git host is one exact name such as github.com, not {h:?}"
-            ));
-        };
-        if removed.contains(&p) {
-            return Err(format!(
-                "morsec: {name} is both added and removed; say one or the other"
-            ));
-        }
-        if !r.hosts.contains(&p) {
-            r.hosts.push(p.clone());
-        }
-        r.git_hosts.push(name.clone());
-    }
-    for h in &a.remove_git_host {
-        let p = HostPattern::parse(h).map_err(|e| format!("morsec: {e}"))?;
-        r.git_hosts.retain(|g| HostPattern::Exact(g.clone()) != p);
-    }
+    use ms_rules::edit::Edit;
+    // The same order the edits were always applied in; ms_rules::edit does the rest, exactly as
+    // for the dashboard (L33 SPEC D-14).
+    let mut edits = Vec::new();
+    edits.extend(a.add_host.iter().cloned().map(Edit::AddHost));
+    edits.extend(a.remove_host.iter().cloned().map(Edit::RemoveHost));
+    edits.extend(a.add_git_host.iter().cloned().map(Edit::AddGitHost));
+    edits.extend(a.remove_git_host.iter().cloned().map(Edit::RemoveGitHost));
     for c in &a.add_command {
-        r.commands.push(parse_command(c)?);
+        edits.push(Edit::AddCommand(parse_command(c)?));
     }
     for c in &a.remove_command {
-        let p = parse_command(c)?;
-        r.commands.retain(|x| *x != p);
+        edits.push(Edit::RemoveCommand(parse_command(c)?));
     }
     for d in &a.add_root {
-        r.roots.push(root_arg(d)?);
+        edits.push(Edit::AddRoot(root_arg(d)?));
     }
     for d in &a.remove_root {
-        let p = root_arg(d)?;
-        r.roots.retain(|x| *x != p);
+        edits.push(Edit::RemoveRoot(root_arg(d)?));
     }
     for n in &a.add_env {
         ms_rules::validate_env_name(n).map_err(|e| format!("morsec: {e}"))?;
@@ -634,43 +600,39 @@ fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRu
                 "morsec: {n} can't carry a key: morsec sets it itself, or it changes how programs load code or run commands. Pick the variable the tool reads its token from"
             ));
         }
-        r.env.push(n.clone());
+        edits.push(Edit::AddEnv(n.clone()));
     }
-    for n in &a.remove_env {
-        r.env.retain(|x| x != n);
-    }
-    for l in &a.add_ssh_host_key {
-        r.ssh_host_keys
-            .push(ms_rules::SshHostKey::parse(l).map_err(|e| format!("morsec: {e}"))?);
-    }
-    for l in &a.remove_ssh_host_key {
-        let p = ms_rules::SshHostKey::parse(l).map_err(|e| format!("morsec: {e}"))?;
-        r.ssh_host_keys.retain(|x| *x != p);
-    }
+    edits.extend(a.remove_env.iter().cloned().map(Edit::RemoveEnv));
+    edits.extend(a.add_ssh_host_key.iter().cloned().map(Edit::AddSshHostKey));
+    edits.extend(
+        a.remove_ssh_host_key
+            .iter()
+            .cloned()
+            .map(Edit::RemoveSshHostKey),
+    );
     if let Some(t) = &a.tier {
-        r.tier = match t.as_str() {
+        edits.push(Edit::SetTier(match t.as_str() {
             "test" => Tier::Test,
             "production" => Tier::Production,
             _ => return Err("morsec: --tier is test or production".into()),
-        };
+        }));
     }
     if let Some(ttl) = a.ttl {
-        r.session_ttl_secs = ttl;
+        edits.push(Edit::SetTtl(ttl));
     }
     if a.read_only {
-        r.read_only = true;
+        edits.push(Edit::SetReadOnly(true));
     }
     if a.writable {
-        r.read_only = false;
+        edits.push(Edit::SetReadOnly(false));
     }
-    // Same limits and per-mode checks as the file.
-    r.normalise("your proposed change", name)
-        .map_err(|e| e.to_string())
+    ms_rules::edit::apply(current, name, &edits)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ms_rules::HostPattern;
 
     // protects=project discovery stops at the git root, so a .morsec.toml above the repository
     // (someone else's directory) is never picked up; fails_when=it walks past .git;

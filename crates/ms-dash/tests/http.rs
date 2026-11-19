@@ -634,7 +634,8 @@ fn refused_connection_gets_no_bytes() {
     assert_eq!(refused[0].session.agent, AgentKind::ClaudeCode);
 }
 
-// protects=criterion 9, each API route answers its view as JSON; keys with `/` are percent-encoded
+// protects=criterion 9 (L32) and L33 criterion 4 (the new fields), each API route answers its
+// view as JSON; keys with `/` are percent-encoded
 // in the path; exports come as attachments with a cleaned file name; fails_when=a route is
 // missing or a key path is mis-parsed; no_claim=msd's views (msd tests)
 #[test]
@@ -648,7 +649,14 @@ fn api_views_round_trip() {
         assert_eq!(r.h("content-type"), Some("application/json"), "{p}");
         serde_json::from_str::<serde_json::Value>(&r.body).unwrap()
     };
-    assert_eq!(ok("/api/home")["keys"], 3);
+    let home = ok("/api/home");
+    assert_eq!(home["keys"], 3);
+    // L33: the warnings, the keys not usable yet and the pending request's shape.
+    assert!(home["warnings"].is_array() && home["not_usable"].is_array());
+    assert!(home["pending"].is_null());
+    assert_eq!(ok("/api/scan")["running"], false);
+    assert!(ok("/api/agents")["warnings"].is_array());
+    assert!(ok("/api/activity")["projects"].is_array());
     ok("/api/projects");
     assert_eq!(ok("/api/projects/shop")["slug"], "shop");
     assert_eq!(get(port, "/api/projects/nope", &a).status, 404);

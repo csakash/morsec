@@ -43,6 +43,10 @@ libc = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 # LaunchServices: msd opens the dashboard itself (L32 SPEC D-12). Already locked through ms-ipc.
 core-foundation-sys = "0.8"
+# The pasteboard for the dashboard's Copy (L33 SPEC D-20). Already locked through ms-approve's
+# Touch ID; the same versions and features.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

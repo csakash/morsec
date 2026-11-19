@@ -20,6 +20,7 @@ use ms_session::Caller;
 use ms_vault::{Listing, Vault, VaultExt};
 use tokio::sync::watch;
 
+pub mod dash_actions;
 mod dash_data;
 pub mod dev;
 mod mcp;
@@ -27,6 +28,7 @@ mod projects;
 mod run;
 mod ssh_git;
 
+pub use dash_actions::{AlertKind, Clipboard};
 pub use dash_data::{ConnChecker, DashSource};
 pub use projects::{PROJECTS_FILE, reset_project_records};
 
@@ -121,7 +123,7 @@ pub struct Daemon {
     receipts: Arc<ReceiptStore>,
     live: RwLock<Live>,
     stopped_sessions: Arc<Mutex<HashSet<SessionId>>>,
-    alerts: Mutex<Vec<String>>,
+    alerts: Mutex<Vec<dash_actions::AlertEntry>>,
     identify: Identify,
     approvals: Arc<HumanApprover>,
     /// How long a request waits for a person, in ms ([`APPROVAL_TIMEOUT`]; shorter in tests).
@@ -158,6 +160,9 @@ pub struct Daemon {
     dev: dev::DevSessions,
     /// Is this PID sandboxed (L34 review D-A)? `ms_session::is_sandboxed`, failing closed.
     sandbox_probe: Mutex<fn(u32) -> bool>,
+    /// The dashboard's actions' own state (L33): the scan it started, the Show/Copy window,
+    /// the pasteboard writer.
+    dash_acts: dash_actions::ActState,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -249,7 +254,7 @@ impl Daemon {
         })?;
         let vault = backend.vault();
         let mac_key = KeyName::new(RULES_HMAC_KEY)?;
-        let mut alerts = Vec::new();
+        let mut alerts: Vec<String> = Vec::new();
 
         let state_key = KeyName::new(DAEMON_STATE_KEY)?;
         let (stopped, vault_floor) = match vault.read_with(&state_key, <[u8]>::to_vec) {
@@ -332,7 +337,12 @@ impl Daemon {
             receipts: Arc::new(receipts),
             live: RwLock::new(Live { rules, min_version }),
             stopped_sessions,
-            alerts: Mutex::new(alerts),
+            alerts: Mutex::new(
+                alerts
+                    .into_iter()
+                    .map(|t| dash_actions::AlertEntry::new(AlertKind::Other, t))
+                    .collect(),
+            ),
             identify,
             approvals,
             approval_timeout_ms: std::sync::atomic::AtomicU64::new(
@@ -352,6 +362,7 @@ impl Daemon {
             dev: dev::DevSessions::default(),
             sandbox_probe: Mutex::new(|pid| ms_session::is_sandboxed(pid).unwrap_or(true)),
             stops: std::sync::atomic::AtomicU64::new(0),
+            dash_acts: dash_actions::ActState::default(),
         }))
     }
 
@@ -499,19 +510,26 @@ impl Daemon {
 
     /// Drops alerts starting with `prefix` (a condition that cleared).
     pub fn clear_alert(&self, prefix: &str) {
-        lock(&self.alerts).retain(|a| !a.starts_with(prefix));
+        lock(&self.alerts).retain(|a| !a.text.starts_with(prefix));
     }
 
-    /// Adds an alert for `ms status` (deduplicated, bounded).
-    pub fn alert(&self, msg: impl Into<String>) {
+    /// Adds an alert of `kind` for `ms status` (deduplicated by text, bounded). `ms status`
+    /// prints the text as before; the dashboard shows it in plain words with its fix (L33 SPEC
+    /// D-10).
+    pub fn alert(&self, kind: AlertKind, msg: impl Into<String>) {
         let msg = msg.into();
         let mut a = lock(&self.alerts);
-        if !a.contains(&msg) {
+        if !a.iter().any(|e| e.text == msg) {
             if a.len() >= MAX_ALERTS {
                 a.remove(0);
             }
-            a.push(msg);
+            a.push(dash_actions::AlertEntry::new(kind, msg));
         }
+    }
+
+    /// The alerts' texts, as `ms status` prints them.
+    fn alert_texts(&self) -> Vec<String> {
+        lock(&self.alerts).iter().map(|a| a.text.clone()).collect()
     }
 
     fn read_live(&self) -> std::sync::RwLockReadGuard<'_, Live> {
@@ -819,6 +837,11 @@ impl Daemon {
             );
             return resp;
         }
+        self.scan_approved(session)
+    }
+
+    /// The scan itself, once a person approved it (`ms scan`, or the dashboard's Run scan).
+    fn scan_approved(&self, session: &SessionId) -> ResponseBody {
         if self.is_stopped() {
             return reply_err(
                 ErrorCode::Denied,
@@ -834,7 +857,7 @@ impl Daemon {
         let mut report = crate::scan::scan(
             &*self.vault,
             keys.iter().map(|m| m.name.clone()).collect(),
-            &crate::scan::roots(),
+            &self.scan_roots(),
             crate::scan::SCAN_BUDGET,
         );
         note_unusable(&mut report, &unusable);
@@ -899,7 +922,10 @@ impl Daemon {
                 l.unusable,
             ),
             Err(e) => {
-                self.alert(format!("the vault could not be listed: {e}"));
+                self.alert(
+                    AlertKind::VaultUnlisted,
+                    format!("the vault could not be listed: {e}"),
+                );
                 (None, Vec::new())
             }
         };
@@ -907,7 +933,7 @@ impl Daemon {
             let l = self.read_live();
             (!l.rules.stopped, l.rules.tampered)
         };
-        let mut alerts = lock(&self.alerts).clone();
+        let mut alerts = self.alert_texts();
         if tampered && !alerts.iter().any(|a| a.contains("integrity")) {
             alerts.push("the rules failed their integrity check, so every key is denied".into());
         }
@@ -935,6 +961,21 @@ impl Daemon {
         name: KeyName,
         meta: KeyMeta,
         value: SecretBytes,
+    ) -> ResponseBody {
+        let _ = in_agent;
+        self.put_key_as(session, name, meta, value, "ms add")
+    }
+
+    /// Stores a new key (`PutKey`, the dashboard's Add). An existing key is never replaced here,
+    /// for any caller (L33 SPEC D-13, T-95): replacing goes through `KeyReplace` / the
+    /// dashboard's Replace, which need Touch ID. `target` names the receipt.
+    pub(crate) fn put_key_as(
+        &self,
+        session: &SessionId,
+        name: KeyName,
+        meta: KeyMeta,
+        value: SecretBytes,
+        target: &str,
     ) -> ResponseBody {
         if is_reserved(&name) {
             return reply_err(
@@ -968,14 +1009,12 @@ impl Daemon {
             Ok(l) => l.keys.iter().any(|m| m.name == name),
             Err(e) => return reply_err(ErrorCode::Internal, e.to_string()),
         };
-        // Replacing a key changes what morsec sends on the user's behalf. From inside an agent
-        // session that is refused; a person replaces keys from their own terminal.
-        if exists && in_agent {
+        // Replacing a key changes what morsec sends on the user's behalf: never silently, for
+        // anyone. A person replaces a value with ms set (Touch ID).
+        if exists {
             return reply_err(
                 ErrorCode::Denied,
-                format!(
-                    "morsec: {name} already exists, and keys can't be replaced from inside an agent session. Replace it from your own terminal: ms add {name}"
-                ),
+                format!("morsec: {name} already exists. Replace it with: ms set {name}"),
             );
         }
         let (mode, tier) = (meta.mode, meta.tier);
@@ -1001,7 +1040,7 @@ impl Daemon {
             session,
             &name,
             mode,
-            "ms add",
+            target,
             version,
             ReceiptResult::Allowed,
             None,
@@ -1098,9 +1137,10 @@ impl Daemon {
             if let Err(e) = self.persist_state(self.is_stopped()) {
                 // The receipt chain still records the version, so the floor is not lost.
                 tracing::error!(error = %e, "could not save the rules floor in the vault");
-                self.alert(format!(
-                    "the rules version could not be saved in the vault ({e})"
-                ));
+                self.alert(
+                    AlertKind::FloorNotSaved,
+                    format!("the rules version could not be saved in the vault ({e})"),
+                );
             }
         }
         self.rebuild_proxy();
@@ -1247,6 +1287,11 @@ impl Daemon {
     }
 
     fn stop(&self, session: &SessionId) -> ResponseBody {
+        self.stop_as(session, "ms stop")
+    }
+
+    /// `ms stop` (or the dashboard's Stop): no approval, at once. `target` names the receipt.
+    fn stop_as(&self, session: &SessionId, target: &str) -> ResponseBody {
         let _f = lock(&self.flag);
         self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // In memory first: from here on every request is refused, whatever happens below.
@@ -1267,9 +1312,12 @@ impl Daemon {
         let mut message = "morsec stopped: every agent request is now refused. Resume from your own terminal with: ms start (needs Touch ID)".to_owned();
         if let Err(e) = self.persist_state(true) {
             tracing::error!(error = %e, "could not persist the stop flag");
-            self.alert(format!(
-                "ms stop could not be saved in the vault ({e}); if msd restarts it may resume"
-            ));
+            self.alert(
+                AlertKind::FloorNotSaved,
+                format!(
+                    "ms stop could not be saved in the vault ({e}); if msd restarts it may resume"
+                ),
+            );
             message.push_str(&format!(
                 ". Warning: the stop could not be saved in the vault ({e}), so a restart of msd would resume"
             ));
@@ -1278,7 +1326,7 @@ impl Daemon {
             session,
             &daemon_key(),
             Mode::Run,
-            "ms stop",
+            target,
             version,
             ReceiptResult::Allowed,
             None,
@@ -1317,8 +1365,20 @@ impl Daemon {
                 return resp;
             }
         };
-        // The approval happens outside the lock (a Touch ID prompt must not hold up ms stop);
-        // the flag is re-checked under it, so a concurrent stop can't be undone.
+        self.resume(session, &token, stops_seen, "ms start")
+    }
+
+    /// Resumes after `token` approved it: the flag is re-checked under the lock (the approval
+    /// happened outside it, a Touch ID prompt must not hold up ms stop), so a concurrent stop
+    /// can't be undone. `target` names the receipt.
+    fn resume(
+        &self,
+        session: &SessionId,
+        token: &ApprovalToken,
+        stops_seen: u64,
+        target: &str,
+    ) -> ResponseBody {
+        let key = daemon_key();
         let _f = lock(&self.flag);
         if !self.is_stopped() {
             return ResponseBody::Ok {
@@ -1344,8 +1404,7 @@ impl Daemon {
             l.rules.version
         };
         lock(&self.stopped_sessions).clear();
-        if let Err(e) = self.record_approved(session, &key, Mode::Run, "ms start", version, &token)
-        {
+        if let Err(e) = self.record_approved(session, &key, Mode::Run, target, version, token) {
             tracing::error!(error = %e, "could not record ms start");
         }
         ResponseBody::Ok {
@@ -1547,17 +1606,17 @@ mod tests {
     use ms_vault::memory::MemoryVault;
     use std::path::PathBuf;
 
-    const CANARY: &str = "sk_test_MSD_CANARY_5b1e";
+    pub(super) const CANARY: &str = "sk_test_MSD_CANARY_5b1e";
 
-    struct H {
-        d: Arc<Daemon>,
-        auth: Arc<FakeAuthenticator>,
-        backend: Backend,
-        dir: tempfile::TempDir,
-        who: Arc<Mutex<Option<Caller>>>,
+    pub(super) struct H {
+        pub(super) d: Arc<Daemon>,
+        pub(super) auth: Arc<FakeAuthenticator>,
+        pub(super) backend: Backend,
+        pub(super) dir: tempfile::TempDir,
+        pub(super) who: Arc<Mutex<Option<Caller>>>,
     }
 
-    fn agent() -> Caller {
+    pub(super) fn agent() -> Caller {
         Caller::Agent(SessionId {
             agent: AgentKind::ClaudeCode,
             pid: 42,
@@ -1565,14 +1624,14 @@ mod tests {
         })
     }
 
-    fn terminal() -> Caller {
+    pub(super) fn terminal() -> Caller {
         Caller::Unattributed {
             pid: 43,
             started_unix_ms: 1,
         }
     }
 
-    fn peer() -> PeerInfo {
+    pub(super) fn peer() -> PeerInfo {
         PeerInfo {
             uid: 501,
             gid: 20,
@@ -1583,21 +1642,25 @@ mod tests {
 
     /// The PID of the person's `ms approve` (always outside any agent), and of an agent's
     /// process trying to approve.
-    const APPROVER_PID: i32 = 99;
-    const AGENT_APPROVER_PID: i32 = 98;
+    pub(super) const APPROVER_PID: i32 = 99;
+    pub(super) const AGENT_APPROVER_PID: i32 = 98;
 
-    fn peer_pid(pid: i32) -> PeerInfo {
+    pub(super) fn peer_pid(pid: i32) -> PeerInfo {
         PeerInfo {
             pid: Some(pid),
             ..peer()
         }
     }
 
-    fn open_with(backend: Backend, dir: tempfile::TempDir, who: Arc<Mutex<Option<Caller>>>) -> H {
+    pub(super) fn open_with(
+        backend: Backend,
+        dir: tempfile::TempDir,
+        who: Arc<Mutex<Option<Caller>>>,
+    ) -> H {
         open_auth(backend, dir, who, FakeAuthenticator::approve())
     }
 
-    fn open_auth(
+    pub(super) fn open_auth(
         backend: Backend,
         dir: tempfile::TempDir,
         who: Arc<Mutex<Option<Caller>>>,
@@ -1634,7 +1697,7 @@ mod tests {
         }
     }
 
-    fn fresh() -> H {
+    pub(super) fn fresh() -> H {
         let dir = tempfile::tempdir().unwrap();
         open_with(
             Backend::Memory(Arc::new(MemoryVault::new())),
@@ -1644,7 +1707,7 @@ mod tests {
     }
 
     /// Closes and reopens the daemon over the same vault and files (a restart).
-    fn restart(h: H) -> H {
+    pub(super) fn restart(h: H) -> H {
         let H {
             d,
             backend,
@@ -1657,14 +1720,14 @@ mod tests {
     }
 
     impl H {
-        fn as_(&self, c: Caller) -> &Self {
+        pub(super) fn as_(&self, c: Caller) -> &Self {
             *lock(&self.who) = Some(c);
             self
         }
-        fn req(&self, r: RequestBody) -> ResponseBody {
+        pub(super) fn req(&self, r: RequestBody) -> ResponseBody {
             self.d.handle(&peer(), r, None)
         }
-        fn put(&self, name: &str, tier: Tier) -> ResponseBody {
+        pub(super) fn put(&self, name: &str, tier: Tier) -> ResponseBody {
             let k = KeyName::new(name).unwrap();
             self.d.handle(
                 &peer(),
@@ -1680,7 +1743,12 @@ mod tests {
                 Some(SecretBytes::new(CANARY.as_bytes().to_vec())),
             )
         }
-        fn propose(&self, key: &str, rule: Option<&str>, at_terminal: bool) -> ResponseBody {
+        pub(super) fn propose(
+            &self,
+            key: &str,
+            rule: Option<&str>,
+            at_terminal: bool,
+        ) -> ResponseBody {
             self.req(RequestBody::RulesProposeLoosen {
                 key: KeyName::new(key).unwrap(),
                 rule: rule.map(|r| format!("version = 1\n[keys.\"{key}\"]\n{r}")),
@@ -1689,7 +1757,7 @@ mod tests {
         }
         /// Runs `f` (which waits for an approval) while a person at `approver_pid` answers the
         /// pending request with `approve` / `scope`. Returns `f`'s reply and the decision's.
-        fn answered(
+        pub(super) fn answered(
             &self,
             approver_pid: i32,
             approve: bool,
@@ -1731,12 +1799,12 @@ mod tests {
             })
         }
         /// `f`, approved by the person with Touch ID (once).
-        fn approved(&self, f: impl FnOnce() -> ResponseBody + Send) -> ResponseBody {
+        pub(super) fn approved(&self, f: impl FnOnce() -> ResponseBody + Send) -> ResponseBody {
             let (out, decision) = self.answered(APPROVER_PID, true, None, f);
             assert!(is_ok(&decision), "{decision:?}");
             out
         }
-        fn swap(&self, key: &str, host: &str) -> Decision {
+        pub(super) fn swap(&self, key: &str, host: &str) -> Decision {
             let s = match agent() {
                 Caller::Agent(s) => s,
                 Caller::Unattributed { .. } => unreachable!(),
@@ -1751,7 +1819,7 @@ mod tests {
                 )
                 .0
         }
-        fn receipts_text(&self) -> String {
+        pub(super) fn receipts_text(&self) -> String {
             let mut out = String::new();
             for e in std::fs::read_dir(self.dir.path().join("receipts")).unwrap() {
                 out.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
@@ -1760,18 +1828,18 @@ mod tests {
         }
     }
 
-    fn is_ok(r: &ResponseBody) -> bool {
+    pub(super) fn is_ok(r: &ResponseBody) -> bool {
         matches!(r, ResponseBody::Ok { .. })
     }
 
-    fn code(r: &ResponseBody) -> Option<ErrorCode> {
+    pub(super) fn code(r: &ResponseBody) -> Option<ErrorCode> {
         match r {
             ResponseBody::Error { code, .. } => Some(*code),
             _ => None,
         }
     }
 
-    fn msg(r: &ResponseBody) -> String {
+    pub(super) fn msg(r: &ResponseBody) -> String {
         match r {
             ResponseBody::Error { message, .. } | ResponseBody::Ok { message } => message.clone(),
             other => format!("{other:?}"),
@@ -1784,7 +1852,7 @@ mod tests {
     // count, the warning lacks the command, or a put fails on the listing; no_claim=the keychain
     // itself (ms-vault foreign_items_are_unusable_not_fatal)
     #[test]
-    fn unusable_keys_from_another_build() {
+    pub(super) fn unusable_keys_from_another_build() {
         let h = fresh();
         let Backend::Memory(v) = &h.backend else {
             panic!("tests use the memory vault")
@@ -1853,7 +1921,7 @@ mod tests {
     // fails_when=an agent can overwrite a key, a morsec/ key can be written, or a new key is usable
     // before the user allows a target; no_claim=the keychain backend (L01 tests it)
     #[test]
-    fn put_key_and_list() {
+    pub(super) fn put_key_and_list() {
         let h = fresh();
         let r = h.put("stripe/test", Tier::Test);
         assert!(is_ok(&r), "{r:?}");
@@ -1881,7 +1949,11 @@ mod tests {
             Some(ErrorCode::Denied)
         );
         assert!(is_ok(&h.as_(agent()).put("openai/test", Tier::Test)));
-        assert!(is_ok(&h.as_(terminal()).put("stripe/test", Tier::Test)));
+        assert_eq!(
+            code(&h.as_(terminal()).put("stripe/test", Tier::Test)),
+            Some(ErrorCode::Denied),
+            "PutKey never replaces (L33)"
+        );
         assert!(!h.receipts_text().contains(CANARY));
         match h.req(RequestBody::Status) {
             ResponseBody::Status {
@@ -1899,11 +1971,46 @@ mod tests {
         }
     }
 
+    // protects=L33 SPEC D-13 and T-95 (was open before L33: PutKey silently replaced a value
+    // for any caller outside an agent session): PutKey on an existing key is refused for every
+    // caller, the agent, a terminal and the person's approver alike, with the ms set command, and
+    // the stored value is unchanged; a new name still stores; fails_when=any caller replaces a
+    // value through PutKey; no_claim=KeyReplace (dash_actions replace tests)
+    #[test]
+    pub(super) fn put_key_refuses_existing_key() {
+        let h = fresh();
+        assert!(is_ok(&h.put("stripe/test", Tier::Test)));
+        for who in [agent(), terminal()] {
+            let k = KeyName::new("stripe/test").unwrap();
+            let r = h.as_(who).d.handle(
+                &peer(),
+                RequestBody::PutKey {
+                    name: k.clone(),
+                    meta: KeyMeta {
+                        name: k,
+                        mode: Mode::Swap,
+                        tier: Tier::Test,
+                        created_unix_ms: 2,
+                    },
+                },
+                Some(SecretBytes::new(b"replaced-value".to_vec())),
+            );
+            assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+            assert!(msg(&r).contains("ms set stripe/test"), "{r:?}");
+        }
+        let v =
+            h.d.vault()
+                .read_with(&KeyName::new("stripe/test").unwrap(), <[u8]>::to_vec)
+                .unwrap();
+        assert_eq!(v, CANARY.as_bytes());
+        assert!(is_ok(&h.put("stripe/other", Tier::Test)));
+    }
+
     // protects=AUTH-4 kill switch: after Stop the next decision is Deny(Stopped), status says
     // stopped, and a restart of msd keeps it stopped (the flag is in the vault); fails_when=the
     // next request is allowed, or killing msd resumes it; no_claim=the proxy path (tests/cli.rs)
     #[test]
-    fn stop_is_immediate_and_survives_restart() {
+    pub(super) fn stop_is_immediate_and_survives_restart() {
         let h = fresh();
         h.put("stripe/test", Tier::Test);
         let r = h.approved(|| {
@@ -1946,7 +2053,7 @@ mod tests {
     // restart and is recorded with the token id and method touch-id; fails_when=morsec resumes
     // without a Touch ID approval from outside every agent tree; no_claim=the real LAContext sheet
     #[test]
-    fn start_needs_touch_id_approval() {
+    pub(super) fn start_needs_touch_id_approval() {
         let h = fresh();
         h.req(RequestBody::Stop);
         let r = h.req(RequestBody::Start { at_terminal: true });
@@ -1991,7 +2098,7 @@ mod tests {
     // protects=SPEC D-4: a failed or cancelled Touch ID denies the request and nothing changes;
     // fails_when=morsec resumes after a failed Touch ID; no_claim=lockout handling of the sheet
     #[test]
-    fn failed_touch_id_denies() {
+    pub(super) fn failed_touch_id_denies() {
         let dir = tempfile::tempdir().unwrap();
         let h = open_auth(
             Backend::Memory(Arc::new(MemoryVault::new())),
@@ -2014,7 +2121,7 @@ mod tests {
     // waiting one; fails_when=an agent sees or answers a request, or a second request is parked;
     // no_claim=the real process-tree walk (agent_e2e)
     #[test]
-    fn approvals_ipc_rules() {
+    pub(super) fn approvals_ipc_rules() {
         let h = fresh();
         let r = h.d.handle(
             &peer_pid(AGENT_APPROVER_PID),
@@ -2076,7 +2183,7 @@ mod tests {
     // payloads are refused; RulesGet returns the saved rules; fails_when=a loosening is saved
     // without Touch ID; no_claim=the real LAContext sheet
     #[test]
-    fn rules_changes() {
+    pub(super) fn rules_changes() {
         let h = fresh();
         h.put("stripe/test", Tier::Test);
         let loose = "mode = \"swap\"\ntier = \"test\"\nhosts = [\"api.stripe.com\", \"files.stripe.com\"]\n";
@@ -2132,7 +2239,7 @@ mod tests {
     // fails_when=a loosening waits for approval while stopped, or a production→test downgrade is
     // shown as test; no_claim=rate limits on prompts before a stop
     #[test]
-    fn loosening_while_stopped_and_downgrade_tier() {
+    pub(super) fn loosening_while_stopped_and_downgrade_tier() {
         let h = fresh();
         h.put("stripe/test", Tier::Test);
         let prod = "mode = \"swap\"\ntier = \"production\"\nhosts = [\"api.stripe.com\"]\n";
@@ -2159,7 +2266,7 @@ mod tests {
     // later changes is refused by the receipt-chain rollback floor; fails_when=a forged or
     // replayed rules file is used; no_claim=tail truncation of the receipts (L24)
     #[test]
-    fn tampered_and_rolled_back_rules_fail_closed() {
+    pub(super) fn tampered_and_rolled_back_rules_fail_closed() {
         let h = fresh();
         h.put("stripe/test", Tier::Test);
         let rules = h.dir.path().join("rules.toml");
@@ -2213,7 +2320,7 @@ mod tests {
     // other sessions carry on; fails_when=the alerting session keeps working; no_claim=the
     // detector's thresholds (L02 tests)
     #[test]
-    fn log2_alert_stops_the_session() {
+    pub(super) fn log2_alert_stops_the_session() {
         let h = fresh();
         let s = match agent() {
             Caller::Agent(s) => s,
@@ -2252,7 +2359,7 @@ mod tests {
     // no_claim=the terminal path (scan.rs tests and tests/e2e run it; here it would read the
     // real home directory)
     #[test]
-    fn scan_refused_inside_agent() {
+    pub(super) fn scan_refused_inside_agent() {
         let h = fresh();
         assert!(is_ok(&h.put("stripe/test", Tier::Test)));
         let r = h.as_(agent()).req(RequestBody::Scan);
@@ -2281,7 +2388,7 @@ mod tests {
     // replace a key, use the terminal path or slip out of a LOG-2 stop; fails_when=None is treated
     // as a non-agent; no_claim=the kernel side (peer_cred of a dead PID)
     #[test]
-    fn unidentified_caller_is_refused() {
+    pub(super) fn unidentified_caller_is_refused() {
         let h = fresh();
         assert!(is_ok(&h.put("stripe/test", Tier::Test)));
         *lock(&h.who) = None;
@@ -2309,7 +2416,7 @@ mod tests {
     // protects=R2: concurrent stop and start never leave morsec on after a stop reported success;
     // fails_when=the in-memory flag and the vault flag disagree after the race; no_claim=fairness
     #[test]
-    fn stop_and_start_are_serialized() {
+    pub(super) fn stop_and_start_are_serialized() {
         let h = Arc::new(fresh());
         // A person who approves whatever is waiting, for the whole test.
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2363,7 +2470,7 @@ mod tests {
     // protects=the state item format round-trips and anything else is rejected (fail closed);
     // fails_when=garbage parses as running; no_claim=-
     #[test]
-    fn state_format() {
+    pub(super) fn state_format() {
         assert_eq!(parse_state(&encode_state(true, 7)), Some((true, 7)));
         assert_eq!(parse_state(&encode_state(false, 0)), Some((false, 0)));
         assert_eq!(parse_state(b"running"), Some((false, 0)));
@@ -2377,7 +2484,7 @@ mod tests {
     // fails_when=u64::MAX (or any unknown floor) is written and the rules stay tampered forever;
     // no_claim=rollback resistance while the state item is unreadable (documented residual)
     #[test]
-    fn unreadable_state_never_persists_a_sentinel_floor() {
+    pub(super) fn unreadable_state_never_persists_a_sentinel_floor() {
         let h = fresh();
         h.put("stripe/test", Tier::Test);
         let state = KeyName::new(DAEMON_STATE_KEY).unwrap();
@@ -2404,7 +2511,7 @@ mod tests {
     // reused across calls; fails_when=a file on disk decides which certificate msd serves or
     // trusts; no_claim=rcgen/X.509 parsing
     #[test]
-    fn ca_comes_from_the_vault_not_the_file() {
+    pub(super) fn ca_comes_from_the_vault_not_the_file() {
         let h = fresh();
         let hosts: std::collections::BTreeSet<String> = ["api.stripe.com".to_owned()].into();
         let first = crate::proxy::ensure_ca(&h.d, &hosts).unwrap();
@@ -2426,7 +2533,7 @@ mod tests {
     // fails_when=a damaged flag reads as running; no_claim=a deleted keychain item (the keychain
     // backend reports it the same way: not found → stopped)
     #[test]
-    fn unreadable_stop_flag_means_stopped() {
+    pub(super) fn unreadable_stop_flag_means_stopped() {
         let h = fresh();
         h.backend
             .put_internal(
@@ -2440,13 +2547,16 @@ mod tests {
 
     // ---- L31 guided-init: ProjectSave / ProjectList / ProjectGet ----
 
-    const STRIPE_KEY: &str = "shop/stripe-secret-key";
-    const OPENAI_KEY: &str = "shop/openai-api-key";
-    const DB_KEY: &str = "shop/database-url";
-    const UNKNOWN_KEY: &str = "shop/session-secret";
+    pub(super) const STRIPE_KEY: &str = "shop/stripe-secret-key";
+    pub(super) const OPENAI_KEY: &str = "shop/openai-api-key";
+    pub(super) const DB_KEY: &str = "shop/database-url";
+    pub(super) const UNKNOWN_KEY: &str = "shop/session-secret";
 
     /// A project root (canonical) and its record naming `keys` as (key, provider).
-    fn project(h: &H, keys: &[(&str, Option<&str>)]) -> ms_projects::record::ProjectRecord {
+    pub(super) fn project(
+        h: &H,
+        keys: &[(&str, Option<&str>)],
+    ) -> ms_projects::record::ProjectRecord {
         use ms_projects::record::*;
         let root = h.dir.path().join("shop");
         std::fs::create_dir_all(&root).unwrap();
@@ -2478,7 +2588,7 @@ mod tests {
         }
     }
 
-    fn put_mode(h: &H, name: &str, mode: Mode, tier: Tier) {
+    pub(super) fn put_mode(h: &H, name: &str, mode: Mode, tier: Tier) {
         let k = KeyName::new(name).unwrap();
         let r = h.d.handle(
             &peer(),
@@ -2497,11 +2607,15 @@ mod tests {
     }
 
     /// The rules the CLI would propose for `rec` against the rules in force.
-    fn proposal(h: &H, rec: &ms_projects::record::ProjectRecord) -> Rules {
+    pub(super) fn proposal(h: &H, rec: &ms_projects::record::ProjectRecord) -> Rules {
         ms_projects::save::initial_rules(ms_import::catalog::Catalog::builtin(), rec, &h.d.rules())
     }
 
-    fn save(h: &H, rec: &ms_projects::record::ProjectRecord, rules: &Rules) -> ResponseBody {
+    pub(super) fn save(
+        h: &H,
+        rec: &ms_projects::record::ProjectRecord,
+        rules: &Rules,
+    ) -> ResponseBody {
         h.req(RequestBody::ProjectSave {
             record: rec.to_toml(),
             rules: ms_projects::save::canonical(rules),
@@ -2509,7 +2623,7 @@ mod tests {
     }
 
     /// The four keys of the fixture: two known swap keys, a run key and an unknown one.
-    fn shop(h: &H) -> ms_projects::record::ProjectRecord {
+    pub(super) fn shop(h: &H) -> ms_projects::record::ProjectRecord {
         h.put(STRIPE_KEY, Tier::Test);
         h.put(OPENAI_KEY, Tier::Test);
         put_mode(h, DB_KEY, Mode::Run, Tier::Production);
@@ -2530,7 +2644,7 @@ mod tests {
     // and ProjectGet answer agents; fails_when=an agent's ProjectSave is applied or reaches the
     // approver; no_claim=a detached same-user process (it is not an agent session: T-04)
     #[test]
-    fn project_requests_refused_in_agent_session() {
+    pub(super) fn project_requests_refused_in_agent_session() {
         let h = fresh();
         let rec = shop(&h);
         let rules = proposal(&h, &rec);
@@ -2555,7 +2669,7 @@ mod tests {
     // fails_when=any of them reaches the approver or is applied; no_claim=the checker's full
     // table (ms-projects save_checks)
     #[test]
-    fn project_save_checks() {
+    pub(super) fn project_save_checks() {
         let h = fresh();
         let rec = shop(&h);
         let good = proposal(&h, &rec);
@@ -2628,7 +2742,7 @@ mod tests {
     // for one save, a changed set reuses the approval, or anything applies on denial;
     // no_claim=the real LAContext sheet (manual check)
     #[test]
-    fn project_save_one_approval_bound_to_rules() {
+    pub(super) fn project_save_one_approval_bound_to_rules() {
         let h = fresh();
         let rec = shop(&h);
         let rules = proposal(&h, &rec);
@@ -2725,7 +2839,7 @@ mod tests {
     // unknown slug Invalid, and no value anywhere in the replies; fails_when=counts ignore the
     // rules or a value appears; no_claim=the CLI's rendering (ms-cli projects)
     #[test]
-    fn project_list_and_get() {
+    pub(super) fn project_list_and_get() {
         let h = fresh();
         let rec = shop(&h);
         assert!(matches!(
@@ -2771,7 +2885,7 @@ mod tests {
     // for existing keys keep working; fails_when=a tampered record is served or saved over, or
     // keys stop working; no_claim=the store's full tamper table (ms-projects store tests)
     #[test]
-    fn projects_toml_tamper_fails_closed() {
+    pub(super) fn projects_toml_tamper_fails_closed() {
         let h = fresh();
         let rec = shop(&h);
         let rules = proposal(&h, &rec);
@@ -2862,7 +2976,7 @@ mod tests {
     // install with no records and no floor works; fails_when=the floor's absence reads as 0 when
     // records exist; no_claim=deleting a keychain item (only msd may; the memory vault stands in)
     #[test]
-    fn missing_projects_floor_fails_closed() {
+    pub(super) fn missing_projects_floor_fails_closed() {
         let h = fresh();
         assert!(matches!(
             h.req(RequestBody::ProjectList),
@@ -2893,7 +3007,7 @@ mod tests {
     // fails_when=project requests stay Denied after a reset, or the old file is deleted;
     // no_claim=the keychain reset itself (ms-vault projects_internal_items)
     #[test]
-    fn force_reset_moves_project_records_aside() {
+    pub(super) fn force_reset_moves_project_records_aside() {
         let h = fresh();
         let rec = shop(&h);
         assert!(is_ok(&save(&h, &rec, &Rules::default())));
@@ -2946,7 +3060,7 @@ mod tests {
     /// The URLs the test opener was handed (the user's browser, in production).
     type Opened = Arc<Mutex<Vec<String>>>;
 
-    fn with_dash(h: &H, check: ConnChecker) -> (tokio::runtime::Runtime, Opened) {
+    pub(super) fn with_dash(h: &H, check: ConnChecker) -> (tokio::runtime::Runtime, Opened) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -2979,13 +3093,13 @@ mod tests {
         (rt, opened)
     }
 
-    fn dash_open(h: &H, view: Option<&str>) -> ResponseBody {
+    pub(super) fn dash_open(h: &H, view: Option<&str>) -> ResponseBody {
         h.req(RequestBody::DashOpen {
             view: view.map(str::to_owned),
         })
     }
 
-    fn allow_all() -> ConnChecker {
+    pub(super) fn allow_all() -> ConnChecker {
         Arc::new(|_, _| {
             Ok(SessionId {
                 agent: AgentKind::Other("dashboard".into()),
@@ -3002,7 +3116,7 @@ mod tests {
     // no_claim=a detached process (it is not an agent session: it gets the same answer as the
     // terminal, which holds no token: dash_open_never_returns_token)
     #[test]
-    fn dash_open_refused_in_agent_session() {
+    pub(super) fn dash_open_refused_in_agent_session() {
         let h = fresh();
         let r = dash_open(&h, None);
         assert_eq!(
@@ -3050,7 +3164,7 @@ mod tests {
     // used and the gap has passed a new tab opens; fails_when=a second tab opens inside either
     // limit; no_claim=-
     #[test]
-    fn dash_open_is_rate_limited() {
+    pub(super) fn dash_open_is_rate_limited() {
         use std::io::{Read, Write};
         let h = fresh();
         let (_rt, opened) = with_dash(&h, allow_all());
@@ -3094,7 +3208,7 @@ mod tests {
     // fails_when=the reply's encoding contains the token or any 64-hex string;
     // no_claim=what the opener does with the URL (LaunchServices)
     #[test]
-    fn dash_open_never_returns_token() {
+    pub(super) fn dash_open_never_returns_token() {
         let h = fresh();
         let (_rt, opened) = with_dash(&h, allow_all());
         // A detached process is unattributed, exactly like the user's terminal.
@@ -3116,7 +3230,7 @@ mod tests {
     // session; fails_when=the refused client reads a response, or no receipt names the session;
     // no_claim=the OS process walk (dash.rs conn_check_* and ms-cli dashboard.rs)
     #[test]
-    fn refused_connection_writes_blocked_receipt() {
+    pub(super) fn refused_connection_writes_blocked_receipt() {
         use std::io::{Read, Write};
         let h = fresh();
         let agent_session = match agent() {
@@ -3162,7 +3276,7 @@ mod tests {
 
     /// The `shop` fixture saved (approved), a key in no project, a receipt for the Stripe key and
     /// a scan report.
-    fn dash_fixture(h: &H) {
+    pub(super) fn dash_fixture(h: &H) {
         let mut rec = shop(h);
         rec.files[0].git_history_commits = Some(2);
         rec.findings.push(ms_projects::record::FindingRecord {
@@ -3212,7 +3326,7 @@ mod tests {
     // records), the last scan, and counts on Home; fails_when=a screen misses its data, misreports
     // a status or shows stale receipts; no_claim=the page's rendering (browser pass)
     #[test]
-    fn dashboard_views_from_records() {
+    pub(super) fn dashboard_views_from_records() {
         let h = fresh();
         dash_fixture(&h);
         let home = h.d.dash_home().unwrap();
@@ -3226,6 +3340,17 @@ mod tests {
         );
         assert!(home.blocked_24h >= 1);
         assert_eq!(home.agents.len(), 2);
+        // L33 D-6, D-7: the keys not usable yet, in the one vocabulary.
+        assert_eq!(home.not_usable.len(), 3);
+        let words: Vec<&str> = home.not_usable.iter().map(|k| k.status.as_str()).collect();
+        assert!(words.contains(&"needs a command") && words.contains(&"needs a website"));
+        assert!(home.warnings.len() >= home.alerts.len().min(1));
+        for a in &home.agents {
+            assert!(
+                a.command == format!("ms connect {}", a.id)
+                    || a.command == format!("ms disconnect {}", a.id)
+            );
+        }
 
         let ps = h.d.dash_projects_view().unwrap();
         assert_eq!(ps.projects.len(), 1);
@@ -3249,6 +3374,15 @@ mod tests {
         assert_eq!(db.status, "needs a command");
         assert_eq!(p.findings[0].masked, "sk_live_… (40 bytes)");
         assert_eq!(p.committed[0].commits, 2);
+        assert_eq!(p.not_usable, 2);
+        assert_eq!(
+            p.dev_command.as_deref(),
+            Some(format!("cd '{}' && ms dev -- npm run dev", p.root).as_str())
+        );
+        assert_eq!(
+            p.rescan_command.as_deref(),
+            Some(format!("cd '{}' && ms init", p.root).as_str())
+        );
         assert_eq!(h.d.dash_project("nope").unwrap_err().status, 404);
 
         let s = h.d.dash_secret(&KeyName::new(STRIPE_KEY).unwrap()).unwrap();
@@ -3299,6 +3433,18 @@ mod tests {
             .unwrap();
         assert_eq!(none.matched, 0);
         assert!(none.total > 0);
+        assert_eq!(none.projects, ["shop"]);
+        // "other" is any agent the filter has no name for (L33 D-15): the fixture has none.
+        let other =
+            h.d.dash_activity(&ms_dash::api::ActivityQuery {
+                agent: Some("other".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(other.rows.iter().all(|r| !matches!(
+            r.agent.as_str(),
+            "claude-code" | "codex" | "terminal" | "dashboard" | "ms-dev"
+        )));
         // The cached receipts follow new records (review R8).
         let before = h.d.dash_activity(&Default::default()).unwrap().matched;
         let _ = h.swap(STRIPE_KEY, "api.stripe.com");
@@ -3343,7 +3489,7 @@ mod tests {
     // fixture's keys all hold the canary; fails_when=the canary appears in any serialized view;
     // no_claim=the HTTP layer (it serializes these same views; ms-cli dashboard.rs fetches them)
     #[test]
-    fn dashboard_never_serves_a_canary() {
+    pub(super) fn dashboard_never_serves_a_canary() {
         let h = fresh();
         dash_fixture(&h);
         let mut out = Vec::new();

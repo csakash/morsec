@@ -23,37 +23,46 @@ pub const SCREENS: &[&str] = &[
     "/scan",
 ];
 
-/// Every subcommand, current or planned in Wave 7.
+/// Every subcommand (L33 SPEC D-26).
 pub const PARITY: &[(&str, Parity)] = &[
     ("status", Parity::Screen("/")),
     ("stats", Parity::Screen("/")),
+    ("stop", Parity::Screen("/")),
+    ("start", Parity::Screen("/")),
+    ("approve", Parity::Screen("/")),
     ("projects", Parity::Screen("/projects")),
+    ("set", Parity::Screen("/secret")),
+    ("rm", Parity::Screen("/secret")),
+    ("add", Parity::Screen("/secret")),
     ("rules", Parity::Screen("/secret")),
+    ("undo", Parity::Screen("/project")),
     ("log", Parity::Screen("/activity")),
     ("doctor", Parity::Screen("/agents")),
     ("scan", Parity::Screen("/scan")),
     (
         "init",
         Parity::Exempt(
-            "L33: Add project. Machine-mode steps stay CLI only: they install the daemon that serves the page",
+            "runs in your terminal: the scan reads your files with your terminal's permissions and loosens new keys' rules; the Projects screen checks the folder and gives the command (L33 D-17)",
         ),
     ),
-    ("add", Parity::Exempt("L33: Secret, Add (hidden field)")),
-    ("import", Parity::Exempt("L33: Add project and re-scan")),
-    ("connect", Parity::Exempt("L33: Agents, Connect")),
-    ("disconnect", Parity::Exempt("L33: Agents, Disconnect")),
     (
-        "stop",
-        Parity::Exempt("L33: Home, Stop (Home shows on or stopped now)"),
+        "import",
+        Parity::Exempt(
+            "runs in your terminal: the scan reads your files with your terminal's permissions and loosens new keys' rules; the Projects screen checks the folder and gives the command (L33 D-17)",
+        ),
     ),
-    ("start", Parity::Exempt("L33: Home, Start (Touch ID)")),
     (
-        "approve",
-        Parity::Exempt("L33: Home, Approve or deny (Home shows the pending request now)"),
+        "connect",
+        Parity::Exempt(
+            "edits the agent's settings with a diff you confirm in the terminal; the Agents screen gives the command (L33 D-16)",
+        ),
     ),
-    ("set", Parity::Exempt("L33: Secret, Replace")),
-    ("rm", Parity::Exempt("L33: Secret, Delete")),
-    ("undo", Parity::Exempt("L33: Project and Secret, Undo")),
+    (
+        "disconnect",
+        Parity::Exempt(
+            "edits the agent's settings with a diff you confirm in the terminal; Disconnect removes the agent's sandbox; the Agents screen gives the command (L33 D-16)",
+        ),
+    ),
     (
         "run",
         Parity::Exempt("agent run-time path; a person never calls it"),
@@ -64,10 +73,33 @@ pub const PARITY: &[(&str, Parity)] = &[
     ),
     (
         "dev",
-        Parity::Exempt("L34: needs the user's own terminal to run their app"),
+        Parity::Exempt(
+            "needs the user's own terminal to run their app; the Project screen shows the command",
+        ),
     ),
     ("dashboard", Parity::Exempt("opens the dashboard itself")),
     ("help", Parity::Exempt("clap's built-in help")),
+];
+
+/// The action routes behind each "Screen" subcommand that changes something (`doctor`'s is
+/// Re-check; `status`, `stats`, `projects`, `log` only read).
+pub const ACTIONS: &[(&str, &[&str])] = &[
+    ("stop", &["/api/stop"]),
+    ("start", &["/api/start"]),
+    (
+        "approve",
+        &["/api/approvals/{id}/approve", "/api/approvals/{id}/deny"],
+    ),
+    ("set", &["/api/keys/{key}/replace"]),
+    ("rm", &["/api/keys/{key}/delete"]),
+    ("add", &["/api/keys"]),
+    ("rules", &["/api/keys/{key}/rules"]),
+    (
+        "undo",
+        &["/api/projects/{slug}/undo", "/api/keys/{key}/undo"],
+    ),
+    ("doctor", &["/api/agents/recheck"]),
+    ("scan", &["/api/scan/run"]),
 ];
 
 /// The entry for `name`, if any.
@@ -79,10 +111,11 @@ pub fn lookup(name: &str) -> Option<Parity> {
 mod tests {
     use super::*;
 
-    // protects=every screen the parity table names is a real route in the page's router, and
-    // every exemption gives a reason; fails_when=a route is renamed or removed from dash.js, or
-    // an exemption is empty; no_claim=that the screen shows everything the command does (browser
-    // pass)
+    // protects=every screen the parity table names is a real route in the page's router, every
+    // exemption gives a reason, and (L33 D-26) each "Screen" subcommand that changes something
+    // has its action route in http's route table and the page posts to it; fails_when=a route
+    // is renamed or removed from dash.js or the route table, or an exemption is empty;
+    // no_claim=that the screen shows everything the command does (browser pass)
     #[test]
     fn parity_routes_exist() {
         let js = crate::assets::DASH_JS;
@@ -96,6 +129,21 @@ mod tests {
             match p {
                 Parity::Screen(s) => assert!(SCREENS.contains(s), "{name}: {s}"),
                 Parity::Exempt(why) => assert!(why.len() > 8, "{name} needs a reason"),
+            }
+        }
+        for (name, routes) in ACTIONS {
+            assert!(
+                matches!(lookup(name), Some(Parity::Screen(_))),
+                "{name} has actions but no screen"
+            );
+            for r in *routes {
+                assert!(
+                    crate::actions::ACTION_ROUTES.iter().any(|(p, _)| p == r),
+                    "{name}: {r} is not in the route table"
+                );
+                // The page builds the path from its fixed prefix.
+                let prefix = r.split('{').next().unwrap_or(r);
+                assert!(js.contains(prefix), "{name}: dash.js never posts to {r}");
             }
         }
     }

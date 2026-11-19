@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, watch};
 
+use crate::actions::{Action, Actor, DashActions};
 use crate::auth::{Access, Auth, RateLog, Throttle};
 use crate::data::{DashData, Refusal};
 use crate::{DEFAULT_PORT, PORT_SPAN};
@@ -114,6 +115,7 @@ struct State {
 pub struct Inner {
     cfg: DashConfig,
     data: Arc<dyn DashData>,
+    actions: Option<Arc<dyn DashActions>>,
     rt: Handle,
     state: Mutex<State>,
 }
@@ -131,6 +133,39 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Inner {
     pub(crate) fn data(&self) -> Arc<dyn DashData> {
         self.data.clone()
+    }
+
+    pub(crate) fn actions(&self) -> Option<Arc<dyn DashActions>> {
+        self.actions.clone()
+    }
+
+    /// One from the session's action bucket (30 a minute, SPEC D-22).
+    pub(crate) fn take_action(&self, cookie: &str, now: Instant) -> bool {
+        lock(&self.state).auth.take_action(cookie, now)
+    }
+
+    /// A `blocked` receipt for an action the envelope refused (throttled like every refusal
+    /// receipt), and a log line.
+    pub(crate) async fn refused_action(
+        &self,
+        actor: &Actor,
+        action: Action,
+        key: Option<ms_core::KeyName>,
+        why: &str,
+    ) {
+        let r = Refusal {
+            session: actor.session.clone(),
+            why: format!("{}: {why}", action.target()),
+        };
+        let allowed = lock(&self.state).throttle.allow(&r.session, Instant::now());
+        self.log_refusal(&r, allowed);
+        if allowed && let Some(acts) = self.actions.clone() {
+            let (actor, why) = (actor.clone(), why.to_owned());
+            let _ = tokio::task::spawn_blocking(move || {
+                acts.refused(&actor, action, key.as_ref(), &why);
+            })
+            .await;
+        }
     }
 
     pub(crate) fn take_anon(&self, now: Instant) -> bool {
@@ -223,12 +258,24 @@ pub struct Dash {
 }
 
 impl Dash {
-    /// A dashboard that is not listening yet. `rt` runs the listener.
+    /// A read-only dashboard that is not listening yet. `rt` runs the listener.
     pub fn new(cfg: DashConfig, data: Arc<dyn DashData>, rt: Handle) -> Self {
+        Self::with_actions(cfg, data, None, rt)
+    }
+
+    /// A dashboard whose action routes go to `actions` (L33); without them every action
+    /// answers 404.
+    pub fn with_actions(
+        cfg: DashConfig,
+        data: Arc<dyn DashData>,
+        actions: Option<Arc<dyn DashActions>>,
+        rt: Handle,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 cfg,
                 data,
+                actions,
                 rt,
                 state: Mutex::new(State {
                     running: None,
@@ -388,7 +435,8 @@ async fn connection(
     let svc_inner = inner.clone();
     let svc = service_fn(move |req| {
         let (inner, who) = (svc_inner.clone(), who.clone());
-        async move { Ok::<_, Infallible>(crate::http::handle(&inner, port, &who, req).await) }
+        let conn = crate::http::Conn { port, peer, local };
+        async move { Ok::<_, Infallible>(crate::http::handle(&inner, conn, &who, req).await) }
     });
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())

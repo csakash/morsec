@@ -40,20 +40,35 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// A token bucket: `rate` per second, burst `rate`.
+/// Action requests per session per minute (L33 SPEC D-22).
+pub const ACTIONS_PER_MINUTE: u32 = 30;
+
+/// A token bucket: `rate` per second, burst `cap`.
 #[derive(Debug, Clone)]
 pub struct Bucket {
     rate: f64,
+    cap: f64,
     tokens: f64,
     last: Instant,
 }
 
 impl Bucket {
-    /// A full bucket.
+    /// A full bucket of `rate` per second, burst `rate`.
     pub fn new(rate: u32) -> Self {
         Self {
             rate: f64::from(rate),
+            cap: f64::from(rate),
             tokens: f64::from(rate),
+            last: Instant::now(),
+        }
+    }
+
+    /// A full bucket of `n` per minute, burst `n`.
+    pub fn per_minute(n: u32) -> Self {
+        Self {
+            rate: f64::from(n) / 60.0,
+            cap: f64::from(n),
+            tokens: f64::from(n),
             last: Instant::now(),
         }
     }
@@ -62,7 +77,7 @@ impl Bucket {
     pub fn take(&mut self, now: Instant) -> bool {
         let dt = now.saturating_duration_since(self.last).as_secs_f64();
         self.last = now;
-        self.tokens = (self.tokens + dt * self.rate).min(self.rate);
+        self.tokens = (self.tokens + dt * self.rate).min(self.cap);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -79,6 +94,8 @@ struct Session {
     csrf: Vec<String>,
     created: Instant,
     bucket: Bucket,
+    /// Action requests (30 a minute, SPEC D-22).
+    actions: Bucket,
 }
 
 /// What a request's cookie and CSRF header add up to.
@@ -176,6 +193,7 @@ impl Auth {
                 csrf: vec![csrf.clone()],
                 created: now,
                 bucket: Bucket::new(self.rate),
+                actions: Bucket::per_minute(ACTIONS_PER_MINUTE),
             },
         );
         Ok((cookie, csrf))
@@ -206,6 +224,14 @@ impl Auth {
             return Access::Limited;
         }
         Access::Ok
+    }
+
+    /// Takes one from the action bucket of the session `cookie` names (checked by [`Auth::check`]
+    /// first). False when the session is gone or over 30 actions a minute.
+    pub fn take_action(&mut self, cookie: &str, now: Instant) -> bool {
+        self.sessions
+            .get_mut(&digest(cookie))
+            .is_some_and(|s| s.actions.take(now))
     }
 
     /// Takes one from the shared bucket for unauthenticated requests (SPEC D-10).

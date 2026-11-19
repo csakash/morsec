@@ -805,6 +805,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1056,6 +1057,8 @@ dependencies = [
  "ms-scan",
  "ms-session",
  "ms-vault",
+ "objc2",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "sha2",

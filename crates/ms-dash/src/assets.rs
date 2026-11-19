@@ -447,7 +447,9 @@ mod tests {
                 for (i, _) in outside.match_indices(&form) {
                     let before = outside[..i].trim_end();
                     assert!(
-                        before.ends_with("field(") || before.ends_with(','),
+                        before.ends_with("field(")
+                            || before.ends_with(',')
+                            || before.ends_with("addEventListener("),
                         "{tag} made outside field(): …{}",
                         &outside[i.saturating_sub(40)..i + form.len()]
                     );
@@ -546,6 +548,92 @@ mod tests {
             reduce
                 .iter()
                 .any(|(s, b, _)| s.contains('*') && b.contains("transition: none !important"))
+        );
+    }
+
+    // protects=L33 SPEC D-12, criterion 9, T-91: the page never keeps a value anywhere but the
+    // one element it shows it in: no localStorage, sessionStorage, indexedDB, caches, cookies
+    // written by script, console output, or history entries with data; fails_when=any of those
+    // appears in the script; no_claim=the browser's own memory until garbage collection
+    // (residual)
+    #[test]
+    fn dash_js_never_stores_values() {
+        let c = code(DASH_JS);
+        for bad in [
+            "localStorage",
+            "sessionStorage",
+            "indexedDB",
+            "caches.",
+            "document.cookie",
+            "console.",
+            "pushState",
+            "postMessage",
+            "BroadcastChannel",
+            "navigator.sendBeacon",
+            "window.name",
+        ] {
+            assert!(!c.contains(bad), "dash.js uses {bad}");
+        }
+        // The one history call drops the launch token from the address bar, with no state.
+        for (i, _) in c.match_indices("history.") {
+            assert!(
+                c[i..].starts_with("history.replaceState(null, '', location.pathname"),
+                "{}",
+                &c[i..i + 60]
+            );
+        }
+        // The shown value reaches the page only as textContent of the value box.
+        assert!(c.contains("box.textContent = t;"));
+        // Clipboard writes are the page's own commands, never a response field.
+        for (i, _) in c.match_indices("clipboard.writeText(") {
+            assert!(c[i..].starts_with("clipboard.writeText(command)"));
+        }
+    }
+
+    // protects=L33 SPEC D-12, T-91: a shown value is cleared after 15 s, on blur, when the page
+    // is hidden, on pagehide and on navigation, and its element can't be selected (Copy is the
+    // way to copy); fails_when=any of these clears is missing, or the value box allows
+    // selection; no_claim=that the browser frees the string (residual)
+    #[test]
+    fn reveal_is_cleared() {
+        let c = code(DASH_JS);
+        assert!(c.contains("setTimeout(hideValue, 15000)"));
+        for ev in [
+            "window.addEventListener('blur', hideValue)",
+            "window.addEventListener('pagehide', hideValue)",
+            "window.addEventListener('hashchange', hideValue)",
+            "document.addEventListener('visibilitychange'",
+        ] {
+            assert!(c.contains(ev), "{ev}");
+        }
+        let start = c.find("function render()").expect("render");
+        assert!(
+            c[start..start + 200].contains("hideValue();"),
+            "navigation hides"
+        );
+        let start = c.find("function signedOut(").expect("signedOut");
+        assert!(c[start..start + 100].contains("hideValue();"));
+        let css = code(DASH_CSS);
+        let value = css
+            .split("\n.value {")
+            .nth(1)
+            .or_else(|| css.split(".value {").nth(1))
+            .expect(".value rule");
+        let body = value.split('}').next().unwrap();
+        assert!(body.contains("user-select: none"), "{body}");
+        // The fields values are typed into are hidden and never autocompleted.
+        let start = c.find("function secretField(").expect("secretField");
+        let f = &c[start..start + 500];
+        for attr in [
+            "'type', 'password'",
+            "'autocomplete', 'off'",
+            "'spellcheck', 'false'",
+        ] {
+            assert!(f.contains(attr), "{attr}");
+        }
+        assert!(
+            !c.contains("'form'"),
+            "value fields are never inside a <form>"
         );
     }
 }
