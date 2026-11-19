@@ -436,7 +436,10 @@ pub fn build(d: &Arc<Daemon>, listen: SocketAddr) -> Result<(ProxyConfig, Deps),
     let (binds, skipped) = bindings_with(&rules, &d.project_providers());
     for s in skipped {
         tracing::warn!("{s}");
-        d.alert(crate::daemon::AlertKind::BindingSkipped, s);
+        let key = s
+            .split_once(':')
+            .and_then(|(k, _)| ms_core::KeyName::new(k).ok());
+        d.alert(crate::daemon::AlertKind::BindingSkipped { key }, s);
     }
     let hosts: BTreeSet<String> = binds.iter().flat_map(|b| b.hosts.iter().cloned()).collect();
     let ca = Arc::new(ensure_ca(d, &hosts)?);

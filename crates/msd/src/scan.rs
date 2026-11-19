@@ -109,15 +109,16 @@ pub fn scan(
     }
 
     for r in roots {
-        notes.push(format!(
-            "searched {}{}",
-            r.display(),
-            match std::fs::symlink_metadata(r) {
-                Ok(m) if m.is_dir() => "",
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => " (could not be read)",
-                _ => " (not found)",
+        notes.push(match std::fs::symlink_metadata(r) {
+            Ok(m) if m.is_dir() => format!("Searched {}.", r.display()),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                format!("{} could not be read, so it was not searched.", r.display())
             }
-        ));
+            _ => format!(
+                "{} doesn't exist, so there was nothing to search there.",
+                r.display()
+            ),
+        });
     }
     let walk = ms_scan::transcript_files(roots, MAX_FILES);
     notes.extend(walk.notes);

@@ -85,6 +85,8 @@ pub struct PendingView {
     pub requester: Option<String>,
     /// It changes morsec itself, so it can be approved once only (review S2).
     pub once_only: bool,
+    /// Show the exact request open, not folded: every request that is not msd's own (SR1).
+    pub expand: bool,
     /// Agent label.
     pub agent: String,
     /// Key.

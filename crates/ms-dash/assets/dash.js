@@ -228,10 +228,31 @@
     if (note) row.appendChild(txt('span', 'muted', note));
     return row;
   }
-  function section(title) {
+  function section(title, id) {
     const s = el('section', 'section');
+    if (id) s.id = id;
     s.appendChild(txt('h2', null, title));
     return s;
+  }
+
+  // One visible result after an action that redraws the screen (P2): shown at the top of the
+  // section the action belongs to (or of the screen), until the next action or navigation.
+  let flash = null;
+  function rerender(anchor, r, node, nav) {
+    if (r) flash = { anchor: anchor, text: sentence(r.message || 'Done.'), node: node || null, nav: !!nav };
+    if (nav) { location.hash = nav; return; }
+    render();
+  }
+  function showFlash() {
+    if (!flash) return;
+    const f = flash;
+    flash = null;
+    const target = (f.anchor && document.getElementById(f.anchor)) || main.querySelector('section');
+    if (!target) return;
+    const p = txt('p', 'signal result', f.text);
+    const head = target.querySelector('h2, .hero');
+    if (head && head.parentNode === target) head.after(p); else target.prepend(p);
+    if (f.node) p.after(f.node);
   }
 
   // ---- API ----------------------------------------------------------------------------------
@@ -263,9 +284,13 @@
     return body;
   }
   // msd's messages already say what to do next; the page shows them once, capitalised (Q6).
+  // A message as one sentence: capitalised (but "morsec" stays lowercase) and ended with a
+  // full stop (P6).
   function sentence(m) {
-    const t = String(m || '').replace(/^morsec: /, '').trim();
-    return t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
+    let t = String(m || '').replace(/^morsec: /, '').trim();
+    if (!t) return t;
+    if (!/^morsec\b/.test(t)) t = t.charAt(0).toUpperCase() + t.slice(1);
+    return /[.!?…)'"]$/.test(t) ? t : t + '.';
   }
   class ActionFailed extends Error {
     constructor(message, code) { super(message); this.code = code; }
@@ -326,6 +351,9 @@
   }
 
   // ---- header: the status control (SPEC D-9) -------------------------------------------------
+  // The outcome of Stop or Start stays visible next to the control until the next navigation
+  // (F1).
+  let stateNote = null;
   function renderState() {
     if (state.running === null) { stateBox.replaceChildren(); return; }
     if (state.running) {
@@ -333,6 +361,7 @@
     } else {
       stateBox.replaceChildren(txt('span', 'word off', 'Stopped'), btn('Start', 'sm solid', start));
     }
+    if (stateNote) stateBox.appendChild(txt('span', (stateNote.err ? 'err' : 'signal') + ' result ask', stateNote.text));
   }
   function confirmStop() {
     const msg = txt('span', 'ask', 'Stop every agent’s access now?');
@@ -341,10 +370,12 @@
       try {
         const r = await act('/api/stop');
         state.running = false;
-        announce(r.message || 'morsec stopped.');
+        stateNote = { text: 'Stopped. Every agent request is refused.', err: false };
+        announce(sentence(r.message || 'morsec stopped.'));
       } catch (e) {
         if (e instanceof SignedOut) { signedOut(e.message); return; }
-        announce(e.message);
+        stateNote = { text: sentence(e.message), err: true };
+        announce(stateNote.text);
       }
       renderState();
       render();
@@ -360,10 +391,12 @@
     try {
       const r = await act('/api/start');
       state.running = true;
-      announce(r.message || 'morsec is on.');
+      stateNote = { text: 'Started with Touch ID.', err: false };
+      announce(sentence(r.message || 'morsec is on.'));
     } catch (e) {
       if (e instanceof SignedOut) { signedOut(e.message); return; }
-      announce(e.message);
+      stateNote = { text: sentence(e.message), err: true };
+      announce(stateNote.text);
     }
     renderState();
     render();
@@ -398,14 +431,14 @@
           run(out, false, async function () {
             const r = await act(route);
             return { message: route === '/api/agents/recheck' ? recheckMessage(r) : r.message };
-          }).then(function (r) { if (r) after(2500, render); });
+          }).then(function (r) { if (r) rerender('needs', r); });
         }));
       }
     }
     for (const f of w.fix) if (f.command) b.appendChild(copyline(f.command, 'Run it in Terminal.'));
     if (w.dismiss) {
       acts.appendChild(btn('Dismiss', 'quiet', function () {
-        run(out, false, function () { return act('/api/warnings/' + enc(w.id) + '/dismiss'); }).then(function (r) { if (r) render(); });
+        run(out, false, function () { return act('/api/warnings/' + enc(w.id) + '/dismiss'); }).then(function (r) { if (r) rerender('needs', r); });
       }));
     }
     if (acts.childNodes.length) b.appendChild(acts);
@@ -421,11 +454,16 @@
     b.appendChild(txt('h3', null, p.from_agent ? p.agent + ' is waiting for you' : 'A request is waiting for you'));
     b.appendChild(txt('p', 'summary', p.summary));
     const facts = [['Key', ref(p.key)], ['Tier', p.tier]];
-    if (!p.from_agent && p.requester) facts.push(['Asked by', txt('span', null, p.requester)]);
+    if (!p.from_agent && p.requester) {
+      facts.push(['Asked by', el('span', null, txt('span', null, p.requester),
+        txt('span', 'muted', ' The program name is what the process called itself; it does not prove who asked.'))]);
+    }
     if (p.cwd) facts.push(['Folder', pathText(p.cwd)]);
     if (p.effect) facts.push(['What it does', txt('span', null, p.effect)]);
     b.appendChild(kv(facts));
     const d = el('details', null);
+    // Anything that is not morsec's own request is shown exactly, open (SR1).
+    if (p.expand) d.open = true;
     d.appendChild(txt('summary', null, 'The exact request (' + plural(p.command.length, 'part', 'parts') + ')'));
     const ol = el('ol', 'argv');
     p.command.forEach(function (a, i) { ol.appendChild(txt('li', null, '[' + i + '] ' + a)); });
@@ -443,7 +481,7 @@
       b.appendChild(txt('p', 'waiting', 'Touch ID is up for this request on this Mac.'));
     } else {
       const id = p.id;
-      const done = function (r) { if (r) after(800, render); };
+      const done = function (r) { if (r) rerender('needs', r); };
       const acts = el('div', 'actions',
         btn('Approve once', 'solid', function () { run(out, true, function () { return act('/api/approvals/' + enc(id) + '/approve', { scope: 'once' }); }).then(done); }));
       if (!p.once_only) {
@@ -469,7 +507,7 @@
       : 'Every agent request is refused until you start it again.'));
     out.appendChild(hero);
 
-    const needs = section('Needs you');
+    const needs = section('Needs you', 'needs');
     let n = 0;
     if (h.pending) { needs.appendChild(pendingCard(h.pending)); n++; }
     for (const w of h.warnings) { needs.appendChild(warningBox(w)); n++; }
@@ -520,7 +558,7 @@
     const s = section('Add a project');
     s.appendChild(txt('p', null, 'Setting up a project reads its files, so it runs in Terminal with your own permissions. morsec checks the folder and gives you the command.'));
     const [w, input] = textField('Project folder', 'folder', 'The full path, for example /Users/you/code/shop');
-    const out = el('div', null);
+    const out = el('div', 'result');
     const go = btn('Check folder', null, async function () {
       const path = input.value.trim();
       if (!path) { out.replaceChildren(txt('p', 'err', 'Type the folder’s full path first.')); return; }
@@ -540,7 +578,7 @@
   }
 
   function addKey() {
-    const s = section('Add a key');
+    const s = section('Add a key', 'addkey');
     s.appendChild(txt('p', 'muted', 'A new key allows nothing until you give it a website or a command on its screen.'));
     const [kw, key] = textField('Key name', 'key', 'For example shop/stripe-secret-key');
     const [vw, value] = secretField('Value (hidden)', 'value', 'Pasted here, sent to morsec, then cleared from this page');
@@ -550,7 +588,7 @@
     const go = btn('Add key', 'solid', function () {
       const body = { key: key.value.trim(), value: value.value, mode: mode.value, tier: tier.value };
       value.value = '';
-      run(out, false, function () { return act('/api/keys', body); }).then(function (r) { if (r) after(1200, render); });
+      run(out, false, function () { return act('/api/keys', body); }).then(function (r) { if (r) rerender('addkey', r); });
       body.value = '';
     });
     s.appendChild(el('div', 'fields', kw, vw, mw, tw, el('div', 'field act', go)));
@@ -630,32 +668,40 @@
       out.appendChild(txt('p', 'err section', 'The scan stopped after ' + num(p.scan_entries) + ' files, so some secrets may be missing. Set up a subfolder on its own.'));
     }
     const result = el('div', null);
-    const sec = section('Secrets');
+    const sec = section('Secrets', 'secrets');
     if (p.rows.length === 0) {
       sec.appendChild(txt('p', 'muted', 'No secrets were found in this project.'));
     } else {
       sec.appendChild(table(['Variable', 'Key', 'Provider', 'Tier', 'Used as', 'Status', 'Last use', ''], p.rows.map(function (r) {
-        const msg = txt('span', 'muted', '');
         const cell = el('div', 'rowacts');
-        const doUndo = function () {
-          run(msg, true, function () { return act('/api/projects/' + enc(p.slug) + '/undo', { key: r.key }); }).then(function (x) {
-            if (x && x.undo) { result.replaceChildren(undoResult(x.undo)); after(2500, render); }
-          });
-        };
-        // Undo is the quiet, second action, and asks first (review Q7).
+        // Undo is the quiet, second action, and asks first in a row of its own beneath, so
+        // the table's columns don't move (review Q7, QA P3).
         const undo = txt('button', 'lnk', 'Undo');
         undo.setAttribute('type', 'button');
         undo.addEventListener('click', function () {
+          const tr = cell.closest('tr');
+          if (!tr || (tr.nextSibling && tr.nextSibling.className === 'confirmrow')) return;
+          const msg = txt('span', 'muted', '');
           const yes = txt('button', 'lnk', 'Write the value back');
           yes.setAttribute('type', 'button');
-          yes.addEventListener('click', doUndo);
           const no = txt('button', 'lnk', 'Cancel');
           no.setAttribute('type', 'button');
-          no.addEventListener('click', function () { cell.replaceChildren(open, undo, msg); });
-          cell.replaceChildren(open, yes, no, msg);
+          const row = el('tr', 'confirmrow');
+          const td = el('td', null, el('div', 'rowacts',
+            txt('span', null, 'Write ' + r.var + '’s value back into ' + r.file + ' and drop the reference? You confirm with Touch ID.'),
+            yes, no, msg));
+          td.colSpan = 8;
+          row.appendChild(td);
+          tr.after(row);
+          no.addEventListener('click', function () { row.remove(); });
+          yes.addEventListener('click', function () {
+            run(msg, true, function () { return act('/api/projects/' + enc(p.slug) + '/undo', { key: r.key }); }).then(function (x) {
+              if (x && x.undo) rerender('secrets', x, undoResult(x.undo));
+            });
+          });
         });
         const open = link('/secret/' + enc(r.key), 'Open');
-        cell.replaceChildren(open, undo, msg);
+        cell.replaceChildren(open, undo);
         return [el('span', null, mono(r.var), txt('span', 'muted', ' ' + r.file + ':' + r.line)), ref(r.key), r.provider || '', r.tier || '', r.mode || '',
           status(r.status), when(r.last_use_unix_ms), cell];
       }), true));
@@ -668,7 +714,10 @@
             btn('Undo whole project', 'danger', function () {
               run(msg, true, function () { return act('/api/projects/' + enc(p.slug) + '/undo', {}); }).then(function (x) {
                 confirmBox.replaceChildren();
-                if (x && x.undo) result.replaceChildren(undoResult(x.undo));
+                if (!x || !x.undo) return;
+                // A fully undone project is gone: go to Projects with the result (F5).
+                if (x.undo.skipped.length === 0) rerender(null, x, undoResult(x.undo), '#/projects');
+                else rerender('secrets', x, undoResult(x.undo));
               });
             }),
             btn('Cancel', null, function () { confirmBox.replaceChildren(); }))));
@@ -731,10 +780,10 @@
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') hideValue(); });
 
   function rulesSection(s) {
-    const box = section('What it may do');
+    const box = section('What it may do', 'rules');
     box.appendChild(txt('p', 'muted', 'Adding a website, a command or a folder, or making it a test key, asks for Touch ID. Taking one away does not.'));
     const out = txt('p', 'muted', '');
-    const edit = function (e) { return run(out, true, function () { return act('/api/keys/' + enc(s.key) + '/rules', { edit: e }); }).then(function (r) { if (r) after(900, render); }); };
+    const edit = function (e) { return run(out, true, function () { return act('/api/keys/' + enc(s.key) + '/rules', { edit: e }); }).then(function (r) { if (r) rerender('rules', r); }); };
     // `items` are what is shown; `values` what goes back to msd: for commands, their exact
     // words from the view, never the display string split again (review R1).
     const removable = function (items, kind, label, values) {
@@ -841,7 +890,7 @@
         hide));
       vs.appendChild(out2);
       // Replace: a hidden field outside any form, cleared as soon as it is sent.
-      const [rw, rv] = secretField('New value (hidden)', 'value', 'Touch ID. The old value stays in use if storing the new one fails');
+      const [rw, rv] = secretField('New value (hidden)', 'value', 'You confirm it with Touch ID. If storing the new value fails, the old one stays in use.');
       const rout = txt('p', 'muted', '');
       vs.appendChild(el('div', 'fields', rw, el('div', 'field act', btn('Replace', null, function () {
         const body = { value: rv.value };
@@ -887,8 +936,8 @@
         });
       };
       del.appendChild(el('div', 'fields', dw, el('div', 'field act', btn('Delete key', 'danger', function () { doDelete(false); }))));
-      del.appendChild(extra);
       del.appendChild(dout);
+      del.appendChild(extra);
       out.appendChild(del);
     }
 
@@ -982,7 +1031,7 @@
     out.appendChild(g);
     if (v.warnings.length) {
       const w = section('Warnings');
-      for (const x of v.warnings) w.appendChild(warningBox(x));
+      w.appendChild(el('p', null, plural(v.warnings.length, 'warning needs', 'warnings need') + ' you. ', link('/', 'See them on Home')));
       out.appendChild(w);
     }
     const ch = section('msd’s checks');
@@ -1117,7 +1166,7 @@
     if (!main.firstChild || main.firstChild.nodeName !== 'SECTION') main.replaceChildren(txt('p', 'muted', 'Loading…'));
     try {
       const node = await view(arg, q);
-      if (mine === seq) { main.replaceChildren(node); main.focus({ preventScroll: true }); }
+      if (mine === seq) { main.replaceChildren(node); showFlash(); main.focus({ preventScroll: true }); }
       if (name !== '/') {
         try { const h = await api('/api/home'); if (mine === seq) setRunning(h.running, h.version); } catch (e) { /* the screen shows its own state */ }
       }
@@ -1163,7 +1212,12 @@
       } catch (e) { state.csrf = null; }
     }
     if (!state.csrf) { signedOut(); return; }
-    window.addEventListener('hashchange', render);
+    window.addEventListener('hashchange', function () {
+      if (flash && flash.nav) flash.nav = false; else flash = null;
+      stateNote = null;
+      renderState();
+      render();
+    });
     render();
   }
 

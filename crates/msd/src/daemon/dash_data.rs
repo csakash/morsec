@@ -414,11 +414,27 @@ impl Daemon {
                 // Rendered here, as ms approve shows it: inert, quoted, never cut (SPEC D-11).
                 let r = &p.request;
                 let from_agent = !matches!(r.session.agent, ms_core::AgentKind::Other(_));
+                let admin = p.admin;
                 PendingView {
-                    summary: self.pending_summary(r, from_agent),
+                    summary: self.pending_summary(r, from_agent, admin),
                     from_agent,
-                    requester: (!from_agent).then(|| super::undo::requester(&r.session)),
-                    once_only: ms_approve::broker::once_only(r),
+                    // Who asked, as recorded when the request was made (N6): msd's own
+                    // requests carry it in their argv; any other names the recorded process.
+                    requester: (!from_agent).then(|| {
+                        r.argv_display
+                            .iter()
+                            .find(|a| admin && a.starts_with("requested by "))
+                            .map(|a| ms_approve::render::inert(a))
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "pid {} (started {}), not an agent session",
+                                    r.session.pid,
+                                    ms_approve::render::utc(r.session.started_unix_ms)
+                                )
+                            })
+                    }),
+                    once_only: admin,
+                    expand: !admin,
                     id: p.id,
                     agent: ms_approve::render::agent_name(&r.session.agent),
                     key: ms_approve::render::inert(r.key.as_str()),
@@ -445,7 +461,12 @@ impl Daemon {
 
     /// What a waiting request asks, in plain words (review Q1). Every part from the request is
     /// rendered inert.
-    fn pending_summary(&self, r: &ms_core::ApprovalRequest, from_agent: bool) -> String {
+    pub(super) fn pending_summary(
+        &self,
+        r: &ms_core::ApprovalRequest,
+        from_agent: bool,
+        admin: bool,
+    ) -> String {
         use ms_approve::render::{agent_name, inert, quoted};
         let who = if from_agent {
             agent_name(&r.session.agent)
@@ -454,6 +475,16 @@ impl Daemon {
         };
         let key = inert(r.key.as_str());
         let a: Vec<&str> = r.argv_display.iter().map(String::as_str).collect();
+        // An agent's (or any other process's) own command: its exact words, never a reading of
+        // them, whatever they look like (L33 re-review SR1). Only requests msd tagged as its own
+        // get the plain-words wording below.
+        let generic = || {
+            let cmd: Vec<String> = a.iter().map(|x| quoted(x)).collect();
+            format!("Let {who} use {key} to run {}", cmd.join(" "))
+        };
+        if !admin {
+            return generic();
+        }
         match a.as_slice() {
             ["ms", "rules", k, toml, ..] => {
                 let k = inert(k);
@@ -478,6 +509,41 @@ impl Daemon {
                         adds.push(format!("the command {}", inert(&cmd.to_string())));
                     }
                 }
+                // Everything that can loosen a rule is named (re-review F3).
+                for root in &n.roots {
+                    if !cur.as_ref().is_some_and(|c| c.roots.contains(root)) {
+                        adds.push(format!("the folder {}", inert(&root.display().to_string())));
+                    }
+                }
+                for v in &n.env {
+                    if !cur.as_ref().is_some_and(|c| c.env.contains(v)) {
+                        adds.push(format!("the variable {}", inert(v)));
+                    }
+                }
+                for g in &n.git_hosts {
+                    if !cur.as_ref().is_some_and(|c| c.git_hosts.contains(g)) {
+                        adds.push(format!("git over {}", inert(g)));
+                    }
+                }
+                for kh in &n.ssh_host_keys {
+                    if !cur.as_ref().is_some_and(|c| c.ssh_host_keys.contains(kh)) {
+                        adds.push(format!("the SSH host key {}", inert(&kh.to_string())));
+                    }
+                }
+                for m in &n.mint_scopes {
+                    if !cur.as_ref().is_some_and(|c| c.mint_scopes.contains(m)) {
+                        adds.push(format!("the scope {}", inert(m)));
+                    }
+                }
+                if !n.read_only && cur.as_ref().is_some_and(|c| c.read_only) {
+                    adds.push("write access (it was read-only)".to_owned());
+                }
+                if cur
+                    .as_ref()
+                    .is_some_and(|c| n.session_ttl_secs > c.session_ttl_secs)
+                {
+                    adds.push(format!("approvals that last {} s", n.session_ttl_secs));
+                }
                 if cur.as_ref().is_some_and(|c| c.tier != n.tier) {
                     adds.push(format!("{} tier", tier_str(n.tier)));
                 }
@@ -487,6 +553,9 @@ impl Daemon {
                     format!("Let {who} give {k} access to {}", adds.join(", "))
                 }
             }
+            // The rules diff above is built from msd's own parse of the proposal, so it is
+            // shown for an agent's ask too; every other wording only for a person's own ask.
+            _ if from_agent => generic(),
             ["ms", "start", ..] => format!("Start morsec again (asked by {who})"),
             ["ms", "scan", ..] => {
                 format!("Run the leak scan: it reads every value (asked by {who})")
@@ -502,11 +571,7 @@ impl Daemon {
                 inert(slug)
             ),
             ["dashboard", action, ..] => format!("{} {key}, from the dashboard", inert(action)),
-            _ => {
-                let cmd: Vec<String> = a.iter().take(3).map(|x| quoted(x)).collect();
-                let more = if a.len() > 3 { " …" } else { "" };
-                format!("Let {who} use {key} for {}{more}", cmd.join(" "))
-            }
+            _ => generic(),
         }
     }
 

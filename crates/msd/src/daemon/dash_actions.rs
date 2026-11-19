@@ -71,7 +71,10 @@ pub enum AlertKind {
     /// The project records failed their integrity check.
     ProjectsUnreadable,
     /// A key's binding was skipped when the proxy was built.
-    BindingSkipped,
+    BindingSkipped {
+        /// The key, when the text names one; the alert goes when the key does (QA P8).
+        key: Option<KeyName>,
+    },
     /// Anything else.
     Other,
 }
@@ -85,7 +88,7 @@ impl AlertKind {
             AlertKind::VaultUnlisted => "vault-unlisted",
             AlertKind::FloorNotSaved => "floor-not-saved",
             AlertKind::ProjectsUnreadable => "projects-unreadable",
-            AlertKind::BindingSkipped => "binding-skipped",
+            AlertKind::BindingSkipped { .. } => "binding-skipped",
             AlertKind::Other => "other",
         }
     }
@@ -94,8 +97,36 @@ impl AlertKind {
     pub fn dismissable(&self) -> bool {
         matches!(
             self,
-            AlertKind::CaReissued { .. } | AlertKind::SettingsChanged { .. }
+            AlertKind::CaReissued { .. }
+                | AlertKind::SettingsChanged { .. }
+                | AlertKind::BindingSkipped { .. }
         )
+    }
+
+    /// The same condition as `other`: a newer alert of it replaces the older one instead of
+    /// stacking (QA P9).
+    pub fn same_as(&self, other: &AlertKind) -> bool {
+        match (self, other) {
+            (AlertKind::CaReissued { .. }, AlertKind::CaReissued { .. })
+            | (AlertKind::ProxyDown, AlertKind::ProxyDown) => true,
+            (
+                AlertKind::SettingsChanged { path: a, .. },
+                AlertKind::SettingsChanged { path: b, .. },
+            ) => a == b,
+            (
+                AlertKind::BindingSkipped { key: Some(a) },
+                AlertKind::BindingSkipped { key: Some(b) },
+            ) => a == b,
+            _ => false,
+        }
+    }
+
+    /// The key this alert is about, if any.
+    pub fn key(&self) -> Option<&KeyName> {
+        match self {
+            AlertKind::BindingSkipped { key } => key.as_ref(),
+            _ => None,
+        }
     }
 }
 
@@ -185,9 +216,19 @@ pub fn warning(e: &AlertEntry) -> WarningView {
             "Undo is off until they are fixed. Keys and rules keep working.".to_owned(),
             vec![command("ms doctor")],
         ),
-        AlertKind::BindingSkipped | AlertKind::Other => {
-            (inert(&e.text), String::new(), vec![command("ms doctor")])
-        }
+        AlertKind::BindingSkipped { key } => (
+            match key {
+                Some(k) => format!("{} isn't sent to any website yet", inert(k.as_str())),
+                None => "A key isn't sent to any website yet".to_owned(),
+            },
+            "morsec doesn't know where this key's credential goes in a request, so it doesn't swap it. Give the key its website on its page, or set the project up again.".to_owned(),
+            Vec::new(),
+        ),
+        AlertKind::Other => (
+            "Something needs a look".to_owned(),
+            inert(&e.text),
+            vec![command("ms doctor")],
+        ),
     };
     WarningView {
         id: e.id(),
@@ -221,6 +262,11 @@ pub struct ActState {
     reveals: Mutex<VecDeque<Instant>>,
     /// The pasteboard writer; the real one unless a test or `--test-pasteboard-to` set another.
     clipboard: OnceLock<Arc<dyn Clipboard>>,
+    /// Texts of alerts the person dismissed: not raised again by themselves (QA P8).
+    dismissed: Mutex<std::collections::HashSet<String>>,
+    /// Tests: value_fingerprint finds no randomness.
+    #[cfg(test)]
+    pub(crate) no_randomness: AtomicBool,
     /// Held across every check-then-write of a value: PutKey's "new only" check and its store,
     /// replace, delete (review S3).
     keys_write: Mutex<()>,
@@ -267,6 +313,18 @@ fn from_reply(r: ResponseBody) -> ActionResult {
 }
 
 impl Daemon {
+    /// The person dismissed an alert with this text.
+    pub(crate) fn dismissed(&self, text: &str) -> bool {
+        lock(&self.dash_acts.dismissed).contains(text)
+    }
+
+    /// Drops alerts about keys that no longer have a rule (QA P8).
+    pub(crate) fn prune_alerts(&self) {
+        let keys: std::collections::BTreeSet<KeyName> =
+            self.read_live().rules.keys.keys().cloned().collect();
+        lock(&self.alerts).retain(|e| e.kind.key().is_none_or(|k| keys.contains(k)));
+    }
+
     /// The value lock (review S3).
     pub(crate) fn keys_lock(&self) -> std::sync::MutexGuard<'_, ()> {
         lock(&self.dash_acts.keys_write)
@@ -274,20 +332,24 @@ impl Daemon {
 
     /// A short fingerprint of a new value, keyed by a per-msd random key: binds `ms set`'s
     /// approval to the value (review S2) without telling anyone else anything about it.
-    pub(crate) fn value_fingerprint(&self, value: &[u8]) -> String {
+    pub(crate) fn value_fingerprint(&self, value: &[u8]) -> Option<String> {
         use hmac::{Hmac, Mac};
-        let key = self.dash_acts.value_mac_key.get_or_init(|| {
-            ms_approve::token::random_bytes::<32>().unwrap_or_else(|_| {
-                let mut k = [0u8; 32];
-                k[..8].copy_from_slice(&now_ms().to_be_bytes());
-                k
-            })
-        });
-        let Ok(mut m) = Hmac::<sha2::Sha256>::new_from_slice(key) else {
-            return String::new();
+        // No randomness, no fingerprint: the caller refuses rather than bind to a guessable key
+        // (re-review N5).
+        #[cfg(test)]
+        if self.dash_acts.no_randomness.load(Ordering::SeqCst) {
+            return None;
+        }
+        let key = match self.dash_acts.value_mac_key.get() {
+            Some(k) => k,
+            None => {
+                let k = ms_approve::token::random_bytes::<32>().ok()?;
+                self.dash_acts.value_mac_key.get_or_init(|| k)
+            }
         };
+        let mut m = Hmac::<sha2::Sha256>::new_from_slice(key).ok()?;
         m.update(value);
-        hex::encode(&m.finalize().into_bytes()[..6])
+        Some(hex::encode(&m.finalize().into_bytes()[..6]))
     }
 
     /// The transcript folders a scan reads.
@@ -543,8 +605,9 @@ impl Daemon {
                 ),
             ));
         }
-        alerts.remove(i);
+        let gone = alerts.remove(i);
         drop(alerts);
+        lock(&self.dash_acts.dismissed).insert(gone.text);
         self.dash_receipt(a, &key, "dismiss warning", ReceiptResult::Allowed, None);
         Ok(ActionOk::new("Dismissed"))
     }
@@ -635,7 +698,7 @@ impl Daemon {
                 "morsec: could not start the scan",
             ));
         }
-        Ok(ActionOk::new("Scanning…"))
+        Ok(ActionOk::new("Scan started."))
     }
 
     /// Add project's folder check (SPEC D-17): no mutation, no file read beyond the folder's
@@ -1205,6 +1268,7 @@ impl Daemon {
                 format!("morsec: the value was deleted; its rule could not be ({e})")
             })?;
         }
+        self.prune_alerts();
         Ok(())
     }
 
@@ -1537,11 +1601,33 @@ mod tests {
         req: ApprovalRequest,
         f: impl FnOnce(&ms_approve::Pending) -> T + Send,
     ) -> (T, ms_approve::ApprovalOutcome) {
+        pending_with(h, req, false, f)
+    }
+
+    /// [`while_pending`] for a request msd made for its own action (`ask_admin`).
+    fn while_pending_admin<T: Send>(
+        h: &H,
+        req: ApprovalRequest,
+        f: impl FnOnce(&ms_approve::Pending) -> T + Send,
+    ) -> (T, ms_approve::ApprovalOutcome) {
+        pending_with(h, req, true, f)
+    }
+
+    fn pending_with<T: Send>(
+        h: &H,
+        req: ApprovalRequest,
+        admin: bool,
+        f: impl FnOnce(&ms_approve::Pending) -> T + Send,
+    ) -> (T, ms_approve::ApprovalOutcome) {
         std::thread::scope(|sc| {
             let approvals = h.d.approvals.clone();
             let asker = sc.spawn(move || {
                 use ms_approve::Approver;
-                approvals.ask(&req, Duration::from_secs(5))
+                if admin {
+                    approvals.ask_admin(&req, Duration::from_secs(5))
+                } else {
+                    approvals.ask(&req, Duration::from_secs(5))
+                }
             });
             let deadline = Instant::now() + Duration::from_secs(5);
             let p = loop {
@@ -1616,9 +1702,9 @@ mod tests {
                 "Project records failed their check",
             ),
             (
-                AlertKind::BindingSkipped,
+                AlertKind::BindingSkipped { key: None },
                 "skipped \u{202e}x",
-                "skipped \\u{202e}x",
+                "A key isn't sent to any website yet",
             ),
         ];
         for (kind, text, _) in &cases {
@@ -1642,6 +1728,7 @@ mod tests {
                     assert_eq!(w.fix[0].label.as_deref(), Some("Re-check"));
                     assert_eq!(cmds, ["ms doctor"]);
                 }
+                AlertKind::BindingSkipped { .. } => assert!(cmds.is_empty()),
                 _ => assert_eq!(cmds, ["ms doctor"]),
             }
             assert!(
@@ -1652,13 +1739,14 @@ mod tests {
         }
         assert_eq!(
             ws.iter().filter(|w| w.dismiss).count(),
-            2,
-            "only CaReissued and SettingsChanged"
+            3,
+            "the informational kinds: CaReissued, SettingsChanged, BindingSkipped"
         );
         assert_eq!(h.d.warnings_for(&texts)[0].id, ws[0].id, "stable");
-        // Computed alerts (no kind) show as inert text with ms doctor.
+        // Computed alerts (no kind) get a plain title, their text as detail, and ms doctor.
         let w = h.d.warnings_for(&["the rules failed".into()]);
-        assert_eq!(w[0].title, "the rules failed");
+        assert_eq!(w[0].title, "Something needs a look");
+        assert_eq!(w[0].detail, "the rules failed");
         assert!(!w[0].dismiss);
     }
 
@@ -2788,7 +2876,7 @@ mod tests {
         assert_ne!(req2.unwrap().argv_hash, req.argv_hash);
 
         // The dashboard refuses a session answer to such a request.
-        let (out, _) = while_pending(
+        let (out, _) = while_pending_admin(
             &h,
             admin_request(
                 &SessionId {
@@ -2944,5 +3032,176 @@ mod tests {
         );
         assert_eq!(paste.text().as_deref(), Some(CANARY));
         h.d.dash().unwrap().shutdown();
+    }
+
+    // ---- fix round 2 ------------------------------------------------------------------------
+
+    // protects=re-review SR1: an agent's own command is never read as morsec's own action, even
+    // when its argv is `dashboard show <key>` or `ms set <key>`: the card says "Let <agent> use
+    // <key> to run <the exact words>", shows the request unfolded, and the normal scopes
+    // (session included) stay offered; fails_when=an agent's argv gets an admin wording, the
+    // exact request is folded away, or the once-only tag follows the argv; no_claim=-
+    #[test]
+    fn agent_requests_keep_their_own_words() {
+        let h = fresh();
+        for argv in [
+            vec!["dashboard".to_owned(), "show".into(), "stripe/live".into()],
+            vec!["ms".to_owned(), "set".into(), "stripe/live".into()],
+        ] {
+            let ((), outcome) = while_pending(&h, agent_request(argv.clone()), |p| {
+                let v = h.d.dash_home().unwrap().pending.unwrap();
+                assert!(v.from_agent && v.expand && !v.once_only, "{v:?}");
+                let words: Vec<String> = argv.iter().map(|a| format!("\"{a}\"")).collect();
+                assert_eq!(
+                    v.summary,
+                    format!(
+                        "Let Claude Code use pg/production to run {}",
+                        words.join(" ")
+                    )
+                );
+                assert!(
+                    h.d.dash_approve(&actor(), &p.id, true).is_ok(),
+                    "session offered"
+                );
+            });
+            assert!(matches!(outcome, ms_approve::ApprovalOutcome::Approved(_)));
+        }
+    }
+
+    // protects=re-review N5: with no randomness for the fingerprint key, ms set refuses instead
+    // of binding to a guessable key, before any approval; fails_when=a replace goes ahead with a
+    // fallback key; no_claim=-
+    #[test]
+    fn replace_refused_without_randomness() {
+        let h = fresh();
+        h.put("stripe/test", Tier::Test);
+        h.d.dash_acts.no_randomness.store(true, Ordering::SeqCst);
+        let r = h.req_value(
+            RequestBody::KeyReplace {
+                key: k("stripe/test"),
+            },
+            Some(SecretBytes::new(b"new".to_vec())),
+        );
+        assert!(
+            matches!(&r, ResponseBody::Error { message, .. } if message.contains("randomness")),
+            "{r:?}"
+        );
+        assert!(h.d.approvals.pending().is_none() && h.auth.reasons().is_empty());
+        assert_eq!(value(&h, "stripe/test").unwrap(), CANARY.as_bytes());
+    }
+
+    // protects=re-review N6: who asked is recorded when the request is made (name, executable
+    // path, PID and start time) and the card shows that record, not a lookup at render time;
+    // fails_when=the card recomputes the requester or lacks the PID and start time; no_claim=that
+    // the name proves who asked (the card says it doesn't)
+    #[test]
+    fn requester_recorded_at_request_time() {
+        let h = fresh();
+        h.put("stripe/test", Tier::Test);
+        let s = SessionId {
+            agent: AgentKind::Other("terminal".into()),
+            pid: 999_999,
+            started_unix_ms: 5,
+        };
+        let who = crate::daemon::undo::requester(&s);
+        assert!(
+            who.contains("pid 999999") && who.contains("started 1970-01-01"),
+            "{who}"
+        );
+        let mut req = admin_request(
+            &s,
+            k("stripe/test"),
+            Tier::Test,
+            &["ms", "rm", "stripe/test"],
+        );
+        req.argv_display.push(who.clone());
+        let (v, _) = std::thread::scope(|sc| {
+            let approvals = h.d.approvals.clone();
+            let r = req.clone();
+            let t = sc.spawn(move || approvals.ask_admin(&r, Duration::from_secs(5)));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while h.d.approvals.pending().is_none() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let v = h.d.dash_home().unwrap().pending.unwrap();
+            h.d.dash_deny(&actor(), &v.id).unwrap();
+            (v, t.join().unwrap())
+        });
+        assert_eq!(v.requester.as_deref(), Some(who.as_str()));
+        assert!(v.once_only && !v.expand);
+    }
+
+    // protects=re-review F3: a rules change waiting for the person names everything that
+    // loosens: folders, variables, git hosts, SSH host keys, write access, longer approvals,
+    // tier, not only websites and commands; fails_when=a loosening field is left out of the
+    // summary; no_claim=-
+    #[test]
+    fn rules_summary_names_every_loosening() {
+        let h = fresh();
+        let key = k("db/run");
+        let r = h.req_value(
+            RequestBody::PutKey {
+                name: key.clone(),
+                meta: KeyMeta {
+                    name: key.clone(),
+                    mode: Mode::Run,
+                    tier: Tier::Production,
+                    created_unix_ms: 1,
+                },
+            },
+            Some(SecretBytes::new(b"v".to_vec())),
+        );
+        assert!(matches!(r, ResponseBody::Ok { .. }));
+        let toml = "version = 1\n[keys.\"db/run\"]\nmode = \"run\"\ntier = \"test\"\ncommands = [[\"psql\"]]\nroots = [\"/private/tmp\"]\nenv = [\"PGPASSWORD\"]\nsession_ttl_secs = 7200\n";
+        let req = admin_request(
+            &SessionId {
+                agent: AgentKind::ClaudeCode,
+                pid: 42,
+                started_unix_ms: 1,
+            },
+            key.clone(),
+            Tier::Production,
+            &["ms", "rules", "db/run", toml],
+        );
+        let s = h.d.pending_summary(&req, true, true);
+        for want in [
+            "the command [\"psql\"]",
+            "the folder /private/tmp",
+            "the variable PGPASSWORD",
+            "approvals that last 7200 s",
+            "test tier",
+        ] {
+            assert!(s.contains(want), "{want}: {s}");
+        }
+    }
+
+    // protects=QA P8 and P9: an alert about a key goes when the key does; a dismissed
+    // informational alert doesn't come back by itself; a newer CA alert replaces the older one
+    // instead of stacking; fails_when=a stale alert about a deleted key stays, a dismissed one
+    // returns on the next rebuild, or two CA alerts show; no_claim=-
+    #[test]
+    fn alerts_follow_their_key_and_dedupe() {
+        let h = fresh();
+        h.put("loose/key", Tier::Test);
+        let key = k("loose/key");
+        h.d.alert(
+            AlertKind::BindingSkipped {
+                key: Some(key.clone()),
+            },
+            "loose/key: no catalog entry",
+        );
+        assert_eq!(h.d.alert_texts().len(), 1);
+        h.d.delete_key(&key).unwrap();
+        assert!(h.d.alert_texts().is_empty(), "gone with its key");
+
+        h.d.alert(AlertKind::CaReissued { hosts: 1 }, "ca 1");
+        h.d.alert(AlertKind::CaReissued { hosts: 2 }, "ca 2");
+        assert_eq!(h.d.alert_texts(), ["ca 2"]);
+
+        let id = h.d.warnings_for(&h.d.alert_texts())[0].id.clone();
+        h.d.dash_dismiss(&actor(), &id).unwrap();
+        h.d.alert(AlertKind::CaReissued { hosts: 2 }, "ca 2");
+        assert!(h.d.alert_texts().is_empty(), "dismissed stays dismissed");
     }
 }

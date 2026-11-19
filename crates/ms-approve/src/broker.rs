@@ -34,6 +34,11 @@ pub struct Pending {
     pub requested_unix_ms: u64,
     /// When it times out, Unix ms.
     pub expires_unix_ms: u64,
+    /// msd built this request for one of its own actions (start, rules, scan, set, rm, undo,
+    /// init, ms dev, a dashboard action): tagged where it was created, never inferred from its
+    /// argv, which an agent controls for its own commands (L33 re-review SR1). Approved once
+    /// only.
+    pub admin: bool,
 }
 
 /// Why a decision was not taken.
@@ -66,14 +71,11 @@ pub enum DecideError {
     Internal(String),
 }
 
-/// True for morsec's own actions (`ms …` or `dashboard …`: start, rules, scan, set, rm, undo,
-/// init): they may be approved once only. A session grant would let the same request run again
-/// with whatever it carries (a new value, another rule) without the person (L33 review S2).
-pub fn once_only(req: &ApprovalRequest) -> bool {
-    matches!(
-        req.argv_display.first().map(String::as_str),
-        Some("ms" | "dashboard")
-    )
+/// True for morsec's own actions (the request's `admin` tag, set where msd created it): they
+/// may be approved once only. A session grant would let the same request run again with
+/// whatever it carries (a new value, another rule) without the person (L33 review S2, SR1).
+pub fn once_only(p: &Pending) -> bool {
+    p.admin
 }
 
 #[derive(Debug)]
@@ -211,6 +213,7 @@ impl HumanApprover {
                     requested_unix_ms: now,
                     expires_unix_ms: now
                         .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                    admin: true,
                 },
                 deciding: true,
                 answer: None,
@@ -286,7 +289,7 @@ impl HumanApprover {
             if slot.deciding {
                 return Err(DecideError::InProgress);
             }
-            if approve && scope == Scope::Session && once_only(&slot.pending.request) {
+            if approve && scope == Scope::Session && slot.pending.admin {
                 return Err(DecideError::OnceOnly);
             }
             if !approve {
@@ -391,6 +394,18 @@ impl HumanApprover {
 
 impl Approver for HumanApprover {
     fn ask(&self, req: &ApprovalRequest, timeout: Duration) -> ApprovalOutcome {
+        self.ask_with(req, timeout, false)
+    }
+}
+
+impl HumanApprover {
+    /// Like [`Approver::ask`] for a request msd built for one of its own actions: tagged
+    /// `admin`, so it is approved once only and shown as morsec's own (L33 SR1).
+    pub fn ask_admin(&self, req: &ApprovalRequest, timeout: Duration) -> ApprovalOutcome {
+        self.ask_with(req, timeout, true)
+    }
+
+    fn ask_with(&self, req: &ApprovalRequest, timeout: Duration, admin: bool) -> ApprovalOutcome {
         let now = now_ms();
         let b = Binding::of(req);
         let mut st = self.lock();
@@ -422,6 +437,7 @@ impl Approver for HumanApprover {
                 requested_unix_ms: now,
                 expires_unix_ms: now
                     .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                admin,
             },
             deciding: false,
             answer: None,
@@ -801,16 +817,29 @@ mod tests {
         assert!(a.pending_state().is_none());
     }
 
-    // protects=L33 review S2: a request that changes morsec itself (argv `ms …` or
-    // `dashboard …`) can't be approved for the session, so one answer can't cover a later
-    // replace, delete or undo; an agent's own command still can; fails_when=a session-scope
-    // answer approves an admin request; no_claim=-
+    // protects=L33 review S2 and re-review SR1: a request msd built for its own action (asked
+    // with ask_admin, or a dashboard confirm) can't be approved for the session; the tag comes
+    // from where the request was made, never from its argv, so an agent command whose argv
+    // reads `ms set …` or `dashboard show …` is an ordinary request with the normal scopes;
+    // fails_when=a session answer approves an admin request, or an agent's argv makes its
+    // request look like morsec's own; no_claim=-
     #[test]
     fn admin_requests_are_once_only() {
         let (a, auth) = approver(FakeAuthenticator::approve());
         let mut admin = req("x");
         admin.argv_display = vec!["ms".into(), "set".into(), "k/x".into()];
-        let (h, p) = ask_bg(&a, admin.clone(), Duration::from_secs(10));
+        let a2 = a.clone();
+        let r2 = admin.clone();
+        let h = std::thread::spawn(move || a2.ask_admin(&r2, Duration::from_secs(10)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let p = loop {
+            if let Some(p) = a.pending() {
+                break p;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(once_only(&p));
         assert_eq!(
             a.decide(&p.id, true, Scope::Session),
             Err(DecideError::OnceOnly)
@@ -821,10 +850,23 @@ mod tests {
             Ok(ApprovalOutcome::Approved(_))
         ));
         h.join().unwrap();
-        assert!(once_only(&admin));
-        assert!(!once_only(&req("x")));
-        let mut dash = req("x");
-        dash.argv_display = vec!["dashboard".into(), "show".into()];
-        assert!(once_only(&dash));
+        // The same argv from an agent's own command is not admin: session scope is offered.
+        for (arg, argv) in [
+            ("y", vec!["ms".to_owned(), "set".into(), "k/x".into()]),
+            (
+                "z",
+                vec!["dashboard".to_owned(), "show".into(), "k/x".into()],
+            ),
+        ] {
+            let mut agent = req(arg);
+            agent.argv_display = argv;
+            let (h, p) = ask_bg(&a, agent, Duration::from_secs(10));
+            assert!(!once_only(&p));
+            assert!(matches!(
+                a.decide(&p.id, true, Scope::Session),
+                Ok(ApprovalOutcome::Approved(_))
+            ));
+            h.join().unwrap();
+        }
     }
 }

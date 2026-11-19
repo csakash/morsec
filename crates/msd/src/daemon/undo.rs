@@ -71,13 +71,25 @@ pub(super) type Receipt<'a> = &'a dyn Fn(&KeyName, ReceiptResult, Option<&Approv
 /// so the person sees its program and PID (L33 review S4).
 pub(super) fn requester(session: &SessionId) -> String {
     use ms_session::ProcessTable;
-    let name = ms_session::OsProcessTable
+    // Read now, while the request is being made, and carried in the request itself: the card
+    // shows this record, not a lookup at render time (L33 re-review N6).
+    let info = ms_session::OsProcessTable
         .info(session.pid)
-        .map(|i| ms_approve::render::inert(&i.name))
-        .unwrap_or_else(|_| "an unknown program".into());
+        .ok()
+        .filter(|i| i.started_unix_ms == session.started_unix_ms);
+    let name = info.as_ref().map_or_else(
+        || "a program that has exited".to_owned(),
+        |i| ms_approve::render::inert(&i.name),
+    );
+    let path = ms_session::table::exe_path(session.pid)
+        .ok()
+        .filter(|_| info.is_some())
+        .map(|p| format!(" at {}", ms_approve::render::inert(&p.to_string_lossy())))
+        .unwrap_or_default();
     format!(
-        "requested by {name} (pid {}), not an agent session",
-        session.pid
+        "requested by {name}{path} (pid {}, started {}), not an agent session",
+        session.pid,
+        ms_approve::render::utc(session.started_unix_ms)
     )
 }
 
@@ -519,10 +531,13 @@ impl Daemon {
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
         // Bound to the value (an HMAC fingerprint only msd can make) and naming who asked
         // (review S2, S4).
-        let fp = format!(
-            "new value fingerprint {}",
-            self.value_fingerprint(value.expose())
-        );
+        let Some(fp) = self.value_fingerprint(value.expose()) else {
+            return reply_err(
+                ErrorCode::Internal,
+                "morsec: no randomness to bind the approval to the new value, so nothing changed",
+            );
+        };
+        let fp = format!("new value fingerprint {fp}");
         let who = requester(session);
         let req = admin_request(
             session,
@@ -530,7 +545,7 @@ impl Daemon {
             tier,
             &["ms", "set", key.as_str(), &fp, &who],
         );
-        let token = match self.approve_exact(&req) {
+        let token = match self.approve_admin(&req) {
             Ok(t) => t,
             Err(resp) => {
                 let _ = self.record(
@@ -630,7 +645,7 @@ impl Daemon {
         argv.push(&who);
         let req = admin_request(session, key.clone(), tier, &argv);
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
-        let token = match self.approve_exact(&req) {
+        let token = match self.approve_admin(&req) {
             Ok(t) => t,
             Err(resp) => {
                 let _ = self.record(
@@ -678,7 +693,7 @@ impl Daemon {
         keys: Option<&[KeyName]>,
     ) -> ResponseBody {
         let confirm =
-            |req: &ApprovalRequest, _reason: &str| self.approve_exact(req).map_err(from_approval);
+            |req: &ApprovalRequest, _reason: &str| self.approve_admin(req).map_err(from_approval);
         let receipt = |k: &KeyName, r: ReceiptResult, t: Option<&ApprovalToken>| {
             let mode = self
                 .read_live()

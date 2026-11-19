@@ -287,6 +287,10 @@ pub struct PendingApproval {
     pub requested_unix_ms: u64,
     /// When it times out, Unix ms.
     pub expires_unix_ms: u64,
+    /// msd built it for one of its own actions: approved once only (L33). Absent from older
+    /// daemons.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
 }
 
 impl RequestBody {

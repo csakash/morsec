@@ -103,7 +103,7 @@ pub(crate) fn once_only(a: Answer) -> Answer {
 /// pressed before the request appeared can't answer it.
 fn review(tty: &mut File, p: &PendingApproval) -> std::io::Result<Answer> {
     // morsec's own actions are approved once only (L33 review S2).
-    review_with(tty, p, ms_approve::broker::once_only(&p.request))
+    review_with(tty, p, p.admin)
 }
 
 fn review_with(tty: &mut File, p: &PendingApproval, once: bool) -> std::io::Result<Answer> {
@@ -284,7 +284,7 @@ fn inline(what: &'static str, once_flag: bool) -> InlineReview {
                     return;
                 };
                 let _ = writeln!(tty, "{what} needs your approval.");
-                let once = once_flag || ms_approve::broker::once_only(&p.request);
+                let once = once_flag || p.admin;
                 let Ok(answer) = review_with(tty, &p, once) else {
                     return;
                 };
@@ -375,6 +375,7 @@ mod tests {
             },
             requested_unix_ms: 0,
             expires_unix_ms: 60_000,
+            admin: false,
         };
         let text = screen(&p, 0).join("\n");
         assert!(

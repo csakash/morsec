@@ -354,7 +354,7 @@ impl Daemon {
                     adopted.len()
                 )),
             };
-            match self.approve_exact(&req) {
+            match self.approve_admin(&req) {
                 Ok(t) => Some(t),
                 Err(resp) => {
                     let v = self.rules_version();

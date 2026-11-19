@@ -716,4 +716,37 @@ mod tests {
         assert!(c[start..start + 200].contains("live.textContent = '';"));
         assert!(c.contains(".toLowerCase() !== last.toLowerCase()"));
     }
+
+    // protects=L33 fix round 2 (re-review F1, F5, SR1, QA P1, P2, P3, P5, P6, P10): a visible
+    // result after every action that redraws (approve, deny, dismiss, add key, rules) and next
+    // to Stop/Start; a whole-project Undo lands on Projects with its result; anything that is
+    // not morsec's own request is shown open; the disclosure has a marker; the Undo confirm is
+    // a row of its own; the nav fits at 375 px; messages keep "morsec" lowercase and end with
+    // a full stop; Home's counts are a ruled row, frames only for the pending card and
+    // failures; fails_when=any of these regresses; no_claim=the rendering (browser QA)
+    #[test]
+    fn dash_js_round_2_fixes() {
+        let c = code(DASH_JS);
+        for anchor in ["'needs', r", "'addkey', r", "'rules', r"] {
+            assert!(c.contains(&format!("rerender({anchor})")), "{anchor}");
+        }
+        assert!(c.contains("showFlash();"));
+        assert!(c.contains("stateNote = { text: 'Stopped."));
+        assert!(c.contains("stateNote = { text: 'Started with Touch ID.'"));
+        assert!(
+            c.contains("'#/projects')"),
+            "whole-project undo goes to Projects"
+        );
+        assert!(c.contains("if (p.expand) d.open = true;"));
+        assert!(c.contains("'confirmrow'"));
+        assert!(c.contains("if (!/^morsec\\b/.test(t))"));
+        let i = c.find("del.appendChild(dout);").unwrap();
+        assert!(c[i..].contains("del.appendChild(extra);"));
+        assert!(DASH_CSS.contains("details > summary::before"));
+        assert!(DASH_CSS.contains("@media (max-width: 440px)"));
+        assert!(DASH_CSS.contains(".box { border-top: 1px solid var(--faint);"));
+        assert!(DASH_CSS.contains(".box.warn { border: 1px solid var(--deny);"));
+        assert!(DASH_CSS.contains(".box.focus { border: 1px solid var(--signal);"));
+        assert!(DASH_CSS.contains("h1.keyname") && DASH_CSS.contains("overflow-wrap: anywhere; }"));
+    }
 }

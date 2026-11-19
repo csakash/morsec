@@ -419,8 +419,29 @@ impl Daemon {
     // The error is the reply itself; it is built once per refused request, so its size is moot.
     #[allow(clippy::result_large_err)]
     pub fn approve_exact(&self, req: &ApprovalRequest) -> Result<ApprovalToken, ResponseBody> {
+        self.approve_with(req, false)
+    }
+
+    /// [`Daemon::approve_exact`] for a request msd built for one of its own actions: tagged
+    /// admin at creation (once only, shown as morsec's own; L33 SR1).
+    #[allow(clippy::result_large_err)]
+    pub fn approve_admin(&self, req: &ApprovalRequest) -> Result<ApprovalToken, ResponseBody> {
+        self.approve_with(req, true)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn approve_with(
+        &self,
+        req: &ApprovalRequest,
+        admin: bool,
+    ) -> Result<ApprovalToken, ResponseBody> {
         let what = render_what(req);
-        match self.approvals.ask(req, self.approval_timeout()) {
+        let outcome = if admin {
+            self.approvals.ask_admin(req, self.approval_timeout())
+        } else {
+            self.approvals.ask(req, self.approval_timeout())
+        };
+        match outcome {
             ApprovalOutcome::Approved(t) => match self.approvals.verify(&t, &Binding::of(req)) {
                 Ok(_) => Ok(t),
                 Err(e) => Err(reply_err(
@@ -459,6 +480,7 @@ impl Daemon {
                 request: p.request,
                 requested_unix_ms: p.requested_unix_ms,
                 expires_unix_ms: p.expires_unix_ms,
+                admin: p.admin,
             }),
         }
     }
@@ -519,8 +541,14 @@ impl Daemon {
     /// D-10).
     pub fn alert(&self, kind: AlertKind, msg: impl Into<String>) {
         let msg = msg.into();
+        // A condition the person dismissed doesn't come back by itself (QA P8).
+        if self.dismissed(&msg) {
+            return;
+        }
         let mut a = lock(&self.alerts);
         if !a.iter().any(|e| e.text == msg) {
+            // A newer alert of the same condition replaces the older one (QA P9).
+            a.retain(|e| !e.kind.same_as(&kind));
             if a.len() >= MAX_ALERTS {
                 a.remove(0);
             }
@@ -530,6 +558,7 @@ impl Daemon {
 
     /// The alerts' texts, as `ms status` prints them.
     fn alert_texts(&self) -> Vec<String> {
+        self.prune_alerts();
         lock(&self.alerts).iter().map(|a| a.text.clone()).collect()
     }
 
@@ -859,7 +888,7 @@ impl Daemon {
         // A scan reads every value: a person approves it first (L11, closes L09's INJ-5
         // residual: a detached process could otherwise use it as a guessing oracle).
         let req = admin_request(session, daemon_key(), Tier::Production, &["ms", "scan"]);
-        if let Err(resp) = self.approve_exact(&req) {
+        if let Err(resp) = self.approve_admin(&req) {
             let _ = self.record(
                 session,
                 &daemon_key(),
@@ -1249,7 +1278,7 @@ impl Daemon {
                     tier,
                     &["ms", "rules", key.as_str(), text],
                 );
-                match self.approve_exact(&req) {
+                match self.approve_admin(&req) {
                     Ok(t) => Some(t),
                     Err(resp) => {
                         let v = self.rules_version();
@@ -1389,7 +1418,7 @@ impl Daemon {
             };
         }
         let key = daemon_key();
-        let token = match self.approve_exact(&admin_request(
+        let token = match self.approve_admin(&admin_request(
             session,
             key.clone(),
             Tier::Production,
