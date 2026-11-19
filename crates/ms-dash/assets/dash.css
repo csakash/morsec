@@ -68,6 +68,7 @@ code, .mono { font-family: var(--f-mono); font-size: .9em; overflow-wrap: anywhe
 .pill:empty { display: none; }
 .pill.stopped { color: var(--deny); border-color: var(--deny); }
 
+main:focus { outline: none; }
 main { padding-top: 32px; padding-bottom: 48px; min-height: 60vh; }
 .foot { border-top: 1px solid var(--faint); padding-top: 16px; padding-bottom: 32px; font-size: 13px; }
 
@@ -102,7 +103,7 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 /* tables scroll inside their own box, never the page */
 .tw { overflow-x: auto; margin-top: 12px; border: 1px solid var(--rule); }
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--faint); vertical-align: top; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--faint); vertical-align: top; white-space: nowrap; }
 th { font: 600 11px/1.2 var(--f-sans); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); background: var(--paper-2); white-space: nowrap; }
 td.mono, td .mono { white-space: nowrap; }
 tr:last-child td { border-bottom: 0; }

@@ -165,7 +165,7 @@
     const g = el('div', 'grid counts');
     g.appendChild(stat('Projects', h.projects));
     g.appendChild(stat('Protected', h.protected));
-    g.appendChild(stat('Need a website', h.needs_website, true));
+    g.appendChild(stat('Need a host or command', h.needs_website, true));
     g.appendChild(stat('Blocked in 24 h', h.blocked_24h, true));
     out.appendChild(g);
     if (h.projects_unreadable) {
@@ -244,7 +244,7 @@
     if (p.rows.length === 0) {
       out.appendChild(txt('p', 'muted', 'No secrets were found in this project.'));
     } else {
-      out.appendChild(table(['Variable', 'File', 'Key', 'Provider', 'Tier', 'Mode', 'Status', 'Last use'], p.rows.map(function (r) {
+      out.appendChild(table(['Variable', 'File', 'Key', 'Provider', 'Tier', 'Mode', 'Status', 'Last activity'], p.rows.map(function (r) {
         return [mono(r.var), mono(r.file + ':' + r.line), link('/secret/' + enc(r.key), r.key, 'mono'),
           r.provider || '', r.tier || '', r.mode || '', status(r.status), when(r.last_use_unix_ms)];
       })));
@@ -259,7 +259,7 @@
     if (p.findings.length) out.appendChild(el('p', 'muted', 'Move each into .env, then run ', cmd('ms init'), ' in the project again.'));
     out.appendChild(txt('h2', null, 'Committed to git'));
     out.appendChild(list(p.committed.map(function (c) {
-      return el('div', null, mono(c.path), ' is in ' + c.commits + ' commits: rotate these keys at each provider');
+      return el('div', null, mono(c.path), ' is in ' + c.commits + (c.commits === 1 ? ' commit' : ' commits') + ': rotate these keys at each provider');
     }), 'No env file is in the git history.'));
     if (p.hints.length) {
       out.appendChild(txt('h2', null, 'Agent hints'));
