@@ -179,6 +179,18 @@ pub fn env_name_allowed(name: &str) -> bool {
         && !DENIED_ENV_SUFFIXES.iter().any(|x| name.ends_with(x))
 }
 
+/// Whether `name` may carry a key (`ms rules --add-env`, the dashboard's "add a variable": one
+/// check for both, L35 SPEC D-15): forwardable ([`env_name_allowed`]) and not one morsec sets
+/// itself ([`crate::runner::BASE_ENV`]). The message is the one `ms rules` prints.
+pub fn check_key_carrier(name: &str) -> Result<(), String> {
+    if env_name_allowed(name) && !crate::runner::BASE_ENV.contains(&name) {
+        return Ok(());
+    }
+    Err(format!(
+        "morsec: {name} can't carry a key: morsec sets it itself, or it changes how programs load code or run commands. Pick the variable the tool reads its token from"
+    ))
+}
+
 fn check_env(env: &[(String, String)]) -> Result<(), RunError> {
     if env.len() > MAX_ENV {
         return Err(RunError::invalid(format!(
@@ -322,5 +334,29 @@ mod tests {
         assert_eq!(names(&r.argv_keys), ["stripe/test"]);
         assert_eq!(names(&r.env_keys), ["pg/x"]);
         assert_eq!(r.keys().len(), 2);
+    }
+
+    // protects=L35 SPEC D-15: the one carrier check `ms rules --add-env` and the dashboard both
+    // call refuses loaders, shells, proxies and the names morsec sets, and accepts token names;
+    // fails_when=the two callers could disagree, or a loader variable passes;
+    // no_claim=validate_env_name's syntax rules (ms-rules)
+    #[test]
+    fn env_carrier_names_shared() {
+        for ok in ["GITHUB_TOKEN", "STRIPE_API_KEY", "_X"] {
+            assert!(check_key_carrier(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "HOME",
+            "PATH",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "NODE_OPTIONS",
+            "BASH_ENV",
+            "a-b",
+            "",
+        ] {
+            let e = check_key_carrier(bad).unwrap_err();
+            assert!(e.contains("can't carry a key"), "{bad}: {e}");
+        }
     }
 }

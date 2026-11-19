@@ -470,6 +470,19 @@ impl ClaudeConnector {
         Ok(self.read_state()?.map(|st| st.proxy_port))
     }
 
+    /// The settings file the previous connect wrote, as its state records it (L35 SPEC D-5).
+    /// `None` when there is no state, or an older build wrote it without the field.
+    pub fn recorded_settings_path(&self) -> Result<Option<PathBuf>> {
+        let Some(text) = fsio::read_text(&self.paths.state).map_err(err)? else {
+            return Ok(None);
+        };
+        let v = json::parse(&text)
+            .map_err(|e| err(format!("{} is damaged ({e})", self.paths.state.display())))?;
+        Ok(v.get("settings_path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from))
+    }
+
     fn read_state(&self) -> Result<Option<State>> {
         let Some(text) = fsio::read_text(&self.paths.state).map_err(err)? else {
             return Ok(None);
@@ -577,6 +590,13 @@ impl ClaudeConnector {
         let mut v = Value::object();
         v.set("version", Value::int(STATE_VERSION));
         v.set("agent", Value::str(ID));
+        // Where this connect wrote (L35 SPEC D-5): msd, which can't see a terminal's
+        // CLAUDE_CONFIG_DIR, refuses to act on a state that names another settings file. Older
+        // builds ignore the field.
+        v.set(
+            "settings_path",
+            Value::str(self.paths.settings.to_string_lossy().into_owned()),
+        );
         v.set("proxy_port", Value::int(i64::from(st.proxy_port)));
         v.set("with_mcp", Value::Bool(st.with_mcp));
         v.set("wrap", Value::Bool(st.wrap));
@@ -1504,5 +1524,48 @@ mod tests {
             pem_blocks(t),
             vec!["-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----"]
         );
+    }
+
+    // protects=L35 SPEC D-5: a connect records which settings file it wrote, so msd (which can't
+    // see a terminal's CLAUDE_CONFIG_DIR) can refuse to act on another one; a state without the
+    // field reads as None; fails_when=the path is missing or wrong after apply;
+    // no_claim=Codex (its state already records "config")
+    #[test]
+    fn state_records_config_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let custom = d.path().join("cfg");
+        let mut c = ClaudeConnector::new(
+            Paths::for_home(d.path(), Some(&custom)),
+            "/opt/homebrew/bin/ms",
+            "/tmp/msd.sock",
+        );
+        c.ca_pem =
+            Some("-----BEGIN CERTIFICATE-----\nTU9SU0VDLUNB\n-----END CERTIFICATE-----\n".into());
+        c.paths.system_roots = d.path().join("roots.pem");
+        std::fs::write(
+            &c.paths.system_roots,
+            "-----BEGIN CERTIFICATE-----\nUk9PVFM=\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert_eq!(c.recorded_settings_path().unwrap(), None);
+        let cfg = ConnectCfg {
+            proxy_port: 4101,
+            allowed_domains: vec![],
+            env: c.ca_env().unwrap(),
+            shim_dir: Some(c.paths.shims.clone()),
+        };
+        let planned = c.try_plan(&cfg).unwrap();
+        c.apply(&planned.diff).unwrap();
+        assert_eq!(
+            c.recorded_settings_path().unwrap(),
+            Some(custom.join("settings.json"))
+        );
+        // An older state, without the field.
+        let text = std::fs::read_to_string(&c.paths.state).unwrap();
+        let mut v = json::parse(&text).unwrap();
+        v.remove("settings_path");
+        std::fs::write(&c.paths.state, json::print_doc(&v, "  ", true)).unwrap();
+        assert_eq!(c.recorded_settings_path().unwrap(), None);
+        assert!(c.is_connected());
     }
 }

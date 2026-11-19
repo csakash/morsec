@@ -39,30 +39,13 @@ pub const PARITY: &[(&str, Parity)] = &[
     ("log", Parity::Screen("/activity")),
     ("doctor", Parity::Screen("/agents")),
     ("scan", Parity::Screen("/scan")),
-    (
-        "init",
-        Parity::Exempt(
-            "runs in your terminal: the scan reads your files with your terminal's permissions and loosens new keys' rules; the Projects screen checks the folder and gives the command (L33 D-17)",
-        ),
-    ),
-    (
-        "import",
-        Parity::Exempt(
-            "runs in your terminal: the scan reads your files with your terminal's permissions and loosens new keys' rules; the Projects screen checks the folder and gives the command (L33 D-17)",
-        ),
-    ),
-    (
-        "connect",
-        Parity::Exempt(
-            "edits the agent's settings with a diff you confirm in the terminal; the Agents screen gives the command (L33 D-16)",
-        ),
-    ),
-    (
-        "disconnect",
-        Parity::Exempt(
-            "edits the agent's settings with a diff you confirm in the terminal; Disconnect removes the agent's sandbox; the Agents screen gives the command (L33 D-16)",
-        ),
-    ),
+    // L35: run from the dashboard behind msd's Touch ID (SPEC D-18). Project mode only; the
+    // machine steps of `ms init` stay in the terminal (they install the daemon that serves the
+    // page), and `ms import`'s one-file, custom-name form stays there too.
+    ("init", Parity::Screen("/projects")),
+    ("import", Parity::Screen("/projects")),
+    ("connect", Parity::Screen("/agents")),
+    ("disconnect", Parity::Screen("/agents")),
     (
         "run",
         Parity::Exempt("agent run-time path; a person never calls it"),
@@ -99,6 +82,22 @@ pub const ACTIONS: &[(&str, &[&str])] = &[
         &["/api/projects/{slug}/undo", "/api/keys/{key}/undo"],
     ),
     ("doctor", &["/api/agents/recheck"]),
+    (
+        "connect",
+        &[
+            "/api/agents/{agent}/connect/preview",
+            "/api/agents/{agent}/connect",
+        ],
+    ),
+    (
+        "disconnect",
+        &[
+            "/api/agents/{agent}/disconnect/preview",
+            "/api/agents/{agent}/disconnect",
+        ],
+    ),
+    ("init", &["/api/projects/preview", "/api/projects/add"]),
+    ("import", &["/api/projects/preview", "/api/projects/add"]),
     ("scan", &["/api/scan/run"]),
 ];
 

@@ -22,6 +22,21 @@ use ms_vault::VaultExt;
 use super::{Daemon, daemon_key, lock, reply_err};
 use crate::backend::{PROJECTS_HMAC_KEY, PROJECTS_STATE_KEY};
 
+/// How a project save's first rules are approved.
+pub(crate) enum SaveAuth<'a> {
+    /// `ProjectSave` over IPC: msd asks (`approve_admin`), bound to the rules' hash.
+    Ask,
+    /// The dashboard's Add project (L35 SPEC D-12): Touch ID already confirmed the previewed
+    /// setup. The rules to save must each be exactly one of `allowed` (the previewed rules), and
+    /// no key that already allows something may join (that stays a terminal `ms init`).
+    Confirmed {
+        /// The token the confirm issued.
+        token: &'a ms_approve::ApprovalToken,
+        /// The rules the person saw.
+        allowed: &'a Rules,
+    },
+}
+
 /// The project records file in msd's state directory.
 pub const PROJECTS_FILE: &str = "projects.toml";
 
@@ -275,6 +290,25 @@ impl Daemon {
             Ok(r) => r,
             Err(e) => return reply_err(ErrorCode::Invalid, e.to_string()),
         };
+        self.project_save_parsed(session, &record, &proposed, SaveAuth::Ask)
+    }
+
+    /// `ProjectSave`'s checks and writes for a parsed record and rules (shared with the
+    /// dashboard's Add project, L35).
+    pub(crate) fn project_save_parsed(
+        &self,
+        session: &SessionId,
+        record: &ProjectRecord,
+        proposed: &Rules,
+        auth: SaveAuth<'_>,
+    ) -> ResponseBody {
+        if self.is_stopped() {
+            return reply_err(
+                ErrorCode::Denied,
+                "morsec: morsec is stopped (ms stop), so projects can't be saved. Resume first with: ms start",
+            );
+        }
+        let (record, proposed) = (record.clone(), proposed.clone());
         let _p = lock(&self.projects_write);
         let (file, floor) = match self.load_projects() {
             Ok(f) => f,
@@ -354,7 +388,34 @@ impl Daemon {
                     adopted.len()
                 )),
             };
-            match self.approve_admin(&req) {
+            let approved = match &auth {
+                SaveAuth::Ask => self.approve_admin(&req),
+                SaveAuth::Confirmed { token, allowed } => {
+                    if !adopted.is_empty() {
+                        Err(reply_err(
+                            ErrorCode::Denied,
+                            format!(
+                                "morsec: {} already allows something, so it joins project {} only from a terminal: run ms init in {}",
+                                adopted[0], record.slug, record.root
+                            ),
+                        ))
+                    } else if let Some((k, _)) = proposed
+                        .keys
+                        .iter()
+                        .find(|(k, r)| allowed.keys.get(*k) != Some(*r))
+                    {
+                        Err(reply_err(
+                            ErrorCode::Denied,
+                            format!(
+                                "morsec: the first rule of {k} is not the one you approved, so no rule was saved. Set the project up again"
+                            ),
+                        ))
+                    } else {
+                        Ok((*token).clone())
+                    }
+                }
+            };
+            match approved {
                 Ok(t) => Some(t),
                 Err(resp) => {
                     let v = self.rules_version();

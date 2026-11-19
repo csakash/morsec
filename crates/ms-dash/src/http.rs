@@ -433,6 +433,19 @@ struct PathReq {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PlanReq {
+    plan: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathPlanReq {
+    path: String,
+    plan: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RulesReq {
     edit: RuleEdit,
 }
@@ -484,6 +497,10 @@ enum Call {
     Delete(KeyName, bool),
     UndoKey(KeyName),
     UndoProject(String, Option<KeyName>),
+    AgentPreview(String, bool),
+    AgentApply(String, bool, String),
+    ProjectPreview(String),
+    ProjectAdd(String, String),
 }
 
 fn key_param(raw: Option<&str>) -> Option<KeyName> {
@@ -510,6 +527,25 @@ fn parse_call(action: Action, raw: Option<&str>, body: &[u8]) -> Result<Call, St
             .map_err(|e| format!("morsec: the request body is not as expected ({e})"))
     }
     let key = || key_param(raw).ok_or_else(|| "morsec: that is not a key name".to_owned());
+    let agent = || {
+        raw.filter(|a| crate::actions::valid_agent(a))
+            .map(str::to_owned)
+            .ok_or_else(|| "morsec: the dashboard connects claude-code or codex".to_owned())
+    };
+    let plan = |p: String| {
+        if crate::actions::valid_plan(&p) {
+            Ok(p)
+        } else {
+            Err("morsec: that is not a plan from a preview".to_owned())
+        }
+    };
+    let folder = |p: String| {
+        if p.is_empty() || p.len() > 4096 {
+            Err("morsec: give the folder's full path".to_owned())
+        } else {
+            Ok(p)
+        }
+    };
     let id = || {
         raw.filter(|i| valid_id(i))
             .map(str::to_owned)
@@ -573,6 +609,22 @@ fn parse_call(action: Action, raw: Option<&str>, body: &[u8]) -> Result<Call, St
                 None => None,
             };
             Call::UndoProject(slug.to_owned(), k)
+        }
+        Action::ConnectPreview | Action::DisconnectPreview => {
+            body_of::<Empty>(body)?;
+            Call::AgentPreview(agent()?, action == Action::DisconnectPreview)
+        }
+        Action::Connect | Action::Disconnect => {
+            let r: PlanReq = body_of(body)?;
+            Call::AgentApply(agent()?, action == Action::Disconnect, plan(r.plan)?)
+        }
+        Action::ProjectPreview => {
+            let r: PathReq = body_of(body)?;
+            Call::ProjectPreview(folder(r.path)?)
+        }
+        Action::ProjectAdd => {
+            let r: PathPlanReq = body_of(body)?;
+            Call::ProjectAdd(folder(r.path)?, plan(r.plan)?)
         }
     })
 }
@@ -714,6 +766,36 @@ async fn route_action(
             Call::Delete(k, force) => done(acts.delete(a, &k, force)),
             Call::UndoKey(k) => undo_answer(acts.undo(a, None, Some(&k))),
             Call::UndoProject(slug, k) => undo_answer(acts.undo(a, Some(&slug), k.as_ref())),
+            Call::AgentPreview(agent, off) => match acts.agent_preview(a, &agent, off) {
+                Ok(v) => action_ok(
+                    &ActionOk::new(if v.nothing_to_do {
+                        "Nothing to change"
+                    } else {
+                        "Review the changes"
+                    }),
+                    serde_json::to_value(&v).ok().map(|v| ("preview", v)),
+                ),
+                Err(e) => action_error(&e),
+            },
+            Call::AgentApply(agent, off, plan) => done(acts.agent_apply(a, &agent, off, &plan)),
+            Call::ProjectPreview(path) => match acts.project_preview(a, &path) {
+                Ok(v) => action_ok(
+                    &ActionOk::new(if v.ok {
+                        "Review what will be set up"
+                    } else {
+                        "That folder can't be set up as a project"
+                    }),
+                    serde_json::to_value(&v).ok().map(|v| ("preview", v)),
+                ),
+                Err(e) => action_error(&e),
+            },
+            Call::ProjectAdd(path, plan) => match acts.project_add(a, &path, &plan) {
+                Ok(v) => action_ok(
+                    &ActionOk::new(v.message.clone()),
+                    serde_json::to_value(&v).ok().map(|v| ("setup", v)),
+                ),
+                Err(e) => action_error(&e),
+            },
         }
     })
     .await;

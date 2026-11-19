@@ -506,6 +506,7 @@ async fn serve(args: Args) -> ExitCode {
     if let Some(c) = clipboard {
         d.set_clipboard(c);
     }
+    d.set_socket_path(socket.clone(), uid);
     // Not listening until the first DashOpen (design §6.1).
     dash::install(&d, ms_dash::DashConfig::new(dash_port), uid, opener);
     let (stop_tx, stop_rx) = watch::channel(false);

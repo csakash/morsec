@@ -595,11 +595,7 @@ fn apply_edits(name: &KeyName, current: &KeyRule, a: &RulesArgs) -> Result<KeyRu
     }
     for n in &a.add_env {
         ms_rules::validate_env_name(n).map_err(|e| format!("morsec: {e}"))?;
-        if !ms_run::input::env_name_allowed(n) || ms_run::runner::BASE_ENV.contains(&n.as_str()) {
-            return Err(format!(
-                "morsec: {n} can't carry a key: morsec sets it itself, or it changes how programs load code or run commands. Pick the variable the tool reads its token from"
-            ));
-        }
+        ms_run::input::check_key_carrier(n)?;
         edits.push(Edit::AddEnv(n.clone()));
     }
     edits.extend(a.remove_env.iter().cloned().map(Edit::RemoveEnv));

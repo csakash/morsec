@@ -817,23 +817,71 @@
     return out;
   }
 
+  // What setting a folder up would do, then Set up with Touch ID (L35 SPEC D-11).
+  function setupPanel(path, out, anchor) {
+    const msg = txt('p', 'muted', '');
+    const show = async function () {
+      out.replaceChildren(msg);
+      const res = await run(msg, false, function () { return act('/api/projects/preview', { path: path }); });
+      if (!res || !res.preview) return;
+      const p = res.preview;
+      msg.textContent = '';
+      if (!p.ok) {
+        out.replaceChildren(txt('p', 'err', sentence(p.reason || 'That folder can’t be set up.')));
+        if (p.command) out.appendChild(copyline(p.command, 'Or set it up in Terminal.'));
+        return;
+      }
+      if (p.nothing_to_do) {
+        out.replaceChildren(txt('p', 'muted', 'Nothing new to protect in “' + p.display + '”.'));
+        return;
+      }
+      const box = el('div', 'plan');
+      box.appendChild(kv([
+        ['Project', el('span', null, txt('span', null, p.display + (p.existing ? ' (set up before: a re-scan)' : '')), ' ', pathText(p.root, 'mono muted'))],
+        ['Files', String(p.files.length)],
+        ['Keys written into code', p.findings ? num(p.findings) + ' (reported only, never moved)' : 'none'],
+      ]));
+      box.appendChild(table(['File', 'Secrets', 'New keys', 'Same value'], p.files.map(function (f) {
+        return { cells: [f.error ? el('span', null, mono(f.path), txt('span', 'sub err', f.error)) : mono(f.path), num(f.secrets), num(f.new_keys), num(f.reused)] };
+      }), { num: true }));
+      if (p.keys.length) {
+        box.appendChild(txt('p', 'lbl', 'What each new key may do'));
+        box.appendChild(list(p.keys.map(function (k) {
+          const what = k.reaches.length ? 'may reach ' + k.reaches.join(', ')
+            : k.runs_in.length ? 'may run in ' + k.runs_in.join(', ')
+            : (k.needs === 'command' ? 'needs a command first' : 'needs a website first');
+          return el('span', 'grow', ref(k.key), ' ', txt('span', k.needs ? 'err' : 'muted', what));
+        }), ''));
+      }
+      if (p.stopped_early) box.appendChild(txt('p', 'err', 'The scan stopped early (' + p.stopped_early + '). Set up a subfolder on its own for the rest.'));
+      const res2 = txt('p', 'muted', '');
+      const go = btn('Set up with Touch ID', 'sm solid', function () {
+        run(res2, true, function () { return act('/api/projects/add', { path: path, plan: p.plan }); }).then(function (x) {
+          if (x && x.setup) {
+            const rows = el('div', 'plan', kv(x.setup.rows.map(function (r) { return [r[0], r[1]]; })));
+            if (anchor) rerender(anchor, x, rows); else out.replaceChildren(res2, rows);
+          } else if (res2.dataset.code === 'changed') after(1200, show);
+        });
+      });
+      out.replaceChildren(
+        txt('p', null, 'morsec moves these secrets into its vault and puts references in the files. Nothing is shown here but names.'),
+        box,
+        el('div', 'actions', go, btn('Cancel', 'sm ghost', function () { out.replaceChildren(); })),
+        res2);
+      if (p.command) out.appendChild(copyline(p.command, 'Or set it up in Terminal.'));
+    };
+    return show;
+  }
+
   function addProject() {
-    const [r, s] = part('Add a project', null, null);
-    s.appendChild(txt('p', null, 'Setting up a project reads its files, so it runs in Terminal with your own permissions. morsec checks the folder and gives you the command.'));
+    const [r, s] = part('Add a project', 'addproject', null);
+    s.appendChild(txt('p', null, 'morsec reads the folder, shows you what it will protect, and sets it up after you confirm with Touch ID.'));
     const [w, input] = textField('Project folder', 'folder', 'The full path, for example /Users/you/code/shop');
     const out = el('div', 'result');
-    const go = btn('Check folder', null, async function () {
+    const go = btn('Check folder', null, function () {
       const path = input.value.trim();
       if (!path) { out.replaceChildren(txt('p', 'err', 'Type the folder’s full path first.')); return; }
-      const msg = txt('p', 'muted', '');
-      out.replaceChildren(msg);
-      const res = await run(msg, false, function () { return act('/api/projects/check-path', { path: path }); });
-      if (!res || !res.check) return;
-      const c = res.check;
-      if (!c.ok) { out.replaceChildren(txt('p', 'err', c.reason)); return; }
-      out.replaceChildren(
-        txt('p', null, c.project ? 'This folder is already the project “' + c.project + '”. Running it again re-scans it.' : 'Run this in Terminal to set it up:'),
-        copyline(c.command));
+      setupPanel(path, out, null)();
     });
     s.appendChild(el('div', 'fields', w, el('div', 'field act', go)));
     s.appendChild(out);
@@ -977,9 +1025,12 @@
       out.appendChild(gr);
     }
 
-    const [ar, again] = part('Set it up again', null, null);
-    again.appendChild(txt('p', null, 'Re-scan the project after you add secrets or code. It runs in Terminal, where it reads your files.'));
-    if (p.rescan_command) again.appendChild(copyline(p.rescan_command));
+    const [ar, again] = part('Set it up again', 'again', null);
+    again.appendChild(txt('p', null, 'Re-scan the project after you add secrets or code. You see what is new first, then confirm with Touch ID.'));
+    const rescanOut = el('div', 'result');
+    again.appendChild(el('div', 'actions', btn('Re-scan', 'sm solid', setupPanel(p.root, rescanOut, 'again'))));
+    again.appendChild(rescanOut);
+    if (p.rescan_command) again.appendChild(copyline(p.rescan_command, 'Or run it in Terminal.'));
     if (p.hints.length) again.appendChild(el('p', 'muted', 'Agent hints in: ', mono(p.hints.join(', '))));
     again.appendChild(kv([['Set up', when(p.created_unix_ms)], ['Last scan', plural(p.scan_entries, 'file and folder', 'files and folders') + ' looked at']]));
     out.appendChild(ar);
@@ -1097,12 +1148,34 @@
         if (h.value.trim()) edit({ add_host: h.value.trim() }, out);
       }))));
     }
-    const ro = [];
-    if (s.git_hosts.length) ro.push(['Git hosts', mono(s.git_hosts.join(', '))]);
-    if (s.env.length) ro.push(['Variables', mono(s.env.join(', '))]);
-    if (ro.length) where.appendChild(kv(ro));
-    where.appendChild(txt('p', 'muted', 'Git hosts, variables, SSH host keys and mint scopes change in Terminal:'));
-    where.appendChild(copyline('ms rules ' + s.key));
+    // Git hosts (swap), variables and SSH host keys (run): L35 SPEC D-15.
+    const addOne = function (label, name, hint, kind, verb) {
+      const [w, i] = textField(label, name, hint);
+      return el('div', 'fields', w, el('div', 'field act', btn(verb, 'sm', function () {
+        const v = i.value.trim();
+        if (!v) return;
+        const e = {};
+        e[kind] = v;
+        edit(e, out);
+      })));
+    };
+    if (s.mode === 'swap') {
+      where.appendChild(txt('p', 'lbl', 'Git hosts'));
+      where.appendChild(removable(s.git_hosts, 'remove_git_host', 'Only needed for git over HTTPS.', null, 'git host'));
+      where.appendChild(addOne('Add a git host', 'githost', 'One exact host name git pushes to over HTTPS, for example github.com', 'add_git_host', 'Add git host'));
+    } else if (s.mode === 'run') {
+      where.appendChild(txt('p', 'lbl', 'Variables'));
+      where.appendChild(removable(s.env, 'remove_env', 'Its commands get it the way the tool expects.', null, 'variable'));
+      where.appendChild(addOne('Add a variable', 'envvar', 'The variable the tool reads its token from, for example GITHUB_TOKEN', 'add_env', 'Add variable'));
+      where.appendChild(txt('p', 'lbl', 'SSH host keys'));
+      where.appendChild(removable(s.ssh_host_keys, 'remove_ssh_host_key', 'Only needed for git over SSH.', null, 'host key'));
+      where.appendChild(addOne('Add an SSH host key', 'hostkey', 'One known_hosts line: host ssh-ed25519 AAAA…', 'add_ssh_host_key', 'Add host key'));
+    }
+    if (s.mint_scopes.length) {
+      where.appendChild(kv([['Mint scopes', mono(s.mint_scopes.join(', '))]]));
+      where.appendChild(txt('p', 'muted', 'Mint scopes are set when the key is added; see them with:'));
+      where.appendChild(copyline('ms rules ' + s.key));
+    }
     where.appendChild(out);
 
     tierCell.appendChild(txt('p', 'lede', s.tier === 'test' ? 'Test: agents use it without asking.' : 'Production: every use asks you first.'));
@@ -1299,6 +1372,61 @@
     return out;
   }
 
+  // A connect or disconnect plan: each file and its changed lines, redacted by msd (L35).
+  function planBox(p) {
+    const box = el('div', 'plan');
+    for (const f of p.files) {
+      const own = f.verb === 'write' || f.verb === 'keep' || f.verb === 'drop';
+      const label = { create: 'Create', change: 'Change', remove: 'Remove', write: 'Write', keep: 'Keep', drop: 'Remove' }[f.verb] || f.verb;
+      box.appendChild(el('p', own ? 'muted' : null, txt('span', 'lbl', label + ' '), pathText(f.path)));
+      if (f.too_large) box.appendChild(txt('p', 'muted', 'Too large to show line by line.'));
+      if (f.lines.length) {
+        const pre = el('div', 'diff');
+        for (const l of f.lines) {
+          pre.appendChild(el('div', l.sign === '+' ? 'add' : 'del', txt('span', 'ln', l.sign + String(l.n).padStart(4, ' ')), txt('code', null, ' ' + l.text)));
+        }
+        box.appendChild(pre);
+      }
+    }
+    if (p.notes.length) box.appendChild(list(p.notes, ''));
+    return box;
+  }
+
+  // Connect or Disconnect: preview, then apply with Touch ID (L35 SPEC D-1, D-19).
+  function agentAction(a, panel) {
+    const off = a.connected;
+    const base = '/api/agents/' + enc(a.id) + '/' + (off ? 'disconnect' : 'connect');
+    const msg = txt('p', 'muted', '');
+    const show = async function () {
+      panel.replaceChildren(msg);
+      const r = await run(msg, false, function () { return act(base + '/preview'); });
+      // Refused here (a terminal-only setup, no ms next to msd…): the terminal command stays.
+      if (!r || !r.preview) { panel.appendChild(copyline(a.command, 'Run it in Terminal instead.')); return; }
+      const p = r.preview;
+      msg.textContent = '';
+      if (p.nothing_to_do) {
+        panel.replaceChildren(txt('p', 'muted', off ? a.name + ' is not connected; nothing to do.' : a.name + ' is already connected; nothing to change.'));
+        return;
+      }
+      const out = txt('p', 'muted', '');
+      const apply = btn(off ? 'Disconnect with Touch ID' : 'Connect with Touch ID', off ? 'sm deny' : 'sm solid', function () {
+        run(out, true, function () { return act(base, { plan: p.plan }); }).then(function (x) {
+          if (x) rerender('agents', x);
+          else if (out.dataset.code === 'changed') after(1200, show);
+        });
+      });
+      panel.replaceChildren(
+        txt('p', null, off
+          ? 'This removes morsec from ' + a.name + '’s settings, including its sandbox: its requests stop going through morsec.'
+          : 'These are the changes to ' + a.name + '’s settings. Values that are yours are shown as “…”.'),
+        planBox(p),
+        el('div', 'actions', apply, btn('Cancel', 'sm ghost', function () { panel.replaceChildren(); })),
+        out,
+        copyline(a.command, 'Or run it in Terminal, which shows the same changes.'));
+    };
+    return btn(off ? 'Disconnect' : 'Connect', off ? 'sm deny' : 'sm solid', show);
+  }
+
   function agentsBody(v, out) {
     const g = el('div', 'tiles');
     v.agents.forEach(function (a, i) {
@@ -1312,11 +1440,14 @@
         ['Blocked', num(a.blocked)],
         ['Last seen', when(a.last_seen_unix_ms)],
       ]));
-      if (a.command) c.appendChild(txt('p', 'muted', a.connected
-        ? 'Disconnecting removes its sandbox and proxy settings; you confirm the change in Terminal.'
-        : 'Connecting edits its settings; Terminal shows the change and asks first.'));
-      if (a.command) c.appendChild(copyline(a.command, 'Then press Re-check.'));
-      else c.appendChild(txt('p', 'muted', 'Install ' + a.name + ' first; then it can be connected here.'));
+      if (a.command) {
+        c.appendChild(txt('p', 'muted', a.connected
+          ? 'Disconnecting removes its sandbox and proxy settings. You see the change first, then confirm with Touch ID.'
+          : 'Connecting edits its settings. You see the change first, then confirm with Touch ID.'));
+        const panel = el('div', 'panel');
+        c.appendChild(el('div', 'actions', agentAction(a, panel)));
+        c.appendChild(panel);
+      } else c.appendChild(txt('p', 'muted', 'Install ' + a.name + ' first; then it can be connected here.'));
       g.appendChild(c);
     });
     out.appendChild(el('section', 'row', el('div', 'tilewrap', g)));
@@ -1338,6 +1469,7 @@
   async function agents() {
     const v = await api('/api/agents');
     const out = sheet();
+    out.id = 'agents';
     out.appendChild(head('Agents', 'Agents', 'Which coding agents send their requests through morsec.', '04'));
     const msg = txt('p', 'muted', '');
     const bar = el('div', 'cell', el('div', 'actions', btn('Re-check', 'sm solid', function () {

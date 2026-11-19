@@ -77,6 +77,29 @@ pub trait Connector: Send + Sync {
 
 pub mod claude;
 pub mod codex;
+pub mod view;
+
+/// Whether `dir` may hold the `ms` that agent settings run at every session start (outside the
+/// sandbox): not under `home` or `cwd` (a repo checkout or a temp dir could repoint it), and no
+/// one but its owner (the user `uid` or root) can write it. Used by `ms connect` (`ms_path`) and
+/// by msd for the dashboard's Connect (L35 SPEC D-6). `home` is `None` to skip that part (debug
+/// msd runs from `target/debug`).
+pub fn stable_dir(
+    dir: &std::path::Path,
+    home: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+    uid: u32,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(cd) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    let under = |base: Option<&std::path::Path>| base.is_some_and(|b| cd.starts_with(b));
+    !under(home)
+        && !under(cwd)
+        && std::fs::metadata(&cd)
+            .is_ok_and(|m| m.mode() & 0o022 == 0 && (m.uid() == uid || m.uid() == 0))
+}
 
 /// Fake connector for tests.
 pub mod fake {

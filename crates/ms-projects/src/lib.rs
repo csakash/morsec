@@ -9,13 +9,15 @@
 //! - [`save`]: what msd accepts in a `ProjectSave` (and the rules the CLI proposes).
 //! - [`hint`]: the agent hint block for `CLAUDE.md` / `AGENTS.md`.
 //!
-//! The CLI runs the orchestration (SPEC D-1); msd only validates and stores.
+//! - [`setup`]: the project steps themselves (prepare, then execute), run by `ms init` over IPC
+//!   and by msd for the dashboard's Add project (L35).
 
 pub mod hint;
 pub mod mode;
 pub mod naming;
 pub mod record;
 pub mod save;
+pub mod setup;
 pub mod slug;
 pub mod store;
 pub mod undo;

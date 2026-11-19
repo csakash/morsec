@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Args;
-use ms_connect::claude::diff::{Line, changed_lines, redact, significant};
 use ms_connect::claude::{ClaudeConnector, Options, Paths, session_env_line};
 use ms_connect::{ConnectCfg, Connector};
 use ms_core::Error;
@@ -133,18 +132,8 @@ pub(crate) fn ms_path() -> Result<String, String> {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|d| std::fs::canonicalize(d).ok());
-    let stable_dir = |d: &Path| {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(cd) = std::fs::canonicalize(d) else {
-            return false;
-        };
-        let under = |base: &Option<PathBuf>| base.as_ref().is_some_and(|b| cd.starts_with(b));
-        let uid = rustix::process::getuid().as_raw();
-        !under(&home)
-            && !under(&cwd)
-            && std::fs::metadata(&cd)
-                .is_ok_and(|m| m.mode() & 0o022 == 0 && (m.uid() == uid || m.uid() == 0))
-    };
+    let uid = rustix::process::getuid().as_raw();
+    let stable_dir = |d: &Path| ms_connect::stable_dir(d, home.as_deref(), cwd.as_deref(), uid);
     let on_path = std::env::var_os("PATH").and_then(|p| {
         std::env::split_paths(&p)
             .filter(|d| d.is_absolute() && stable_dir(d))
@@ -257,23 +246,10 @@ pub(crate) fn rule_hosts(file: Option<&Path>) -> Result<Vec<String>, String> {
 /// values morsec didn't write are shown as "…", so a value of the user's own (a token in an env
 /// entry or hook) never reaches the terminal or an agent's transcript.
 pub(crate) fn show_file(path: &Path, before: Option<&str>, after: Option<&str>, safe: &[String]) {
-    let safe = |s: &str| safe.iter().any(|x| x == s);
-    let verb = match (before, after) {
-        (None, Some(_)) => "create",
-        (Some(_), None) => "remove",
-        _ => "change",
-    };
-    say(&format!("{verb} {}:", path.display()));
-    match changed_lines(before.unwrap_or(""), after.unwrap_or("")) {
-        Some(lines) => {
-            for l in significant(lines) {
-                match l {
-                    Line::Removed(n, t) => say(&format!("  -{n:>4} {}", redact(t, &safe))),
-                    Line::Added(n, t) => say(&format!("  +{n:>4} {}", redact(t, &safe))),
-                }
-            }
-        }
-        None => say("  (too large to show line by line)"),
+    let f =
+        ms_connect::view::settings_file(path, before, after, ms_connect::view::Syntax::Json, safe);
+    for l in ms_connect::view::terminal_lines(&f) {
+        say(&l);
     }
 }
 
