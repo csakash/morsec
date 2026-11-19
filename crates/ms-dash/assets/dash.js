@@ -6,7 +6,7 @@
 (function () {
   const state = { csrf: null };
   const main = document.getElementById('main');
-  const pill = document.getElementById('pill');
+  const stateBox = document.getElementById('state');
 
   // ---- DOM helpers: text only --------------------------------------------------------------
   function el(tag, cls) {
@@ -320,32 +320,46 @@
     for (const k of Object.keys(filters)) if (filters[k]) q.push(k + '=' + enc(filters[k]));
     return q.join('&');
   }
-  function select(name, options) {
-    const s = el('select', null);
-    s.setAttribute('name', name);
+  function select(label, name, options) {
+    const [w, s] = field(label, 'select', name, null);
     for (const [value, label] of options) {
       const o = txt('option', null, label);
       o.value = value;
       if (filters[name] === value) o.selected = true;
       s.appendChild(o);
     }
-    return s;
+    return w;
   }
-  function field(label, control) { return el('label', null, label, control); }
+  // Every form control is made here: a <label for> above it and an example in a hint line,
+  // never in the field itself (SPEC D-4).
+  let fieldSeq = 0;
+  function field(label, tag, name, hint) {
+    const id = 'f-' + (++fieldSeq);
+    const c = document.createElement(tag);
+    c.id = id;
+    c.setAttribute('name', name);
+    const l = txt('label', null, label);
+    l.setAttribute('for', id);
+    const w = el('div', 'field', l, c);
+    if (hint) w.appendChild(txt('p', 'hint', hint));
+    return [w, c];
+  }
 
   async function activity() {
     const out = el('section', null);
     out.appendChild(txt('h1', null, 'Activity'));
     out.appendChild(txt('p', 'lead', 'Every use of a key, and every refusal, as msd recorded it.'));
-    const f = el('form', 'filters');
-    f.appendChild(field('Time', select('since', [['1h', 'Last hour'], ['24h', 'Last 24 h'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['', 'All']])));
-    f.appendChild(field('Result', select('result', [['', 'Any'], ['allowed', 'Allowed'], ['approved', 'Approved'], ['blocked', 'Blocked'], ['denied', 'Denied'], ['failed', 'Failed'], ['alert', 'Alert']])));
-    f.appendChild(field('Agent', select('agent', [['', 'Any'], ['claude-code', 'Claude Code'], ['codex', 'Codex'], ['cursor', 'Cursor'], ['gemini-cli', 'Gemini CLI']])));
-    const key = el('input', null); key.setAttribute('name', 'key'); key.value = filters.key; key.setAttribute('placeholder', 'shop/stripe-secret-key');
-    f.appendChild(field('Key', key));
-    const proj = el('input', null); proj.setAttribute('name', 'project'); proj.value = filters.project; proj.setAttribute('placeholder', 'shop');
-    f.appendChild(field('Project', proj));
-    f.appendChild(txt('button', null, 'Filter'));
+    const f = el('form', 'fields');
+    f.appendChild((select('Since', 'since', [['1h', 'Last hour'], ['24h', 'Last 24 h'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['', 'All']])));
+    f.appendChild((select('Result', 'result', [['', 'Any'], ['allowed', 'Allowed'], ['approved', 'Approved'], ['blocked', 'Blocked'], ['denied', 'Denied'], ['failed', 'Failed'], ['alert', 'Alert']])));
+    f.appendChild((select('Agent', 'agent', [['', 'Any'], ['claude-code', 'Claude Code'], ['codex', 'Codex'], ['cursor', 'Cursor'], ['gemini-cli', 'Gemini CLI']])));
+    const [kw, key] = field('Key', 'input', 'key', 'For example shop/stripe-secret-key');
+    key.value = filters.key;
+    f.appendChild(kw);
+    const [pw, proj] = field('Project', 'input', 'project', 'For example shop');
+    proj.value = filters.project;
+    f.appendChild(pw);
+    f.appendChild(txt('button', 'btn', 'Filter'));
     f.addEventListener('submit', function (e) {
       e.preventDefault();
       for (const k of Object.keys(filters)) {
@@ -356,7 +370,7 @@
     });
     out.appendChild(f);
     const acts = el('div', 'actions');
-    const verify = txt('button', null, 'Verify the chain');
+    const verify = txt('button', 'btn', 'Verify the chain');
     const verdict = txt('p', null, '');
     verify.setAttribute('type', 'button');
     verify.addEventListener('click', async function () {
@@ -369,7 +383,7 @@
     });
     acts.appendChild(verify);
     for (const fmt of ['json', 'csv']) {
-      const b = txt('button', null, 'Export ' + fmt.toUpperCase());
+      const b = txt('button', 'btn', 'Export ' + fmt.toUpperCase());
       b.setAttribute('type', 'button');
       b.addEventListener('click', async function () {
         try { await download('/api/activity/export?format=' + fmt + '&' + query(), 'morsec-receipts.' + fmt); } catch (e) { fail(e, verdict); }
@@ -456,8 +470,7 @@
   }
 
   function setPill(running) {
-    pill.textContent = running ? 'on' : 'stopped';
-    pill.className = running ? 'pill' : 'pill stopped';
+    stateBox.replaceChildren(txt('span', running ? 'word on' : 'word off', running ? 'On' : 'Stopped'));
   }
 
   function fail(e, where) {
@@ -471,7 +484,8 @@
     const [name, arg] = parseHash();
     const view = Object.prototype.hasOwnProperty.call(routes, name) ? routes[name] : null;
     for (const a of document.querySelectorAll('#nav a')) {
-      a.className = a.getAttribute('data-route') === name ? 'on' : '';
+      if (a.getAttribute('data-route') === name) a.setAttribute('aria-current', 'page');
+      else a.removeAttribute('aria-current');
     }
     const mine = ++seq;
     if (!view) { main.replaceChildren(txt('p', 'err', 'No such screen.')); return; }
@@ -485,7 +499,7 @@
 
   function signedOut(why) {
     state.csrf = null;
-    pill.textContent = '';
+    stateBox.replaceChildren();
     const s = el('section', null);
     s.appendChild(txt('h1', null, 'Open the dashboard from your terminal.'));
     if (why === 'closed') s.appendChild(txt('p', 'lead', 'The dashboard closed: it was idle for 30 minutes, or morsec stopped.'));

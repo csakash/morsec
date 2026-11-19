@@ -21,14 +21,15 @@
       <a href="#/agents" data-route="/agents">Agents</a>
       <a href="#/scan" data-route="/scan">Scan</a>
     </nav>
-    <span class="pill" id="pill" aria-live="polite"></span>
+    <div class="state" id="state"></div>
   </div>
+  <div class="notice" id="live" role="status" aria-live="polite"><p></p></div>
 </header>
 <main class="wrap" id="main" tabindex="-1">
   <p class="muted">Loading…</p>
 </main>
 <footer class="wrap foot">
-  <p class="muted">Local to this Mac. Values never reach this page. Read-only.</p>
+  <p class="muted"><span>Local to this Mac. Values are shown only after Touch ID, and hidden again after 15 seconds.</span><span id="ver"></span><span>Fonts (SIL Open Font License 1.1): <a href="/fonts/OFL-Archivo.txt">Archivo</a>, <a href="/fonts/OFL-InstrumentSerif.txt">Instrument Serif</a>, <a href="/fonts/OFL-IBMPlexMono.txt">IBM Plex Mono</a></span></p>
 </footer>
 </body>
 </html>

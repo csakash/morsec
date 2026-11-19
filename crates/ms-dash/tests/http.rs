@@ -717,3 +717,35 @@ fn slow_body_times_out() {
     assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 408"));
     assert!(started.elapsed() < Duration::from_secs(8));
 }
+
+// protects=L33 SPEC D-1 and criterion 1: the vendored fonts and their licences are served at
+// /fonts/<file> without a session, with font/woff2 or text/plain and every security header, the
+// exact bytes msd embeds; anything else under /fonts/ is a 404; fails_when=a font is missing, has
+// another type or lacks a header, or a path outside the list is served; no_claim=the bytes'
+// provenance (assets::fonts_are_pinned)
+#[test]
+fn fonts_served_with_headers() {
+    let t = setup(|_| {});
+    let o = t.dash.open().unwrap();
+    for (name, ctype, bytes, _) in ms_dash::assets::FONTS {
+        let r = get(o.port, &format!("/fonts/{name}"), "");
+        assert_eq!(r.status, 200, "{name}");
+        assert_eq!(r.h("content-type"), Some(*ctype), "{name}");
+        assert_eq!(
+            r.h("content-length"),
+            Some(bytes.len().to_string().as_str()),
+            "{name}"
+        );
+        for (k, v) in HEADERS {
+            assert_eq!(r.h(k), Some(v), "{k} on {name}");
+        }
+    }
+    for bad in [
+        "/fonts/",
+        "/fonts/SOURCES.txt",
+        "/fonts/../dash.js",
+        "/fonts/x.woff2",
+    ] {
+        assert_eq!(get(o.port, bad, "").status, 404, "{bad}");
+    }
+}
