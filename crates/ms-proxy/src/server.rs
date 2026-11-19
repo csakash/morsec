@@ -437,7 +437,7 @@ impl Inner {
         };
         let (host, port) = split_authority(&auth, 443);
         let bound = !self.bound(&host, port).is_empty();
-        if !bound && !self.cfg.allowed(&host) {
+        if !bound && !self.cfg.allowed(&host) && !self.deps.sessions.open_egress(&session) {
             self.block(Some(&session), &host, port, BlockKind::NotAllowed);
             return text(
                 StatusCode::FORBIDDEN,
@@ -932,7 +932,7 @@ impl Inner {
                 ),
             );
         }
-        if !self.cfg.allowed(&host) {
+        if !self.cfg.allowed(&host) && !self.deps.sessions.open_egress(&session) {
             self.block(Some(&session), &host, port, BlockKind::NotAllowed);
             return text(
                 StatusCode::FORBIDDEN,
