@@ -113,8 +113,8 @@ ms dev -- npm run dev
 
 `ms dev` runs your command in your terminal with `HTTPS_PROXY` pointing at morsec, so requests to
 your keys' services get the real key swapped in, and puts the real database URLs (run-mode keys
-of this project) in its environment. A project with a production key asks for Touch ID once per
-run. Node needs version 24 or later to send its requests through a proxy (`ms dev` sets
+of this project) in its environment. Each run asks you once (Touch ID); the sheet lists the keys, the
+variables that get values and that the command may reach other websites. Node needs version 24 or later to send its requests through a proxy (`ms dev` sets
 `NODE_USE_ENV_PROXY=1` and warns about older versions). It refuses to start a coding agent, and
 it doesn't run inside one.
 

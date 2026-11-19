@@ -48,7 +48,7 @@ real key in, and run-mode values (database URLs) are put in the command's enviro
   ms dev -- npm run dev
 
 Run it inside a project you set up with ms init, from your own terminal (not inside an agent). \
-A project with a production key asks for Touch ID once per run. Node needs version 24 or later \
+Each run asks you once (Touch ID), on this terminal or with ms approve. Node needs version 24 or later \
 to send its requests through morsec (ms dev sets NODE_USE_ENV_PROXY=1).
 
 Exit status: the command's own; 77 refused, 69 the daemon is not running, 64 usage error, 70 \

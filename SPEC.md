@@ -58,13 +58,29 @@ ms dev -- npm run dev
   else it is skipped with a note. ms-ipc gets an additive `Handler::handle_with_values` (default:
   no values) and `Client::request_with_values`; the server sends values only after a `DevStarted`
   whose name list has the same length.
-- **D-4 One Touch ID per run, for production (§7.2).** If any key of the project (by its rule in
-  force) is production tier, `DevStart` calls `approve_exact` once. The request is bound to the
-  argv `["ms","dev","--project",<slug>,"--root",<root>,"--keys",<production keys…>,"--",<argv…>]`
-  and the canonical cwd, so the sheet shows the real command and keys. The token covers this dev
-  session only: the proxy's approver answers a production swap of a key of this project from this
-  session with that token (its id is on every receipt) and asks a person as usual for anything
-  else. `ms stop` ends every dev session.
+- **D-4 One Touch ID for every run (§7.2; review D-A, stricter than the design).** Every
+  `DevStart` calls `approve_exact` once, whatever the tiers. The request is bound to the argv
+  `["ms","dev","--project",<slug>,"--root",<root>,"--swap",<swap keys…>,"--env",<VAR=key…>,
+  "--production",<production keys…>,"--other-websites","allowed","--",<argv…>]` and the
+  canonical cwd, so the sheet shows the real command, the keys it may use, each variable that will
+  get a value and that other websites are reachable. Values go out only for keys whose rule is
+  still exactly the one the sheet was built from (review R1). Why every run: a prompt-injected,
+  sandboxed agent can double-fork out of its tree; msd then sees an unattributed process, and
+  without a person it could start a dev session for itself and get open egress (D-7), project
+  swaps and run-mode values. A tty check would not stop it (`script -q /dev/null …`).
+- **D-4b Production swaps ride on the run's approval only briefly (review D-B).** The proxy's
+  approver answers a production swap of a key the sheet listed as production, from this dev
+  session, with the run's token (its id on every receipt) only while the token is live (not
+  revoked by `ms stop`) and for at most `min(token expiry, the key's session_ttl_secs)` after the
+  approval. The token is a once token, so its expiry (60 s) is usually the limit; afterwards each
+  production swap asks a person as for an agent. Within the window, code in the dev tree
+  (including agent-edited code a dev server hot-reloads) can use those production keys, to their
+  bound hosts only.
+- **D-4c Sandboxed callers are refused (review D-A).** msd refuses `DevStart` from a process for
+  which `sandbox_check(pid, NULL, 0)` (libsystem_sandbox, declared in `ms-session`'s only unsafe
+  module) says it is sandboxed, or when the check fails: an agent command that left its tree is
+  still in the agent's Seatbelt sandbox. An agent without a sandbox is not caught by this; the
+  approval is the gate then.
 - **D-5 Dev sessions use only their project's keys.** Policy for a dev session denies any key not
   in the project record (`NoSuchKey`); hosts, tiers and receipts are otherwise the agents' rules.
   Receipts name the session `other("ms-dev")` with the `ms dev` PID.
@@ -74,13 +90,17 @@ ms dev -- npm run dev
   ends them.
 - **D-7 Egress for dev sessions (Refinement).** A dev session may reach hosts no key is bound to
   through a plain tunnel (no TLS interception, SSRF guard unchanged): the user's own process is
-  not sandboxed and could connect directly, so refusing would only break the app. Agents are
-  unchanged. ms-proxy gets an additive `SessionResolver::open_egress(session)` (default `false`).
+  not sandboxed and could connect directly, so refusing would only break the app. This would
+  bypass an agent's network sandbox if an agent could get a dev session, which is why every run
+  needs the person (D-4, shown on the sheet as "other websites allowed") and sandboxed callers
+  are refused (D-4c). Agents are unchanged. ms-proxy gets an additive `SessionResolver::open_egress(session)` (default `false`).
   `NO_PROXY` gets `localhost,127.0.0.1,::1` added so local services are not sent to the proxy.
 - **D-8 Refusals.** Refused inside an agent session (`ms` checks its own tree before contacting
-  msd; msd checks the caller) and when `argv[0]` names a known agent binary: `ms` checks the
-  given name and the name after resolving it on `PATH` and following symlinks; msd checks the
-  basename it receives. Refused while stopped, and when cwd is in no recorded project root (the
+  msd; msd checks the caller, and refuses sandboxed callers: D-4c) and when `argv[0]` names a
+  known agent binary: `ms` checks the given name, the name after resolving it on `PATH` and
+  following symlinks, and both paths against agents' install paths (`…/claude/versions/<v>`, the
+  `@anthropic-ai/claude-code`, `@openai/codex`, `@google/gemini-cli` packages, review N2); msd
+  checks the basename and install path of the `argv[0]` it receives. Refused while stopped, and when cwd is in no recorded project root (the
   deepest matching root wins).
 - **D-9 CA variables as connectors set them.** `ms` writes `~/.morsec/dev-ca-bundle.pem`
   (system roots + the CA certificate msd returns; public, atomic, 0644) and points
@@ -96,7 +116,23 @@ ms dev -- npm run dev
   key's credential location only through catalog key names (`stripe/test`) or a first segment
   that is a provider id, so L31's project keys (`shop/stripe-secret-key`) were never swapped. The
   proxy now takes the provider from the MAC'd project record (`bindings_with`), and a project save
-  rebuilds the proxy. Test `crates/msd/src/proxy.rs::project_keys_bind_with_their_recorded_provider`.
+  rebuilds the proxy. A recorded provider counts only when its catalog hosts cover every host of
+  the key's rule (review N1); otherwise the old lookup applies (fails closed for `shop/…`). Test
+  `crates/msd/src/proxy.rs::project_keys_bind_with_their_recorded_provider`.
+- **D-13 What ms dev hands out depends on the record and the rule's shape (review S2).** Run
+  values go out only for rules shaped exactly as `ms init` makes a database URL's: the project
+  root as the only root, no commands, not read-only, no `env` names or the variable among them;
+  any other run rule is skipped with a note. `ProjectSave` asks the person when the record adds a
+  key that the stored record didn't list and whose rule already allows something (a key made by
+  hand being adopted); the sheet names it ("joins the project"). Fresh keys (allowing nothing)
+  join without a prompt; re-saving the same keys asks nothing, so `reinit_is_idempotent` is
+  unchanged, and `orphaned_keys_are_adopted_on_reinit` is unchanged too (orphans are fresh and get
+  their first rules in the same approval).
+- **D-14 Robustness (review R2-R4, R6, R7, R9).** The stop check and the session insert share the
+  session lock; capacity is checked before anything is asked, read or recorded; an empty or
+  oversized value is skipped with a note; `ms dev` lists only variables it really set; signals are
+  forwarded only to a child that is not reaped (polled with `try_wait`); value receipts carry the
+  rules version in force after the approval. A session's end (`DevEnd`, reaper) leaves a receipt.
 
 ## Behaviour
 
@@ -126,16 +162,19 @@ ms dev -- npm run dev
 
 | # | Criterion | Test(s) |
 |---|---|---|
-| 1 | `DevStart` is refused (no value, no session, no approval asked) from an agent session; `ms dev` refuses inside an agent session before contacting msd | `crates/msd/src/daemon/dev_tests.rs::dev_refused_in_agent_session`, `crates/ms-cli/tests/dev_cli.rs::dev_refused_in_agent_session` |
-| 2 | `ms dev` and msd refuse when `argv[0]` is an agent binary (`claude`, `codex`, `cursor-agent`, `gemini`; by name, path or symlink) | `crates/ms-cli/src/dev.rs::dev_refused_for_agent_binary`, `crates/msd/src/daemon/dev_tests.rs::dev_refused_for_agent_binary` |
+| 1 | `DevStart` is refused (no value, no session, no approval asked) from an agent session and from a sandboxed process; `ms dev` refuses inside an agent session before contacting msd | `crates/msd/src/daemon/dev_tests.rs::dev_refused_in_agent_session`, `crates/ms-cli/tests/dev_cli.rs::dev_refused_in_agent_session`, `crates/ms-session/tests/live.rs::sandboxed_process_is_detected` |
+| 2 | `ms dev` and msd refuse when `argv[0]` is an agent binary (`claude`, `codex`, `cursor-agent`, `gemini`; by name, path, symlink or install path) | `crates/ms-cli/src/dev.rs::dev_refused_for_agent_binary`, `crates/msd/src/daemon/dev_tests.rs::dev_refused_for_agent_binary`, `crates/ms-session/src/walk.rs::install_paths` |
 | 3 | A connection from the `ms dev` tree with the credential is a dev session; the credential from outside the tree, the tree without the credential, a dead `ms dev` or a reused PID are refused; an agent inside the tree stays an agent session | `crates/msd/src/proxy.rs::dev_swaps_refs_for_child_tree`, `crates/ms-session/src/walk.rs::within_checks_the_chain` |
 | 4 | Dev sessions swap only their project's keys, to the keys' hosts, with receipts | `crates/msd/src/daemon/dev_tests.rs::dev_swaps_refs_for_child_tree` |
-| 5 | The session ends when the child exits (`DevEnd`, reaper), on `ms stop` and on msd restart | `crates/msd/src/daemon/dev_tests.rs::dev_session_ends_with_child` |
-| 6 | Values are returned only for run-mode keys of the cwd's project whose rule is ready and whose root holds the cwd; never for swap keys, other projects' keys or outside a project; never in a JSON frame | `crates/msd/src/daemon/dev_tests.rs::dev_run_mode_values_only_for_project_keys`, `crates/ms-ipc/tests/ipc.rs::values_follow_dev_started_as_raw_frames` |
-| 7 | A project with a production key asks one Touch ID per `ms dev` run, bound to the command; every production swap of that run uses it without another prompt; denial starts nothing | `crates/msd/src/daemon/dev_tests.rs::dev_production_needs_one_approval` |
-| 8 | End to end: a child of `ms dev` calls a fake Stripe upstream over HTTPS with an `ms://` ref through `HTTPS_PROXY`, and the upstream receives the canary; the child gets the run-mode value in its environment; the canary is in none of `ms dev`'s output, receipts, msd's log or IPC replies; after `ms dev` exits its credential is refused | `tests/e2e/tests/canary.rs::dev_swaps_for_the_users_own_command` |
+| 5 | The session ends when the child exits (`DevEnd`, reaper), on `ms stop` (also while the approval is pending) and on msd restart; each end leaves a receipt | `crates/msd/src/daemon/dev_tests.rs::dev_session_ends_with_child` |
+| 6 | Values are returned only for run-mode keys of the cwd's project whose rule is shaped as `ms init` makes it; never for swap keys, other projects' keys, hand-changed run rules, empty values or outside a project; never in a JSON frame | `crates/msd/src/daemon/dev_tests.rs::dev_run_mode_values_only_for_project_keys`, `crates/ms-ipc/tests/ipc.rs::values_follow_dev_started_as_raw_frames` |
+| 7 | Every `ms dev` run asks one Touch ID, bound to the command, keys, variables and open egress; production swaps of that run use it without another prompt only while it is live and within the key's session length; a key outside the project is denied; denial starts nothing | `crates/msd/src/daemon/dev_tests.rs::dev_production_needs_one_approval`, `crates/ms-approve/src/broker.rs::is_live_after_use_until_revoked` |
+| 7b | A key whose rule changes while the sheet is up gets no value | `crates/msd/src/daemon/dev_tests.rs::dev_values_follow_the_rules_the_person_saw` |
+| 7c | `ProjectSave` asks the person to adopt a key that already allows something | `crates/msd/src/daemon/dev_tests.rs::project_save_asks_to_adopt_a_key_that_allows_something` |
+| 8 | End to end: a child of `ms dev` calls a fake Stripe upstream over HTTPS with an `ms://` ref through `HTTPS_PROXY`, and the upstream receives the canary; the child gets the run-mode value in its environment; the canary is in none of `ms dev`'s output, receipts, msd's log or IPC replies; the session's end is recorded when the command exits and its credential is refused afterwards | `tests/e2e/tests/canary.rs::dev_swaps_for_the_users_own_command` |
 | 9 | Node older than 24 is warned about; env names and output never carry a value | `crates/ms-cli/src/dev.rs::node_version_warning`, `crates/ms-cli/src/dev.rs::child_env_is_built_from_names` |
 | 10 | Dev sessions may tunnel to unbound hosts; agents still can't | `crates/ms-proxy/src/itests.rs::open_egress_only_for_sessions_that_have_it` |
+| 11 | A project key is bound with its recorded provider only when that provider's hosts cover the rule | `crates/msd/src/proxy.rs::project_keys_bind_with_their_recorded_provider` |
 
 Every new test carries a `// protects=…; fails_when=…; no_claim=…` card. The e2e uses `curl`
 with `HTTPS_PROXY` (no Node 24 in the gate; noted in PROOF).
@@ -144,11 +183,19 @@ with `HTTPS_PROXY` (no Node 24 in the gate; noted in PROOF).
 
 - Run-mode values in the child's environment can be read by any same-user process (as run mode
   before L23) and are inherited by every grandchild, an agent the dev server starts included.
-- A detached same-user process is not an agent session: it can send `DevStart` and receive a
-  project's test-tier run-mode values (production needs Touch ID). Same class as T-04 / T-40.
+- A detached, unsandboxed same-user process is not an agent session: it can ask for `DevStart`,
+  but every run needs the person's approval, whose sheet names the command, keys and variables
+  (the gate is then the person reading it, as T-04).
+- Within the run's approval window (D-4b), code in the dev tree, including agent-edited code a
+  dev server hot-reloads, can use the project's production keys, to their bound hosts only.
 - Node older than 24 ignores `HTTPS_PROXY`; refs then go out unswapped and fail (fail closed).
-- An agent started through a wrapper `ms dev` doesn't recognise (`npx claude`, a shell script)
-  still gets the run-mode values in its environment; its own proxy traffic is an agent session.
+- Agents started through a wrapper are not recognised, by `ms dev` or by the proxy's session
+  walk (which goes by process name): `npx claude`, a `#!/usr/bin/env node` script, or Claude
+  Code's native binary started by its versioned path (`~/.local/share/claude/versions/<v>`, whose
+  process name is the version). `ms dev` catches the install paths it knows (D-8); anything else
+  in the dev tree gets the run-mode values in its environment and, if not named like an agent,
+  is served as the dev session.
+- At most 64 dev sessions at once (global); filling them needs an approval per session (review N3).
 
 ## Out of scope
 

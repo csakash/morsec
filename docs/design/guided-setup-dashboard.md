@@ -261,7 +261,7 @@ agent session, except `ProjectList` and `KeyInfo` (read-only, no values).
 | `KeyReveal { key }` | Touch ID every time | returns the value to the dashboard only (§6.6) |
 | `KeyCopy { key }` | Touch ID every time | msd puts the value on the pasteboard itself (§6.6) |
 | `DashOpen` | none | starts the dashboard listener if needed, returns `{ port, launch_token }` |
-| `DevStart { argv, cwd }` | production keys: Touch ID once per run | L34, §7 |
+| `DevStart { argv, cwd }` | Touch ID once per run, every tier (L34 review) | L34, §7 |
 
 ## 6. The dashboard
 
