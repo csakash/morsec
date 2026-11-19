@@ -14,7 +14,9 @@ use ms_proxy::{
     BasicField, Binding, Ca, Deps, Location, Policy, Proxy, ProxyConfig, SessionResolver,
 };
 use ms_rules::{HostPattern, Rules, is_reserved};
-use ms_session::{OsProcessTable, PortResolver, cross_check};
+use ms_session::{
+    Caller, OsProcessTable, PortResolver, ProcessTable, Resolver, cross_check, is_dev_proxy_user,
+};
 use tokio::sync::watch;
 
 use crate::backend::{CA_CERT_KEY, CA_PEM_KEY, CaKeyWriter};
@@ -99,20 +101,58 @@ impl SessionResolver for Sessions {
         if self.daemon.is_stopped() {
             return None;
         }
-        let caller = {
-            let _g = self.gate.enter();
-            self.ports.resolve(peer, local).ok()?
-        };
-        let session = match proxy_user {
-            Some(u) => cross_check(&caller, u).ok()?.clone(),
-            // Without a username the process tree alone decides; an unattributed caller has no
-            // session, so it is refused.
-            None => caller.session()?.clone(),
-        };
+        let _g = self.gate.enter();
+        let caller = self.ports.resolve(peer, local).ok()?;
+        let session = session_for(
+            &caller,
+            proxy_user,
+            |c| self.daemon.dev_by_credential(c),
+            self.ports.resolver(),
+        )?;
         if self.daemon.session_stopped(&session) {
             return None;
         }
         Some(session)
+    }
+
+    fn open_egress(&self, session: &SessionId) -> bool {
+        self.daemon.dev_session(session).is_some()
+    }
+}
+
+/// The session a proxy connection is served as (L06, L34 SPEC D-1/D-2):
+///
+/// - an agent anywhere on the chain: that agent's session. Its username is cross-checked,
+///   except that an `ms dev` credential is ignored (an agent inside a dev tree stays an agent);
+/// - no agent, an `ms dev` credential that `dev` knows, and the dev session's `ms dev` process
+///   (same start time) on the caller's parent chain: the dev session;
+/// - anything else (no username, an unknown or copied credential, a process outside the tree):
+///   none, so the connection is refused.
+pub fn session_for<T: ProcessTable>(
+    caller: &Caller,
+    proxy_user: Option<&str>,
+    dev: impl Fn(&str) -> Option<SessionId>,
+    tree: &Resolver<T>,
+) -> Option<SessionId> {
+    match (caller, proxy_user) {
+        (Caller::Agent(s), Some(u)) if is_dev_proxy_user(u) => Some(s.clone()),
+        (_, Some(u)) if !is_dev_proxy_user(u) => cross_check(caller, u).ok().cloned(),
+        (
+            Caller::Unattributed {
+                pid,
+                started_unix_ms,
+            },
+            Some(u),
+        ) => {
+            let d = dev(u)?;
+            tree.within(*pid, *started_unix_ms, d.pid, d.started_unix_ms)
+                .ok()?
+                .then_some(d)
+        }
+        // Without a username the process tree alone decides; an unattributed caller has no
+        // session, so it is refused.
+        (_, None) => caller.session().cloned(),
+        (Caller::Agent(_), Some(_)) => None,
     }
 }
 
@@ -459,6 +499,83 @@ pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>, test
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ms_core::AgentKind;
+    use ms_session::ProcInfo;
+    use std::collections::HashMap;
+
+    /// A fixed process table: pid → (ppid, start, name).
+    struct Table(HashMap<u32, (u32, u64, &'static str)>);
+
+    impl ProcessTable for Table {
+        fn info(&self, pid: u32) -> std::io::Result<ProcInfo> {
+            let (ppid, started, name) = *self
+                .0
+                .get(&pid)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+            Ok(ProcInfo {
+                pid,
+                ppid,
+                uid: 501,
+                started_unix_ms: started,
+                name: name.into(),
+            })
+        }
+    }
+
+    // protects=L34 SPEC D-1/D-2 (design §7.4): a proxy client under the ms dev process that
+    // presents the session's credential is served as the dev session; the same credential from a
+    // process outside the tree, from a tree whose ms dev restarted (new start time), an unknown
+    // credential, and the tree without a credential are refused; an agent inside the tree stays
+    // that agent's session whatever it presents, and agent usernames are still cross-checked;
+    // fails_when=a copied credential works outside the tree, or a dev credential turns an agent
+    // connection into a dev session; no_claim=the live port→PID lookup (ms-session live tests) and
+    // the swap itself (e2e dev_swaps_for_the_users_own_command)
+    #[test]
+    fn dev_swaps_refs_for_child_tree() {
+        let t = Resolver::new(Table(HashMap::from([
+            (1, (0, 1, "launchd")),
+            (60, (1, 10, "zsh")),
+            (70, (60, 20, "ms")),
+            (80, (70, 30, "node")),
+            (90, (80, 40, "node")),
+            (95, (90, 50, "claude")),
+            (96, (95, 60, "curl")),
+            (200, (60, 25, "python3")),
+        ])));
+        let cred = format!("ms-dev-{}", "ab".repeat(32));
+        let dev = crate::daemon::dev::dev_session_id(70, 20);
+        let known = |c: &str| (c == cred).then(|| dev.clone());
+        let un = |pid, started_unix_ms| Caller::Unattributed {
+            pid,
+            started_unix_ms,
+        };
+        assert_eq!(
+            session_for(&un(90, 40), Some(&cred), known, &t),
+            Some(dev.clone())
+        );
+        assert_eq!(session_for(&un(200, 25), Some(&cred), known, &t), None);
+        assert_eq!(session_for(&un(90, 40), None, known, &t), None);
+        let other = format!("ms-dev-{}", "cd".repeat(32));
+        assert_eq!(session_for(&un(90, 40), Some(&other), known, &t), None);
+        let restarted = crate::daemon::dev::dev_session_id(70, 21);
+        assert_eq!(
+            session_for(&un(90, 40), Some(&cred), |_| Some(restarted.clone()), &t),
+            None
+        );
+        let agent = SessionId {
+            agent: AgentKind::ClaudeCode,
+            pid: 95,
+            started_unix_ms: 50,
+        };
+        let a = Caller::Agent(agent.clone());
+        assert_eq!(session_for(&a, Some(&cred), known, &t), Some(agent.clone()));
+        assert_eq!(
+            session_for(&a, Some("claude-code"), known, &t),
+            Some(agent.clone())
+        );
+        assert_eq!(session_for(&a, Some("codex"), known, &t), None);
+        assert_eq!(session_for(&a, None, known, &t), Some(agent));
+    }
 
     fn rules(text: &str) -> Rules {
         Rules::from_toml(text, "test").unwrap()
