@@ -789,6 +789,7 @@ mod tests {
         }
     }
 
+    const OPENAI: &str = concat!("sk-", "proj-", "canaryxxxxxxxxxxxxxxxxxxxxxxxx");
     const STRIPE: &str = concat!("sk_", "test_", "51HcanaryDIGESTxxxxxxxxxxxxxxxxxxxxxxxx");
 
     fn project() -> (tempfile::TempDir, PathBuf) {
@@ -868,7 +869,7 @@ mod tests {
         assert_eq!(a, b);
         std::fs::write(
             root.join(".env"),
-            format!("STRIPE_SECRET_KEY={STRIPE}\nPORT=3000\nOPENAI_API_KEY=sk-proj-canaryxxxxxxxxxxxxxxxxxxxxxxxx\n"),
+            format!("STRIPE_SECRET_KEY={STRIPE}\nPORT=3000\nOPENAI_API_KEY={OPENAI}\n"),
         )
         .unwrap();
         let c = prepare(&host, Catalog::builtin(), &root, None)

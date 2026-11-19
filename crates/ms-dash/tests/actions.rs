@@ -164,6 +164,50 @@ impl DashActions for Fake {
             ..UndoView::default()
         })
     }
+    fn agent_preview(
+        &self,
+        _a: &Actor,
+        agent: &str,
+        disconnect: bool,
+    ) -> Result<AgentPlanView, ActionError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("preview {agent} {disconnect}"));
+        Ok(AgentPlanView {
+            agent: agent.into(),
+            plan: "0".repeat(64),
+            ..AgentPlanView::default()
+        })
+    }
+    fn agent_apply(&self, _a: &Actor, agent: &str, disconnect: bool, plan: &str) -> ActionResult {
+        self.called(&format!("apply {agent} {disconnect} {plan}"))
+    }
+    fn project_preview(&self, _a: &Actor, path: &str) -> Result<ProjectPreviewView, ActionError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("project preview {path}"));
+        Ok(ProjectPreviewView {
+            ok: true,
+            ..ProjectPreviewView::default()
+        })
+    }
+    fn project_add(
+        &self,
+        _a: &Actor,
+        path: &str,
+        plan: &str,
+    ) -> Result<ProjectAddView, ActionError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("project add {path} {plan}"));
+        Ok(ProjectAddView {
+            message: "set up".into(),
+            ..ProjectAddView::default()
+        })
+    }
     fn refused(&self, _a: &Actor, action: Action, _k: Option<&KeyName>, why: &str) {
         self.action_refusals
             .lock()
@@ -314,7 +358,8 @@ fn sample(pattern: &str, action: Action) -> (String, &'static str) {
     let path = pattern
         .replace("{key}", "shop%2Fstripe-secret-key")
         .replace("{slug}", "shop")
-        .replace("{id}", "apr-0123");
+        .replace("{id}", "apr-0123")
+        .replace("{agent}", "claude-code");
     let body = match action {
         Action::CheckPath => "{\"path\":\"/tmp/shop\"}",
         Action::Rules => "{\"edit\":{\"add_host\":\"api.stripe.com\"}}",
@@ -324,6 +369,13 @@ fn sample(pattern: &str, action: Action) -> (String, &'static str) {
         }
         Action::Approve => "{\"scope\":\"once\"}",
         Action::Delete => "{\"force\":false}",
+        Action::Connect | Action::Disconnect => {
+            "{\"plan\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}"
+        }
+        Action::ProjectPreview => "{\"path\":\"/tmp/shop\"}",
+        Action::ProjectAdd => {
+            "{\"path\":\"/tmp/shop\",\"plan\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}"
+        }
         _ => "{}",
     };
     (path, body)
@@ -585,4 +637,50 @@ fn approving_actions_need_fetch_site() {
     ] {
         assert!(!a.sensitive(), "{a:?}");
     }
+}
+
+// protects=L35 SPEC D-17, criterion 11: the six connect and setup routes are in the table and
+// `sensitive` (Sec-Fetch-Site: same-origin required); an unknown agent, a malformed plan or an
+// empty folder is refused before msd; fails_when=a new route skips the browser-only check or msd
+// sees a bad parameter; no_claim=the per-route envelope (every_action_route_checks_envelope)
+#[test]
+fn connect_routes_are_sensitive() {
+    for a in [
+        Action::ConnectPreview,
+        Action::Connect,
+        Action::DisconnectPreview,
+        Action::Disconnect,
+        Action::ProjectPreview,
+        Action::ProjectAdd,
+    ] {
+        assert!(a.sensitive(), "{a:?}");
+        assert!(ACTION_ROUTES.iter().any(|(_, x)| *x == a), "{a:?}");
+    }
+    let t = setup();
+    let (port, cookie, csrf) = signed_in(&t);
+    let before = t.fake.calls.lock().unwrap().len();
+    for (path, body) in [
+        ("/api/agents/cursor/connect/preview", "{}"),
+        ("/api/agents/claude-code/connect", "{\"plan\":\"short\"}"),
+        (
+            "/api/agents/claude-code/connect",
+            "{\"plan\":\"0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef\"}",
+        ),
+        ("/api/projects/preview", "{\"path\":\"\"}"),
+        ("/api/projects/add", "{\"path\":\"/x\"}"),
+    ] {
+        let r = post(port, &cookie, &csrf, path, body, &[]);
+        assert_eq!(r.status, 400, "{path} {body}: {r:?}");
+    }
+    assert_eq!(t.fake.calls.lock().unwrap().len(), before);
+    let ok = post(
+        port,
+        &cookie,
+        &csrf,
+        "/api/agents/codex/disconnect/preview",
+        "{}",
+        &[],
+    );
+    assert_eq!(ok.status, 200, "{ok:?}");
+    assert!(ok.body.contains("\"preview\""), "{ok:?}");
 }

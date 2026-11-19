@@ -1224,6 +1224,7 @@ mod tests {
     use std::sync::Arc;
 
     const TOKEN: &str = concat!("ghp_", "CONNECTcanaryxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    const OPENAI: &str = concat!("sk-", "proj-", "canaryxxxxxxxxxxxxxxxxxxxxxxxx");
     const STRIPE: &str = concat!("sk_", "test_", "51HcanaryADDPROJECTxxxxxxxxxxxxxxxxxxxxxx");
 
     fn actor() -> Actor {
@@ -1686,7 +1687,7 @@ mod tests {
         let v = h.d.dash_project_preview(&actor(), path).unwrap();
         std::fs::write(
             root.join(".env"),
-            format!("STRIPE_SECRET_KEY={STRIPE}\nOPENAI_API_KEY=sk-proj-canaryxxxxxxxxxxxxxxxxxxxxxxxx\n"),
+            format!("STRIPE_SECRET_KEY={STRIPE}\nOPENAI_API_KEY={OPENAI}\n"),
         )
         .unwrap();
         let e = h.d.dash_project_add(&actor(), path, &v.plan).unwrap_err();
@@ -1808,7 +1809,7 @@ mod tests {
         let v = h.d.dash_project_preview(&actor(), path).unwrap();
         h.d.dash_project_add(&actor(), path, &v.plan).unwrap();
         let mut env = std::fs::read_to_string(root.join(".env")).unwrap();
-        env.push_str("OPENAI_API_KEY=sk-proj-canaryRESCANxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+        env.push_str(&format!("OPENAI_API_KEY={OPENAI}x\n"));
         std::fs::write(root.join(".env"), env).unwrap();
         let v = h.d.dash_project_preview(&actor(), path).unwrap();
         assert!(v.existing);

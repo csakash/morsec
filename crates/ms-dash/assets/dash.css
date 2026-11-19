@@ -518,3 +518,14 @@ input.mono { font-family: var(--f-mono); font-size: 13.5px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 }
+
+/* L35: connect / disconnect / add project previews */
+.panel:empty { display: none; }
+.panel, .plan { margin-top: var(--s-4, 16px); min-width: 0; }
+.plan > * + * { margin-top: var(--s-3, 12px); }
+.diff { border: 1px solid var(--rule); font-family: var(--f-mono); font-size: 12.5px; max-width: 100%; overflow-x: auto; }
+.diff > div { display: flex; gap: 8px; padding: 2px 10px; min-width: 0; }
+.diff .ln { flex: none; font-variant-numeric: tabular-nums; color: var(--muted); white-space: pre; }
+.diff code { white-space: pre-wrap; word-break: break-word; min-width: 0; }
+.diff .add .ln { color: var(--signal); }
+.diff .del .ln { color: var(--deny); }

@@ -772,6 +772,10 @@ impl Daemon {
                 .map(|r| r.roots.iter().map(|p| p.display().to_string()).collect())
                 .unwrap_or_default(),
             env: r.map(|r| r.env.clone()).unwrap_or_default(),
+            ssh_host_keys: r
+                .map(|r| r.ssh_host_keys.iter().map(ToString::to_string).collect())
+                .unwrap_or_default(),
+            mint_scopes: r.map(|r| r.mint_scopes.clone()).unwrap_or_default(),
             read_only: r.is_some_and(|r| r.read_only),
             used_in,
             uses,

@@ -268,6 +268,10 @@ pub struct SecretView {
     pub roots: Vec<String>,
     /// Run environment variable names.
     pub env: Vec<String>,
+    /// SSH host keys (known_hosts lines) for SSH git (L35).
+    pub ssh_host_keys: Vec<String>,
+    /// Mint scopes, read-only: `ms rules` has no edit for them (L35 SPEC D-16).
+    pub mint_scopes: Vec<String>,
     /// Read-only (MCP tools).
     pub read_only: bool,
     /// Where project files refer to it.
