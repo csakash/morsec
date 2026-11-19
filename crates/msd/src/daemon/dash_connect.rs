@@ -251,9 +251,11 @@ impl Daemon {
             Agent::Claude => {
                 let paths = ms_connect::claude::Paths::for_home(&home, None);
                 let (socket, socket_env) = self.connect_socket()?;
+                // Disconnect writes no ms path, but the lines it removes show it: the real one
+                // when it resolves, so the page matches the terminal (review R4).
                 let ms = if disconnect {
-                    // Disconnect writes no ms path; any placeholder plans the same removal.
-                    String::from("ms")
+                    self.connect_ms_path(&home)
+                        .unwrap_or_else(|_| String::from("ms"))
                 } else {
                     self.connect_ms_path(&home)?
                 };
@@ -369,7 +371,8 @@ impl Daemon {
             Agent::Codex => {
                 let paths = ms_connect::codex::Paths::for_home(&home, None);
                 let ms = if disconnect {
-                    String::from("ms")
+                    self.connect_ms_path(&home)
+                        .unwrap_or_else(|_| String::from("ms"))
                 } else {
                     self.connect_ms_path(&home)?
                 };
@@ -579,7 +582,28 @@ impl Daemon {
         if again.digest != plan {
             return Err(refuse(changed(agent)));
         }
+        // msd's own writes are not drift (SPEC D-8). The content it is about to write is
+        // recorded before writing, so a poll between the write and the record can't alert on it
+        // (review R8); afterwards only what is really on disk stays recorded.
         let watched = crate::drift::watched(&home);
+        let expected: Vec<(PathBuf, Option<String>)> = planned_contents(&again.plan)
+            .into_iter()
+            .filter(|(p, _)| watched.contains(p))
+            .map(|(p, after)| {
+                let fp = after.map(|t| {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(t.as_bytes()))
+                });
+                (p, fp)
+            })
+            .collect();
+        {
+            let mut w = lock(&self.dash_acts.conn.own_writes);
+            for (p, fp) in &expected {
+                w.retain(|(q, _)| q != p);
+                w.push((p.clone(), fp.clone()));
+            }
+        }
         let partly = match &again.plan {
             Plan::ClaudeConnect(c, p) => c.apply(&p.diff).map(|()| false),
             Plan::CodexConnect(c, p) => c.apply(&p.diff).map(|()| false),
@@ -587,14 +611,13 @@ impl Daemon {
             Plan::CodexRemove(c, Some(p)) => c.apply_remove(p).map(|()| false),
             Plan::ClaudeRemove(_, None) | Plan::CodexRemove(_, None) => Ok(false),
         };
-        // Whatever was written (all or part), msd's own writes are not drift (SPEC D-8).
         {
             let mut w = lock(&self.dash_acts.conn.own_writes);
-            for p in &watched {
-                if again.files.iter().any(|f| &f.path == p) {
-                    let fp = crate::drift::fingerprint(p);
-                    w.retain(|(q, _)| q != p);
-                    w.push((p.clone(), fp));
+            for (p, fp) in &expected {
+                w.retain(|(q, _)| q != p);
+                let now = crate::drift::fingerprint(p);
+                if partly.is_ok() && now == *fp {
+                    w.push((p.clone(), now));
                 }
             }
         }
@@ -654,7 +677,10 @@ impl Daemon {
             Ok(p) => Ok(Ok((p, command))),
             Err(e) => {
                 let e = setup::safe_text(&e);
-                let reason = if e.contains("Operation not permitted") || e.contains("permission") {
+                let low = e.to_lowercase();
+                let reason = if low.contains("operation not permitted")
+                    || low.contains("permission denied")
+                {
                     format!(
                         "macOS did not let morsec read this folder ({e}). Allow msd in System Settings → Privacy & Security → Files and Folders, or run the command below in a terminal"
                     )
@@ -761,8 +787,10 @@ impl Daemon {
             ],
         );
         let reason = approval_reason(&p, &shown_root);
+        // A Stop (and Start) while the sheet is up voids it, as for every loosening (review R2).
+        let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
         let token = self.dash_confirm(&req, &reason).map_err(refuse)?;
-        if self.is_stopped() {
+        if self.is_stopped() || self.stops.load(std::sync::atomic::Ordering::SeqCst) != stops_seen {
             return Err(refuse(err(
                 ActionCode::Stopped,
                 "morsec: morsec was stopped while Touch ID was up, so nothing was set up",
@@ -772,7 +800,12 @@ impl Daemon {
         host.confirmed = Some((token, p.proposed.clone()));
         let slug = p.slug.clone();
         let rep = setup::execute(&host, Catalog::builtin(), p, now_ms());
-        Ok(add_view(&rep, &slug))
+        let keys = rep
+            .record
+            .as_ref()
+            .map(|r| self.key_statuses(r))
+            .unwrap_or_default();
+        Ok(add_view(&rep, &slug, &keys))
     }
 }
 
@@ -798,6 +831,35 @@ impl Daemon {
                         .is_some_and(|r| !ms_projects::save::is_fresh(r))
             })
             .cloned()
+    }
+}
+
+/// Each file a plan writes, with its content after (`None`: removed).
+fn planned_contents(plan: &Plan) -> Vec<(PathBuf, Option<String>)> {
+    match plan {
+        Plan::ClaudeConnect(_, p) => p
+            .diff
+            .changes
+            .iter()
+            .map(|c| (c.path.clone(), Some(c.after.clone())))
+            .collect(),
+        Plan::CodexConnect(_, p) => p
+            .diff
+            .changes
+            .iter()
+            .map(|c| (c.path.clone(), Some(c.after.clone())))
+            .collect(),
+        Plan::ClaudeRemove(_, Some(p)) => p
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.after.clone()))
+            .collect(),
+        Plan::CodexRemove(c, Some(p)) => p
+            .config
+            .as_ref()
+            .map(|(_, after)| vec![(c.paths.config.clone(), after.clone())])
+            .unwrap_or_default(),
+        Plan::ClaudeRemove(_, None) | Plan::CodexRemove(_, None) => Vec::new(),
     }
 }
 
@@ -941,6 +1003,16 @@ fn preview_view(p: &Prepared, command: String) -> ProjectPreviewView {
             files.push(v);
         }
     }
+    // Keys an earlier run stored that get their first rule now (review R1).
+    for k in p.proposed.keys.keys() {
+        if seen.insert(k.clone()) {
+            let provider = p
+                .previous
+                .as_ref()
+                .and_then(|r| r.provider_of(k).map(str::to_owned));
+            keys.push(key_view(p, k, provider, None));
+        }
+    }
     for (rel, why) in &p.failed {
         files.push(ProjectFileView {
             path: setup::safe_text(rel),
@@ -1002,7 +1074,7 @@ fn key_view(
 }
 
 /// The `ms init` summary, as rows for the page.
-fn add_view(r: &setup::Report, slug: &str) -> ProjectAddView {
+fn add_view(r: &setup::Report, slug: &str, keys: &[ms_ipc::KeyStatus]) -> ProjectAddView {
     let mut rows: Vec<(String, String)> = Vec::new();
     let plural =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
@@ -1010,6 +1082,10 @@ fn add_view(r: &setup::Report, slug: &str) -> ProjectAddView {
         "Project".into(),
         format!("{}  ({})", r.display, r.root.display()),
     ));
+    // The rows `ms init` prints (its `summary_rows`), from the same report and key states
+    // (review R6).
+    let total = keys.len();
+    let ready = keys.iter().filter(|k| k.ready).count();
     rows.push((
         "Found".into(),
         if r.found > 0 {
@@ -1018,10 +1094,67 @@ fn add_view(r: &setup::Report, slug: &str) -> ProjectAddView {
                 plural(r.found, "secret", "secrets"),
                 plural(r.files, "file", "files")
             )
+        } else if total > 0 {
+            let waiting = total - ready;
+            if waiting == 0 {
+                format!("nothing new; {ready} already protected")
+            } else {
+                format!(
+                    "nothing new; {ready} already protected, {waiting} still {} you",
+                    if waiting == 1 { "needs" } else { "need" }
+                )
+            }
         } else {
-            "nothing new".into()
+            "no secrets in this project".into()
         },
     ));
+    if total > 0 {
+        rows.push(("Protected".into(), format!("{ready}, ready to use")));
+    }
+    if let Some(first) = r.missing.first() {
+        rows.push((
+            "Missing".into(),
+            format!(
+                "{} no longer in the vault ({first}{}); its lines still hold the ref",
+                plural(r.missing.len(), "key is", "keys are"),
+                if r.missing.len() > 1 { " and more" } else { "" }
+            ),
+        ));
+    }
+    let unknown: Vec<&ms_ipc::KeyStatus> = keys
+        .iter()
+        .filter(|k| {
+            !k.ready
+                && k.mode != Some(Mode::Run)
+                && r.record
+                    .as_ref()
+                    .is_some_and(|rec| rec.provider_of(&k.key).is_none())
+        })
+        .collect();
+    if let Some(k) = unknown.first() {
+        rows.push((
+            "Needs you".into(),
+            format!(
+                "{} no known service yet: give {} its website on its page",
+                plural(unknown.len(), "has", "have"),
+                k.key
+            ),
+        ));
+    }
+    let run_keys: Vec<&ms_ipc::KeyStatus> = keys
+        .iter()
+        .filter(|k| !k.ready && k.mode == Some(Mode::Run))
+        .collect();
+    if let Some(k) = run_keys.first() {
+        rows.push((
+            "Needs you".into(),
+            format!(
+                "{} can run only in this folder and needs its commands: add them on {}'s page",
+                plural(run_keys.len(), "database key", "database keys"),
+                k.key
+            ),
+        ));
+    }
     if r.recovered > 0 {
         rows.push((
             "Recovered".into(),
@@ -1056,6 +1189,15 @@ fn add_view(r: &setup::Report, slug: &str) -> ProjectAddView {
                 } else {
                     ""
                 }
+            ),
+        ));
+    }
+    if r.findings_skipped > 0 {
+        rows.push((
+            "In code".into(),
+            format!(
+                "{} more not recorded (too many, or a path morsec can't record)",
+                r.findings_skipped
             ),
         ));
     }
@@ -1713,55 +1855,141 @@ mod tests {
         assert!(h.receipts_text().contains("dashboard: add project"));
     }
 
-    // protects=SPEC D-12 / T-108: with the dashboard's token, project_save applies only rules
-    // that are exactly the previewed ones; a different first rule is refused (no rule saved,
-    // denied receipts) and no key that already allows something may join; fails_when=the token
-    // covers rules the person never saw; no_claim=IPC ProjectSave (asks as before)
+    // protects=SPEC D-12 / T-108 (review R3): with the dashboard's token, the first rules are
+    // saved only when each is exactly one the person saw: run through the real execute with a
+    // token whose approved set is empty, the catalog-valid rules are refused (Denied, keys stay
+    // inert, the record is saved, denied receipts) by the Confirmed branch, not by the catalog
+    // check; and a key that already allows something can't join through the token (the
+    // adoption branch, bypassing the pre-sheet check); fails_when=either branch is removed;
+    // no_claim=IPC ProjectSave (asks as before)
     #[test]
     fn add_project_rules_bound_to_preview() {
         let h = fresh();
         let (_d, root) = project();
-        let path = root.to_str().unwrap();
-        let v = h.d.dash_project_preview(&actor(), path).unwrap();
-        h.d.dash_project_add(&actor(), path, &v.plan).unwrap();
-        // A forged save with a wider rule than the one approved is refused.
-        let key = KeyName::new("shop/stripe-secret-key").unwrap();
-        let record = h.d.dash_projects().unwrap().projects[0].clone();
-        let approved = h.d.read_live().rules.clone();
-        let mut wider = Rules::default();
-        let mut r = ms_rules::KeyRule::new(Mode::Swap, Tier::Test);
-        r.hosts = vec![ms_rules::HostPattern::parse("evil.example").unwrap()];
-        wider.keys.insert(key.clone(), r);
+        let session = actor().session;
         let token =
             h.d.dash_confirm(
-                &admin_request(&actor().session, daemon_key(), Tier::Production, &["x"]),
+                &admin_request(&session, daemon_key(), Tier::Production, &["x"]),
                 "test",
             )
             .unwrap();
-        let resp = h.d.project_save_parsed(
-            &actor().session,
-            &record,
-            &wider,
-            SaveAuth::Confirmed {
-                token: &token,
-                allowed: &approved,
-            },
+        let mut host = MsdHost::new(&h.d, &session);
+        let p = setup::prepare(&host, Catalog::builtin(), &root, None).unwrap();
+        assert!(!p.proposed.keys.is_empty());
+        host.confirmed = Some((token.clone(), Rules::default()));
+        let rep = setup::execute(&host, Catalog::builtin(), p, 1);
+        let why = rep.declined.clone().unwrap_or_default();
+        assert!(why.contains("not the one you approved"), "{rep:?}");
+        assert!(
+            rep.save_error.is_none(),
+            "the record is saved first: {rep:?}"
+        );
+        let key = KeyName::new("shop/stripe-secret-key").unwrap();
+        assert!(h.d.read_live().rules.keys[&key].allows_nothing());
+        assert!(h.receipts_text().contains("ms init: first rules"));
+
+        // Adoption through the token: a loose key of the project referenced in the folder.
+        let (_d2, root2) = project();
+        std::fs::rename(&root2, root2.with_file_name("shop2")).unwrap();
+        let root2 = root2.with_file_name("shop2");
+        assert!(matches!(
+            h.put("shop2/loose", Tier::Test),
+            ResponseBody::Ok { .. }
+        ));
+        let loose = KeyName::new("shop2/loose").unwrap();
+        let mut r = ms_rules::KeyRule::new(Mode::Swap, Tier::Test);
+        r.hosts = vec![ms_rules::HostPattern::parse("api.example.com").unwrap()];
+        h.d.change_rule(&loose, Some(r), true).unwrap();
+        std::fs::write(root2.join(".env"), "LOOSE=ms://shop2/loose\n").unwrap();
+        let mut host = MsdHost::new(&h.d, &session);
+        let p = setup::prepare(&host, Catalog::builtin(), &root2, None).unwrap();
+        assert_eq!(p.slug, "shop2");
+        host.confirmed = Some((token, p.proposed.clone()));
+        let rep = setup::execute(&host, Catalog::builtin(), p, 1);
+        let e = rep.save_error.clone().unwrap_or_default();
+        assert!(
+            e.contains("joins project shop2") && e.contains("terminal"),
+            "{rep:?}"
         );
         assert!(
-            matches!(
-                &resp,
-                ResponseBody::Error {
-                    code: ErrorCode::Denied | ErrorCode::Invalid,
-                    ..
-                }
-            ),
-            "{resp:?}"
-        );
-        assert!(
-            !h.d.read_live().rules.keys[&key]
-                .hosts
+            h.d.dash_projects()
+                .unwrap()
+                .projects
                 .iter()
-                .any(|h| h.to_string() == "evil.example")
+                .all(|p| p.slug != "shop2")
+        );
+    }
+
+    // protects=review R2: a Stop and Start while the Add project sheet is up void it: nothing is
+    // imported and no rule loosens; fails_when=a sheet answered across a stop still applies;
+    // no_claim=the real sheet timing
+    #[test]
+    fn add_project_void_after_stop_during_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = open_auth(
+            crate::backend::Backend::Memory(Arc::new(ms_vault::memory::MemoryVault::new())),
+            dir,
+            Arc::new(Mutex::new(Some(terminal()))),
+            FakeAuthenticator::approve().after(std::time::Duration::from_millis(400)),
+        );
+        h.d.set_approval_timeout(std::time::Duration::from_secs(5));
+        let (_d, root) = project();
+        let path = root.to_str().unwrap();
+        let v = h.d.dash_project_preview(&actor(), path).unwrap();
+        let e = std::thread::scope(|sc| {
+            sc.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                // A stop and start completed while the sheet was up (the count moved, morsec
+                // is on again).
+                h.d.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+            h.d.dash_project_add(&actor(), path, &v.plan).unwrap_err()
+        });
+        assert_eq!(e.code, ActionCode::Stopped, "{e:?}");
+        assert!(
+            std::fs::read_to_string(root.join(".env"))
+                .unwrap()
+                .contains(STRIPE)
+        );
+        assert!(h.d.dash_projects().unwrap().projects.is_empty());
+    }
+
+    // protects=review R1: keys an earlier run stored inert (rules declined) are not "nothing to
+    // do": the re-scan preview lists them and the add gives them their first rules, as ms init
+    // run again would; fails_when=the dashboard leaves them inert; no_claim=new secrets
+    #[test]
+    fn rescan_gives_inert_keys_their_rules() {
+        let h = fresh();
+        let (_d, root) = project();
+        let session = actor().session;
+        let token =
+            h.d.dash_confirm(
+                &admin_request(&session, daemon_key(), Tier::Production, &["x"]),
+                "test",
+            )
+            .unwrap();
+        let mut host = MsdHost::new(&h.d, &session);
+        let p = setup::prepare(&host, Catalog::builtin(), &root, None).unwrap();
+        host.confirmed = Some((token, Rules::default()));
+        let rep = setup::execute(&host, Catalog::builtin(), p, 1);
+        assert!(rep.declined.is_some());
+        let path = root.to_str().unwrap();
+        let v = h.d.dash_project_preview(&actor(), path).unwrap();
+        assert!(!v.nothing_to_do, "{v:?}");
+        assert!(
+            v.keys
+                .iter()
+                .any(|k| k.key == "shop/stripe-secret-key" && !k.reaches.is_empty()),
+            "{v:?}"
+        );
+        let done = h.d.dash_project_add(&actor(), path, &v.plan).unwrap();
+        assert!(!done.partial, "{done:?}");
+        let key = KeyName::new("shop/stripe-secret-key").unwrap();
+        assert!(!h.d.read_live().rules.keys[&key].allows_nothing());
+        assert!(
+            h.d.dash_project_preview(&actor(), path)
+                .unwrap()
+                .nothing_to_do
         );
     }
 

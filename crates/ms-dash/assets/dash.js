@@ -1400,7 +1400,8 @@
     const show = async function () {
       panel.replaceChildren(msg);
       const r = await run(msg, false, function () { return act(base + '/preview'); });
-      if (!r || !r.preview) return;
+      // Refused here (a terminal-only setup, no ms next to msd…): the terminal command stays.
+      if (!r || !r.preview) { panel.appendChild(copyline(a.command, 'Run it in Terminal instead.')); return; }
       const p = r.preview;
       msg.textContent = '';
       if (p.nothing_to_do) {

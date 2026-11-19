@@ -166,14 +166,16 @@ impl Prepared {
             .sum()
     }
 
-    /// Nothing to import, and no ref to adopt that the earlier record doesn't already list.
+    /// Nothing to import, no ref to adopt that the earlier record doesn't already list, and no
+    /// first rule left to give (keys an earlier, declined run stored inert: review R1).
     pub fn nothing_to_do(&self) -> bool {
         let known: Vec<KeyName> = self
             .previous
             .as_ref()
             .map(ProjectRecord::keys)
             .unwrap_or_default();
-        self.rewrites() == 0
+        self.proposed.keys.is_empty()
+            && self.rewrites() == 0
             && self
                 .adopted
                 .iter()
@@ -385,7 +387,12 @@ pub fn prepare_with(
         adopted,
         proposed: Rules::default(),
     };
-    p.proposed = expected_rules(catalog, &p, &host.rules()?);
+    // Rules that can't be read propose nothing here; `execute` reports why when it asks again
+    // (as before the move: review R8).
+    p.proposed = host
+        .rules()
+        .map(|current| expected_rules(catalog, &p, &current))
+        .unwrap_or_default();
     Ok(p)
 }
 
