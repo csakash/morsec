@@ -175,10 +175,17 @@ fn location(l: &ms_import::catalog::Location) -> Option<Location> {
     }
 }
 
-/// The catalog provider for a key: one whose default key name is this key, else one whose id
-/// is the key's first segment.
-fn provider_for(key: &KeyName) -> Option<&'static ms_import::catalog::Provider> {
+/// The catalog provider for a key: the one its project record names (L31 keys are
+/// `<project>/<var>`, so only the MAC'd record knows their provider), else one whose default key
+/// name is this key, else one whose id is the key's first segment.
+fn provider_for(
+    key: &KeyName,
+    recorded: &BTreeMap<KeyName, String>,
+) -> Option<&'static ms_import::catalog::Provider> {
     let cat = ms_import::catalog::Catalog::builtin();
+    if let Some(p) = recorded.get(key) {
+        return cat.get(p);
+    }
     cat.providers
         .iter()
         .find(|p| p.key_name(Tier::Test) == *key || p.key_name(Tier::Production) == *key)
@@ -188,8 +195,18 @@ fn provider_for(key: &KeyName) -> Option<&'static ms_import::catalog::Provider> 
         })
 }
 
-/// Swap bindings from the rules: swap keys with exact DNS hosts and a catalog location.
+/// Swap bindings from the rules alone (no project records).
+#[cfg(test)]
 pub fn bindings(rules: &Rules) -> (Vec<Binding>, Vec<String>) {
+    bindings_with(rules, &BTreeMap::new())
+}
+
+/// Swap bindings from the rules: swap keys with exact DNS hosts and a catalog location, the
+/// provider of a project key coming from its project record (`recorded`).
+pub fn bindings_with(
+    rules: &Rules,
+    recorded: &BTreeMap<KeyName, String>,
+) -> (Vec<Binding>, Vec<String>) {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     if rules.tampered {
@@ -231,7 +248,7 @@ pub fn bindings(rules: &Rules) -> (Vec<Binding>, Vec<String>) {
         if hosts.is_empty() {
             continue;
         }
-        let Some(loc) = provider_for(key).and_then(|p| location(&p.location)) else {
+        let Some(loc) = provider_for(key, recorded).and_then(|p| location(&p.location)) else {
             skipped.push(format!(
                 "{key}: no catalog entry says where its credential goes in a request, so it is not swapped"
             ));
@@ -398,7 +415,7 @@ impl TestHook {
 /// Builds a proxy config and its dependencies from the daemon's current state.
 pub fn build(d: &Arc<Daemon>, listen: SocketAddr) -> Result<(ProxyConfig, Deps), String> {
     let rules = d.rules();
-    let (binds, skipped) = bindings(&rules);
+    let (binds, skipped) = bindings_with(&rules, &d.project_providers());
     for s in skipped {
         tracing::warn!("{s}");
         d.alert(s);
@@ -475,7 +492,7 @@ pub async fn supervise(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>, test
                                 r = c.changed() => if r.is_err() { return },
                                 _ = s.changed() => return,
                             }
-                            if bindings(&dd.rules()).0 != current {
+                            if bindings_with(&dd.rules(), &dd.project_providers()).0 != current {
                                 return;
                             }
                         }
@@ -618,6 +635,35 @@ commands = [["psql", "**"]]
         let mut t = r.clone();
         t.tampered = true;
         assert!(bindings(&t).0.is_empty());
+    }
+
+    // protects=L34 (found building ms dev): a project key (`shop/stripe-secret-key`) is swapped
+    // with the location of the provider its project record names; without a record it is skipped
+    // with a note (fails closed) and a recorded provider never adds a host the rule lacks;
+    // fails_when=project keys are never bound, or bound with another provider's location;
+    // no_claim=the records' MAC (ms-projects store tests)
+    #[test]
+    fn project_keys_bind_with_their_recorded_provider() {
+        let r = rules(
+            r#"
+version = 3
+[keys."shop/stripe-secret-key"]
+mode = "swap"
+tier = "test"
+hosts = ["api.stripe.com"]
+"#,
+        );
+        let key = KeyName::new("shop/stripe-secret-key").unwrap();
+        let (none, skipped) = bindings(&r);
+        assert!(none.is_empty() && skipped.len() == 1, "{skipped:?}");
+        let recorded = BTreeMap::from([(key.clone(), "stripe".to_string())]);
+        let (b, skipped) = bindings_with(&r, &recorded);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].hosts, ["api.stripe.com"]);
+        assert!(
+            matches!(&b[0].location, Location::Header { name, .. } if name.eq_ignore_ascii_case("authorization"))
+        );
     }
 
     // protects=L30 D2 a key's git hosts get their own Basic-password binding and its other hosts

@@ -136,6 +136,28 @@ impl Daemon {
             .collect()
     }
 
+    /// The provider each project key's record names (for the proxy's credential location, L34).
+    /// Empty when the records can't be read: those keys are then not swapped (fails closed).
+    pub fn project_providers(&self) -> BTreeMap<KeyName, String> {
+        let Ok(floor) = self.projects_floor() else {
+            return BTreeMap::new();
+        };
+        let Ok(file) = self.projects_store().load(floor) else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for p in &file.projects {
+            for f in &p.files {
+                for s in &f.secrets {
+                    if let Some(prov) = &s.provider {
+                        out.entry(s.key.clone()).or_insert_with(|| prov.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// `ProjectList`.
     pub(super) fn project_list(&self) -> ResponseBody {
         let (file, _) = match self.load_projects() {
@@ -384,6 +406,9 @@ impl Daemon {
                 );
             }
         };
+        // The proxy takes project keys' providers from the records (L34): rebuild it now that
+        // they are saved, not only when the rules changed (which came first).
+        self.rebuild_proxy();
         if let Err(e) = self.backend.put_internal(
             &key(PROJECTS_STATE_KEY),
             SecretBytes::new(format!("v={saved}").into_bytes()),

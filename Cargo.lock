@@ -816,6 +816,8 @@ dependencies = [
  "ms-core",
  "ms-ipc",
  "ms-scan",
+ "rcgen",
+ "rustls",
  "serde_json",
  "tempfile",
  "tokio",

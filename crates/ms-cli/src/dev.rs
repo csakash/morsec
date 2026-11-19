@@ -301,6 +301,8 @@ fn dev(a: &DevArgs) -> Result<i32, (String, i32)> {
         .build()
         .map_err(|e| (format!("morsec: {e}"), EXIT_INTERNAL))?;
 
+    // A project with a production key needs one approval: reviewed here, on this terminal.
+    let review = crate::approve::inline_review("ms dev");
     let (reply, values) = rt.block_on(async {
         let mut c = Client::connect(&socket)
             .await
@@ -315,6 +317,7 @@ fn dev(a: &DevArgs) -> Result<i32, (String, i32)> {
         .await
         .map_err(|e| (e.to_string(), EXIT_INTERNAL))
     })?;
+    drop(review);
     let (started, ca_pem) = match reply {
         ResponseBody::DevStarted {
             session,
