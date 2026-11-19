@@ -972,7 +972,7 @@
         ['Blocked', num(a.blocked)],
         ['Last seen', when(a.last_seen_unix_ms)],
       ]));
-      c.appendChild(txt('p', 'muted', a.connected
+      if (a.command) c.appendChild(txt('p', 'muted', a.connected
         ? 'Disconnecting removes its sandbox and proxy settings; you confirm the change in Terminal.'
         : 'Connecting edits its settings; Terminal shows the change and asks first.'));
       if (a.command) c.appendChild(copyline(a.command, 'then press Re-check'));
