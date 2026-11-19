@@ -520,7 +520,7 @@ repo root.
 | 6 | `crates/msd/src/daemon/dash_actions.rs::stop_needs_no_approval`, `crates/msd/src/daemon/dash_actions.rs::start_from_dashboard_needs_touch_id` |
 | 7 | `crates/msd/src/daemon/dash_actions.rs::approve_from_dashboard_binds_id`, `crates/msd/src/daemon/dash_actions.rs::deny_needs_no_touch_id`, `crates/msd/src/daemon/dash_actions.rs::pending_card_is_inert_and_complete` |
 | 8 | `crates/ms-rules/src/edit.rs::edit_matches_cli_semantics`, `crates/msd/src/daemon/dash_actions.rs::rules_edit_loosen_needs_touch_id`, `crates/msd/src/daemon/dash_actions.rs::rules_edit_tighten_needs_none`, `crates/ms-cli/tests/rules_cli.rs` (existing, still passing over `ms_rules::edit`) |
-| 9 | `crates/msd/src/daemon/dash_actions.rs::reveal_requires_fresh_approval`, `crates/msd/src/daemon/dash_actions.rs::reveal_token_bound_to_key_and_action`, `crates/msd/src/daemon/dash_actions.rs::reveal_refused_while_stopped`, `crates/ms-dash/tests/actions.rs::reveal_response_is_no_store`, `crates/ms-dash/src/assets.rs::dash_js_never_stores_values` (no `localStorage`, `sessionStorage`, `indexedDB`, `console.`, `history.pushState` with data, in the assets), `crates/ms-dash/src/assets.rs::reveal_is_cleared` (the clear timers and listeners exist), `crates/msd/src/daemon/dash_actions.rs::reveal_refuses_non_text` |
+| 9 | `crates/msd/src/daemon/dash_actions.rs::reveal_requires_fresh_approval`, `crates/msd/src/daemon/dash_actions.rs::reveal_token_bound_to_key_and_action`, `crates/msd/src/daemon/dash_actions.rs::reveal_refused_while_stopped`, `crates/ms-dash/tests/actions.rs::reveal_response_is_no_store`, `crates/ms-dash/src/assets.rs::dash_js_never_stores_values` (`localStorage` only for the theme choice; no `sessionStorage`, `indexedDB`, `console.`, `history.pushState` with data, in the assets), `crates/ms-dash/src/assets.rs::reveal_is_cleared` (the clear timers and listeners exist), `crates/msd/src/daemon/dash_actions.rs::reveal_refuses_non_text` |
 | 10 | `crates/ms-dash/tests/actions.rs::copy_never_sends_value_to_browser`, `crates/msd/src/pasteboard.rs::pasteboard_cleared_after_30s`, `crates/msd/src/pasteboard.rs::pasteboard_left_alone_when_changed`, `crates/msd/src/pasteboard.rs::pasteboard_markers_set` (fake), `crates/msd/src/main.rs::test_pasteboard_to_needs_the_memory_vault` |
 | 11 | `crates/msd/src/daemon/dash_actions.rs::reveal_rate_limited`, `crates/ms-dash/tests/actions.rs::action_bucket_per_session` |
 | 12 | `crates/msd/src/daemon/dash_actions.rs::replace_keeps_old_value_on_failure`, `crates/msd/src/daemon/dash_actions.rs::replace_needs_touch_id`, `crates/ms-dash/tests/actions.rs::replace_never_echoes_value`, `crates/msd/src/daemon.rs::put_key_refuses_existing_key`, `crates/msd/src/daemon/dash_actions.rs::add_key_new_only` |
@@ -626,7 +626,8 @@ same-user program), T-99 (hyper buffers), T-103.
   formats that are easy to get wrong in a form.
 - **`ms doctor` static checks in the page**: Re-check covers msd's own checks; the CLI's checks read
   the terminal's environment.
-- **A theme toggle**: the page follows the system.
+- ~~**A theme toggle**~~: added in the design round (the landing page's toggle). The one thing
+  the page keeps in the browser is that choice, `light` or `dark`, under its own localStorage key.
 - **Zeroizing hyper's buffers** (T-99 residual): needs a custom body and connection buffer
   strategy; recorded, not built.
 

@@ -99,6 +99,16 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    /// The landing page's stylesheet; dash.css begins with it, byte for byte.
+    const SHARED_CSS: &str = include_str!("../../../site/src/shared.css");
+
+    /// The dashboard's own rules: dash.css after the copied landing block.
+    fn dash_part() -> &'static str {
+        DASH_CSS
+            .strip_prefix(SHARED_CSS)
+            .expect("dash.css starts with shared.css")
+    }
+
     /// The asset text with `//` line comments and `/* */` comments removed, so a word in a
     /// comment neither hides nor fakes a finding. Rough on purpose: strings that contain `//` are
     /// rare in these files and are checked as code.
@@ -342,10 +352,13 @@ mod tests {
         }
     }
 
-    // protects=L33 SPEC D-5.1 (the Projects grid painted a light block in dark mode): no grid
-    // uses the "gap as border" trick, a background in --rule behind its cells; fails_when=any
-    // rule that makes a grid sets background: var(--rule); no_claim=the rendering (browser QA
-    // screenshots of 1, 2 and 5 cards in dark mode)
+    // protects=L33 SPEC D-5.1 (the Projects grid painted a light block in dark mode): the one
+    // grid that paints its gaps as rules is the landing page's `.row`, which the page only fills
+    // with a fixed number of cells; a row of any number of tiles is ruled by its tiles' own
+    // borders inside a clipping wrapper, so an empty track stays paper; fails_when=another grid
+    // sets background: var(--rule) or 1px gaps, a painted grid auto-fills its tracks, or a tiles
+    // grid is built outside its wrapper; no_claim=the rendering (browser QA screenshots of 1, 2
+    // and 5 projects in dark mode)
     #[test]
     fn css_has_no_gap_painted_grids() {
         let blocks = css_blocks(DASH_CSS);
@@ -354,15 +367,35 @@ mod tests {
             .filter(|(_, b, _)| b.contains("display: grid") || b.contains("grid-template"))
             .collect();
         assert!(grids.len() >= 4, "{}", grids.len());
+        let mut painted = 0;
         for (sel, body, _) in &grids {
             let b = body.replace(' ', "");
-            assert!(
-                !b.contains("background:var(--rule)")
-                    && !b.contains("background-color:var(--rule)"),
-                "{sel} paints its gaps"
-            );
-            assert!(!b.contains("gap:1px"), "{sel} uses 1px gaps as rules");
+            if b.contains("background:var(--rule)") || b.contains("background-color:var(--rule)") {
+                painted += 1;
+                assert_eq!(sel, ".row", "{sel} paints its gaps");
+                assert!(!b.contains("auto-fill") && !b.contains("auto-fit"), "{sel}");
+            } else {
+                assert!(!b.contains("gap:1px"), "{sel} uses 1px gaps as rules");
+            }
         }
+        assert_eq!(painted, 1);
+        // Every grid-template that auto-fills is a form grid, which paints nothing.
+        for (sel, body, _) in &blocks {
+            if body.contains("auto-fill") || body.contains("auto-fit") {
+                assert_eq!(sel, ".fields", "{sel} auto-fills");
+            }
+        }
+        let css = dash_part();
+        assert!(css.contains(".tilewrap { overflow: hidden; }"));
+        assert!(css.contains(
+            ".tiles > * { min-width: 0; border-left: 1px solid var(--rule); border-top: 1px solid var(--rule); }"
+        ));
+        let js = code(DASH_JS);
+        assert_eq!(
+            js.matches("el('div', 'tiles')").count(),
+            js.matches("el('div', 'tilewrap', g)").count(),
+            "a tiles grid outside its wrapper"
+        );
     }
 
     // protects=L33 SPEC D-5.2 (the Home counts were cut off): every grid track can shrink to the
@@ -468,35 +501,61 @@ mod tests {
     }
 
     // protects=L33 SPEC D-4: hover styling only where hover exists, so touch screens don't keep
-    // a stuck hover state; fails_when=a :hover rule sits outside @media (hover: hover);
-    // no_claim=focus styling (one :focus-visible rule, checked by eye)
+    // a stuck hover state: the dashboard's own :hover rules sit in @media (hover: hover), and
+    // each :hover rule of the copied landing block is undone in @media (hover: none);
+    // fails_when=a dashboard :hover rule sits outside those media, or a landing hover is not
+    // undone for touch; no_claim=focus styling (one :focus-visible rule, checked by eye)
     #[test]
     fn hover_only_under_hover_media() {
         let mut n = 0;
-        for (sel, _, at) in css_blocks(DASH_CSS) {
+        let ours = css_blocks(dash_part());
+        let at_is = |at: &Vec<String>, m: &str| at.iter().any(|a| a.replace(' ', "") == m);
+        for (sel, _, at) in &ours {
             if sel.contains(":hover") {
                 n += 1;
                 assert!(
-                    at.iter()
-                        .any(|a| a.replace(' ', "") == "@media(hover:hover)"),
+                    at_is(at, "@media(hover:hover)") || at_is(at, "@media(hover:none)"),
                     "{sel} is outside @media (hover: hover)"
                 );
             }
         }
         assert!(n > 0);
+        let undone: Vec<String> = ours
+            .iter()
+            .filter(|(_, _, at)| at_is(at, "@media(hover:none)"))
+            .flat_map(|(sel, _, _)| {
+                sel.split(',')
+                    .map(|p| p.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (sel, _, _) in css_blocks(SHARED_CSS) {
+            for part in sel
+                .split(',')
+                .map(str::trim)
+                .filter(|p| p.contains(":hover"))
+            {
+                assert!(
+                    undone.iter().any(|u| u == part),
+                    "the landing's {part} is not undone for touch"
+                );
+            }
+        }
         assert!(
-            DASH_CSS
+            dash_part()
                 .contains(":focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }")
         );
     }
 
     // protects=L33 SPEC D-4: transitions name their properties (background-color, color,
-    // border-color, opacity) and last at most 150 ms; fails_when=transition: all, another
-    // property, or a longer duration appears; no_claim=animations (none exist)
+    // border-color, opacity) and last at most 150 ms; the landing block's longer ones are
+    // overridden for the same selectors; fails_when=transition: all, another property, a longer
+    // duration, or a landing transition left in force appears; no_claim=animations (none exist)
     #[test]
     fn transitions_are_named_and_short() {
         let mut n = 0;
-        for (sel, body, at) in css_blocks(DASH_CSS) {
+        let mut ours = Vec::new();
+        for (sel, body, at) in css_blocks(dash_part()) {
             if at.iter().any(|a| a.contains("prefers-reduced-motion")) {
                 continue;
             }
@@ -509,6 +568,10 @@ mod tests {
                     continue;
                 }
                 assert_eq!(prop, "transition", "{sel}");
+                ours.push(sel.clone());
+                if value.trim() == "none" {
+                    continue;
+                }
                 for part in value.split(',') {
                     n += 1;
                     let words: Vec<&str> = part.split_whitespace().collect();
@@ -528,6 +591,18 @@ mod tests {
             }
         }
         assert!(n > 0);
+        for (sel, body, at) in css_blocks(SHARED_CSS) {
+            if at.iter().any(|a| a.contains("prefers-reduced-motion")) {
+                continue;
+            }
+            let b = body.replace(' ', "");
+            if b.contains("transition:") && !b.contains("transition:none") {
+                assert!(
+                    ours.contains(&sel),
+                    "the landing's {sel} transition is not overridden"
+                );
+            }
+        }
         assert!(!DASH_CSS.contains("animation:") || DASH_CSS.contains("animation: none"));
     }
 
@@ -553,15 +628,32 @@ mod tests {
     }
 
     // protects=L33 SPEC D-12, criterion 9, T-91: the page never keeps a value anywhere but the
-    // one element it shows it in: no localStorage, sessionStorage, indexedDB, caches, cookies
-    // written by script, console output, or history entries with data; fails_when=any of those
-    // appears in the script; no_claim=the browser's own memory until garbage collection
-    // (residual)
+    // one element it shows it in: no sessionStorage, indexedDB, caches, cookies written by
+    // script, console output, or history entries with data, and localStorage only for the theme
+    // choice ('light' or 'dark', design round); fails_when=any of those appears in the script, or
+    // localStorage is used for anything but the theme key; no_claim=the browser's own memory
+    // until garbage collection (residual)
     #[test]
     fn dash_js_never_stores_values() {
         let c = code(DASH_JS);
+        // The one thing kept in the browser is the theme choice, 'light' or 'dark', under its
+        // own key, and every access is inside a try (a private window throws).
+        assert!(c.contains("const THEME_KEY = 'morsec.dashboard.theme';"));
+        let uses: Vec<_> = c.match_indices("localStorage").collect();
+        assert_eq!(uses.len(), 2, "localStorage outside the theme helpers");
+        for (i, _) in uses {
+            let rest = &c[i..];
+            assert!(
+                rest.starts_with("localStorage.getItem(THEME_KEY);")
+                    || rest.starts_with(
+                        "localStorage.setItem(THEME_KEY, t === 'dark' ? 'dark' : 'light');"
+                    ),
+                "{}",
+                &rest[..rest.len().min(70)]
+            );
+            assert!(c[i.saturating_sub(80)..i].contains("try {"), "outside try");
+        }
         for bad in [
-            "localStorage",
             "sessionStorage",
             "indexedDB",
             "caches.",
@@ -638,28 +730,46 @@ mod tests {
         );
     }
 
-    /// The `--name: #rrggbb` tokens of the first `:root` block (light) and of the dark one.
-    fn tokens(dark: bool) -> std::collections::HashMap<String, (f64, f64, f64)> {
+    /// The `--name: #rrggbb` tokens in force: every plain `:root` block in order (light), then,
+    /// for dark, the dark blocks of one kind on top: `variant` 1 is the system preference
+    /// (`:root:not([data-theme="light"])` in the dark media), 2 the toggle (`:root[data-theme="dark"]`).
+    fn tokens(variant: u8) -> std::collections::HashMap<String, (f64, f64, f64)> {
         let blocks = css_blocks(DASH_CSS);
-        let body = blocks
-            .iter()
-            .find(|(sel, _, at)| {
-                sel == ":root"
-                    && at.iter().any(|a| a.contains("prefers-color-scheme: dark")) == dark
-            })
-            .map(|(_, b, _)| b.clone())
-            .expect(":root");
         let mut out = std::collections::HashMap::new();
-        for decl in body.split(';') {
-            let Some((k, v)) = decl.split_once(':') else {
-                continue;
-            };
-            let v = v.trim();
-            if let Some(hex) = v.strip_prefix('#').filter(|h| h.len() == 6) {
-                let c = |i: usize| f64::from(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
-                out.insert(k.trim().to_owned(), (c(0), c(2), c(4)));
+        let mut apply = |body: &str| {
+            for decl in body.split(';') {
+                let Some((k, v)) = decl.split_once(':') else {
+                    continue;
+                };
+                let v = v.trim();
+                if let Some(hex) = v.strip_prefix('#').filter(|h| h.len() == 6) {
+                    let c = |i: usize| f64::from(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
+                    out.insert(k.trim().to_owned(), (c(0), c(2), c(4)));
+                }
+            }
+        };
+        let dark_media =
+            |at: &Vec<String>| at.iter().any(|a| a.contains("prefers-color-scheme: dark"));
+        let mut seen = 0;
+        for (sel, body, at) in &blocks {
+            if sel == ":root" && !dark_media(at) {
+                apply(body);
+                seen += 1;
             }
         }
+        assert!(seen >= 1, ":root");
+        for (sel, body, at) in &blocks {
+            let hit = match variant {
+                1 => sel == ":root:not([data-theme=\"light\"])" && dark_media(at),
+                2 => sel == ":root[data-theme=\"dark\"]",
+                _ => false,
+            };
+            if hit {
+                apply(body);
+                seen += 1;
+            }
+        }
+        assert!(variant == 0 || seen >= 2, "dark tokens {variant}");
         out
     }
 
@@ -680,17 +790,18 @@ mod tests {
         (x.max(y) + 0.05) / (x.min(y) + 0.05)
     }
 
-    // protects=L33 review Q5 (WCAG AA for small text): in light and dark mode the text tokens
-    // (ink, ink-2, muted, signal, deny) reach 4.5:1 on both paper backgrounds;
+    // protects=L33 review Q5 (WCAG AA for small text): in light mode, in dark mode by system
+    // preference and in dark mode by the toggle, the text tokens in force (ink, ink-2, muted,
+    // signal, deny) reach 4.5:1 on both paper backgrounds;
     // fails_when=a token is lightened below AA; no_claim=text over images (none)
     #[test]
     fn text_tokens_meet_aa_contrast() {
-        for dark in [false, true] {
-            let t = tokens(dark);
+        for variant in [0, 1, 2] {
+            let t = tokens(variant);
             for bg in ["--paper", "--paper-2"] {
                 for fg in ["--ink", "--ink-2", "--muted", "--signal", "--deny"] {
                     let c = contrast(t[fg], t[bg]);
-                    assert!(c >= 4.5, "{fg} on {bg} (dark={dark}): {c:.2}");
+                    assert!(c >= 4.5, "{fg} on {bg} (variant {variant}): {c:.2}");
                 }
             }
         }
@@ -722,8 +833,7 @@ mod tests {
     // to Stop/Start; a whole-project Undo lands on Projects with its result; anything that is
     // not morsec's own request is shown open; the disclosure has a marker; the Undo confirm is
     // a row of its own; the nav fits at 375 px; messages keep "morsec" lowercase and end with
-    // a full stop; Home's counts are a ruled row, frames only for the pending card and
-    // failures; fails_when=any of these regresses; no_claim=the rendering (browser QA)
+    // a full stop; the pending request and failures are marked in Needs you; fails_when=any of these regresses; no_claim=the rendering (browser QA)
     #[test]
     fn dash_js_round_2_fixes() {
         let c = code(DASH_JS);
@@ -742,12 +852,15 @@ mod tests {
         assert!(c.contains("if (!/^morsec\\b/.test(t))"));
         let i = c.find("del.appendChild(dout);").unwrap();
         assert!(c[i..].contains("del.appendChild(extra);"));
-        assert!(DASH_CSS.contains("details > summary::before"));
+        assert!(DASH_CSS.contains(".more > summary::after { content: \"+\";"));
+        assert!(DASH_CSS.contains(".more[open] > summary::after"));
         assert!(DASH_CSS.contains("@media (max-width: 440px)"));
-        assert!(DASH_CSS.contains(".box { border-top: 1px solid var(--faint);"));
-        assert!(DASH_CSS.contains(".box.warn { border: 1px solid var(--deny);"));
-        assert!(DASH_CSS.contains(".box.focus { border: 1px solid var(--signal);"));
-        assert!(DASH_CSS.contains("h1.keyname") && DASH_CSS.contains("overflow-wrap: anywhere; }"));
+        assert!(DASH_CSS.contains(".need.focus { box-shadow: inset 3px 0 0 var(--signal); }"));
+        assert!(DASH_CSS.contains(".need.warn { box-shadow: inset 3px 0 0 var(--deny); }"));
+        assert!(
+            DASH_CSS.contains(".head h2.keyname")
+                && DASH_CSS.contains("overflow-wrap: anywhere; }")
+        );
     }
 
     // protects=L33 fix round 3 (V1, V2, V3, V5, G3): a new result clears the others; Stop and
@@ -768,7 +881,7 @@ mod tests {
             .filter(|l| l.contains("overflow-wrap: anywhere"))
         {
             assert!(
-                ["h1.keyname", ".cmd", "ol.argv", ".chips", "user-select"]
+                ["h2.keyname", ".cmd", "ol.argv", ".chips", "user-select"]
                     .iter()
                     .any(|ok| line.contains(ok))
                     || line
@@ -778,5 +891,76 @@ mod tests {
             );
         }
         assert!(DASH_CSS.contains(".confirmrow td { display: block; }"));
+        // A long ref or path wraps inside its stacked cell on a 375 px phone.
+        assert!(DASH_CSS.contains(
+            "table.led.stack td .ref, table.led.stack td .mono { overflow-wrap: break-word;"
+        ));
+    }
+
+    // protects=the design round (the dashboard is the landing page's design system): dash.css
+    // begins with site/src/shared.css byte for byte, so tokens, rows, labels, buttons, header
+    // and footer can't drift from the landing page; fails_when=shared.css changes and dash.css
+    // is not updated, or the copy is edited; no_claim=the landing page's inline styles (the
+    // dashboard restates the ones it uses)
+    #[test]
+    fn dash_css_starts_with_the_landing_css() {
+        assert!(
+            DASH_CSS.starts_with(SHARED_CSS),
+            "dash.css must begin with shared.css"
+        );
+        assert!(
+            dash_part()
+                .trim_start()
+                .starts_with("/* ==== morsec dashboard")
+        );
+        // The dashboard part declares no new font family and keeps the faces after the copy.
+        assert!(!SHARED_CSS.contains("@font-face"));
+        assert!(dash_part().contains("@font-face"));
+    }
+
+    // protects=the design round (navigation and type): upright Archivo headings with at most one
+    // serif italic accent (Home's hero), the rail of five numbered screens, breadcrumbs on inner
+    // screens, whole rows that open what they name with the landing page's arrow, its theme
+    // toggle and its footer; fails_when=a heading turns serif or italic again, a second accent
+    // appears, the rail or breadcrumbs go, or rows stop being links; no_claim=how it looks
+    // (screenshots in proof/screenshots-design)
+    #[test]
+    fn dash_uses_the_landing_design() {
+        let css = code(dash_part());
+        assert!(!css.contains("italic 400"), "a serif italic heading");
+        assert!(!css.contains("var(--f-serif)"), "serif outside em.it");
+        let js = code(DASH_JS);
+        assert_eq!(js.matches("txt('em', 'it'").count(), 1, "one italic accent");
+        for (n, (route, name)) in [
+            ("/", "Home"),
+            ("/projects", "Projects"),
+            ("/activity", "Activity"),
+            ("/agents", "Agents"),
+            ("/scan", "Scan"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                INDEX_HTML.contains(&format!(
+                    "data-route=\"{route}\"><span class=\"num\">0{}</span><span class=\"t\">{name}</span>",
+                    n + 1
+                )),
+                "rail entry {name}"
+            );
+        }
+        assert!(INDEX_HTML.contains("<nav class=\"rail\" id=\"nav\""));
+        assert!(INDEX_HTML.contains("<template id=\"t-arrow\">"));
+        assert!(INDEX_HTML.contains("id=\"theme\""));
+        assert!(INDEX_HTML.contains("<div class=\"big\""));
+        assert!(js.contains("function crumbs("));
+        assert!(js.contains("out.appendChild(crumbs("));
+        assert!(js.contains("tr.addEventListener('click'"));
+        assert!(js.contains("function linkList("));
+        assert!(
+            dash_part().contains(
+                ".rail .scr[aria-current] { background: var(--ink); color: var(--paper); }"
+            )
+        );
     }
 }

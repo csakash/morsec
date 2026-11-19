@@ -7,7 +7,9 @@ entries. Move the entries from Unreleased into it when you bump the version.
 ## [Unreleased]
 
 - The dashboard (`ms dashboard`) now looks like morsec's site, with its fonts bundled in msd
-  (nothing is fetched), works in light and dark from phone width up, and can act, not only show.
+  (nothing is fetched): one ruled sheet, a numbered rail of the five screens (with what's
+  waiting, your projects and the open project's keys), breadcrumbs, rows that open what they
+  name, and the site's light/dark switch, works in light and dark from phone width up, and can act, not only show.
   From Home you approve or deny the request an agent is waiting on, see each warning in plain
   words with its fix, and stop or start morsec. On a key's page you can show its value or copy
   it (Touch ID every time; a shown value hides after 15 seconds and the clipboard is cleared

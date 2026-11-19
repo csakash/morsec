@@ -193,18 +193,17 @@ fn quiet_port() -> u16 {
 }
 
 fn setup() -> T {
+    setup_with(DashConfig::new(quiet_port()))
+}
+
+fn setup_with(cfg: DashConfig) -> T {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
     let fake = Arc::new(Fake::default());
-    let dash = Dash::with_actions(
-        DashConfig::new(quiet_port()),
-        fake.clone(),
-        Some(fake.clone()),
-        rt.handle().clone(),
-    );
+    let dash = Dash::with_actions(cfg, fake.clone(), Some(fake.clone()), rt.handle().clone());
     T {
         _rt: rt,
         dash,
@@ -503,12 +502,15 @@ fn replace_never_echoes_value() {
 // fails_when=a 31st action runs; no_claim=the refill rate's exact timing
 #[test]
 fn action_bucket_per_session() {
-    let t = setup();
+    // The per-second request bucket is opened wide, so the 31 actions can go out without
+    // pauses: with pauses, a slow machine let the action bucket refill one token mid-test.
+    let mut cfg = DashConfig::new(quiet_port());
+    cfg.rate = 1000;
+    let t = setup_with(cfg);
     let (port, cookie, csrf) = signed_in(&t);
     let mut codes = Vec::new();
     for _ in 0..31 {
         codes.push(post(port, &cookie, &csrf, "/api/agents/recheck", "{}", &[]).status);
-        std::thread::sleep(Duration::from_millis(60));
     }
     assert!(codes[..30].iter().all(|c| *c == 200), "{codes:?}");
     assert_eq!(codes[30], 429, "{codes:?}");
