@@ -88,16 +88,25 @@ pub(crate) fn agent_binary(argv0: &OsStr, path: Option<&OsStr>) -> Option<String
                 .find(|c| c.is_file())
         })
     };
-    if let Some(real) = found.and_then(|f| std::fs::canonicalize(f).ok())
-        && let Some(n) = real.file_name()
-    {
+    let real = found.and_then(|f| std::fs::canonicalize(f).ok());
+    if let Some(n) = real.as_deref().and_then(Path::file_name) {
         names.push(n.to_owned());
     }
-    names
+    if let Some(n) = names
         .iter()
         .filter_map(|n| n.to_str())
         .find(|n| ms_session::agent_kind(n).is_some())
-        .map(str::to_owned)
+    {
+        return Some(n.to_owned());
+    }
+    // Review N2: a versioned native binary (`~/.local/share/claude/versions/2.0.5`) or an npm
+    // package path says it is an agent only by where it lives.
+    [Some(given), real.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.to_str())
+        .find_map(ms_session::agent_install_path)
+        .map(|k| format!("{k:?}"))
 }
 
 /// The major version in `node --version` output (`v22.3.0` → 22).
@@ -357,8 +366,14 @@ fn dev(a: &DevArgs) -> Result<i32, (String, i32)> {
         None => None,
     };
     let current: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    let env_names = started.env.clone();
     let (set, more) = child_env(&started, values, bundle.as_deref(), &current);
+    // Review R6: name only the variables the child really gets.
+    let env_names: Vec<String> = started
+        .env
+        .iter()
+        .filter(|n| set.iter().any(|(k, _)| k == n.as_str()))
+        .cloned()
+        .collect();
     notes.extend(more);
     if let Some(w) = node_warning(argv0, node_version(path.as_deref()).as_deref()) {
         notes.push(w);
@@ -445,24 +460,31 @@ async fn run_child(
         )
     })?;
     let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap_or(0));
-    let wait = tokio::task::spawn_blocking(move || child.wait());
-    tokio::pin!(wait);
-    let forward = |s: rustix::process::Signal| {
-        if let Some(p) = pid {
+    // Review R7: the child is polled here (try_wait), never reaped on another thread, so a
+    // signal is forwarded only while it is known not to be reaped: its PID can't be reused yet.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    let forward = |child: &mut std::process::Child, s: rustix::process::Signal| {
+        if matches!(child.try_wait(), Ok(None))
+            && let Some(p) = pid
+        {
             let _ = rustix::process::kill_process(p, s);
         }
     };
     let status = loop {
         tokio::select! {
-            r = &mut wait => break r,
-            _ = term.recv() => forward(rustix::process::Signal::TERM),
-            _ = hup.recv() => forward(rustix::process::Signal::HUP),
+            _ = tick.tick() => match child.try_wait() {
+                Ok(Some(st)) => break Ok(st),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            },
+            _ = term.recv() => forward(&mut child, rustix::process::Signal::TERM),
+            _ = hup.recv() => forward(&mut child, rustix::process::Signal::HUP),
             _ = int.recv() => {}
             _ = quit.recv() => {}
         }
     };
     match status {
-        Ok(Ok(st)) => Ok(st
+        Ok(st) => Ok(st
             .code()
             .or_else(|| st.signal().map(|s| 128 + s))
             .unwrap_or(1)),
@@ -475,7 +497,8 @@ mod tests {
     use super::*;
 
     // protects=L34 SPEC criterion 2 (design §7.1): ms dev refuses an agent by bare name, by
-    // path, and through a symlink with another name found on PATH; a plain program is fine;
+    // path, through a symlink with another name found on PATH, and by an agent's install path
+    // (review N2); a plain program is fine;
     // fails_when=claude, codex, cursor-agent or gemini reach DevStart under any of those names;
     // no_claim=wrappers (npx claude, a script that runs claude; SPEC residual)
     #[test]
@@ -501,6 +524,13 @@ mod tests {
         let full = bin.join("helper");
         assert!(agent_binary(full.as_os_str(), None).is_some());
         assert_eq!(agent_binary(OsStr::new("node"), Some(path)), None);
+        // Review N2: by install path, given or behind a symlink with a plain name.
+        let versions = d.path().join("share/claude/versions");
+        std::fs::create_dir_all(&versions).unwrap();
+        std::fs::write(versions.join("2.0.5"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(versions.join("2.0.5"), bin.join("cc")).unwrap();
+        assert!(agent_binary(versions.join("2.0.5").as_os_str(), None).is_some());
+        assert!(agent_binary(OsStr::new("cc"), Some(path)).is_some());
         assert_eq!(agent_binary(OsStr::new("npm"), Some(path)), None);
     }
 
