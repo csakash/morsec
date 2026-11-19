@@ -56,9 +56,24 @@ pub enum DecideError {
     /// `ms stop` (or another answer) ended the request while Touch ID was up.
     #[error("the request was ended (ms stop) while Touch ID was up; nothing was approved")]
     Ended,
+    /// A session-scope answer to a request that changes morsec itself (L33 review S2).
+    #[error(
+        "this request changes morsec itself (a value, a rule, the kill switch), so it can only be approved once, never for the session"
+    )]
+    OnceOnly,
     /// The token could not be made (no randomness).
     #[error("could not issue the approval: {0}")]
     Internal(String),
+}
+
+/// True for morsec's own actions (`ms …` or `dashboard …`: start, rules, scan, set, rm, undo,
+/// init): they may be approved once only. A session grant would let the same request run again
+/// with whatever it carries (a new value, another rule) without the person (L33 review S2).
+pub fn once_only(req: &ApprovalRequest) -> bool {
+    matches!(
+        req.argv_display.first().map(String::as_str),
+        Some("ms" | "dashboard")
+    )
 }
 
 #[derive(Debug)]
@@ -270,6 +285,9 @@ impl HumanApprover {
             };
             if slot.deciding {
                 return Err(DecideError::InProgress);
+            }
+            if approve && scope == Scope::Session && once_only(&slot.pending.request) {
+                return Err(DecideError::OnceOnly);
             }
             if !approve {
                 slot.answer = Some(ApprovalOutcome::Denied);
@@ -781,5 +799,32 @@ mod tests {
         a.revoke_all().unwrap();
         assert_eq!(h.join().unwrap(), Err(ConfirmError::Ended));
         assert!(a.pending_state().is_none());
+    }
+
+    // protects=L33 review S2: a request that changes morsec itself (argv `ms …` or
+    // `dashboard …`) can't be approved for the session, so one answer can't cover a later
+    // replace, delete or undo; an agent's own command still can; fails_when=a session-scope
+    // answer approves an admin request; no_claim=-
+    #[test]
+    fn admin_requests_are_once_only() {
+        let (a, auth) = approver(FakeAuthenticator::approve());
+        let mut admin = req("x");
+        admin.argv_display = vec!["ms".into(), "set".into(), "k/x".into()];
+        let (h, p) = ask_bg(&a, admin.clone(), Duration::from_secs(10));
+        assert_eq!(
+            a.decide(&p.id, true, Scope::Session),
+            Err(DecideError::OnceOnly)
+        );
+        assert!(auth.reasons().is_empty(), "no sheet for a refused scope");
+        assert!(matches!(
+            a.decide(&p.id, true, Scope::Once),
+            Ok(ApprovalOutcome::Approved(_))
+        ));
+        h.join().unwrap();
+        assert!(once_only(&admin));
+        assert!(!once_only(&req("x")));
+        let mut dash = req("x");
+        dash.argv_display = vec!["dashboard".into(), "show".into()];
+        assert!(once_only(&dash));
     }
 }

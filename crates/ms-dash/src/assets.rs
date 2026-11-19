@@ -484,9 +484,10 @@ mod tests {
             }
         }
         assert!(n > 0);
-        assert!(DASH_CSS.contains(
-            ":focus-visible { outline: 1.5px solid var(--signal); outline-offset: 2px; }"
-        ));
+        assert!(
+            DASH_CSS
+                .contains(":focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }")
+        );
     }
 
     // protects=L33 SPEC D-4: transitions name their properties (background-color, color,
@@ -635,5 +636,84 @@ mod tests {
             !c.contains("'form'"),
             "value fields are never inside a <form>"
         );
+    }
+
+    /// The `--name: #rrggbb` tokens of the first `:root` block (light) and of the dark one.
+    fn tokens(dark: bool) -> std::collections::HashMap<String, (f64, f64, f64)> {
+        let blocks = css_blocks(DASH_CSS);
+        let body = blocks
+            .iter()
+            .find(|(sel, _, at)| {
+                sel == ":root"
+                    && at.iter().any(|a| a.contains("prefers-color-scheme: dark")) == dark
+            })
+            .map(|(_, b, _)| b.clone())
+            .expect(":root");
+        let mut out = std::collections::HashMap::new();
+        for decl in body.split(';') {
+            let Some((k, v)) = decl.split_once(':') else {
+                continue;
+            };
+            let v = v.trim();
+            if let Some(hex) = v.strip_prefix('#').filter(|h| h.len() == 6) {
+                let c = |i: usize| f64::from(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
+                out.insert(k.trim().to_owned(), (c(0), c(2), c(4)));
+            }
+        }
+        out
+    }
+
+    fn luminance((r, g, b): (f64, f64, f64)) -> f64 {
+        let f = |c: f64| {
+            let c = c / 255.0;
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+    }
+
+    fn contrast(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    // protects=L33 review Q5 (WCAG AA for small text): in light and dark mode the text tokens
+    // (ink, ink-2, muted, signal, deny) reach 4.5:1 on both paper backgrounds;
+    // fails_when=a token is lightened below AA; no_claim=text over images (none)
+    #[test]
+    fn text_tokens_meet_aa_contrast() {
+        for dark in [false, true] {
+            let t = tokens(dark);
+            for bg in ["--paper", "--paper-2"] {
+                for fg in ["--ink", "--ink-2", "--muted", "--signal", "--deny"] {
+                    let c = contrast(t[fg], t[bg]);
+                    assert!(c >= 4.5, "{fg} on {bg} (dark={dark}): {c:.2}");
+                }
+            }
+        }
+    }
+
+    // protects=L33 fix round 1 (reviews R1, R5, R6, Q2, Q4, Q13): a command is removed by the
+    // words the view sends, "Delete anyway" follows the answer's code, Touch ID disables only
+    // the screen's buttons (Stop stays usable), [hidden] really hides, the live region is for
+    // screen readers only and is cleared on navigation, and the delete confirmation ignores
+    // case; fails_when=any of these regresses; no_claim=the rendering (browser QA)
+    #[test]
+    fn dash_js_review_fixes() {
+        let c = code(DASH_JS);
+        assert!(c.contains("{ words: values[i] }") && c.contains("s.command_words"));
+        assert!(!c.contains("x.split(' ')"));
+        assert!(c.contains("dout.dataset.code === 'referenced'"));
+        assert!(!c.contains("/refer/"));
+        assert!(c.contains("document.querySelectorAll('main button')"));
+        assert!(!c.contains("#state button"));
+        assert!(DASH_CSS.contains("[hidden] { display: none !important; }"));
+        assert!(INDEX_HTML.contains("class=\"vh\" id=\"live\""));
+        let start = c.find("async function render()").unwrap();
+        assert!(c[start..start + 200].contains("live.textContent = '';"));
+        assert!(c.contains(".toLowerCase() !== last.toLowerCase()"));
     }
 }

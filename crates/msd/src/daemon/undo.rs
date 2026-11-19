@@ -66,6 +66,21 @@ pub(super) type Confirm<'a> =
 /// How a caller writes its receipt for one key.
 pub(super) type Receipt<'a> = &'a dyn Fn(&KeyName, ReceiptResult, Option<&ApprovalToken>);
 
+/// Who asked, for the approval card, `ms approve` and the Touch ID sheet: a request from
+/// outside every agent session may still come from a detached process an agent started (T-04),
+/// so the person sees its program and PID (L33 review S4).
+pub(super) fn requester(session: &SessionId) -> String {
+    use ms_session::ProcessTable;
+    let name = ms_session::OsProcessTable
+        .info(session.pid)
+        .map(|i| ms_approve::render::inert(&i.name))
+        .unwrap_or_else(|_| "an unknown program".into());
+    format!(
+        "requested by {name} (pid {}), not an agent session",
+        session.pid
+    )
+}
+
 impl Daemon {
     /// The lines an Undo of `slug` (or of every project holding `keys`, without a slug) would
     /// restore, only those of `keys` when given.
@@ -125,6 +140,8 @@ impl Daemon {
     /// Undo (SPEC D-21) for `session`: confirms with `confirm`, restores the lines, deletes keys
     /// nothing refers to any more, removes the agent hint when a whole project goes, and saves
     /// the records. `who` names the receipts' target (`ms undo` or `dashboard: undo`).
+    // Each argument is one part of the request (who, what, how to confirm and record).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn undo_run(
         &self,
         session: &SessionId,
@@ -133,6 +150,7 @@ impl Daemon {
         confirm: Confirm<'_>,
         receipt: Receipt<'_>,
         argv0: &str,
+        requester: Option<&str>,
     ) -> Result<UndoView, ActionError> {
         let refuse_all = |e: ActionError| {
             receipt(
@@ -154,13 +172,15 @@ impl Daemon {
                 "morsec: morsec is stopped, so no value is written back. Start it first",
             )));
         }
-        let _p = lock(&self.projects_write);
-        let (file, floor) = self.load_projects().map_err(|_| {
-            refuse_all(err(
+        let unreadable = || {
+            err(
                 ActionCode::Refused,
                 "morsec: the project records failed their integrity check, so Undo is off until they are fixed. Keys and rules keep working (ms doctor)",
-            ))
-        })?;
+            )
+        };
+        // Read without the records lock: Touch ID can take a while, and ms init must not wait
+        // on it (review R4). Everything is read again under the lock after the approval.
+        let (file, _) = self.load_projects().map_err(|_| refuse_all(unreadable()))?;
         let targets = Self::undo_targets(&file, slug, keys).map_err(refuse_all)?;
 
         // The sheet names every file that will receive a value (SPEC D-21).
@@ -192,23 +212,47 @@ impl Daemon {
         for f in &files {
             argv.push(f);
         }
+        if let Some(r) = requester {
+            argv.push(r);
+        }
         let key = match keys {
             Some([one]) => one.clone(),
             _ => daemon_key(),
         };
         let req = admin_request(session, key, Tier::Production, &argv);
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
+        let reason = match requester {
+            Some(r) => format!("{reason}; {r}"),
+            None => reason,
+        };
         let token = confirm(&req, &reason).map_err(refuse_all)?;
+        // From here the approval is spent: every failure still leaves a receipt (review R8).
+        let failed = |e: ActionError| {
+            receipt(
+                &req.key,
+                ReceiptResult::Failed(e.message.chars().take(120).collect()),
+                Some(&token),
+            );
+            e
+        };
         if self.is_stopped() || self.stops.load(std::sync::atomic::Ordering::SeqCst) != stops_seen {
-            return Err(refuse_all(err(
+            return Err(failed(err(
                 ActionCode::Stopped,
                 "morsec: morsec was stopped while Touch ID was up, so nothing was written",
+            )));
+        }
+        let _p = lock(&self.projects_write);
+        let (file, floor) = self.load_projects().map_err(|_| failed(unreadable()))?;
+        if Self::undo_targets(&file, slug, keys).ok().as_ref() != Some(&targets) {
+            return Err(failed(err(
+                ActionCode::Gone,
+                "morsec: the project records changed while Touch ID was up, so nothing was written. Look again and undo again",
             )));
         }
 
         let owner = std::fs::metadata(&self.paths.state)
             .map(|m| m.uid())
-            .map_err(|e| err(ActionCode::Internal, format!("morsec: {e}")))?;
+            .map_err(|e| failed(err(ActionCode::Internal, format!("morsec: {e}"))))?;
         let mut restored: Vec<UndoLineView> = Vec::new();
         let mut skipped: Vec<UndoLineView> = Vec::new();
         // (slug, file, line, var) of every restored line.
@@ -258,23 +302,7 @@ impl Daemon {
                     .flat_map(|(_, ls)| ls.iter().map(|l| l.key.clone()))
             })
             .collect();
-        let mut deleted: Vec<KeyName> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
-        for k in &touched {
-            let all_back = file.projects.iter().all(|p| {
-                p.files.iter().all(|f| {
-                    f.secrets.iter().filter(|x| &x.key == k).all(|x| {
-                        done.contains(&(p.slug.clone(), f.path.clone(), x.line, x.var.clone()))
-                    })
-                })
-            });
-            if all_back {
-                match self.delete_key(k) {
-                    Ok(()) => deleted.push(k.clone()),
-                    Err(m) => notes.push(m),
-                }
-            }
-        }
 
         // The records: restored lines leave them; a whole project with nothing skipped goes,
         // with its agent hint block.
@@ -297,8 +325,24 @@ impl Daemon {
                 p.files.retain(|f| !f.secrets.is_empty());
             }
         }
+        let mut saved = true;
         if !done.is_empty() || !dropped.is_empty() {
-            match self.projects_store().save(&next, floor) {
+            #[cfg(test)]
+            let injected = self
+                .dash_acts
+                .fail_next_records_save
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let injected = false;
+            let result = if injected {
+                Err(ms_projects::Error::Io {
+                    context: "saving the records".to_owned(),
+                    source: std::io::Error::other("injected failure"),
+                })
+            } else {
+                self.projects_store().save(&next, floor)
+            };
+            match result {
                 Ok(v) => {
                     if let Err(e) = self.backend.put_internal(
                         &KeyName::new(PROJECTS_STATE_KEY)
@@ -313,13 +357,39 @@ impl Daemon {
                         );
                     }
                 }
-                Err(e) => notes.push(format!(
-                    "the project records could not be updated ({e}); the files were written"
-                )),
+                Err(e) => {
+                    saved = false;
+                    notes.push(format!(
+                        "the project records could not be updated ({e}); the files were written, and no key was deleted"
+                    ));
+                }
             }
             self.rebuild_proxy();
         }
+        // Keys go only once the records no longer name them (review R2): a failed save keeps
+        // every key, so the records never point at a key that is gone.
+        let mut deleted: Vec<KeyName> = Vec::new();
+        if saved {
+            for k in &touched {
+                let all_back = file.projects.iter().all(|p| {
+                    p.files.iter().all(|f| {
+                        f.secrets.iter().filter(|x| &x.key == k).all(|x| {
+                            done.contains(&(p.slug.clone(), f.path.clone(), x.line, x.var.clone()))
+                        })
+                    })
+                });
+                if all_back {
+                    match self.delete_key(k) {
+                        Ok(()) => deleted.push(k.clone()),
+                        Err(m) => notes.push(m),
+                    }
+                }
+            }
+        }
         for (s, root) in &dropped {
+            if !saved {
+                break;
+            }
             if let Err(e) = ms_projects::hint::remove(Path::new(root), s) {
                 notes.push(format!("the agent hint could not be removed ({e})"));
             }
@@ -357,12 +427,11 @@ impl Daemon {
             if restored.len() == 1 { "" } else { "s" }
         );
         if !skipped.is_empty() {
-            message.push_str(&format!(
-                "; {} line{} left as {} were",
-                skipped.len(),
-                if skipped.len() == 1 { "" } else { "s" },
-                if skipped.len() == 1 { "it" } else { "they" }
-            ));
+            message.push_str(&if skipped.len() == 1 {
+                "; 1 line left as it was".to_owned()
+            } else {
+                format!("; {} lines left as they were", skipped.len())
+            });
         }
         if !deleted.is_empty() {
             message.push_str(&format!(
@@ -448,7 +517,19 @@ impl Daemon {
             .get(key)
             .map_or(Tier::Production, |r| r.tier);
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
-        let req = admin_request(session, key.clone(), tier, &["ms", "set", key.as_str()]);
+        // Bound to the value (an HMAC fingerprint only msd can make) and naming who asked
+        // (review S2, S4).
+        let fp = format!(
+            "new value fingerprint {}",
+            self.value_fingerprint(value.expose())
+        );
+        let who = requester(session);
+        let req = admin_request(
+            session,
+            key.clone(),
+            tier,
+            &["ms", "set", key.as_str(), &fp, &who],
+        );
         let token = match self.approve_exact(&req) {
             Ok(t) => t,
             Err(resp) => {
@@ -541,10 +622,12 @@ impl Daemon {
             .keys
             .get(key)
             .map_or(Tier::Production, |r| r.tier);
+        let who = requester(session);
         let mut argv = vec!["ms", "rm", key.as_str()];
         if force {
             argv.push("--force");
         }
+        argv.push(&who);
         let req = admin_request(session, key.clone(), tier, &argv);
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
         let token = match self.approve_exact(&req) {
@@ -614,7 +697,16 @@ impl Daemon {
                 tracing::error!(error = %e, "could not record ms undo");
             }
         };
-        match self.undo_run(session, Some(slug), keys, &confirm, &receipt, "ms") {
+        let who = requester(session);
+        match self.undo_run(
+            session,
+            Some(slug),
+            keys,
+            &confirm,
+            &receipt,
+            "ms",
+            Some(&who),
+        ) {
             Ok(v) => ResponseBody::Undone {
                 restored: v
                     .restored

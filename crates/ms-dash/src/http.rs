@@ -694,7 +694,11 @@ async fn route_action(
             },
             Call::CheckPath(p) => match acts.check_path(a, &p) {
                 Ok(c) => action_ok(
-                    &ActionOk::new(if c.ok { "checked" } else { "refused" }),
+                    &ActionOk::new(if c.ok {
+                        "Checked"
+                    } else {
+                        "That folder can't be set up as a project"
+                    }),
                     serde_json::to_value(&c).ok().map(|v| ("check", v)),
                 ),
                 Err(e) => action_error(&e),

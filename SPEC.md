@@ -436,6 +436,12 @@ Where the build chose within the decisions above, or departed from their letter:
 - **B-7 "No other project refers to it":** `ms init` names keys after their project
   (`shop/…`), and the record check refuses a key of another project, so the case is a key whose
   other lines in the same project were skipped; the test covers that.
+- **B-9 Fix round 1:** morsec's own requests (argv `ms …` / `dashboard …`) are approved once
+  only, in the broker; `Sec-Fetch-Site: same-origin` is also required for Approve, Start, Rules
+  and Run scan; the pasteboard is written as one item after `prepareForNewContents…` with no
+  clear in between; Undo takes the records lock only after the approval, re-checks the records
+  and deletes keys only after the records are saved; one msd lock covers every check-then-write
+  of a value.
 - **B-8 Activity's "other" agent** is any session that is none of Claude Code, Codex,
   Terminal, Dashboard and ms dev.
 
@@ -636,6 +642,13 @@ same-user program), T-99 (hyper buffers), T-103.
 - hyper's request and write buffers holding a posted or shown value are not zeroized.
 - Undo into a folder macOS protects may be refused by macOS; those lines are skipped and listed.
 - The real Touch ID sheets, real pasteboard and real browser opening are checked by hand only.
+- T-94, T-95, T-96 (fix round 1, review S4): a detached process outside every agent tree and
+  every sandbox (an agent command that double-forked out, T-04) can still send `KeyReplace`,
+  `KeyDelete` or `ProjectUndo`. The gate is the approval: the card, `ms approve` and the Touch
+  ID sheet name the requesting program and PID, the request is approved once only (never for the
+  session) and `ms set`'s is bound to an msd-keyed fingerprint of the new value.
+- msd killed with SIGKILL within a copy's 30 s leaves the value on the pasteboard (a normal exit
+  clears it, review N4).
 
 ## Revert
 

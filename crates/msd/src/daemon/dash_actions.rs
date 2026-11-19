@@ -200,6 +200,16 @@ pub fn warning(e: &AlertEntry) -> WarningView {
 
 // ---- state ---------------------------------------------------------------------------------
 
+/// Clears the "scan running" flag when dropped, so a scan that panics doesn't block every later
+/// one (review R7).
+struct ScanRunning<'a>(&'a AtomicBool);
+
+impl Drop for ScanRunning<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The actions' own state.
 #[derive(Default)]
 pub struct ActState {
@@ -211,9 +221,18 @@ pub struct ActState {
     reveals: Mutex<VecDeque<Instant>>,
     /// The pasteboard writer; the real one unless a test or `--test-pasteboard-to` set another.
     clipboard: OnceLock<Arc<dyn Clipboard>>,
+    /// Held across every check-then-write of a value: PutKey's "new only" check and its store,
+    /// replace, delete (review S3).
+    keys_write: Mutex<()>,
+    /// Keys the fingerprint of a new value shown on `ms set`'s approval (an HMAC, so the
+    /// fingerprint says nothing about the value to anyone without msd's memory).
+    value_mac_key: OnceLock<[u8; 32]>,
     /// Tests: the next store fails (after deleting, as the keychain's replace would).
     #[cfg(test)]
     pub(crate) fail_next_put: AtomicBool,
+    /// Tests: the next save of the project records by Undo fails.
+    #[cfg(test)]
+    pub(crate) fail_next_records_save: AtomicBool,
     /// Tests: the transcript folders a scan reads (never the real home).
     #[cfg(test)]
     pub(crate) scan_roots: Mutex<Option<Vec<PathBuf>>>,
@@ -248,6 +267,29 @@ fn from_reply(r: ResponseBody) -> ActionResult {
 }
 
 impl Daemon {
+    /// The value lock (review S3).
+    pub(crate) fn keys_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        lock(&self.dash_acts.keys_write)
+    }
+
+    /// A short fingerprint of a new value, keyed by a per-msd random key: binds `ms set`'s
+    /// approval to the value (review S2) without telling anyone else anything about it.
+    pub(crate) fn value_fingerprint(&self, value: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        let key = self.dash_acts.value_mac_key.get_or_init(|| {
+            ms_approve::token::random_bytes::<32>().unwrap_or_else(|_| {
+                let mut k = [0u8; 32];
+                k[..8].copy_from_slice(&now_ms().to_be_bytes());
+                k
+            })
+        });
+        let Ok(mut m) = Hmac::<sha2::Sha256>::new_from_slice(key) else {
+            return String::new();
+        };
+        m.update(value);
+        hex::encode(&m.finalize().into_bytes()[..6])
+    }
+
     /// The transcript folders a scan reads.
     pub(crate) fn scan_roots(&self) -> Vec<PathBuf> {
         #[cfg(test)]
@@ -579,11 +621,12 @@ impl Daemon {
         let spawned = std::thread::Builder::new()
             .name("dash-scan".into())
             .spawn(move || {
+                // Reset however the scan ends, a panic included (review R7).
+                let _running = ScanRunning(&me.dash_acts.scan_running);
                 let r = me.scan_approved(&session);
                 if let ResponseBody::Error { message, .. } = r {
                     *lock(&me.dash_acts.scan_error) = Some(message);
                 }
-                me.dash_acts.scan_running.store(false, Ordering::SeqCst);
             });
         if spawned.is_err() {
             self.dash_acts.scan_running.store(false, Ordering::SeqCst);
@@ -1021,6 +1064,7 @@ impl Daemon {
         meta: KeyMeta,
         value: ms_core::SecretBytes,
     ) -> Result<(), String> {
+        let _k = self.keys_lock();
         let old = self
             .vault
             .read_with(key, |b| ms_core::SecretBytes::new(b.to_vec()))
@@ -1125,7 +1169,12 @@ impl Daemon {
                     message,
                 ),
             )),
-            _ => Err(err(ActionCode::Internal, "morsec: unexpected answer")),
+            _ => Err(self.refuse(
+                a,
+                &key,
+                what,
+                err(ActionCode::Internal, "morsec: unexpected answer"),
+            )),
         }
     }
 
@@ -1146,6 +1195,7 @@ impl Daemon {
 
     /// Deletes `key`'s value and rule (the rule through `change_rule`: a tightening).
     pub(crate) fn delete_key(&self, key: &KeyName) -> Result<(), String> {
+        let _k = self.keys_lock();
         match self.vault.delete(key) {
             Ok(()) | Err(ms_core::Error::NoSuchKey(_)) => {}
             Err(e) => return Err(format!("morsec: the value could not be deleted ({e})")),
@@ -1266,6 +1316,7 @@ impl Daemon {
             &confirm,
             &receipt,
             "dashboard",
+            None,
         )
     }
 }
@@ -1350,6 +1401,10 @@ fn decide_error(e: DecideError) -> ActionError {
         DecideError::Ended => err(
             ActionCode::Stopped,
             "morsec was stopped while Touch ID was up; nothing was approved",
+        ),
+        DecideError::OnceOnly => err(
+            ActionCode::Invalid,
+            "This request changes morsec itself, so it can be approved once only",
         ),
         DecideError::Internal(m) => err(ActionCode::Internal, m),
     }
@@ -2537,5 +2592,357 @@ mod tests {
         });
         assert!(matches!(r, ResponseBody::Ok { .. }), "{r:?}");
         assert!(value(&h, "stripe/test").is_none());
+    }
+
+    // ---- fix round 1 ------------------------------------------------------------------------
+
+    /// Runs `f` while this test answers the request it raises (once, approve); returns `f`'s
+    /// reply and the request as it was shown.
+    fn answer_and_capture(
+        h: &H,
+        f: impl FnOnce() -> ResponseBody + Send,
+    ) -> (ResponseBody, Option<ApprovalRequest>) {
+        std::thread::scope(|sc| {
+            let seen = sc.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    if let Some(p) = h.d.approvals.pending() {
+                        let _ = h.d.approvals.decide(&p.id, true, Scope::Once);
+                        return Some(p.request);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                None
+            });
+            let out = f();
+            (out, seen.join().unwrap())
+        })
+    }
+
+    // protects=review R1: a command is removed from the Secret screen by its exact words (from
+    // the view's command_words), including a word that holds a space, so the rule really
+    // shrinks; fails_when=the page's words don't match the stored command and nothing is
+    // removed; no_claim=the page's click handler (assets dash_js_review_fixes)
+    #[test]
+    fn rules_remove_command_by_words() {
+        let h = fresh();
+        let key = k("db/run");
+        let r = h.req_value(
+            RequestBody::PutKey {
+                name: key.clone(),
+                meta: KeyMeta {
+                    name: key.clone(),
+                    mode: Mode::Run,
+                    tier: Tier::Test,
+                    created_unix_ms: 1,
+                },
+            },
+            Some(SecretBytes::new(b"v".to_vec())),
+        );
+        assert!(matches!(r, ResponseBody::Ok { .. }), "{r:?}");
+        let words = vec!["sh".to_owned(), "-c".into(), "echo hi there".into()];
+        h.d.dash_rules(
+            &actor(),
+            &key,
+            &RuleEdit::AddCommand {
+                words: words.clone(),
+            },
+        )
+        .unwrap();
+        let view = h.d.dash_secret(&key).unwrap();
+        assert_eq!(view.command_words, [words]);
+        let back = view.command_words[0].clone();
+        h.d.dash_rules(&actor(), &key, &RuleEdit::RemoveCommand { words: back })
+            .unwrap();
+        assert!(
+            h.d.rules().keys[&key].commands.is_empty(),
+            "the rule shrank"
+        );
+    }
+
+    // protects=review R2: Undo saves the trimmed records before it deletes any key; when the
+    // save fails, every key stays (the records still name them) and the answer says so;
+    // fails_when=keys are deleted while the records still point at them; no_claim=-
+    #[test]
+    fn undo_keeps_keys_when_records_save_fails() {
+        let h = fresh();
+        let rec = saved_shop(&h);
+        h.d.dash_acts
+            .fail_next_records_save
+            .store(true, Ordering::SeqCst);
+        let v = h.d.dash_undo(&actor(), Some("shop"), None).unwrap();
+        assert!(v.deleted_keys.is_empty(), "{v:?}");
+        assert!(v.message.contains("no key was deleted"), "{}", v.message);
+        for key in [STRIPE_KEY, OPENAI_KEY, DB_KEY, UNKNOWN_KEY] {
+            assert!(value(&h, key).is_some(), "{key} kept");
+        }
+        assert!(h.d.dash_projects().unwrap().get(&rec.slug).is_some());
+    }
+
+    /// A daemon whose Touch ID answers yes after `ms` milliseconds.
+    fn slow(ms: u64) -> H {
+        let dir = tempfile::tempdir().unwrap();
+        open_auth(
+            crate::backend::Backend::Memory(Arc::new(ms_vault::memory::MemoryVault::new())),
+            dir,
+            Arc::new(Mutex::new(Some(terminal()))),
+            FakeAuthenticator::approve().after(Duration::from_millis(ms)),
+        )
+    }
+
+    // protects=review R4 and R8: Undo does not hold the project records lock while Touch ID is
+    // up (ms init can save meanwhile), re-reads the records under the lock after the approval,
+    // and refuses when they changed, leaving a receipt with the spent token;
+    // fails_when=the lock is held across the sheet, or a stale target is written, or the
+    // refusal leaves no receipt; no_claim=-
+    #[test]
+    fn undo_rechecks_records_after_touch_id() {
+        let h = slow(400);
+        h.d.set_approval_timeout(Duration::from_secs(5));
+        let rec = saved_shop(&h);
+        let before = std::fs::read_to_string(Path::new(&rec.root).join(".env")).unwrap();
+        let (r, free) = std::thread::scope(|sc| {
+            let free = sc.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                let free = h.d.projects_write.try_lock().is_ok();
+                // The records change while the sheet is up.
+                let (mut file, floor) = h.d.load_projects().unwrap();
+                file.projects[0].files[0].secrets.pop();
+                let v = h.d.projects_store().save(&file, floor).unwrap();
+                h.d.backend
+                    .put_internal(
+                        &k(crate::backend::PROJECTS_STATE_KEY),
+                        SecretBytes::new(format!("v={v}").into_bytes()),
+                    )
+                    .unwrap();
+                free
+            });
+            let r = h.d.dash_undo(&actor(), Some("shop"), None);
+            (r, free.join().unwrap())
+        });
+        assert!(free, "the records lock was free during Touch ID");
+        let e = r.unwrap_err();
+        assert_eq!(e.code, ActionCode::Gone, "{}", e.message);
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&rec.root).join(".env")).unwrap(),
+            before
+        );
+        let receipts = h.receipts_text();
+        assert!(
+            receipts.contains("dashboard: undo") && receipts.contains("\"failed\""),
+            "{receipts}"
+        );
+    }
+
+    // protects=review R7: the "scan running" flag is reset however the scan ends, a panic
+    // included, so Run scan is never stuck at busy; fails_when=a panicking scan leaves it set;
+    // no_claim=-
+    #[test]
+    fn scan_running_reset_on_panic() {
+        let flag = AtomicBool::new(true);
+        let r = std::panic::catch_unwind(|| {
+            let _g = ScanRunning(&flag);
+            panic!("scan failed");
+        });
+        assert!(r.is_err());
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    // protects=review S2: morsec's own requests (ms set/rm/undo, rules, start) can't be
+    // approved for the session from the dashboard (no sheet), the card says so, and ms set's
+    // request is bound to the new value by an msd-only fingerprint that is not the value and
+    // names who asked (review S4); fails_when=one session answer covers later replaces, or the
+    // value or a plain hash of it reaches the card; no_claim=-
+    #[test]
+    fn admin_requests_once_only_and_bound_to_value() {
+        let h = fresh();
+        h.put("stripe/test", Tier::Test);
+        let (r, req) = answer_and_capture(&h, || {
+            h.req_value(
+                RequestBody::KeyReplace {
+                    key: k("stripe/test"),
+                },
+                Some(SecretBytes::new(b"brand-new-value-1".to_vec())),
+            )
+        });
+        assert!(matches!(r, ResponseBody::Ok { .. }), "{r:?}");
+        let req = req.unwrap();
+        let shown = req.argv_display.join(" ");
+        assert!(shown.contains("new value fingerprint "), "{shown}");
+        assert!(!shown.contains("brand-new-value-1"));
+        let plain = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"brand-new-value-1"));
+        assert!(!shown.contains(&plain[..12]), "not a plain hash");
+        assert!(
+            shown.contains("requested by") && shown.contains("pid"),
+            "{shown}"
+        );
+        // A second replace with another value is another request (other argv, other binding).
+        let (_, req2) = answer_and_capture(&h, || {
+            h.req_value(
+                RequestBody::KeyReplace {
+                    key: k("stripe/test"),
+                },
+                Some(SecretBytes::new(b"brand-new-value-2".to_vec())),
+            )
+        });
+        assert_ne!(req2.unwrap().argv_hash, req.argv_hash);
+
+        // The dashboard refuses a session answer to such a request.
+        let (out, _) = while_pending(
+            &h,
+            admin_request(
+                &SessionId {
+                    agent: AgentKind::Other("terminal".into()),
+                    pid: std::process::id(),
+                    started_unix_ms: 1,
+                },
+                k("stripe/test"),
+                Tier::Production,
+                &["ms", "rm", "stripe/test"],
+            ),
+            |p| {
+                let home = h.d.dash_home().unwrap();
+                let v = home.pending.unwrap();
+                assert!(v.once_only && !v.from_agent);
+                assert!(
+                    v.requester
+                        .as_deref()
+                        .unwrap()
+                        .contains(&std::process::id().to_string())
+                );
+                assert!(v.summary.starts_with("Delete stripe/test"), "{}", v.summary);
+                let n = h.auth.reasons().len();
+                let e = h.d.dash_approve(&actor(), &p.id, true).unwrap_err();
+                assert_eq!(h.auth.reasons().len(), n, "no sheet");
+                h.d.dash_deny(&actor(), &p.id).unwrap();
+                e
+            },
+        );
+        assert_eq!(out.code, ActionCode::Invalid);
+    }
+
+    // protects=review S3: PutKey's "new keys only" check and its store are one step: of many
+    // concurrent PutKeys of the same new name, exactly one stores and the rest are refused, so
+    // no value is replaced; fails_when=two succeed (the second silently replaced the first);
+    // no_claim=other processes writing the keychain directly (T-16)
+    #[test]
+    fn put_key_new_only_under_concurrency() {
+        let h = fresh();
+        let key = k("race/key");
+        let results: Vec<ResponseBody> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..8)
+                .map(|i| {
+                    let (h, key) = (&h, key.clone());
+                    sc.spawn(move || {
+                        h.d.handle(
+                            &PeerInfo {
+                                uid: 501,
+                                gid: 20,
+                                pid: Some(42),
+                                accepted_unix_ms: 1,
+                            },
+                            RequestBody::PutKey {
+                                name: key.clone(),
+                                meta: KeyMeta {
+                                    name: key,
+                                    mode: Mode::Swap,
+                                    tier: Tier::Test,
+                                    created_unix_ms: 1,
+                                },
+                            },
+                            Some(SecretBytes::new(format!("value-{i}").into_bytes())),
+                        )
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let ok = results
+            .iter()
+            .filter(|r| matches!(r, ResponseBody::Ok { .. }))
+            .count();
+        assert_eq!(ok, 1, "{results:?}");
+    }
+
+    /// One HTTP/1.1 request to the dashboard; returns (status, body).
+    fn http(port: u16, head: &str, body: &str) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "{head}\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        let status = out
+            .split(' ')
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = out.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_owned();
+        (status, body)
+    }
+
+    // protects=SPEC D-12, criterion 10, T-92 (review R9): Copy through msd's real dashboard
+    // (HTTP envelope, session, CSRF, the confirm path, the pasteboard writer) puts the value on
+    // the pasteboard and answers the browser without it; fails_when=the value or any part of it
+    // reaches the HTTP answer, or the pasteboard doesn't get it; no_claim=the real pasteboard
+    // (manual)
+    #[test]
+    fn copy_never_sends_value_to_browser() {
+        let h = fresh();
+        h.put("stripe/test", Tier::Test);
+        let paste = with_fake_clipboard(&h);
+        let (_rt, opened) = with_dash(&h, allow_all());
+        assert!(matches!(dash_open(&h, None), ResponseBody::Dash { .. }));
+        let url = lock(&opened).last().cloned().unwrap();
+        let rest = url.strip_prefix("http://127.0.0.1:").unwrap();
+        let (port, token) = rest.split_once("/#t=").unwrap();
+        let port: u16 = port.parse().unwrap();
+        let origin = format!("Origin: http://127.0.0.1:{port}");
+        let raw = {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let body = format!("{{\"token\":\"{token}\"}}");
+            write!(
+                s,
+                "POST /api/session HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{origin}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out);
+            out
+        };
+        let cookie = raw
+            .lines()
+            .find_map(|l| l.strip_prefix("set-cookie: ms_dash="))
+            .and_then(|c| c.split(';').next())
+            .unwrap()
+            .to_owned();
+        let csrf = raw
+            .split("\"csrf\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let (status, body) = http(
+            port,
+            &format!(
+                "POST /api/keys/stripe%2Ftest/copy HTTP/1.1\r\n{origin}\r\nContent-Type: application/json\r\nCookie: ms_dash={cookie}\r\nX-Morsec-CSRF: {csrf}\r\nSec-Fetch-Site: same-origin"
+            ),
+            "{}",
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !body.contains(CANARY) && !body.contains(&CANARY[8..]),
+            "{body}"
+        );
+        assert_eq!(paste.text().as_deref(), Some(CANARY));
+        h.d.dash().unwrap().shutdown();
     }
 }

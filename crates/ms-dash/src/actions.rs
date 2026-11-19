@@ -87,12 +87,17 @@ impl Action {
         }
     }
 
-    /// Value and destructive actions: `Sec-Fetch-Site: same-origin` must be present (browsers
+    /// Value, destructive and approving actions (approve, start, rules, scan too: review N3):
+    /// `Sec-Fetch-Site: same-origin` must be present (browsers
     /// always send it; other clients don't).
     pub fn sensitive(self) -> bool {
         matches!(
             self,
-            Action::Show
+            Action::Approve
+                | Action::Start
+                | Action::Rules
+                | Action::ScanRun
+                | Action::Show
                 | Action::Copy
                 | Action::Replace
                 | Action::AddKey

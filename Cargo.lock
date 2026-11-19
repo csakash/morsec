@@ -1042,6 +1042,7 @@ dependencies = [
  "clap",
  "core-foundation-sys",
  "hex",
+ "hmac",
  "libc",
  "ms-approve",
  "ms-connect",

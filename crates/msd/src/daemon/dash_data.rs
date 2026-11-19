@@ -293,10 +293,12 @@ impl Daemon {
                 sessions,
                 blocked,
                 last_seen_unix_ms: last_seen(id),
-                command: format!(
-                    "ms {} {id}",
-                    if connected { "disconnect" } else { "connect" }
-                ),
+                command: (installed || connected).then(|| {
+                    format!(
+                        "ms {} {id}",
+                        if connected { "disconnect" } else { "connect" }
+                    )
+                }),
             }
         })
         .collect()
@@ -411,7 +413,12 @@ impl Daemon {
             pending: self.approvals.pending_state().map(|(p, deciding)| {
                 // Rendered here, as ms approve shows it: inert, quoted, never cut (SPEC D-11).
                 let r = &p.request;
+                let from_agent = !matches!(r.session.agent, ms_core::AgentKind::Other(_));
                 PendingView {
+                    summary: self.pending_summary(r, from_agent),
+                    from_agent,
+                    requester: (!from_agent).then(|| super::undo::requester(&r.session)),
+                    once_only: ms_approve::broker::once_only(r),
                     id: p.id,
                     agent: ms_approve::render::agent_name(&r.session.agent),
                     key: ms_approve::render::inert(r.key.as_str()),
@@ -434,6 +441,73 @@ impl Daemon {
             agents: self.agent_views(&records),
             projects_unreadable: projects.is_err(),
         })
+    }
+
+    /// What a waiting request asks, in plain words (review Q1). Every part from the request is
+    /// rendered inert.
+    fn pending_summary(&self, r: &ms_core::ApprovalRequest, from_agent: bool) -> String {
+        use ms_approve::render::{agent_name, inert, quoted};
+        let who = if from_agent {
+            agent_name(&r.session.agent)
+        } else {
+            "a program outside any agent session".to_owned()
+        };
+        let key = inert(r.key.as_str());
+        let a: Vec<&str> = r.argv_display.iter().map(String::as_str).collect();
+        match a.as_slice() {
+            ["ms", "rules", k, toml, ..] => {
+                let k = inert(k);
+                let next = ms_rules::Rules::from_toml(toml, "the request")
+                    .ok()
+                    .and_then(|x| x.keys.into_iter().next().map(|(_, v)| v));
+                let cur = self.read_live().rules.keys.get(&r.key).cloned();
+                let Some(n) = next else {
+                    return format!("Let {who} change what {k} may do");
+                };
+                let mut adds: Vec<String> = Vec::new();
+                for h in n.hosts.iter().map(ToString::to_string) {
+                    let had = cur
+                        .as_ref()
+                        .is_some_and(|c| c.hosts.iter().any(|x| x.to_string() == h));
+                    if !had {
+                        adds.push(inert(&h));
+                    }
+                }
+                for cmd in &n.commands {
+                    if !cur.as_ref().is_some_and(|c| c.commands.contains(cmd)) {
+                        adds.push(format!("the command {}", inert(&cmd.to_string())));
+                    }
+                }
+                if cur.as_ref().is_some_and(|c| c.tier != n.tier) {
+                    adds.push(format!("{} tier", tier_str(n.tier)));
+                }
+                if adds.is_empty() {
+                    format!("Let {who} change what {k} may do")
+                } else {
+                    format!("Let {who} give {k} access to {}", adds.join(", "))
+                }
+            }
+            ["ms", "start", ..] => format!("Start morsec again (asked by {who})"),
+            ["ms", "scan", ..] => {
+                format!("Run the leak scan: it reads every value (asked by {who})")
+            }
+            ["ms", "set", k, ..] => format!("Replace the value of {} (asked by {who})", inert(k)),
+            ["ms", "rm", k, ..] => format!("Delete {} and its rule (asked by {who})", inert(k)),
+            ["ms", "undo", slug, ..] => format!(
+                "Write values back into project {}'s files (asked by {who})",
+                inert(slug)
+            ),
+            ["ms", "init", slug, ..] => format!(
+                "Set up project {}: its new keys may reach their services (asked by {who})",
+                inert(slug)
+            ),
+            ["dashboard", action, ..] => format!("{} {key}, from the dashboard", inert(action)),
+            _ => {
+                let cmd: Vec<String> = a.iter().take(3).map(|x| quoted(x)).collect();
+                let more = if a.len() > 3 { " …" } else { "" };
+                format!("Let {who} use {key} for {}{more}", cmd.join(" "))
+            }
+        }
     }
 
     pub(crate) fn dash_projects_view(&self) -> Result<ProjectsView, ApiError> {
@@ -614,6 +688,9 @@ impl Daemon {
             commands: r
                 .map(|r| r.commands.iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
+            command_words: r
+                .map(|r| r.commands.iter().map(|c| c.to_strings()).collect())
+                .unwrap_or_default(),
             roots: r
                 .map(|r| r.roots.iter().map(|p| p.display().to_string()).collect())
                 .unwrap_or_default(),
@@ -707,17 +784,18 @@ impl Daemon {
         match lock(&self.ca).as_ref() {
             Some((_, hosts)) => checks.push(CheckView {
                 ok: true,
-                text: format!("proxy CA issued for {} hosts", hosts.len()),
+                text: format!(
+                    "proxy CA issued for {} host{}",
+                    hosts.len(),
+                    if hosts.len() == 1 { "" } else { "s" }
+                ),
             }),
             None => checks.push(CheckView {
                 ok: true,
                 text: "no host bound yet, so no proxy CA in use".into(),
             }),
         }
-        checks.extend(alerts.iter().map(|a| CheckView {
-            ok: false,
-            text: a.clone(),
-        }));
+        // The alerts themselves are the Warnings section, not checks again (review Q17).
         Ok(AgentsView {
             agents: self.agent_views(&records),
             checks,

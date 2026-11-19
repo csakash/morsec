@@ -30,21 +30,23 @@ pub const TRANSIENT: &str = "org.nspasteboard.TransientType";
 
 /// The pasteboard calls Copy makes, one per Objective-C message.
 pub trait PasteboardApi: Send + Sync {
-    /// `prepareForNewContentsWithOptions: NSPasteboardContentsCurrentHostOnly`.
+    /// `prepareForNewContentsWithOptions: NSPasteboardContentsCurrentHostOnly` (this also
+    /// clears the pasteboard; a later `clearContents` would reset the option, so Copy never
+    /// calls it after this: review S1).
     fn prepare_current_host_only(&self) -> Result<(), String>;
     /// `clearContents`.
     fn clear_contents(&self) -> Result<(), String>;
-    /// `setString:forType:`.
-    fn set_string(&self, value: &str, kind: &str) -> Result<(), String>;
-    /// `setData:forType:` with empty data.
-    fn set_empty_data(&self, kind: &str) -> Result<(), String>;
+    /// One `NSPasteboardItem` holding `value` as `kind` and empty data for every marker type,
+    /// all set before `writeObjects:` puts it on the pasteboard (review N1).
+    fn write_item(&self, value: &str, kind: &str, markers: &[&str]) -> Result<(), String>;
     /// `changeCount`.
     fn change_count(&self) -> Result<i64, String>;
 }
 
 /// What msd uses to copy.
 pub trait Clipboard: Send + Sync {
-    /// Writes `text` with the markers and returns the change count right after.
+    /// Writes `text` with the markers and returns the change count right after. On any error
+    /// the pasteboard is cleared before the error is returned (review R3).
     fn write(&self, text: &str) -> Result<i64, String>;
     /// The change count now.
     fn change_count(&self) -> Result<i64, String>;
@@ -60,11 +62,14 @@ impl<P: PasteboardApi> Clipboard for Marked<P> {
     fn write(&self, text: &str) -> Result<i64, String> {
         let p = &self.0;
         p.prepare_current_host_only()?;
-        p.clear_contents()?;
-        p.set_string(text, TEXT)?;
-        p.set_empty_data(CONCEALED)?;
-        p.set_empty_data(TRANSIENT)?;
-        p.change_count()
+        let written = p
+            .write_item(text, TEXT, &[CONCEALED, TRANSIENT])
+            .and_then(|()| p.change_count());
+        if written.is_err() {
+            // Nothing half-written stays behind.
+            let _ = p.clear_contents();
+        }
+        written
     }
     fn change_count(&self) -> Result<i64, String> {
         self.0.change_count()
@@ -103,26 +108,60 @@ pub fn system() -> Arc<dyn Clipboard> {
     }
 }
 
+/// The copy still waiting for its clear: (pasteboard, change count after the write). msd
+/// clears it on shutdown when nothing was copied since (review N4).
+static PENDING: std::sync::Mutex<Option<(Arc<dyn Clipboard>, i64)>> = std::sync::Mutex::new(None);
+
+fn pending() -> std::sync::MutexGuard<'static, Option<(Arc<dyn Clipboard>, i64)>> {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Clears `cb` if its change count is still `count` (nothing else was copied since).
+fn clear_if_unchanged(cb: &dyn Clipboard, count: i64) {
+    match cb.change_count() {
+        Ok(now) if now == count => {
+            if let Err(e) = cb.clear() {
+                tracing::warn!(error = %e, "could not clear the pasteboard");
+            }
+        }
+        Ok(_) => tracing::info!("the pasteboard changed since Copy; left as it is"),
+        Err(e) => tracing::warn!(error = %e, "could not read the pasteboard"),
+    }
+}
+
 /// Writes `text` and clears the pasteboard after `after` if nothing else was copied since.
-/// The clear runs on its own thread; the call returns once the text is on the pasteboard.
+/// The clear runs on its own thread; the call returns once the text is on the pasteboard. If
+/// the clear can't be scheduled, the pasteboard is cleared now and the copy reported as failed.
 pub fn copy_then_clear(cb: Arc<dyn Clipboard>, text: &str, after: Duration) -> Result<(), String> {
     let count = cb.write(text)?;
-    std::thread::Builder::new()
+    *pending() = Some((cb.clone(), count));
+    let later = cb.clone();
+    let spawned = std::thread::Builder::new()
         .name("pasteboard-clear".into())
         .spawn(move || {
             std::thread::sleep(after);
-            match cb.change_count() {
-                Ok(now) if now == count => {
-                    if let Err(e) = cb.clear() {
-                        tracing::warn!(error = %e, "could not clear the pasteboard");
-                    }
-                }
-                Ok(_) => tracing::info!("the pasteboard changed since Copy; left as it is"),
-                Err(e) => tracing::warn!(error = %e, "could not read the pasteboard"),
+            clear_if_unchanged(&*later, count);
+            let mut p = pending();
+            if p.as_ref().is_some_and(|(_, c)| *c == count) {
+                *p = None;
             }
-        })
-        .map_err(|e| format!("could not schedule the clear: {e}"))?;
+        });
+    if let Err(e) = spawned {
+        clear_if_unchanged(&*cb, count);
+        *pending() = None;
+        return Err(format!(
+            "could not schedule the clear, so the copy was cleared now: {e}"
+        ));
+    }
     Ok(())
+}
+
+/// msd is exiting: a copy still within its 30 s is cleared now if nothing was copied since
+/// (review N4).
+pub fn clear_pending_now() {
+    if let Some((cb, count)) = pending().take() {
+        clear_if_unchanged(&*cb, count);
+    }
 }
 
 /// `msd --test-pasteboard-to FILE` (debug build with the memory vault only, like
@@ -170,13 +209,19 @@ impl FilePasteboard {
 impl PasteboardApi for FilePasteboard {
     fn prepare_current_host_only(&self) -> Result<(), String> {
         let mut st = self.st();
-        st.markers = vec!["current-host-only"];
         st.count += 1;
+        let cleared = std::mem::take(&mut st.on_board);
+        st.markers = vec!["current-host-only"];
+        drop(st);
+        if cleared {
+            self.line(&serde_json::json!({ "cleared": true }));
+        }
         Ok(())
     }
     fn clear_contents(&self) -> Result<(), String> {
         let mut st = self.st();
         st.count += 1;
+        st.markers.clear();
         let cleared = std::mem::take(&mut st.on_board);
         drop(st);
         if cleared {
@@ -184,23 +229,21 @@ impl PasteboardApi for FilePasteboard {
         }
         Ok(())
     }
-    fn set_string(&self, value: &str, kind: &str) -> Result<(), String> {
+    fn write_item(&self, value: &str, kind: &str, markers: &[&str]) -> Result<(), String> {
         use sha2::{Digest, Sha256};
         let mut st = self.st();
         if kind == TEXT {
             st.markers.push("text");
         }
+        for m in markers {
+            st.markers.push(match *m {
+                CONCEALED => "concealed",
+                TRANSIENT => "transient",
+                _ => "other",
+            });
+        }
         let h = Sha256::digest(value.as_bytes());
         st.pending = Some((value.len(), hex::encode(&h[..8])));
-        Ok(())
-    }
-    fn set_empty_data(&self, kind: &str) -> Result<(), String> {
-        let mut st = self.st();
-        st.markers.push(match kind {
-            CONCEALED => "concealed",
-            TRANSIENT => "transient",
-            _ => "other",
-        });
         Ok(())
     }
     fn change_count(&self) -> Result<i64, String> {
@@ -232,6 +275,9 @@ pub(crate) mod fake {
         pub calls: Mutex<Vec<String>>,
         pub count: Mutex<i64>,
         pub text: Mutex<Option<String>>,
+        /// The options and marker types the current contents carry.
+        pub markers: Mutex<Vec<String>>,
+        pub fail_write: Mutex<bool>,
     }
 
     impl Fake {
@@ -251,21 +297,33 @@ pub(crate) mod fake {
                 .unwrap()
                 .push("prepare:current-host-only".into());
             *self.count.lock().unwrap() += 1;
+            *self.text.lock().unwrap() = None;
+            *self.markers.lock().unwrap() = vec!["current-host-only".into()];
             Ok(())
         }
         fn clear_contents(&self) -> Result<(), String> {
             self.calls.lock().unwrap().push("clear".into());
             *self.count.lock().unwrap() += 1;
             *self.text.lock().unwrap() = None;
+            // Like the real pasteboard, a clear resets the options prepare set (review S1).
+            self.markers.lock().unwrap().clear();
             Ok(())
         }
-        fn set_string(&self, value: &str, kind: &str) -> Result<(), String> {
-            self.calls.lock().unwrap().push(format!("string:{kind}"));
+        fn write_item(&self, value: &str, kind: &str, markers: &[&str]) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("item:{kind}+{}", markers.join("+")));
+            if *self.fail_write.lock().unwrap() {
+                // Simulates a half-done write: the text went on, then an error.
+                *self.text.lock().unwrap() = Some(value.to_owned());
+                return Err("injected write failure".into());
+            }
             *self.text.lock().unwrap() = Some(value.to_owned());
-            Ok(())
-        }
-        fn set_empty_data(&self, kind: &str) -> Result<(), String> {
-            self.calls.lock().unwrap().push(format!("data:{kind}"));
+            self.markers
+                .lock()
+                .unwrap()
+                .extend(markers.iter().map(|m| (*m).to_owned()));
             Ok(())
         }
         fn change_count(&self) -> Result<i64, String> {
@@ -281,9 +339,11 @@ mod tests {
 
     const V: &str = concat!("sk_live_", "PASTE_CANARY_77");
 
-    // protects=SPEC D-20 and T-92: every Copy prepares the pasteboard for this host only,
-    // clears it, writes the text, then the concealed and transient markers, in that order;
-    // fails_when=a marker is missing or the text goes on without current-host-only;
+    // protects=SPEC D-20, T-92, review S1 and N1: every Copy prepares the pasteboard for this
+    // host only and then writes one item that already carries the text and the concealed and
+    // transient markers; nothing clears the pasteboard after prepare (a clear would drop
+    // current-host-only, letting the value reach Universal Clipboard); fails_when=a marker is
+    // missing, a clear follows prepare, or the text is written before its markers;
     // no_claim=what a given clipboard manager does with the markers (manual check)
     #[test]
     fn pasteboard_markers_set() {
@@ -294,13 +354,41 @@ mod tests {
             *f.calls.lock().unwrap(),
             [
                 "prepare:current-host-only",
-                "clear",
-                "string:public.utf8-plain-text",
-                "data:org.nspasteboard.ConcealedType",
-                "data:org.nspasteboard.TransientType",
+                "item:public.utf8-plain-text+org.nspasteboard.ConcealedType+org.nspasteboard.TransientType",
             ]
         );
         assert_eq!(f.text().as_deref(), Some(V));
+        assert_eq!(
+            *f.markers.lock().unwrap(),
+            [
+                "current-host-only",
+                "org.nspasteboard.ConcealedType",
+                "org.nspasteboard.TransientType"
+            ]
+        );
+    }
+
+    // protects=review R3: when the write fails part way, the pasteboard is cleared before the
+    // error is returned, so a value never stays on it unmarked or unscheduled;
+    // fails_when=a failed write leaves the text on the pasteboard; no_claim=-
+    #[test]
+    fn pasteboard_failed_write_leaves_nothing() {
+        let f = Arc::new(Fake::default());
+        *f.fail_write.lock().unwrap() = true;
+        let e = copy_then_clear(Arc::new(Marked(f.clone())), V, Duration::from_secs(30));
+        assert!(e.is_err());
+        assert_eq!(f.text(), None, "cleared after the failure");
+    }
+
+    // protects=review N4: a copy still within its 30 s is cleared when msd exits, unless
+    // something else was copied since; fails_when=an msd exit leaves the value on the
+    // pasteboard; no_claim=msd being killed with SIGKILL (nothing runs then)
+    #[test]
+    fn pasteboard_cleared_on_shutdown() {
+        let f = Arc::new(Fake::default());
+        copy_then_clear(Arc::new(Marked(f.clone())), V, Duration::from_secs(60)).unwrap();
+        clear_pending_now();
+        assert_eq!(f.text(), None);
     }
 
     // protects=SPEC D-20 and T-92: the copied value is cleared after the delay (30 s in msd)

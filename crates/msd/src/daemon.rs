@@ -27,7 +27,7 @@ mod mcp;
 mod projects;
 mod run;
 mod ssh_git;
-mod undo;
+pub(crate) mod undo;
 
 pub use dash_actions::{AlertKind, Clipboard};
 pub use dash_data::{ConnChecker, DashSource};
@@ -437,7 +437,7 @@ impl Daemon {
             ApprovalOutcome::Denied => Err(reply_err(
                 ErrorCode::NeedsApproval,
                 format!(
-                    "morsec: {what} was not approved (denied in ms approve, Touch ID did not confirm, ms stop ran, or this session asked again within {}s of a refusal)",
+                    "morsec: {what} was not approved (denied by the person in ms approve or the dashboard, Touch ID did not confirm, ms stop ran, or this session asked again within {}s of a refusal)",
                     ms_approve::broker::COOLDOWN.as_secs()
                 ),
             )),
@@ -1031,6 +1031,9 @@ impl Daemon {
                 "morsec: the value is empty; nothing stored",
             );
         }
+        // The check and the write happen under one lock that every value change takes, so a
+        // concurrent PutKey can't slip a replace in between (review S3).
+        let _k = self.keys_lock();
         let exists = match self.scan_keys() {
             Ok(l) if l.unusable.contains(&name) => {
                 // The keychain lets only the build that stored it delete it, so this msd can't
@@ -1055,11 +1058,15 @@ impl Daemon {
         if let Err(e) = self.vault.put(&name, value, meta) {
             return reply_err(ErrorCode::Internal, e.to_string());
         }
+        drop(_k);
         // A new key gets a rule that allows nothing until the user adds hosts or commands.
         let mut note = String::new();
         let needs_rule = !self.read_live().rules.keys.contains_key(&name);
         if needs_rule {
             match self.change_rule(&name, Some(KeyRule::new(mode, tier)), false) {
+                Ok(_) if target.starts_with("dashboard") => {
+                    note = ". Give it a website or a command on its page to make it usable".into()
+                }
                 Ok(_) => {
                     note =
                         format!(". It is usable once you allow hosts or commands: ms rules {name}")
@@ -1343,7 +1350,11 @@ impl Daemon {
         }
         // No proxy rebuild: the proxy's session resolver returns no session while stopped, so
         // the next request is refused without the listener going away.
-        let mut message = "morsec stopped: every agent request is now refused. Resume from your own terminal with: ms start (needs Touch ID)".to_owned();
+        let mut message = if target.starts_with("dashboard") {
+            "morsec stopped: every agent request is now refused. Start it again with Start (Touch ID)".to_owned()
+        } else {
+            "morsec stopped: every agent request is now refused. Resume from your own terminal with: ms start (needs Touch ID)".to_owned()
+        };
         if let Err(e) = self.persist_state(true) {
             tracing::error!(error = %e, "could not persist the stop flag");
             self.alert(
@@ -3383,10 +3394,13 @@ mod tests {
         assert!(words.contains(&"needs a command") && words.contains(&"needs a website"));
         assert!(home.warnings.len() >= home.alerts.len().min(1));
         for a in &home.agents {
-            assert!(
-                a.command == format!("ms connect {}", a.id)
-                    || a.command == format!("ms disconnect {}", a.id)
-            );
+            // No connect command for an agent that isn't installed (review Q17).
+            match &a.command {
+                None => assert!(!a.installed && !a.connected),
+                Some(c) => assert!(
+                    *c == format!("ms connect {}", a.id) || *c == format!("ms disconnect {}", a.id)
+                ),
+            }
         }
 
         let ps = h.d.dash_projects_view().unwrap();

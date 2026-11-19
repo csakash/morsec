@@ -11,6 +11,8 @@ use objc2_foundation::NSString;
 
 use super::PasteboardApi;
 
+// SAFETY: an empty extern block declares no symbols; it only links AppKit so that
+// `NSPasteboard` and `NSPasteboardItem` exist for the class lookups below.
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {}
 
@@ -57,38 +59,53 @@ impl PasteboardApi for General {
         })
     }
 
-    fn set_string(&self, value: &str, kind: &str) -> Result<(), String> {
+    fn write_item(&self, value: &str, kind: &str, markers: &[&str]) -> Result<(), String> {
         autoreleasepool(|_| {
             let pb = general()?;
-            let (v, t) = (ns(value), ns(kind));
-            // SAFETY: `setString:forType:` takes two live NSStrings and returns BOOL. The
-            // NSString holding the value is released when `v` drops, right after.
-            let ok: bool = unsafe { msg_send![&*pb, setString: &*v, forType: &*t] };
-            drop(v);
-            if ok {
-                Ok(())
-            } else {
-                Err("the pasteboard refused the text".into())
-            }
-        })
-    }
-
-    fn set_empty_data(&self, kind: &str) -> Result<(), String> {
-        autoreleasepool(|_| {
-            let pb = general()?;
-            let Some(cls) = AnyClass::get(c"NSData") else {
-                return Err("NSData is not available".into());
+            let (Some(item_cls), Some(data_cls), Some(array_cls)) = (
+                AnyClass::get(c"NSPasteboardItem"),
+                AnyClass::get(c"NSData"),
+                AnyClass::get(c"NSArray"),
+            ) else {
+                return Err("AppKit's NSPasteboardItem is not available".into());
             };
+            // SAFETY: `+new` on NSPasteboardItem returns an owned, empty item.
+            let item: Option<Retained<AnyObject>> = unsafe { msg_send![item_cls, new] };
+            let item = item.ok_or("no NSPasteboardItem")?;
             // SAFETY: `+[NSData data]` returns an empty, autoreleased NSData; objc2 retains it.
-            let data: Option<Retained<AnyObject>> = unsafe { msg_send![cls, data] };
-            let data = data.ok_or("no NSData")?;
-            let t = ns(kind);
-            // SAFETY: `setData:forType:` takes a live NSData and NSString and returns BOOL.
-            let ok: bool = unsafe { msg_send![&*pb, setData: &*data, forType: &*t] };
+            let empty: Option<Retained<AnyObject>> = unsafe { msg_send![data_cls, data] };
+            let empty = empty.ok_or("no NSData")?;
+            // Every type is on the item before it reaches the pasteboard, so the text is never
+            // there without its markers (review N1).
+            for m in markers {
+                let t = ns(m);
+                // SAFETY: `setData:forType:` on a live item with a live NSData and NSString;
+                // returns BOOL.
+                let ok: bool = unsafe { msg_send![&*item, setData: &*empty, forType: &*t] };
+                if !ok {
+                    return Err(format!("the pasteboard item refused the {m} marker"));
+                }
+            }
+            let (v, t) = (ns(value), ns(kind));
+            // SAFETY: `setString:forType:` on a live item with two live NSStrings; returns BOOL.
+            // The NSString holding the value is released when `v` drops, right after.
+            let ok: bool = unsafe { msg_send![&*item, setString: &*v, forType: &*t] };
+            drop(v);
+            if !ok {
+                return Err("the pasteboard item refused the text".into());
+            }
+            // SAFETY: `+arrayWithObject:` with a live object returns an autoreleased NSArray;
+            // objc2 retains it.
+            let arr: Option<Retained<AnyObject>> =
+                unsafe { msg_send![array_cls, arrayWithObject: &*item] };
+            let arr = arr.ok_or("no NSArray")?;
+            // SAFETY: `writeObjects:` on the live pasteboard with an array of one
+            // NSPasteboardItem (it conforms to NSPasteboardWriting); returns BOOL.
+            let ok: bool = unsafe { msg_send![&*pb, writeObjects: &*arr] };
             if ok {
                 Ok(())
             } else {
-                Err(format!("the pasteboard refused the {kind} marker"))
+                Err("the pasteboard refused the item".into())
             }
         })
     }

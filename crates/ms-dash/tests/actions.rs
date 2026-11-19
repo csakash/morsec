@@ -455,11 +455,11 @@ fn reveal_response_is_no_store() {
     assert_eq!(r.json()["code"], "not_text");
 }
 
-// protects=SPEC D-12, criterion 10, T-92: Copy's answer never holds the value: msd writes the
-// pasteboard itself and the browser gets a message; fails_when=the value appears in Copy's
-// answer; no_claim=msd's pasteboard writer (pasteboard.rs)
+// protects=SPEC D-12, criterion 10: the HTTP layer turns Copy's answer into {ok, message} and
+// adds nothing to it; fails_when=anything from the request reaches the answer; no_claim=msd's
+// own copy (msd dash_actions::copy_never_sends_value_to_browser runs it for real)
 #[test]
-fn copy_never_sends_value_to_browser() {
+fn copy_answer_holds_no_value() {
     let t = setup();
     let (port, cookie, csrf) = signed_in(&t);
     let r = post(port, &cookie, &csrf, "/api/keys/shop%2Fx/copy", "{}", &[]);
@@ -551,4 +551,36 @@ fn recheck_changes_nothing() {
     assert_eq!(*t.fake.calls.lock().unwrap(), ["recheck"]);
     assert!(t.fake.action_refusals.lock().unwrap().is_empty());
     assert!(t.fake.refused.lock().unwrap().is_empty());
+}
+
+// protects=L33 review N3: approving, starting, rule changes and the scan need
+// Sec-Fetch-Site: same-origin too, like the value and destructive routes; read-only and
+// refusing actions don't; fails_when=one of them accepts a request without it;
+// no_claim=-
+#[test]
+fn approving_actions_need_fetch_site() {
+    for a in [
+        Action::Approve,
+        Action::Start,
+        Action::Rules,
+        Action::ScanRun,
+        Action::Show,
+        Action::Copy,
+        Action::Replace,
+        Action::AddKey,
+        Action::Delete,
+        Action::UndoKey,
+        Action::UndoProject,
+    ] {
+        assert!(a.sensitive(), "{a:?}");
+    }
+    for a in [
+        Action::Stop,
+        Action::Deny,
+        Action::Dismiss,
+        Action::Recheck,
+        Action::CheckPath,
+    ] {
+        assert!(!a.sensitive(), "{a:?}");
+    }
 }

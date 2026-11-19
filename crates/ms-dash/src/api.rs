@@ -76,6 +76,15 @@ pub struct FixView {
 pub struct PendingView {
     /// The id a decision must name.
     pub id: String,
+    /// What it asks, in plain words, first (review Q1).
+    pub summary: String,
+    /// It comes from an agent session (otherwise from a process outside one, named in
+    /// `requester`).
+    pub from_agent: bool,
+    /// Who asked when it is not an agent session: program and PID (review S4).
+    pub requester: Option<String>,
+    /// It changes morsec itself, so it can be approved once only (review S2).
+    pub once_only: bool,
     /// Agent label.
     pub agent: String,
     /// Key.
@@ -248,8 +257,11 @@ pub struct SecretView {
     pub hosts: Vec<String>,
     /// Git hosts (Basic password).
     pub git_hosts: Vec<String>,
-    /// Run commands, each as its words joined by spaces.
+    /// Run commands, each as its words joined by spaces (for display).
     pub commands: Vec<String>,
+    /// The same commands as their exact words, which the page sends back to remove one
+    /// (review R1).
+    pub command_words: Vec<Vec<String>>,
     /// Run roots.
     pub roots: Vec<String>,
     /// Run environment variable names.
@@ -382,8 +394,9 @@ pub struct AgentView {
     pub blocked: u64,
     /// Its last receipt, Unix ms.
     pub last_seen_unix_ms: Option<u64>,
-    /// `ms connect <id>` or `ms disconnect <id>`, for the page to copy (SPEC D-16).
-    pub command: String,
+    /// `ms connect <id>` or `ms disconnect <id>`, for the page to copy (SPEC D-16); none while
+    /// the agent is not installed.
+    pub command: Option<String>,
 }
 
 /// One check.

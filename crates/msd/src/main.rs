@@ -529,6 +529,8 @@ async fn serve(args: Args) -> ExitCode {
             shutdown_signal(),
         )
         .await;
+    // A copy still within its 30 s leaves the pasteboard with msd (review N4).
+    pasteboard::clear_pending_now();
     if let Some(dash) = d.dash() {
         dash.shutdown();
     }

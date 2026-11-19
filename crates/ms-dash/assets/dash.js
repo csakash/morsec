@@ -45,11 +45,31 @@
   }
   function enc(s) { return encodeURIComponent(String(s)); }
   function mono(s) { return txt('span', 'mono', s); }
-  function ref(key) { return link('/secret/' + enc(key), key, 'ref'); }
+  // Text that may break only after a "/" (refs, paths): wide tables never split a word.
+  function slashed(node, s) {
+    const parts = String(s).split('/');
+    parts.forEach(function (p, i) {
+      node.appendChild(document.createTextNode(p + (i < parts.length - 1 ? '/' : '')));
+      if (i < parts.length - 1) node.appendChild(document.createElement('wbr'));
+    });
+    return node;
+  }
+  function ref(key) {
+    const a = slashed(document.createElement('a'), key);
+    a.className = 'ref';
+    a.setAttribute('href', '#/secret/' + enc(key));
+    return a;
+  }
+  function pathText(s, cls) { return slashed(txt('span', cls || 'mono', ''), s); }
   function cmd(s) { return txt('code', 'cmd', s); }
   function num(n) { return Number(n || 0).toLocaleString(); }
   function plural(n, one, many) { return num(n) + ' ' + (Number(n) === 1 ? one : many); }
-  function announce(msg) { live.textContent = msg; }
+  let liveTimer = null;
+  function announce(msg) {
+    live.textContent = msg;
+    clearTimeout(liveTimer);
+    liveTimer = setTimeout(function () { live.textContent = ''; }, 6000);
+  }
   function after(ms, f) { const t = setTimeout(f, ms); timers.push(t); return t; }
 
   // Buttons are type=button and at least 44 px (CSS).
@@ -242,20 +262,11 @@
     if (!r.ok) throw new Error((body && body.error) || ('error ' + r.status));
     return body;
   }
-  // What each action error code means, and what to do (SPEC D-23).
-  const NEXT = {
-    touch_id_failed: 'Nothing was done. Try again and confirm with Touch ID on this Mac.',
-    busy: 'Answer the request on Home first, or wait for the scan to finish.',
-    stopped: 'morsec is stopped. Start it (top right), then try again.',
-    referenced: 'A project file still uses this key.',
-    rate_limited: 'Wait a little, then try again.',
-    not_text: '',
-    invalid: '',
-    gone: 'It changed meanwhile. The screen was refreshed.',
-    refused: '',
-    unavailable: '',
-    internal: 'Run ms doctor in Terminal to see what is wrong.',
-  };
+  // msd's messages already say what to do next; the page shows them once, capitalised (Q6).
+  function sentence(m) {
+    const t = String(m || '').replace(/^morsec: /, '').trim();
+    return t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
+  }
   class ActionFailed extends Error {
     constructor(message, code) { super(message); this.code = code; }
   }
@@ -268,9 +279,7 @@
     if (r.status === 403 && out && /CSRF/.test(String(out.error))) throw new SignedOut('another tab');
     if (!r.ok) {
       const code = out && out.code ? String(out.code) : '';
-      const msg = (out && out.error ? String(out.error).replace(/^morsec: /, '') : 'error ' + r.status);
-      const next = Object.prototype.hasOwnProperty.call(NEXT, code) ? NEXT[code] : '';
-      throw new ActionFailed(next ? msg + '. ' + next : msg, code);
+      throw new ActionFailed(sentence(out && out.error ? out.error : 'Error ' + r.status), code);
     }
     return out;
   }
@@ -292,22 +301,23 @@
   // Runs an action that may raise Touch ID: the screen's buttons are disabled and the page says
   // where to confirm until msd answers (SPEC D-19). `out` shows the result under the control.
   async function run(out, touchId, f) {
-    const buttons = Array.from(document.querySelectorAll('main button, #state button'));
+    const buttons = Array.from(document.querySelectorAll('main button'));
     for (const b of buttons) b.disabled = true;
     out.className = touchId ? 'waiting' : 'muted';
     out.textContent = touchId ? 'Confirm with Touch ID on this Mac…' : 'Working…';
     if (touchId) announce('Confirm with Touch ID on this Mac.');
     try {
       const r = await f();
-      out.className = 'signal';
-      out.textContent = r && r.message ? r.message : 'Done.';
+      out.className = 'signal result';
+      out.textContent = r && r.message ? sentence(r.message) : 'Done.';
       announce(out.textContent);
       return r;
     } catch (e) {
       if (e instanceof SignedOut) { signedOut(e.message); return null; }
-      out.className = 'err';
-      out.textContent = e && e.message ? e.message : 'Something went wrong.';
+      out.className = 'err result';
+      out.textContent = e && e.message ? sentence(e.message) : 'Something went wrong.';
       announce(out.textContent);
+      out.dataset.code = e && e.code ? e.code : '';
       if (e && e.code === 'gone') after(1500, render);
       return null;
     } finally {
@@ -325,7 +335,7 @@
     }
   }
   function confirmStop() {
-    const msg = txt('span', 'word', 'Stop every agent’s access now?');
+    const msg = txt('span', 'ask', 'Stop every agent’s access now?');
     const yes = btn('Stop', 'sm danger', async function () {
       yes.disabled = true;
       try {
@@ -365,8 +375,18 @@
   }
 
   // ---- warnings and the waiting request (SPEC D-10, D-11) -------------------------------------
+  // "Checked just now · 3 checks fine, 1 needs you" after a Re-check (review Q8).
+  function recheckMessage(r) {
+    const v = r && r.agents ? r.agents : { checks: [], warnings: [] };
+    const fine = v.checks.filter(function (c) { return c.ok; }).length;
+    const bad = v.checks.length - fine + v.warnings.length;
+    return 'Checked just now · ' + plural(fine, 'check', 'checks') + ' fine' + (bad ? ', ' + num(bad) + ' still need' + (bad === 1 ? 's' : '') + ' you' : '');
+  }
+
+  // A warning: red only when something is blocked or failing; informational ones are quiet.
+  // The fix is the primary button, Dismiss a quiet one after it (review Q12).
   function warningBox(w) {
-    const b = el('div', 'box warn');
+    const b = el('div', w.dismiss ? 'box' : 'box warn');
     b.appendChild(txt('h3', null, w.title));
     if (w.detail) b.appendChild(txt('p', null, w.detail));
     const out = txt('p', 'muted', '');
@@ -374,36 +394,43 @@
     for (const f of w.fix) {
       if (f.action && f.label) {
         const route = f.action;
-        acts.appendChild(btn(f.label, null, function () {
-          run(out, false, function () { return act(route); }).then(function (r) { if (r) after(800, render); });
+        acts.appendChild(btn(f.label, 'solid', function () {
+          run(out, false, async function () {
+            const r = await act(route);
+            return { message: route === '/api/agents/recheck' ? recheckMessage(r) : r.message };
+          }).then(function (r) { if (r) after(2500, render); });
         }));
       }
     }
+    for (const f of w.fix) if (f.command) b.appendChild(copyline(f.command, 'Run it in Terminal.'));
     if (w.dismiss) {
-      acts.appendChild(btn('Dismiss', null, function () {
+      acts.appendChild(btn('Dismiss', 'quiet', function () {
         run(out, false, function () { return act('/api/warnings/' + enc(w.id) + '/dismiss'); }).then(function (r) { if (r) render(); });
       }));
     }
     if (acts.childNodes.length) b.appendChild(acts);
-    for (const f of w.fix) if (f.command) b.appendChild(copyline(f.command, 'Run it in Terminal.'));
     b.appendChild(out);
     return b;
   }
 
+  // The request waiting for the person: what it asks in plain words first, the exact command
+  // folded away, empty fields left out (review Q1). Who asked is named when it is not an agent
+  // session (review S4); morsec's own actions are approved once only (review S2).
   function pendingCard(p) {
-    const b = el('div', 'box warn');
-    b.appendChild(txt('h3', null, 'An agent is waiting for you'));
-    b.appendChild(kv([
-      ['Agent', p.agent],
-      ['Key', ref(p.key)],
-      ['Tier', p.tier],
-      ['Folder', p.cwd ? mono(p.cwd) : txt('span', 'muted', 'none')],
-      ['What it does', p.effect ? mono(p.effect) : txt('span', 'muted', 'no preview')],
-    ]));
-    b.appendChild(txt('p', 'lbl', 'The command, exactly (' + plural(p.command.length, 'argument', 'arguments') + ')'));
+    const b = el('div', 'box focus');
+    b.appendChild(txt('h3', null, p.from_agent ? p.agent + ' is waiting for you' : 'A request is waiting for you'));
+    b.appendChild(txt('p', 'summary', p.summary));
+    const facts = [['Key', ref(p.key)], ['Tier', p.tier]];
+    if (!p.from_agent && p.requester) facts.push(['Asked by', txt('span', null, p.requester)]);
+    if (p.cwd) facts.push(['Folder', pathText(p.cwd)]);
+    if (p.effect) facts.push(['What it does', txt('span', null, p.effect)]);
+    b.appendChild(kv(facts));
+    const d = el('details', null);
+    d.appendChild(txt('summary', null, 'The exact request (' + plural(p.command.length, 'part', 'parts') + ')'));
     const ol = el('ol', 'argv');
     p.command.forEach(function (a, i) { ol.appendChild(txt('li', null, '[' + i + '] ' + a)); });
-    b.appendChild(ol);
+    d.appendChild(ol);
+    b.appendChild(d);
     const left = txt('p', 'muted count', '');
     const tick = function () {
       const s = Math.max(0, Math.round((p.expires_unix_ms - Date.now()) / 1000));
@@ -411,18 +438,21 @@
       if (s > 0) after(1000, tick);
     };
     tick();
-    b.appendChild(left);
     const out = txt('p', 'muted', '');
     if (p.deciding) {
       b.appendChild(txt('p', 'waiting', 'Touch ID is up for this request on this Mac.'));
     } else {
       const id = p.id;
       const done = function (r) { if (r) after(800, render); };
-      b.appendChild(el('div', 'actions',
-        btn('Approve once', 'solid', function () { run(out, true, function () { return act('/api/approvals/' + enc(id) + '/approve', { scope: 'once' }); }).then(done); }),
-        btn('Approve for this session', null, function () { run(out, true, function () { return act('/api/approvals/' + enc(id) + '/approve', { scope: 'session' }); }).then(done); }),
-        btn('Deny', 'danger', function () { run(out, false, function () { return act('/api/approvals/' + enc(id) + '/deny'); }).then(done); })));
+      const acts = el('div', 'actions',
+        btn('Approve once', 'solid', function () { run(out, true, function () { return act('/api/approvals/' + enc(id) + '/approve', { scope: 'once' }); }).then(done); }));
+      if (!p.once_only) {
+        acts.appendChild(btn('Approve for this session', null, function () { run(out, true, function () { return act('/api/approvals/' + enc(id) + '/approve', { scope: 'session' }); }).then(done); }));
+      }
+      acts.appendChild(btn('Deny', 'danger', function () { run(out, false, function () { return act('/api/approvals/' + enc(id) + '/deny'); }).then(done); }));
+      b.appendChild(acts);
     }
+    b.appendChild(left);
     b.appendChild(out);
     return b;
   }
@@ -483,7 +513,6 @@
     }), 'No supported agent found.'));
     ag.appendChild(link('/agents', 'Agents and checks'));
     out.appendChild(ag);
-    out.appendChild(txt('p', 'muted section', 'msd ' + h.version + ' · vault: ' + h.vault + ' · ' + plural(h.keys, 'key', 'keys')));
     return out;
   }
 
@@ -505,7 +534,7 @@
         txt('p', null, c.project ? 'This folder is already the project “' + c.project + '”. Running it again re-scans it.' : 'Run this in Terminal to set it up:'),
         copyline(c.command));
     });
-    s.appendChild(el('div', 'fields', w, el('div', 'field', go)));
+    s.appendChild(el('div', 'fields', w, el('div', 'field act', go)));
     s.appendChild(out);
     return s;
   }
@@ -515,8 +544,8 @@
     s.appendChild(txt('p', 'muted', 'A new key allows nothing until you give it a website or a command on its screen.'));
     const [kw, key] = textField('Key name', 'key', 'For example shop/stripe-secret-key');
     const [vw, value] = secretField('Value (hidden)', 'value', 'Pasted here, sent to morsec, then cleared from this page');
-    const [mw, mode] = select('Used as', 'mode', [['swap', 'swap: sent to websites'], ['run', 'run: given to commands']], 'swap');
-    const [tw, tier] = select('Tier', 'tier', [['production', 'production: asks before each use'], ['test', 'test: never asks']], 'production');
+    const [mw, mode] = select('Used as', 'mode', [['swap', 'swap (websites)'], ['run', 'run (commands)']], 'swap');
+    const [tw, tier] = select('Tier', 'tier', [['production', 'production (asks each use)'], ['test', 'test (never asks)']], 'production');
     const out = txt('p', 'muted', '');
     const go = btn('Add key', 'solid', function () {
       const body = { key: key.value.trim(), value: value.value, mode: mode.value, tier: tier.value };
@@ -524,7 +553,7 @@
       run(out, false, function () { return act('/api/keys', body); }).then(function (r) { if (r) after(1200, render); });
       body.value = '';
     });
-    s.appendChild(el('div', 'fields', kw, vw, mw, tw, el('div', 'field', go)));
+    s.appendChild(el('div', 'fields', kw, vw, mw, tw, el('div', 'field act', go)));
     s.appendChild(out);
     return s;
   }
@@ -546,7 +575,7 @@
       for (const p of cards) {
         const c = el('div', 'card');
         c.appendChild(txt('h3', null, p.display));
-        c.appendChild(txt('p', 'root', p.root));
+        c.appendChild(el('p', null, pathText(p.root, 'root')));
         c.appendChild(txt('p', 'count', num(p.protected) + ' protected · ' + num(p.needs_website) + ' not usable yet'));
         const b = el('div', 'badges');
         if (p.findings) b.appendChild(badge(plural(p.findings, 'key in code', 'keys in code'), 'bad'));
@@ -575,7 +604,7 @@
 
   function undoResult(u) {
     const box = el('div', 'box');
-    box.appendChild(txt('h3', null, u.message));
+    box.appendChild(txt('h3', null, 'What changed'));
     if (u.restored.length) {
       box.appendChild(txt('p', 'lbl', 'Written back'));
       box.appendChild(list(u.restored.map(function (l) { return el('div', null, mono(l.file + ':' + l.line), ' ', mono(l.var)); }), ''));
@@ -595,7 +624,7 @@
     const hero = el('div', 'hero');
     hero.appendChild(txt('h1', null, p.display));
     hero.appendChild(txt('p', 'lead', plural(p.rows.length, 'secret', 'secrets') + ', ' + num(p.not_usable) + ' not usable yet'));
-    hero.appendChild(txt('p', 'root mono muted', p.root));
+    hero.appendChild(pathText(p.root, 'root mono muted'));
     out.appendChild(hero);
     if (p.stopped_early) {
       out.appendChild(txt('p', 'err section', 'The scan stopped after ' + num(p.scan_entries) + ' files, so some secrets may be missing. Set up a subfolder on its own.'));
@@ -607,13 +636,28 @@
     } else {
       sec.appendChild(table(['Variable', 'Key', 'Provider', 'Tier', 'Used as', 'Status', 'Last use', ''], p.rows.map(function (r) {
         const msg = txt('span', 'muted', '');
-        const undo = btn('Undo this one', 'sm', function () {
+        const cell = el('div', 'rowacts');
+        const doUndo = function () {
           run(msg, true, function () { return act('/api/projects/' + enc(p.slug) + '/undo', { key: r.key }); }).then(function (x) {
             if (x && x.undo) { result.replaceChildren(undoResult(x.undo)); after(2500, render); }
           });
+        };
+        // Undo is the quiet, second action, and asks first (review Q7).
+        const undo = txt('button', 'lnk', 'Undo');
+        undo.setAttribute('type', 'button');
+        undo.addEventListener('click', function () {
+          const yes = txt('button', 'lnk', 'Write the value back');
+          yes.setAttribute('type', 'button');
+          yes.addEventListener('click', doUndo);
+          const no = txt('button', 'lnk', 'Cancel');
+          no.setAttribute('type', 'button');
+          no.addEventListener('click', function () { cell.replaceChildren(open, undo, msg); });
+          cell.replaceChildren(open, yes, no, msg);
         });
-        return [mono(r.var + ' (' + r.file + ':' + r.line + ')'), ref(r.key), r.provider || '', r.tier || '', r.mode || '',
-          status(r.status), when(r.last_use_unix_ms), el('div', 'actions', link('/secret/' + enc(r.key), 'Open', 'btn sm'), undo, msg)];
+        const open = link('/secret/' + enc(r.key), 'Open');
+        cell.replaceChildren(open, undo, msg);
+        return [el('span', null, mono(r.var), txt('span', 'muted', ' ' + r.file + ':' + r.line)), ref(r.key), r.provider || '', r.tier || '', r.mode || '',
+          status(r.status), when(r.last_use_unix_ms), cell];
       }), true));
       const msg = txt('p', 'muted', '');
       const confirmBox = el('div', null);
@@ -658,7 +702,7 @@
     again.appendChild(txt('p', null, 'Re-scan the project after you add secrets or code. It runs in Terminal, where it reads your files.'));
     if (p.rescan_command) again.appendChild(copyline(p.rescan_command));
     if (p.hints.length) again.appendChild(el('p', 'muted', 'Agent hints in: ', mono(p.hints.join(', '))));
-    again.appendChild(kv([['Set up', when(p.created_unix_ms)], ['Last scan', num(p.scan_entries) + ' entries in ' + num(p.scan_ms) + ' ms']]));
+    again.appendChild(kv([['Set up', when(p.created_unix_ms)], ['Last scan', plural(p.scan_entries, 'file and folder', 'files and folders') + ' looked at']]));
     out.appendChild(again);
     return out;
   }
@@ -688,20 +732,23 @@
 
   function rulesSection(s) {
     const box = section('What it may do');
+    box.appendChild(txt('p', 'muted', 'Adding a website, a command or a folder, or making it a test key, asks for Touch ID. Taking one away does not.'));
     const out = txt('p', 'muted', '');
     const edit = function (e) { return run(out, true, function () { return act('/api/keys/' + enc(s.key) + '/rules', { edit: e }); }).then(function (r) { if (r) after(900, render); }); };
-    const removable = function (items, kind, label) {
-      return list(items.map(function (x) {
+    // `items` are what is shown; `values` what goes back to msd: for commands, their exact
+    // words from the view, never the display string split again (review R1).
+    const removable = function (items, kind, label, values) {
+      return list(items.map(function (x, i) {
         return el('div', 'row', mono(x), btn('Remove', 'sm', function () {
           const e = {};
-          e[kind] = kind === 'remove_command' ? { words: x.split(' ') } : x;
+          e[kind] = kind === 'remove_command' ? { words: values[i] } : x;
           edit(e);
         }));
       }), 'None yet.' + (label ? ' ' + label : ''));
     };
     if (s.mode === 'run') {
       box.appendChild(txt('h3', null, 'Commands'));
-      box.appendChild(removable(s.commands, 'remove_command', 'It is not usable until it has one.'));
+      box.appendChild(removable(s.commands, 'remove_command', 'It is not usable until it has one.', s.command_words));
       const [cw, c] = textField('Add a command', 'command', 'One word per space, for example psql -c * . A word with a space or a quote needs ms rules ' + s.key + ' --add-command \'["…"]\' in Terminal.');
       const chips = el('div', 'chips');
       c.addEventListener('input', function () {
@@ -709,21 +756,21 @@
         for (const w of c.value.split(' ').filter(Boolean)) chips.appendChild(txt('span', null, w));
       });
       cw.appendChild(chips);
-      box.appendChild(el('div', 'fields', cw, el('div', 'field', btn('Add command', null, function () {
+      box.appendChild(el('div', 'fields', cw, el('div', 'field act', btn('Add command', null, function () {
         const words = c.value.split(' ').filter(Boolean);
         if (words.length) edit({ add_command: { words: words } });
       }))));
       box.appendChild(txt('h3', 'section', 'Folders'));
       box.appendChild(removable(s.roots, 'remove_folder', ''));
       const [fw, f] = textField('Add a folder', 'folder', 'Its commands run only inside it, for example /Users/you/code/shop');
-      box.appendChild(el('div', 'fields', fw, el('div', 'field', btn('Add folder', null, function () {
+      box.appendChild(el('div', 'fields', fw, el('div', 'field act', btn('Add folder', null, function () {
         if (f.value.trim()) edit({ add_folder: f.value.trim() });
       }))));
     } else {
       box.appendChild(txt('h3', null, 'Websites'));
       box.appendChild(removable(s.hosts, 'remove_host', 'It is not usable until it has one.'));
       const [hw, h] = textField('Add a website', 'host', 'A host name: api.example.com, or *.example.com for every subdomain');
-      box.appendChild(el('div', 'fields', hw, el('div', 'field', btn('Add website', null, function () {
+      box.appendChild(el('div', 'fields', hw, el('div', 'field act', btn('Add website', null, function () {
         if (h.value.trim()) edit({ add_host: h.value.trim() });
       }))));
     }
@@ -732,7 +779,6 @@
     box.appendChild(el('div', 'actions', s.tier === 'test'
       ? btn('Make it production (always ask)', null, function () { edit({ set_tier: 'production' }); })
       : btn('Make it test (never ask)', null, function () { edit({ set_tier: 'test' }); })));
-    box.appendChild(txt('p', 'muted', 'Adding a website, a command or a folder, or making it test, needs Touch ID. Taking one away does not.'));
     const ro = [];
     if (s.git_hosts.length) ro.push(['Git hosts', mono(s.git_hosts.join(', '))]);
     if (s.env.length) ro.push(['Variables', mono(s.env.join(', '))]);
@@ -751,9 +797,15 @@
     if (s.used_in.length) { crumbs.appendChild(txt('span', 'muted', ' / ')); crumbs.appendChild(link('/project/' + enc(s.used_in[0].project), s.used_in[0].project)); }
     out.appendChild(crumbs);
     const hero = el('div', 'hero');
-    const h1 = txt('h1', 'ref', s.key);
+    const h1 = slashed(txt('h1', 'mono keyname', ''), s.key);
     hero.appendChild(h1);
     hero.appendChild(el('p', 'lead', status(s.status)));
+    hero.appendChild(kv([
+      ['Provider', s.provider || 'unknown'],
+      ['Tier', s.tier || 'no rule'],
+      ['Used as', s.mode || 'no rule'],
+      ['Added', when(s.created_unix_ms)],
+    ]));
     out.appendChild(hero);
 
     // The value: hidden until Show (Touch ID), cleared after 15 s.
@@ -764,6 +816,7 @@
     const out2 = txt('p', 'muted', '');
     const hide = btn('Hide', null, hideValue);
     hide.hidden = true;
+    vs.appendChild(txt('p', 'muted', 'Show and Copy ask for Touch ID on this Mac every time. A shown value hides after 15 seconds; a copied one leaves the clipboard after 30.'));
     vs.appendChild(box);
     vs.appendChild(note);
     if (s.stored) {
@@ -788,9 +841,9 @@
         hide));
       vs.appendChild(out2);
       // Replace: a hidden field outside any form, cleared as soon as it is sent.
-      const [rw, rv] = secretField('New value (hidden)', 'value', 'The old value stays in use if storing the new one fails');
+      const [rw, rv] = secretField('New value (hidden)', 'value', 'Touch ID. The old value stays in use if storing the new one fails');
       const rout = txt('p', 'muted', '');
-      vs.appendChild(el('div', 'fields', rw, el('div', 'field', btn('Replace', null, function () {
+      vs.appendChild(el('div', 'fields', rw, el('div', 'field act', btn('Replace', null, function () {
         const body = { value: rv.value };
         rv.value = '';
         if (!body.value) { rout.className = 'err'; rout.textContent = 'Type the new value first.'; return; }
@@ -800,13 +853,6 @@
       vs.appendChild(rout);
     }
     out.appendChild(vs);
-
-    out.appendChild(kv([
-      ['Provider', s.provider || 'unknown'],
-      ['Tier', s.tier || 'no rule'],
-      ['Used as', s.mode || 'no rule'],
-      ['Added', when(s.created_unix_ms)],
-    ]));
     if (s.mode) out.appendChild(rulesSection(s));
 
     const used = section('Where it is used');
@@ -834,29 +880,35 @@
       const dout = txt('p', 'muted', '');
       const extra = el('div', null);
       const doDelete = function (force) {
-        if (d.value.trim() !== last) { dout.className = 'err'; dout.textContent = 'Type ' + last + ' first.'; return; }
+        if (d.value.trim().toLowerCase() !== last.toLowerCase()) { dout.className = 'err'; dout.textContent = 'Type ' + last + ' first.'; return; }
         run(dout, true, function () { return act('/api/keys/' + enc(s.key) + '/delete', { force: force }); }).then(function (r) {
           if (r) { after(1200, function () { location.hash = '#/projects'; }); return; }
-          if (!force && /refer/.test(dout.textContent)) extra.replaceChildren(btn('Delete anyway', 'danger', function () { doDelete(true); }));
+          if (!force && dout.dataset.code === 'referenced') extra.replaceChildren(btn('Delete anyway', 'danger', function () { doDelete(true); }));
         });
       };
-      del.appendChild(el('div', 'fields', dw, el('div', 'field', btn('Delete key', 'danger', function () { doDelete(false); }))));
+      del.appendChild(el('div', 'fields', dw, el('div', 'field act', btn('Delete key', 'danger', function () { doDelete(false); }))));
       del.appendChild(extra);
       del.appendChild(dout);
       out.appendChild(del);
     }
 
     const uses = section('Last 20 uses');
-    uses.appendChild(activityTable(s.uses));
+    uses.appendChild(activityTable(s.uses, true));
     out.appendChild(uses);
     return out;
   }
 
-  function activityTable(rows) {
+  // `oneKey`: the Secret screen's table, where every row is this key (no Key column: Q11).
+  function activityTable(rows, oneKey) {
     if (!rows.length) return txt('p', 'muted', 'Nothing recorded.');
+    const what = function (r) { return mono((r.mechanism ? r.mechanism + ' · ' : '') + r.target); };
+    if (oneKey) {
+      return table(['When', 'Agent', 'What', 'Result'], rows.map(function (r) {
+        return [when(r.time_unix_ms), agentCell(r.agent, r.pid), what(r), result(r.result, r.reason)];
+      }), true);
+    }
     return table(['When', 'Agent', 'Key', 'What', 'Result'], rows.map(function (r) {
-      return [when(r.time_unix_ms), agentCell(r.agent, r.pid), r.key ? ref(r.key) : '',
-        mono((r.mechanism ? r.mechanism + ' · ' : '') + r.target), result(r.result, r.reason)];
+      return [when(r.time_unix_ms), agentCell(r.agent, r.pid), r.key ? ref(r.key) : '', what(r), result(r.result, r.reason)];
     }), true);
   }
 
@@ -881,7 +933,7 @@
       const parts = FILTERS.map(function (k) { return k + '=' + enc(n[k]); });
       location.hash = '#/activity?' + parts.join('&');
     });
-    out.appendChild(el('div', 'fields', sw, pw, kw, aw, rw, el('div', 'field', apply)));
+    out.appendChild(el('div', 'fields', sw, pw, kw, aw, rw, el('div', 'field act', apply)));
     const verdict = txt('p', 'muted', '');
     out.appendChild(el('div', 'actions',
       btn('Verify the chain', null, async function () {
@@ -923,7 +975,8 @@
       c.appendChild(txt('p', 'muted', a.connected
         ? 'Disconnecting removes its sandbox and proxy settings; you confirm the change in Terminal.'
         : 'Connecting edits its settings; Terminal shows the change and asks first.'));
-      c.appendChild(copyline(a.command, 'then press Re-check'));
+      if (a.command) c.appendChild(copyline(a.command, 'then press Re-check'));
+      else c.appendChild(txt('p', 'muted', 'Install ' + a.name + ' first; then it can be connected here.'));
       g.appendChild(c);
     }
     out.appendChild(g);
@@ -952,7 +1005,10 @@
     const msg = txt('p', 'muted', '');
     const body = el('div', null, agentsBody(v));
     out.appendChild(el('div', 'actions section', btn('Re-check', 'solid', function () {
-      run(msg, false, function () { return act('/api/agents/recheck'); }).then(function (r) {
+      run(msg, false, async function () {
+        const r = await act('/api/agents/recheck');
+        return { message: recheckMessage(r), agents: r.agents };
+      }).then(function (r) {
         if (r && r.agents) body.replaceChildren(agentsBody(r.agents));
       });
     })));
@@ -1046,6 +1102,7 @@
   let seq = 0;
   async function render() {
     hideValue();
+    live.textContent = '';
     for (const t of timers) clearTimeout(t);
     timers = [];
     const [name, arg, q] = parseHash();
