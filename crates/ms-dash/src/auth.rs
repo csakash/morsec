@@ -20,6 +20,8 @@ pub const SESSION_TTL: Duration = Duration::from_secs(43_200);
 pub const REFUSALS_PER_MINUTE: u32 = 30;
 /// Sessions the refusal throttle remembers.
 const THROTTLE_SESSIONS: usize = 1024;
+/// CSRF tokens one session keeps: one per page that signed in with its cookie (review R1).
+pub const CSRF_PER_SESSION: usize = 4;
 
 /// A fresh token: 32 random bytes, hex.
 pub fn new_token() -> std::io::Result<String> {
@@ -73,7 +75,8 @@ impl Bucket {
 /// One signed-in page.
 #[derive(Debug)]
 struct Session {
-    csrf: String,
+    /// Newest last; a page holds one of them.
+    csrf: Vec<String>,
     created: Instant,
     bucket: Bucket,
 }
@@ -134,8 +137,25 @@ impl Auth {
         matches!(self.launch.remove(&digest(token)), Some(exp) if exp > now)
     }
 
-    /// Starts a session: (cookie value, CSRF token).
-    pub fn start_session(&mut self, now: Instant) -> std::io::Result<(String, String)> {
+    /// Starts a session, or joins `existing` when that cookie names a live one (a second
+    /// `ms dashboard` in the same browser: cookies are not port-scoped, so a new cookie would
+    /// sign the first tab out; review R1). Returns (cookie value, a new CSRF token).
+    pub fn start_session(
+        &mut self,
+        now: Instant,
+        existing: Option<&str>,
+    ) -> std::io::Result<(String, String)> {
+        if let Some(c) = existing.filter(|c| c.len() == 64)
+            && let Some(s) = self.sessions.get_mut(&digest(c))
+            && now.saturating_duration_since(s.created) < SESSION_TTL
+        {
+            let csrf = new_token()?;
+            s.csrf.push(csrf.clone());
+            if s.csrf.len() > CSRF_PER_SESSION {
+                s.csrf.remove(0);
+            }
+            return Ok((c.to_owned(), csrf));
+        }
         self.sessions
             .retain(|_, s| now.saturating_duration_since(s.created) < SESSION_TTL);
         while self.sessions.len() >= MAX_SESSIONS {
@@ -153,7 +173,7 @@ impl Auth {
         self.sessions.insert(
             digest(&cookie),
             Session {
-                csrf: csrf.clone(),
+                csrf: vec![csrf.clone()],
                 created: now,
                 bucket: Bucket::new(self.rate),
             },
@@ -173,7 +193,13 @@ impl Auth {
             self.sessions.remove(&digest(cookie));
             return Access::NoSession;
         }
-        if !csrf.is_some_and(|c| ct_eq(c.as_bytes(), s.csrf.as_bytes())) {
+        // Every stored token is compared, so the time taken doesn't say which one matched.
+        let ok = csrf.is_some_and(|c| {
+            s.csrf
+                .iter()
+                .fold(false, |hit, t| ct_eq(c.as_bytes(), t.as_bytes()) | hit)
+        });
+        if !ok {
             return Access::BadCsrf;
         }
         if !s.bucket.take(now) {
@@ -200,15 +226,30 @@ impl Auth {
     }
 }
 
-/// At most [`REFUSALS_PER_MINUTE`] refusal receipts per session per minute.
+/// At most [`REFUSALS_PER_MINUTE`] refusal receipts per agent session per minute, and as many
+/// for every caller outside an agent session together (security review S3: such callers are
+/// keyed by PID, which a looping process changes at will).
 #[derive(Debug, Default)]
 pub struct Throttle {
     seen: HashMap<SessionId, (Instant, u32)>,
 }
 
+/// The key all non-agent refusals share.
+fn family(s: &SessionId) -> SessionId {
+    match &s.agent {
+        ms_core::AgentKind::Other(_) => SessionId {
+            agent: ms_core::AgentKind::Other("dashboard".into()),
+            pid: 0,
+            started_unix_ms: 0,
+        },
+        _ => s.clone(),
+    }
+}
+
 impl Throttle {
     /// True when this refusal should get a receipt.
     pub fn allow(&mut self, s: &SessionId, now: Instant) -> bool {
+        let s = &family(s);
         if self.seen.len() >= THROTTLE_SESSIONS && !self.seen.contains_key(s) {
             self.seen
                 .retain(|_, (t, _)| now.saturating_duration_since(*t) < Duration::from_secs(60));
@@ -225,6 +266,42 @@ impl Throttle {
         }
         e.1 += 1;
         true
+    }
+}
+
+/// Log lines for refusals: the first per key per minute, then one count of the rest when the
+/// next minute's first arrives (review R3: msd's log is not rotated).
+#[derive(Debug, Default)]
+pub struct RateLog {
+    seen: HashMap<String, (Instant, u64)>,
+}
+
+impl RateLog {
+    /// `Some(suppressed since the last line)` when a line should be written now.
+    pub fn allow(&mut self, key: &str, now: Instant) -> Option<u64> {
+        if self.seen.len() >= THROTTLE_SESSIONS && !self.seen.contains_key(key) {
+            self.seen
+                .retain(|_, (t, _)| now.saturating_duration_since(*t) < Duration::from_secs(60));
+            if self.seen.len() >= THROTTLE_SESSIONS {
+                return None;
+            }
+        }
+        match self.seen.get_mut(key) {
+            Some((t, n)) if now.saturating_duration_since(*t) < Duration::from_secs(60) => {
+                *n += 1;
+                None
+            }
+            Some((t, n)) => {
+                let quiet = *n;
+                *t = now;
+                *n = 0;
+                Some(quiet)
+            }
+            None => {
+                self.seen.insert(key.to_owned(), (now, 0));
+                Some(0)
+            }
+        }
     }
 }
 
@@ -257,7 +334,7 @@ mod tests {
     fn sessions_csrf_and_rate() {
         let mut a = Auth::new(5);
         let now = Instant::now();
-        let (c, x) = a.start_session(now).unwrap();
+        let (c, x) = a.start_session(now, None).unwrap();
         assert_eq!(a.check(Some(&c), Some("nope"), now), Access::BadCsrf);
         assert_eq!(a.check(Some(&c), None, now), Access::BadCsrf);
         assert_eq!(a.check(Some(&x), Some(&x), now), Access::NoSession);
@@ -279,6 +356,45 @@ mod tests {
         assert_eq!(a.session_count(), 0);
     }
 
+    // protects=review R1: a second sign-in from the same browser joins the session and adds a
+    // CSRF token, so the first tab keeps working; an unknown cookie starts a new session;
+    // fails_when=the first tab's token stops matching after one more sign-in, or a stale cookie
+    // is joined; no_claim=-
+    #[test]
+    fn second_sign_in_joins_the_session() {
+        let mut a = Auth::new(50);
+        let now = Instant::now();
+        let (c, x1) = a.start_session(now, None).unwrap();
+        let (c2, x2) = a.start_session(now, Some(&c)).unwrap();
+        assert_eq!(c, c2);
+        assert_eq!(a.session_count(), 1);
+        assert_eq!(a.check(Some(&c), Some(&x1), now), Access::Ok);
+        assert_eq!(a.check(Some(&c), Some(&x2), now), Access::Ok);
+        for _ in 0..CSRF_PER_SESSION {
+            a.start_session(now, Some(&c)).unwrap();
+        }
+        assert_eq!(
+            a.check(Some(&c), Some(&x1), now),
+            Access::BadCsrf,
+            "oldest dropped"
+        );
+        let (c3, _) = a.start_session(now, Some(&"f".repeat(64))).unwrap();
+        assert_ne!(c3, c);
+        assert_eq!(a.session_count(), 2);
+    }
+
+    // protects=review R3: one log line per key per minute, then the count of what was skipped;
+    // fails_when=a looping caller writes a line per request; no_claim=-
+    #[test]
+    fn refusal_log_is_rate_limited() {
+        let mut l = RateLog::default();
+        let now = Instant::now();
+        assert_eq!(l.allow("k", now), Some(0));
+        assert!((0..50).all(|_| l.allow("k", now).is_none()));
+        assert_eq!(l.allow("other", now), Some(0));
+        assert_eq!(l.allow("k", now + Duration::from_secs(61)), Some(50));
+    }
+
     // protects=SPEC D-9, an agent looping requests can't write more than 30 refusal receipts a
     // minute per session; fails_when=the 31st in a minute is allowed, or the next minute is
     // still blocked; no_claim=the receipt itself (msd)
@@ -294,5 +410,19 @@ mod tests {
         let n = (0..100).filter(|_| t.allow(&s, now)).count();
         assert_eq!(n, REFUSALS_PER_MINUTE as usize);
         assert!(t.allow(&s, now + Duration::from_secs(61)));
+        // Callers outside agent sessions share one budget whatever their PID (review S3).
+        let n = (0..100u32)
+            .filter(|i| {
+                t.allow(
+                    &SessionId {
+                        agent: AgentKind::Other("dashboard".into()),
+                        pid: 1000 + i,
+                        started_unix_ms: 1,
+                    },
+                    now,
+                )
+            })
+            .count();
+        assert_eq!(n, REFUSALS_PER_MINUTE as usize);
     }
 }

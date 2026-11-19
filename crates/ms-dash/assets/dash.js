@@ -102,27 +102,31 @@
 
   // ---- API ----------------------------------------------------------------------------------
   class SignedOut extends Error {}
+  // A request that never got an answer: the listener closed (idle, or msd stopped).
+  async function send(path) {
+    try {
+      return await fetch(path, {
+        headers: { 'X-Morsec-CSRF': state.csrf || '' },
+        credentials: 'same-origin',
+        cache: 'no-store',
+        redirect: 'error',
+      });
+    } catch (e) {
+      throw new SignedOut('closed');
+    }
+  }
   async function api(path) {
-    const r = await fetch(path, {
-      headers: { 'X-Morsec-CSRF': state.csrf || '' },
-      credentials: 'same-origin',
-      cache: 'no-store',
-      redirect: 'error',
-    });
+    const r = await send(path);
     if (r.status === 401) throw new SignedOut('signed out');
     let body = null;
     try { body = await r.json(); } catch (e) { body = null; }
+    if (r.status === 403 && body && /CSRF/.test(String(body.error))) throw new SignedOut('another tab');
     if (!r.ok) throw new Error((body && body.error) || ('error ' + r.status));
     return body;
   }
   async function download(url, fallback) {
-    const r = await fetch(url, {
-      headers: { 'X-Morsec-CSRF': state.csrf || '' },
-      credentials: 'same-origin',
-      cache: 'no-store',
-      redirect: 'error',
-    });
-    if (r.status === 401) throw new SignedOut('signed out');
+    const r = await send(url);
+    if (r.status === 401 || r.status === 403) throw new SignedOut('signed out');
     if (!r.ok) throw new Error('export failed: ' + r.status);
     const blob = await r.blob();
     const href = URL.createObjectURL(blob);
@@ -330,7 +334,6 @@
   function field(label, control) { return el('label', null, label, control); }
 
   async function activity() {
-    const v = await api('/api/activity?' + query());
     const out = el('section', null);
     out.appendChild(txt('h1', null, 'Activity'));
     out.appendChild(txt('p', 'lead', 'Every use of a key, and every refusal, as msd recorded it.'));
@@ -375,8 +378,15 @@
     }
     out.appendChild(acts);
     out.appendChild(verdict);
-    out.appendChild(txt('p', 'muted', v.rows.length + ' shown of ' + v.matched + ' matching (' + v.total + ' in all)'));
-    out.appendChild(activityTable(v.rows));
+    // A bad filter shows its error under the form, which stays usable (review R2).
+    try {
+      const v = await api('/api/activity?' + query());
+      out.appendChild(txt('p', 'muted', v.rows.length + ' shown of ' + v.matched + ' matching (' + v.total + ' in all)'));
+      out.appendChild(activityTable(v.rows));
+    } catch (e) {
+      if (e instanceof SignedOut) throw e;
+      out.appendChild(txt('p', 'err', e && e.message ? e.message : 'The filter could not be applied.'));
+    }
     return out;
   }
 
@@ -451,7 +461,7 @@
   }
 
   function fail(e, where) {
-    if (e instanceof SignedOut) { signedOut(); return; }
+    if (e instanceof SignedOut) { signedOut(e.message); return; }
     const p = txt('p', 'err', e && e.message ? e.message : 'Something went wrong.');
     if (where) { where.textContent = p.textContent; where.className = 'err'; } else { main.replaceChildren(p); }
   }
@@ -473,11 +483,13 @@
     }
   }
 
-  function signedOut() {
+  function signedOut(why) {
     state.csrf = null;
     pill.textContent = '';
     const s = el('section', null);
     s.appendChild(txt('h1', null, 'Open the dashboard from your terminal.'));
+    if (why === 'closed') s.appendChild(txt('p', 'lead', 'The dashboard closed: it was idle for 30 minutes, or morsec stopped.'));
+    if (why === 'another tab') s.appendChild(txt('p', 'lead', 'It was opened again in another tab, which signed this one out.'));
     s.appendChild(el('p', 'lead', 'This page signs in with a one-time link that only works once and only for a minute. Run ', cmd('ms dashboard'), ' to get a new one.'));
     main.replaceChildren(s);
   }

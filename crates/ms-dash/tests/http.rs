@@ -369,8 +369,9 @@ fn dash_rejects_foreign_host_header() {
 
 // protects=design §6.2.4 and §8 (CSRF): a POST needs Origin equal to this dashboard and
 // Sec-Fetch-Site same-origin when sent; a cross-site GET is refused too; a refused POST does not
-// consume the launch token; fails_when=a missing, null or foreign Origin, or a cross-site or
-// same-site fetch, gets a session or data; no_claim=SameSite enforcement by browsers
+// consume the launch token; Origin refusals are recorded, Sec-Fetch-Site ones only logged;
+// fails_when=a missing, null or foreign Origin, or a cross-site or same-site fetch, gets a
+// session or data; no_claim=SameSite enforcement by browsers
 #[test]
 fn dash_rejects_cross_origin_post() {
     let t = setup(|_| {});
@@ -404,7 +405,13 @@ fn dash_rejects_cross_origin_post() {
         &format!("Cookie: {cookie}\r\nX-Morsec-CSRF: {csrf}\r\nSec-Fetch-Site: cross-site"),
     );
     assert_eq!(r.status, 403, "cross-site GET");
-    assert!(t.fake.refused.lock().unwrap().len() >= 7);
+    // Origin refusals get receipts; a browser's own cross-site fetch is only logged (review S4).
+    let refused = t.fake.refused.lock().unwrap();
+    assert_eq!(refused.len(), 4, "{refused:?}");
+    assert!(
+        refused.iter().all(|r| r.why.contains("Origin")),
+        "{refused:?}"
+    );
 }
 
 // protects=SPEC D-4 and criterion 6: every API request, GET included, needs the session cookie
@@ -530,8 +537,9 @@ fn body_limit_and_methods() {
     assert_eq!(r.status, 404, "no actions in L32: {r:?}");
 }
 
-// protects=design §6.2.6: 20 requests/s per session; fails_when=a burst of 40 all pass;
-// no_claim=exact refill timing
+// protects=design §6.2.6: 20 requests/s per session, and unauthenticated API requests share one
+// bucket too (review R3); fails_when=a burst of 40 all pass, or 40 cookie-less requests all get
+// 401; no_claim=exact refill timing
 #[test]
 fn rate_limited_per_session() {
     let t = setup(|_| {});
@@ -542,26 +550,47 @@ fn rate_limited_per_session() {
     let limited = codes.iter().filter(|c| **c == 429).count();
     assert!(limited > 0, "{codes:?}");
     assert!((20..40).contains(&ok), "{codes:?}");
-    assert!(
-        t.fake
-            .refused
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|r| r.why.contains("20 requests"))
-    );
+    let anon: Vec<u16> = (0..40).map(|_| get(port, "/api/home", "").status).collect();
+    assert!(anon.contains(&429) && anon.contains(&401), "{anon:?}");
+    // Rate refusals are logged (throttled), not receipts (review R3).
+    assert!(t.fake.refused.lock().unwrap().is_empty());
 }
 
-// protects=design §6.1: after `idle` without an authenticated request the listener and its
-// sessions close; DashOpen starts it again; fails_when=the port still answers or a session
-// survives; no_claim=the 30-minute value itself (DashConfig::new)
+// protects=design §6.1: after `idle` without an authenticated request the listener, its sessions
+// and its open keep-alive connections close; DashOpen starts it again; fails_when=the port or a
+// held connection still answers, or a session survives; no_claim=the 30-minute value itself
+// (DashConfig::new)
 #[test]
 fn dash_closes_when_idle() {
     assert_eq!(DashConfig::new(1).idle, Duration::from_secs(1800));
     let t = setup(|c| c.idle = Duration::from_millis(300));
     let (port, cookie, csrf) = signed_in(&t);
     assert_eq!(get(port, "/api/home", &auth(&cookie, &csrf)).status, 200);
+    // A keep-alive connection held open across the close is closed too (review R7).
+    let mut held = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    held.write_all(
+        format!(
+            "GET /api/home HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{}\r\n\r\n",
+            auth(&cookie, &csrf)
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut buf = [0u8; 4096];
+    let n = held.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
     std::thread::sleep(Duration::from_millis(900));
+    let mut rest = Vec::new();
+    let _ = held.read_to_end(&mut rest);
+    let after = held
+        .write_all(format!("GET /api/home HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes());
+    let mut more = [0u8; 64];
+    let got = held.read(&mut more).unwrap_or(0);
+    assert!(
+        after.is_err() || got == 0,
+        "the held connection still answers"
+    );
     assert_eq!(t.dash.port(), None);
     assert_eq!(t.dash.session_count(), 0);
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
@@ -641,4 +670,50 @@ fn api_views_round_trip() {
         Some("attachment; filename=\"rx.csv\"")
     );
     assert_eq!(get(port, "/api/nope", &a).status, 404);
+}
+
+// protects=review R1: opening the dashboard again in the same browser (a second launch token,
+// sent with the first tab's cookie) joins that session, so the first tab keeps working and no
+// receipt is written; fails_when=the first tab's CSRF token stops working or a refusal is
+// recorded; no_claim=-
+#[test]
+fn second_open_keeps_the_first_tab() {
+    let t = setup(|_| {});
+    let (port, cookie, csrf1) = signed_in(&t);
+    let o = t.dash.open().unwrap();
+    let r = post_session(
+        port,
+        &o.token,
+        &format!("{}\r\nCookie: ms_dash={cookie}", origin(port)),
+    );
+    assert_eq!(r.status, 200, "{r:?}");
+    let csrf2: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    let csrf2 = csrf2["csrf"].as_str().unwrap().to_owned();
+    assert_eq!(get(port, "/api/home", &auth(&cookie, &csrf1)).status, 200);
+    assert_eq!(get(port, "/api/home", &auth(&cookie, &csrf2)).status, 200);
+    assert_eq!(t.dash.session_count(), 1);
+    assert!(t.fake.refused.lock().unwrap().is_empty());
+}
+
+// protects=security review S2: a POST whose body never finishes is answered 408 after 5 s and
+// frees its connection; fails_when=it hangs; no_claim=-
+#[test]
+fn slow_body_times_out() {
+    let t = setup(|_| {});
+    let o = t.dash.open().unwrap();
+    let mut s = TcpStream::connect(("127.0.0.1", o.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(
+        format!(
+            "POST /api/session HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nOrigin: http://127.0.0.1:{p}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{\"to",
+            p = o.port
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 256];
+    let n = s.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 408"));
+    assert!(started.elapsed() < Duration::from_secs(8));
 }

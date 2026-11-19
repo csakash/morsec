@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, watch};
 
-use crate::auth::{Access, Auth, Throttle};
+use crate::auth::{Access, Auth, RateLog, Throttle};
 use crate::data::{DashData, Refusal};
 use crate::{DEFAULT_PORT, PORT_SPAN};
 
@@ -56,13 +56,45 @@ impl Default for DashConfig {
     }
 }
 
-/// What `DashOpen` returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What [`Dash::open`] gives msd. The token goes to the browser opener and nowhere else: never
+/// over IPC (SPEC D-12), never into a log (its `Debug` hides it).
+#[derive(Clone, PartialEq, Eq)]
 pub struct Opened {
     /// The port msd holds.
     pub port: u16,
     /// A single-use launch token (hex).
     pub token: String,
+}
+
+impl std::fmt::Debug for Opened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opened")
+            .field("port", &self.port)
+            .field("token", &"[hidden]")
+            .finish()
+    }
+}
+
+impl Opened {
+    /// The sign-in URL: the token only in the fragment, on 127.0.0.1 and this port. `view` must
+    /// already be checked ([`valid_view`]).
+    pub fn url(&self, view: Option<&str>) -> String {
+        match view {
+            Some(v) => format!("http://127.0.0.1:{}/#t={}&v={v}", self.port, self.token),
+            None => format!("http://127.0.0.1:{}/#t={}", self.port, self.token),
+        }
+    }
+}
+
+/// `project/<slug>` with a slug of `a-z0-9-` (64 bytes at most): the only view a URL may name.
+pub fn valid_view(v: &str) -> bool {
+    v.strip_prefix("project/").is_some_and(|slug| {
+        !slug.is_empty()
+            && slug.len() <= 64
+            && slug
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    })
 }
 
 struct Running {
@@ -75,6 +107,7 @@ struct State {
     auth: Auth,
     last_auth: Instant,
     throttle: Throttle,
+    log: RateLog,
 }
 
 /// Shared by the listener, its connections and [`Dash`].
@@ -114,10 +147,12 @@ impl Inner {
         a
     }
 
-    /// Trades a launch token for a session: `Ok(None)` when the token is not good.
+    /// Trades a launch token for a session (joining `existing` when that cookie is live):
+    /// `Ok(None)` when the token is not good.
     pub(crate) fn start_session(
         &self,
         token: &str,
+        existing: Option<&str>,
         now: Instant,
     ) -> Result<Option<(String, String)>, String> {
         let mut st = lock(&self.state);
@@ -126,19 +161,49 @@ impl Inner {
         }
         st.last_auth = now;
         st.auth
-            .start_session(now)
+            .start_session(now, existing)
             .map(Some)
             .map_err(|e| format!("morsec: no randomness for a session: {e}"))
     }
 
-    /// Records a refusal, at most 30 a minute per session (SPEC D-9).
+    /// Logs a refusal: the first per caller and reason per minute, then a count (review R3).
+    pub(crate) fn log_refusal(&self, r: &Refusal, receipt: bool) {
+        let key = format!("{:?}/{}:{}", r.session.agent, r.session.pid, r.why);
+        if let Some(quiet) = lock(&self.state).log.allow(&key, Instant::now()) {
+            tracing::warn!(
+                pid = r.session.pid,
+                why = %r.why,
+                receipt,
+                similar_skipped = quiet,
+                "dashboard refused"
+            );
+        }
+    }
+
+    /// Records a refusal with a receipt: at most 30 a minute per agent session, and 30 for
+    /// every other caller together (SPEC D-9, review S3).
     pub(crate) async fn refused(&self, r: Refusal) {
         let allowed = lock(&self.state).throttle.allow(&r.session, Instant::now());
-        tracing::warn!(pid = r.session.pid, why = %r.why, receipt = allowed, "dashboard refused");
+        self.log_refusal(&r, allowed);
         if allowed {
             let data = self.data.clone();
             let _ = tokio::task::spawn_blocking(move || data.record_refused(&r)).await;
         }
+    }
+
+    /// Closes the dashboard if no authenticated request came within `idle`; checked and done
+    /// under one lock, so a request can't slip in between (review R6). True when it closed.
+    fn shutdown_if_idle(&self) -> bool {
+        let mut st = lock(&self.state);
+        if st.last_auth.elapsed() < self.cfg.idle {
+            return false;
+        }
+        if let Some(r) = st.running.take() {
+            let _ = r.stop.send(true);
+            tracing::info!(port = r.port, "dashboard idle; closed");
+        }
+        st.auth.clear();
+        true
     }
 
     fn shutdown(&self) {
@@ -170,6 +235,7 @@ impl Dash {
                     auth: Auth::new(20),
                     last_auth: Instant::now(),
                     throttle: Throttle::default(),
+                    log: RateLog::default(),
                 }),
             }),
         }
@@ -184,11 +250,12 @@ impl Dash {
         if st.running.is_none() {
             let (listener, port) = bind_first(inner.cfg.first_port, inner.cfg.span)?;
             let (tx, rx) = watch::channel(false);
-            st.auth = Auth::new(inner.cfg.rate);
-            st.running = Some(Running { port, stop: tx });
             let _g = inner.rt.enter();
             let listener = TcpListener::from_std(listener)
                 .map_err(|e| format!("morsec: the dashboard listener failed: {e}"))?;
+            // Only now is it running (review R5).
+            st.auth = Auth::new(inner.cfg.rate);
+            st.running = Some(Running { port, stop: tx });
             inner
                 .rt
                 .spawn(accept_loop(inner.clone(), listener, port, rx.clone()));
@@ -256,10 +323,7 @@ async fn idle_watch(inner: Arc<Inner>, mut stop: watch::Receiver<bool>) {
             _ = stop.changed() => return,
             () = tokio::time::sleep(tick) => {}
         }
-        let idle = lock(&inner.state).last_auth.elapsed() >= inner.cfg.idle;
-        if idle {
-            tracing::info!("dashboard idle; closing");
-            inner.shutdown();
+        if inner.shutdown_if_idle() {
             return;
         }
     }

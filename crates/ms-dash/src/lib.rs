@@ -27,7 +27,7 @@ pub mod parity;
 pub mod server;
 
 pub use data::{ApiError, DashData, Refusal};
-pub use server::{Dash, DashConfig, Opened};
+pub use server::{Dash, DashConfig, Opened, valid_view};
 
 /// The first port the dashboard tries (design §6.1).
 pub const DEFAULT_PORT: u16 = 7311;

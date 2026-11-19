@@ -146,6 +146,24 @@ struct SessionReq {
     token: String,
 }
 
+/// How long a request body may take to arrive (security review S2).
+pub const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Answers a refusal that gets a log line only (throttled), no receipt: a browser's own
+/// cross-site fetch, a stale tab's CSRF token, a missing session, a rate limit. Every caller
+/// that reaches this point already passed the process check, so it is not an agent session
+/// (reviews R1, R3, S4).
+fn quiet(inner: &Inner, who: &SessionId, status: StatusCode, why: &str) -> Resp {
+    inner.log_refusal(
+        &Refusal {
+            session: who.clone(),
+            why: why.to_owned(),
+        },
+        false,
+    );
+    json_error(status, &format!("morsec: refused: {why}"))
+}
+
 /// Records a refusal (throttled) and answers it.
 async fn refuse(inner: &Inner, who: &SessionId, status: StatusCode, why: &str) -> Resp {
     inner
@@ -189,13 +207,12 @@ pub async fn handle(
         }
     };
     if !fetch_site_ok(h, post) {
-        return refuse(
+        return quiet(
             inner,
             who,
             StatusCode::FORBIDDEN,
             "a request from another site",
-        )
-        .await;
+        );
     }
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
@@ -207,13 +224,12 @@ pub async fn handle(
             return json_error(StatusCode::NOT_FOUND, "morsec: no such page");
         }
         if !inner.take_anon(now) {
-            return refuse(
+            return quiet(
                 inner,
                 who,
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many requests",
-            )
-            .await;
+            );
         }
         return match assets::get(path) {
             Some((ctype, bytes)) => finish(StatusCode::OK, ctype, bytes.to_vec()),
@@ -249,9 +265,17 @@ pub async fn handle(
             )
             .await;
         }
-        match Limited::new(body, MAX_BODY).collect().await {
-            Ok(c) => body_bytes = c.to_bytes(),
+        match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
+            Ok(Ok(c)) => body_bytes = c.to_bytes(),
             Err(_) => {
+                return quiet(
+                    inner,
+                    who,
+                    StatusCode::REQUEST_TIMEOUT,
+                    "the body took over 5 s",
+                );
+            }
+            Ok(Err(_)) => {
                 return refuse(
                     inner,
                     who,
@@ -265,18 +289,18 @@ pub async fn handle(
 
     if post && path == "/api/session" {
         if !inner.take_anon(now) {
-            return refuse(
+            return quiet(
                 inner,
                 who,
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many requests",
-            )
-            .await;
+            );
         }
         let Ok(r) = serde_json::from_slice::<SessionReq>(&body_bytes) else {
             return json_error(StatusCode::BAD_REQUEST, "morsec: expected {\"token\": …}");
         };
-        return match inner.start_session(&r.token, now) {
+        let existing = session_cookie(h);
+        return match inner.start_session(&r.token, existing.as_deref(), now) {
             Ok(Some((cookie, csrf))) => {
                 let mut resp = json(&serde_json::json!({ "csrf": csrf }));
                 let c = format!(
@@ -305,32 +329,38 @@ pub async fn handle(
     let csrf = header(h, CSRF_HEADER);
     match inner.check(cookie.as_deref(), csrf, now) {
         Access::Ok => {}
+        // Unauthenticated API requests share the unauthenticated bucket (review R3).
+        Access::NoSession if !inner.take_anon(now) => {
+            return quiet(
+                inner,
+                who,
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many requests",
+            );
+        }
         Access::NoSession => {
-            return refuse(
+            return quiet(
                 inner,
                 who,
                 StatusCode::UNAUTHORIZED,
                 "no dashboard session (open it again with ms dashboard)",
-            )
-            .await;
+            );
         }
         Access::BadCsrf => {
-            return refuse(
+            return quiet(
                 inner,
                 who,
                 StatusCode::FORBIDDEN,
-                "the CSRF token is missing or wrong",
-            )
-            .await;
+                "the CSRF token is missing or wrong (the page was opened again in another tab)",
+            );
         }
         Access::Limited => {
-            return refuse(
+            return quiet(
                 inner,
                 who,
                 StatusCode::TOO_MANY_REQUESTS,
                 "over 20 requests a second",
-            )
-            .await;
+            );
         }
     }
     if post {
