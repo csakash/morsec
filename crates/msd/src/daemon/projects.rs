@@ -136,9 +136,10 @@ impl Daemon {
             .collect()
     }
 
-    /// The provider each project key's record names (for the proxy's credential location, L34).
-    /// Empty when the records can't be read: those keys are then not swapped (fails closed).
-    pub fn project_providers(&self) -> BTreeMap<KeyName, String> {
+    /// Every key a project record lists, with the provider it names, if any (for the proxy's
+    /// credential location, L34). Empty when the records can't be read: project keys are then
+    /// not swapped (fails closed).
+    pub fn project_providers(&self) -> BTreeMap<KeyName, Option<String>> {
         let Ok(floor) = self.projects_floor() else {
             return BTreeMap::new();
         };
@@ -149,8 +150,9 @@ impl Daemon {
         for p in &file.projects {
             for f in &p.files {
                 for s in &f.secrets {
-                    if let Some(prov) = &s.provider {
-                        out.entry(s.key.clone()).or_insert_with(|| prov.clone());
+                    let e = out.entry(s.key.clone()).or_insert(None);
+                    if e.is_none() {
+                        e.clone_from(&s.provider);
                     }
                 }
             }
@@ -305,7 +307,10 @@ impl Daemon {
         // L34 review S2: a key in the record decides what `ms dev` hands out and which keys a
         // dev session may use, so adopting a key that already allows something (one the stored
         // record didn't list: made by hand, or by another tool) needs the person too. Keys that
-        // still allow nothing are harmless to list; re-saving the same keys asks nothing.
+        // still allow nothing join without a prompt (ms init's own new keys of unknown services
+        // are such keys); re-saving the same keys asks nothing. Residual (round 2 F3, T-82): a
+        // key can join while it allows nothing and be loosened later with ms rules; that
+        // loosening needs its own approval, and every ms dev run's sheet lists the key again.
         let earlier: BTreeSet<KeyName> = file
             .get(&record.slug)
             .map(|p| p.keys().into_iter().collect())
@@ -444,6 +449,21 @@ impl Daemon {
             self.alert(format!(
                 "the project records version could not be saved in the vault ({e})"
             ));
+        }
+        if let Some(t) = &token {
+            for k in &adopted {
+                let mode = current.keys.get(k).map_or(Mode::Swap, |r| r.mode);
+                if let Err(e) = self.record_approved(
+                    session,
+                    k,
+                    mode,
+                    &format!("ms init: joins project {}", record.slug),
+                    version,
+                    t,
+                ) {
+                    tracing::error!(error = %e, "could not record a key joining a project");
+                }
+            }
         }
         if let Err(e) = self.record(
             session,

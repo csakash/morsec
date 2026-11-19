@@ -186,16 +186,19 @@ fn location(l: &ms_import::catalog::Location) -> Option<Location> {
 fn provider_for(
     key: &KeyName,
     rule: &ms_rules::KeyRule,
-    recorded: &BTreeMap<KeyName, String>,
+    recorded: &BTreeMap<KeyName, Option<String>>,
 ) -> Option<&'static ms_import::catalog::Provider> {
     let cat = ms_import::catalog::Catalog::builtin();
-    if let Some(p) = recorded.get(key).and_then(|p| cat.get(p))
-        && rule.hosts.iter().all(|h| {
-            let h = h.to_string();
-            p.hosts.iter().any(|c| c.eq_ignore_ascii_case(&h))
-        })
-    {
-        return Some(p);
+    // Review round 2: a key a project record lists gets only the provider that record names
+    // (when its hosts cover the rule), never the first-segment guess below: a project slug such
+    // as `stripe` must not lend Stripe's location to the project's other keys.
+    if let Some(named) = recorded.get(key) {
+        return named.as_deref().and_then(|p| cat.get(p)).filter(|p| {
+            rule.hosts.iter().all(|h| {
+                let h = h.to_string();
+                p.hosts.iter().any(|c| c.eq_ignore_ascii_case(&h))
+            })
+        });
     }
     cat.providers
         .iter()
@@ -216,7 +219,7 @@ pub fn bindings(rules: &Rules) -> (Vec<Binding>, Vec<String>) {
 /// provider of a project key coming from its project record (`recorded`).
 pub fn bindings_with(
     rules: &Rules,
-    recorded: &BTreeMap<KeyName, String>,
+    recorded: &BTreeMap<KeyName, Option<String>>,
 ) -> (Vec<Binding>, Vec<String>) {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
@@ -652,7 +655,8 @@ commands = [["psql", "**"]]
     // protects=L34 (found building ms dev): a project key (`shop/stripe-secret-key`) is swapped
     // with the location of the provider its project record names; without a record it is skipped
     // with a note (fails closed); a recorded provider whose catalog hosts don't cover the rule's
-    // hosts is not used (review N1);
+    // hosts is not used (review N1), and a recorded key never falls back to the first-segment
+    // guess (round 2);
     // fails_when=project keys are never bound, or bound with another provider's location;
     // no_claim=the records' MAC (ms-projects store tests)
     #[test]
@@ -669,7 +673,7 @@ hosts = ["api.stripe.com"]
         let key = KeyName::new("shop/stripe-secret-key").unwrap();
         let (none, skipped) = bindings(&r);
         assert!(none.is_empty() && skipped.len() == 1, "{skipped:?}");
-        let recorded = BTreeMap::from([(key.clone(), "stripe".to_string())]);
+        let recorded = BTreeMap::from([(key.clone(), Some("stripe".to_string()))]);
         let (b, skipped) = bindings_with(&r, &recorded);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert_eq!(b.len(), 1);
@@ -690,9 +694,25 @@ hosts = ["api.stripe.com", "evil.example"]
         );
         let (b, skipped) = bindings_with(&other, &recorded);
         assert!(b.is_empty() && skipped.len() == 1, "{b:?} {skipped:?}");
-        let openai = BTreeMap::from([(key.clone(), "openai".to_string())]);
+        let openai = BTreeMap::from([(key.clone(), Some("openai".to_string()))]);
         let (b, _) = bindings_with(&r, &openai);
         assert!(b.is_empty(), "openai's header for a stripe host: {b:?}");
+        // Review round 2: a project slugged like a provider (`stripe`) doesn't lend that
+        // provider's location to a recorded key without one; unrecorded, the old lookup holds.
+        let slugged = rules(
+            r#"
+version = 3
+[keys."stripe/session-secret"]
+mode = "swap"
+tier = "test"
+hosts = ["api.stripe.com"]
+"#,
+        );
+        let k2 = KeyName::new("stripe/session-secret").unwrap();
+        let (b, _) = bindings_with(&slugged, &BTreeMap::from([(k2.clone(), None)]));
+        assert!(b.is_empty(), "{b:?}");
+        let (b, _) = bindings_with(&slugged, &BTreeMap::new());
+        assert_eq!(b.len(), 1);
     }
 
     // protects=L30 D2 a key's git hosts get their own Basic-password binding and its other hosts

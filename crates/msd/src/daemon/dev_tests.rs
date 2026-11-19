@@ -255,6 +255,16 @@ fn dev_session_ends_with_child() {
     assert_eq!(h.d.reap_dev(|pid, st| (pid, st) == (43, 2)), 1, "restarted");
     assert_eq!(h.d.dev_by_credential(&cred), None);
     assert!(h.receipts_text().contains("ended (its process is gone)"));
+    // Review round 2 F5: liveness is asked once per session, so a flaky answer can't remove a
+    // session without its end receipt.
+    let (_, cred, _) = start(&h);
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let removed = h.d.reap_dev(|_, _| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 2 == 1
+    });
+    assert_eq!(removed, 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(h.d.dev_by_credential(&cred), None);
 
     // Review R2: ms stop while the person is still deciding: nothing starts, no value is sent.
     let ((r, values), _) = with_person(
@@ -448,6 +458,81 @@ fn dev_run_mode_values_only_for_project_keys() {
     assert!(run_env(&rec, &tampered, &root, &mut notes).is_empty());
 }
 
+// protects=L34 review round 2 F1: the Touch ID reason is capped, so the command comes first on
+// ms dev's sheet: with many keys and a long root the whole command is still in the reason msd
+// renders; a huge command is cut on the sheet with a marker and its full SHA-256, and the
+// approval still binds the full command; fails_when=the command is cut off by the key list, or a
+// cut command loses its binding; no_claim=the real LAContext sheet's own layout (manual)
+#[test]
+fn dev_sheet_shows_the_command_first() {
+    let h = fresh();
+    let long = h.dir.path().join(format!("{}/shop", "a-rather-long-folder-name".repeat(6)));
+    std::fs::create_dir_all(&long).unwrap();
+    let root = std::fs::canonicalize(&long).unwrap();
+    let mut keys = Vec::new();
+    for i in 0..8 {
+        let k = format!("shop/database-url-{i}");
+        put_mode(&h, &k, Mode::Run, Tier::Test);
+        keys.push(k);
+    }
+    let pairs: Vec<(&str, Option<&str>)> = keys.iter().map(|k| (k.as_str(), Some("pg"))).collect();
+    let mut rec = project(&h, &pairs);
+    rec.root = root.display().to_string();
+    let rules = proposal(&h, &rec);
+    assert!(is_ok(&h.approved(|| save(&h, &rec, &rules))));
+
+    let cmd = ["npm", "run", "dev", "--", "--port", "3000"];
+    let (r, _) = dev_start(&h, &cmd, &root);
+    assert!(matches!(r, ResponseBody::DevStarted { .. }), "{r:?}");
+    let reason = h.auth.reasons().last().cloned().unwrap();
+    let quoted = cmd
+        .iter()
+        .map(|a| ms_approve::render::quoted(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(reason.contains(&quoted), "{reason}");
+
+    // A huge command: cut with a marker on the sheet, bound in full.
+    let big: Vec<String> = (0..40).map(|i| format!("--flag-number-{i}=value")).collect();
+    let mut argv = vec!["node"];
+    argv.extend(big.iter().map(String::as_str));
+    let ((r, _), seen) = with_person(&h, true, |_| {}, || dev_start_raw(&h, &argv, &root));
+    assert!(matches!(r, ResponseBody::DevStarted { .. }), "{r:?}");
+    let shown = seen.unwrap().argv_display.join(" ");
+    let full: Vec<String> = argv.iter().map(|a| (*a).to_owned()).collect();
+    assert!(
+        shown.contains(&format!(
+            "--full-command-sha256 {}",
+            hex::encode(ms_rules::argv_hash(&full))
+        )),
+        "{shown}"
+    );
+    let reason = h.auth.reasons().last().cloned().unwrap();
+    assert!(reason.contains("\"node\" \"--flag-number-0=value\""), "{reason}");
+    assert!(reason.contains("command cut"), "{reason}");
+}
+
+// protects=L34 review round 2 F2: an approval answered for the session (`s`) is refused for ms dev
+// (it would stretch the production window to hours): nothing starts, no value goes out;
+// fails_when=a session-scope token starts a dev session; no_claim=the inline review's prompt
+// (ms-cli approve inline_review_once_only)
+#[test]
+fn dev_refuses_a_session_scope_approval() {
+    let h = fresh();
+    let rec = dev_shop(&h, Tier::Production, Tier::Production);
+    let root = PathBuf::from(&rec.root);
+    let (r, decision) = h.answered(
+        APPROVER_PID,
+        true,
+        Some(ApprovalScope::Session),
+        || dev_start_raw(h.as_(terminal()), &["npm", "run", "dev"], &root).0,
+    );
+    assert!(is_ok(&decision), "{decision:?}");
+    assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
+    assert!(msg(&r).contains("answer o"), "{r:?}");
+    assert_eq!(h.d.dev.len(), 0);
+}
+
 // protects=L34 SPEC criterion 7 (design §7.2, AUTH-3, review D-A/D-B): every ms dev run asks one
 // Touch ID, bound to the command (the sheet's argv names the project, the root, the swapped keys,
 // each variable that gets a value with its key, the production keys, that other websites are
@@ -491,7 +576,7 @@ fn dev_production_needs_one_approval() {
     assert_eq!(
         shown,
         format!(
-            "ms dev --project shop --root {} --swap {STRIPE_KEY} --env VAR_1={DB_KEY} --production {DB_KEY} {STRIPE_KEY} --other-websites allowed -- npm run dev",
+            "ms dev --project shop --command(3 args) npm run dev --root {} --swap {STRIPE_KEY} --env VAR_1={DB_KEY} --production {DB_KEY} {STRIPE_KEY} --other-websites allowed",
             rec.root
         )
     );
@@ -595,8 +680,9 @@ fn dev_values_follow_the_rules_the_person_saw() {
 // protects=L34 review S2(b): a record that adds a key whose rule already allows something (made
 // by hand, not by this ms init) asks the person, with the key named on the sheet; a denial saves
 // no record; once saved, saving the same record again asks nothing; keys that still allow nothing
-// join without a prompt; fails_when=a detached process quietly makes an existing key part of a
-// project (and so of ms dev's key set and run values); no_claim=ms init's own flow (ms-cli
+// join without a prompt; an approved adoption leaves an approved receipt per key; ProjectSave from
+// a sandboxed process is refused (round 2 F3); fails_when=a detached process quietly makes an
+// existing key part of a project (and so of ms dev's key set and run values); no_claim=ms init's own flow (ms-cli
 // init_project tests)
 #[test]
 fn project_save_asks_to_adopt_a_key_that_allows_something() {
@@ -614,6 +700,15 @@ fn project_save_asks_to_adopt_a_key_that_allows_something() {
     assert_eq!(code(&r), Some(ErrorCode::NeedsApproval), "{r:?}");
     assert!(!h.dir.path().join(PROJECTS_FILE).exists());
 
+    // Round 2 F3: from a sandboxed process, refused before any approval.
+    h.d.set_sandbox_probe(|_| true);
+    let n = h.auth.reasons().len();
+    let r = save(h.as_(terminal()), &rec, &rules);
+    assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+    assert!(msg(&r).contains("sandboxed"), "{r:?}");
+    assert_eq!(h.auth.reasons().len(), n);
+    h.d.set_sandbox_probe(|_| false);
+
     let n = h.auth.reasons().len();
     let (r, seen) = with_person(&h, true, |_| {}, || save(&h, &rec, &rules));
     assert!(is_ok(&r), "{r:?}");
@@ -622,6 +717,10 @@ fn project_save_asks_to_adopt_a_key_that_allows_something() {
     assert!(shown.contains(&format!("{legacy} joins the project")), "{shown}");
     assert!(!shown.contains(&format!("{UNKNOWN_KEY} joins")), "{shown}");
 
+    assert!(
+        h.receipts_text().contains("ms init: joins project shop"),
+        "the adoption is on the record"
+    );
     let n = h.auth.reasons().len();
     assert!(is_ok(&save(&h, &rec, &rules)), "same record again");
     assert_eq!(h.auth.reasons().len(), n, "nothing new to approve");

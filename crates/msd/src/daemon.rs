@@ -706,6 +706,12 @@ impl Daemon {
                 ErrorCode::Denied,
                 "morsec: projects can't be set up from inside an agent session. Run ms init in your own terminal",
             ),
+            // L34 review F3: an agent command that double-forked out of its tree is still in the
+            // agent's sandbox.
+            RequestBody::ProjectSave { .. } if self.caller_sandboxed(caller.as_ref()) => reply_err(
+                ErrorCode::Denied,
+                "morsec: projects can't be set up from a sandboxed process (an agent's command sandbox). Run ms init in your own terminal",
+            ),
             RequestBody::ProjectSave { record, rules } => {
                 self.project_save(&session, &record, &rules)
             }

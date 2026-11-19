@@ -98,6 +98,42 @@ pub fn agent_binary(argv0: &str) -> Option<AgentKind> {
     ms_session::agent_kind(base).or_else(|| ms_session::agent_install_path(argv0))
 }
 
+/// Longest command shown on the approval sheet, in characters as the sheet quotes them (two
+/// quotes and a space per argument). The Touch ID reason is capped at 480 characters and its own
+/// header takes about 200, so this leaves room for the cut marker after it.
+const SHEET_COMMAND_CHARS: usize = 160;
+
+/// The command as the approval sheet shows it (review F1), and whether it was cut: every
+/// argument when it fits in [`SHEET_COMMAND_CHARS`], else the leading ones and a short marker.
+/// When cut, the caller binds the full command by its SHA-256 at the end of the sheet's argv.
+pub fn command_for_sheet(argv: &[String]) -> (Vec<String>, bool) {
+    let cost = |a: &String| a.chars().count() + 3;
+    let total: usize = argv.iter().map(cost).sum();
+    if total <= SHEET_COMMAND_CHARS {
+        return (argv.to_vec(), false);
+    }
+    let budget = SHEET_COMMAND_CHARS.saturating_sub(40);
+    let mut out = Vec::new();
+    let mut used = 0;
+    for a in argv {
+        if used + cost(a) > budget {
+            let room = budget.saturating_sub(used + 3);
+            if room > 8 {
+                out.push(a.chars().take(room).collect());
+                used += room + 3;
+            }
+            break;
+        }
+        out.push(a.clone());
+        used += cost(a);
+    }
+    out.push(format!(
+        "…(command cut: {} more characters)",
+        total.saturating_sub(used)
+    ));
+    (out, true)
+}
+
 /// The project whose root holds `cwd` (both canonical); the deepest root wins.
 pub fn project_for<'a>(projects: &'a [ProjectRecord], cwd: &Path) -> Option<&'a ProjectRecord> {
     projects
@@ -210,13 +246,13 @@ impl Daemon {
     pub fn reap_dev(&self, alive: impl Fn(u32, u64) -> bool) -> usize {
         let gone: Vec<DevSession> = {
             let mut m = lock(&self.dev.0);
-            let gone = m
-                .values()
-                .filter(|d| !alive(d.session.pid, d.session.started_unix_ms))
-                .cloned()
+            // Review F5: liveness is decided once per session, so every removed one is reported.
+            let dead: Vec<String> = m
+                .iter()
+                .filter(|(_, d)| !alive(d.session.pid, d.session.started_unix_ms))
+                .map(|(c, _)| c.clone())
                 .collect();
-            m.retain(|_, d| alive(d.session.pid, d.session.started_unix_ms));
-            gone
+            dead.iter().filter_map(|c| m.remove(c)).collect()
         };
         for d in &gone {
             self.record_dev_end(d, "its process is gone");
@@ -266,6 +302,14 @@ impl Daemon {
         let now = super::now_ms();
         for d in lock(&self.dev.0).values_mut() {
             d.approved_unix_ms = now.saturating_sub(ms);
+        }
+    }
+
+    /// True when `caller` is an unattributed process inside a sandbox (or the check failed).
+    pub(super) fn caller_sandboxed(&self, caller: Option<&Caller>) -> bool {
+        match caller {
+            Some(Caller::Unattributed { pid, .. }) => (*lock(&self.sandbox_probe))(*pid),
+            _ => false,
         }
     }
 
@@ -339,8 +383,7 @@ impl Daemon {
             }
         };
         // Review D-A: a double fork leaves an agent's tree but not its sandbox.
-        let probe = *lock(&self.sandbox_probe);
-        if probe(pid) {
+        if self.caller_sandboxed(caller) {
             return none(reply_err(
                 ErrorCode::Denied,
                 "morsec: ms dev was asked from a sandboxed process (an agent's command sandbox), so it was refused. Run it in your own terminal",
@@ -440,15 +483,21 @@ impl Daemon {
 
         // One approval for every run (review D-A), bound to all of this.
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
+        // Review F1: the Touch ID reason is capped, so the command comes right after the project
+        // and before the (possibly long) root and key lists; a huge command is cut here with a
+        // marker and its full SHA-256 stays in the bound argv.
         let mut shown = vec![
             "ms".to_owned(),
             "dev".into(),
             "--project".into(),
             record.slug.clone(),
-            "--root".into(),
-            record.root.clone(),
-            "--swap".into(),
+            format!("--command({} args)", argv.len()),
         ];
+        let (cmd_shown, cut) = command_for_sheet(argv);
+        shown.extend(cmd_shown);
+        shown.push("--root".into());
+        shown.push(record.root.clone());
+        shown.push("--swap".into());
         shown.extend(swapped.iter().cloned());
         shown.push("--env".into());
         shown.extend(wanted.iter().map(|(v, k)| format!("{v}={k}")));
@@ -456,8 +505,10 @@ impl Daemon {
         shown.extend(production.iter().map(|k| k.as_str().to_owned()));
         shown.push("--other-websites".into());
         shown.push("allowed".into());
-        shown.push("--".into());
-        shown.extend(argv.iter().cloned());
+        if cut {
+            shown.push("--full-command-sha256".into());
+            shown.push(hex::encode(ms_rules::argv_hash(argv)));
+        }
         let req = ApprovalRequest {
             session: terminal.clone(),
             key: daemon_key(),
@@ -473,8 +524,25 @@ impl Daemon {
                 wanted.len()
             )),
         };
+        // Review F2: one run, one approval. A session-scope token (answered `s`) would stretch the
+        // production window (D-4b) to hours, so it is refused.
         let approval = match self.approve_exact(&req) {
-            Ok(t) => t,
+            Ok(t) if ms_approve::Scope::of_id(&t.id) == Some(ms_approve::Scope::Once) => t,
+            Ok(_) => {
+                let _ = self.record(
+                    &terminal,
+                    &daemon_key(),
+                    Mode::Run,
+                    &format!("ms dev: project {} start", record.slug),
+                    snap.version,
+                    ReceiptResult::Denied,
+                    None,
+                );
+                return none(reply_err(
+                    ErrorCode::NeedsApproval,
+                    "morsec: ms dev takes an approval for this run only. Run it again and answer o (once), not s",
+                ));
+            }
             Err(resp) => {
                 let _ = self.record(
                     &terminal,
@@ -489,6 +557,13 @@ impl Daemon {
             }
         };
         let approved_unix_ms = super::now_ms();
+        // Review F4: don't read a single value after ms stop.
+        if self.is_stopped() || self.stops.load(std::sync::atomic::Ordering::SeqCst) != stops_seen {
+            return none(reply_err(
+                ErrorCode::Denied,
+                "morsec: ms stop ran while ms dev waited for approval, so it did not start",
+            ));
+        }
 
         // Run-mode values (SPEC D-3). Review R1: only for keys whose rule is still exactly what
         // the person saw; R9: receipts carry the rules version in force now.
