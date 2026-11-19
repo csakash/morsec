@@ -178,13 +178,24 @@ fn location(l: &ms_import::catalog::Location) -> Option<Location> {
 /// The catalog provider for a key: the one its project record names (L31 keys are
 /// `<project>/<var>`, so only the MAC'd record knows their provider), else one whose default key
 /// name is this key, else one whose id is the key's first segment.
+///
+/// A recorded provider counts only when every host of the key's rule is one of that provider's
+/// catalog hosts (review N1): the record says where the credential goes in a request, never
+/// where it may be sent, so a record can't make a hand-made key's hosts get another provider's
+/// header.
 fn provider_for(
     key: &KeyName,
+    rule: &ms_rules::KeyRule,
     recorded: &BTreeMap<KeyName, String>,
 ) -> Option<&'static ms_import::catalog::Provider> {
     let cat = ms_import::catalog::Catalog::builtin();
-    if let Some(p) = recorded.get(key) {
-        return cat.get(p);
+    if let Some(p) = recorded.get(key).and_then(|p| cat.get(p))
+        && rule.hosts.iter().all(|h| {
+            let h = h.to_string();
+            p.hosts.iter().any(|c| c.eq_ignore_ascii_case(&h))
+        })
+    {
+        return Some(p);
     }
     cat.providers
         .iter()
@@ -248,7 +259,8 @@ pub fn bindings_with(
         if hosts.is_empty() {
             continue;
         }
-        let Some(loc) = provider_for(key, recorded).and_then(|p| location(&p.location)) else {
+        let Some(loc) = provider_for(key, rule, recorded).and_then(|p| location(&p.location))
+        else {
             skipped.push(format!(
                 "{key}: no catalog entry says where its credential goes in a request, so it is not swapped"
             ));
@@ -639,7 +651,8 @@ commands = [["psql", "**"]]
 
     // protects=L34 (found building ms dev): a project key (`shop/stripe-secret-key`) is swapped
     // with the location of the provider its project record names; without a record it is skipped
-    // with a note (fails closed) and a recorded provider never adds a host the rule lacks;
+    // with a note (fails closed); a recorded provider whose catalog hosts don't cover the rule's
+    // hosts is not used (review N1);
     // fails_when=project keys are never bound, or bound with another provider's location;
     // no_claim=the records' MAC (ms-projects store tests)
     #[test]
@@ -664,6 +677,22 @@ hosts = ["api.stripe.com"]
         assert!(
             matches!(&b[0].location, Location::Header { name, .. } if name.eq_ignore_ascii_case("authorization"))
         );
+        // A recorded provider whose catalog hosts don't cover the rule's hosts is ignored: the
+        // key falls back to the old lookup, which finds nothing for `shop/…` (fails closed).
+        let other = rules(
+            r#"
+version = 3
+[keys."shop/stripe-secret-key"]
+mode = "swap"
+tier = "test"
+hosts = ["api.stripe.com", "evil.example"]
+"#,
+        );
+        let (b, skipped) = bindings_with(&other, &recorded);
+        assert!(b.is_empty() && skipped.len() == 1, "{b:?} {skipped:?}");
+        let openai = BTreeMap::from([(key.clone(), "openai".to_string())]);
+        let (b, _) = bindings_with(&r, &openai);
+        assert!(b.is_empty(), "openai's header for a stripe host: {b:?}");
     }
 
     // protects=L30 D2 a key's git hosts get their own Basic-password binding and its other hosts

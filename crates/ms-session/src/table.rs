@@ -269,3 +269,19 @@ mod imp {
 pub fn exe_path(pid: u32) -> io::Result<PathBuf> {
     imp::exe_path(pid)
 }
+
+/// Whether `pid` runs inside a macOS sandbox profile (App Sandbox, `sandbox-exec`, an agent's
+/// command sandbox such as Claude Code's or Codex's Seatbelt). Such a process is an agent's,
+/// whatever its parent chain says (L34: a double fork escapes the tree, not the sandbox). Other
+/// platforms: `Ok(false)`.
+pub fn is_sandboxed(pid: u32) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::sys::macos::is_sandboxed(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        Ok(false)
+    }
+}

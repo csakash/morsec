@@ -1,8 +1,10 @@
 //! `ms dev` sessions (L34, SPEC D-1 to D-8): the user's own command, served by the swap proxy.
 //!
 //! `DevStart` comes from `ms dev` in the user's terminal. msd refuses it inside an agent session,
-//! while stopped, for an agent binary and outside every recorded project root; asks one Touch ID
-//! when a key of the project is production; then binds a dev session to the **`ms dev` process**
+//! from a sandboxed process (an agent's command that double-forked out of its tree is still in
+//! the agent's sandbox), while stopped, for an agent binary and outside every recorded project
+//! root; asks one Touch ID for every run (SPEC D-4, review D-A), showing the keys, the variables
+//! that get values and that other websites are reachable; then binds a dev session to the **`ms dev` process**
 //! (the kernel peer: PID and start time) and hands back a random proxy credential. The proxy
 //! serves a connection as that session only when it presents the credential **and** its process
 //! has the `ms dev` process on its parent chain with no agent above it (`proxy.rs`), so a copied
@@ -43,10 +45,15 @@ pub struct DevSession {
     pub slug: String,
     /// Every key of the project: the only keys this session may use.
     pub keys: BTreeSet<KeyName>,
-    /// The production keys the one approval covered.
+    /// The production keys the run's approval listed.
     pub production: BTreeSet<KeyName>,
-    /// The approval for this run, when a key was production.
-    pub approval: Option<ApprovalToken>,
+    /// The run's approval, and what it was bound to.
+    pub approval: ApprovalToken,
+    /// The binding of that approval (to check it is still live: `ms stop` revokes it).
+    pub binding: ms_approve::Binding,
+    /// When it was approved, Unix ms (production swaps are covered for the rule's session
+    /// length at most, SPEC D-B).
+    pub approved_unix_ms: u64,
 }
 
 /// The dev sessions, by credential. Memory only: a restart ends them all.
@@ -84,10 +91,11 @@ fn hex_random(n: usize) -> Result<String, String> {
     Ok(hex::encode(&b.expose()[..n.min(32)]))
 }
 
-/// The agent a program name is, after the last `/` (L34 SPEC D-8).
+/// The agent a program name is, after the last `/`, or by where agents install themselves
+/// (`…/claude/versions/2.0.5`) (L34 SPEC D-8).
 pub fn agent_binary(argv0: &str) -> Option<AgentKind> {
     let base = argv0.rsplit('/').next().unwrap_or(argv0);
-    ms_session::agent_kind(base)
+    ms_session::agent_kind(base).or_else(|| ms_session::agent_install_path(argv0))
 }
 
 /// The project whose root holds `cwd` (both canonical); the deepest root wins.
@@ -98,36 +106,52 @@ pub fn project_for<'a>(projects: &'a [ProjectRecord], cwd: &Path) -> Option<&'a 
         .max_by_key(|p| p.root.len())
 }
 
-/// The variables to give values (L34 SPEC D-3): every recorded variable of `record` whose key is
-/// run mode with a rule root holding `cwd`, by variable name. A variable recorded with two
-/// different keys takes the root `.env`'s key, else is skipped with a note. Names the run
-/// mode would never put a reference in (PATH, loaders, proxies…) are skipped.
+/// The variables to give values (L34 SPEC D-3, review S2): every recorded variable of `record`
+/// whose key is run mode with exactly the rule `ms init` gives a database URL: the project root as
+/// its only root, no commands, not read-only, and no environment names or this variable among
+/// them. A run key whose rule was changed by hand is skipped with a note. A variable recorded with
+/// two different keys takes the root `.env`'s key, else is skipped with a note. Names that steer
+/// programs (PATH, loaders, proxies…) are skipped.
 pub fn run_env(
     record: &ProjectRecord,
     rules: &ms_rules::Rules,
     cwd: &Path,
     notes: &mut Vec<String>,
 ) -> BTreeMap<String, KeyName> {
-    if rules.tampered || rules.stopped {
+    if rules.tampered || rules.stopped || !cwd.starts_with(Path::new(&record.root)) {
         return BTreeMap::new();
     }
-    let runs = |k: &KeyName| {
-        rules.keys.get(k).is_some_and(|r| {
-            r.mode == Mode::Run && r.roots.iter().any(|root| cwd.starts_with(root))
-        })
-    };
+    let root = vec![std::path::PathBuf::from(&record.root)];
     let mut seen: BTreeMap<String, Vec<(&str, &KeyName)>> = BTreeMap::new();
+    let mut odd: BTreeSet<String> = BTreeSet::new();
     for f in &record.files {
         for s in &f.secrets {
-            if runs(&s.key) {
+            let Some(r) = rules.keys.get(&s.key).filter(|r| r.mode == Mode::Run) else {
+                continue;
+            };
+            let shaped = r.roots == root
+                && r.commands.is_empty()
+                && !r.read_only
+                && (r.env.is_empty() || r.env.contains(&s.var));
+            if shaped {
                 seen.entry(s.var.clone())
                     .or_default()
                     .push((f.path.as_str(), &s.key));
+            } else {
+                odd.insert(s.var.clone());
             }
         }
     }
+    for var in &odd {
+        notes.push(format!(
+            "{var} was not set: its key's rule was changed by hand (commands, other roots, read-only or other variables), and ms dev only gives values ms init set up"
+        ));
+    }
     let mut out = BTreeMap::new();
     for (var, uses) in seen {
+        if odd.contains(&var) {
+            continue;
+        }
         if !ms_run::input::env_name_allowed(&var) {
             notes.push(format!(
                 "{var} was not set: morsec never puts a value in a variable that changes how programs load code or connect"
@@ -166,12 +190,38 @@ impl Daemon {
         self.dev.by_session(s)
     }
 
+    /// Records the end of a dev session (best effort).
+    fn record_dev_end(&self, d: &DevSession, why: &str) {
+        tracing::info!(project = %d.slug, pid = d.session.pid, why, "ms dev session ended");
+        if let Err(e) = self.record(
+            &d.session,
+            &daemon_key(),
+            Mode::Run,
+            &format!("ms dev: project {} ended ({why})", d.slug),
+            self.rules_version(),
+            ReceiptResult::Allowed,
+            None,
+        ) {
+            tracing::error!(error = %e, "could not record the end of an ms dev session");
+        }
+    }
+
     /// Drops every dev session whose `ms dev` process is gone (`alive(pid, start)` false).
     pub fn reap_dev(&self, alive: impl Fn(u32, u64) -> bool) -> usize {
-        let mut m = lock(&self.dev.0);
-        let before = m.len();
-        m.retain(|_, d| alive(d.session.pid, d.session.started_unix_ms));
-        before - m.len()
+        let gone: Vec<DevSession> = {
+            let mut m = lock(&self.dev.0);
+            let gone = m
+                .values()
+                .filter(|d| !alive(d.session.pid, d.session.started_unix_ms))
+                .cloned()
+                .collect();
+            m.retain(|_, d| alive(d.session.pid, d.session.started_unix_ms));
+            gone
+        };
+        for d in &gone {
+            self.record_dev_end(d, "its process is gone");
+        }
+        gone.len()
     }
 
     /// Ends every dev session (`ms stop`).
@@ -192,15 +242,37 @@ impl Daemon {
         }
     }
 
-    /// Approver hook (SPEC D-4): a production key of this dev session's project, covered by the
-    /// run's one approval, gets that approval's token; anything else asks a person.
+    /// Approver hook (SPEC D-4, review D-B): a production key of this dev session's project
+    /// that the run's approval listed gets that approval's token, while the token is live (not
+    /// revoked by `ms stop`) and for at most `min(token expiry, the key's session length)` after
+    /// the approval. Anything else asks a person as usual.
     pub(super) fn dev_approval(&self, req: &ApprovalRequest) -> Option<ApprovalToken> {
         let d = self.dev_session(&req.session)?;
-        if d.production.contains(&req.key) {
-            d.approval
-        } else {
-            None
+        if !d.production.contains(&req.key) || !self.approvals.is_live(&d.approval, &d.binding) {
+            return None;
         }
+        let ttl = self.rules().keys.get(&req.key)?.session_ttl_secs;
+        let until = d
+            .approval
+            .expires_unix_ms
+            .min(d.approved_unix_ms.saturating_add(ttl.saturating_mul(1000)));
+        (super::now_ms() < until).then_some(d.approval)
+    }
+
+    /// Moves every dev session's approval time `ms` milliseconds into the past (tests of the
+    /// production window; 0 puts it back to now).
+    #[cfg(test)]
+    pub fn age_dev_approvals(&self, ms: u64) {
+        let now = super::now_ms();
+        for d in lock(&self.dev.0).values_mut() {
+            d.approved_unix_ms = now.saturating_sub(ms);
+        }
+    }
+
+    /// Replaces the sandbox probe (tests: fake callers have no real process).
+    #[cfg(test)]
+    pub fn set_sandbox_probe(&self, f: fn(u32) -> bool) {
+        *lock(&self.sandbox_probe) = f;
     }
 
     /// `DevEnd`: only the `ms dev` process that started the session may end it.
@@ -216,27 +288,31 @@ impl Daemon {
             );
         };
         let me = dev_session_id(*pid, *started_unix_ms);
-        let mut m = lock(&self.dev.0);
-        let before = m.len();
-        m.retain(|_, d| {
-            let ends = d.id == id && d.session == me;
-            if ends {
-                tracing::info!(project = %d.slug, pid = d.session.pid, "ms dev session ended");
-            }
-            !ends
-        });
-        if m.len() == before {
+        let ended: Vec<DevSession> = {
+            let mut m = lock(&self.dev.0);
+            let ended = m
+                .values()
+                .filter(|d| d.id == id && d.session == me)
+                .cloned()
+                .collect();
+            m.retain(|_, d| !(d.id == id && d.session == me));
+            ended
+        };
+        if ended.is_empty() {
             return reply_err(
                 ErrorCode::Denied,
                 "morsec: no such ms dev session for this process",
             );
+        }
+        for d in &ended {
+            self.record_dev_end(d, "the command exited");
         }
         ResponseBody::Ok {
             message: "ms dev session ended".into(),
         }
     }
 
-    /// `DevStart` (SPEC D-1 to D-8). Returns the reply and the values that follow it.
+    /// `DevStart` (SPEC D-1 to D-8, review D-A). Returns the reply and the values that follow.
     pub(super) fn dev_start(
         &self,
         caller: Option<&Caller>,
@@ -262,6 +338,14 @@ impl Daemon {
                 ));
             }
         };
+        // Review D-A: a double fork leaves an agent's tree but not its sandbox.
+        let probe = *lock(&self.sandbox_probe);
+        if probe(pid) {
+            return none(reply_err(
+                ErrorCode::Denied,
+                "morsec: ms dev was asked from a sandboxed process (an agent's command sandbox), so it was refused. Run it in your own terminal",
+            ));
+        }
         if self.is_stopped() {
             return none(reply_err(
                 ErrorCode::Denied,
@@ -307,88 +391,109 @@ impl Daemon {
                 ),
             ));
         };
+        let dev = dev_session_id(pid, started);
+        let full = |m: &HashMap<String, DevSession>| {
+            m.len() >= MAX_DEV_SESSIONS && !m.values().any(|d| d.session == dev)
+        };
+        let busy = || {
+            none(reply_err(
+                ErrorCode::Busy,
+                format!("morsec: {MAX_DEV_SESSIONS} ms dev sessions are running already"),
+            ))
+        };
+        // Review R3: before anything is asked, read or recorded.
+        if full(&lock(&self.dev.0)) {
+            return busy();
+        }
+
+        // What the person approves: computed from the rules as they are now (the snapshot).
         let keys: BTreeSet<KeyName> = record.keys().into_iter().collect();
-        let rules = self.rules();
-        if rules.tampered {
+        let snap = self.rules();
+        if snap.tampered {
             return none(self.rules_get(None));
         }
+        let mut notes = Vec::new();
+        let wanted = run_env(&record, &snap, &cwd, &mut notes);
         let production: BTreeSet<KeyName> = keys
             .iter()
             .filter(|k| {
-                rules
-                    .keys
+                snap.keys
                     .get(*k)
                     .is_some_and(|r| r.tier == Tier::Production)
             })
             .cloned()
+            .collect();
+        let swapped: Vec<String> = keys
+            .iter()
+            .filter(|k| {
+                snap.keys
+                    .get(*k)
+                    .is_some_and(|r| r.mode == Mode::Swap && !r.allows_nothing())
+            })
+            .map(|k| k.as_str().to_owned())
             .collect();
         let terminal = SessionId {
             agent: AgentKind::Other("terminal".into()),
             pid,
             started_unix_ms: started,
         };
-        let dev = dev_session_id(pid, started);
-        let version = self.rules_version();
 
-        // One approval for the run when the project has a production key (SPEC D-4).
+        // One approval for every run (review D-A), bound to all of this.
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
-        let approval = if production.is_empty() {
-            None
-        } else {
-            let mut shown = vec![
-                "ms".to_owned(),
-                "dev".into(),
-                "--project".into(),
-                record.slug.clone(),
-                "--root".into(),
-                record.root.clone(),
-                "--keys".into(),
-            ];
-            shown.extend(production.iter().map(|k| k.as_str().to_owned()));
-            shown.push("--".into());
-            shown.extend(argv.iter().cloned());
-            let req = ApprovalRequest {
-                session: terminal.clone(),
-                key: daemon_key(),
-                tier: Tier::Production,
-                argv_hash: ms_rules::argv_hash(&shown),
-                argv_display: shown,
-                cwd: cwd.clone(),
-                effect: Some(format!(
-                    "this command may use {} production key(s) of project {} until it exits",
-                    production.len(),
-                    record.slug
-                )),
-            };
-            match self.approve_exact(&req) {
-                Ok(t) => Some(t),
-                Err(resp) => {
-                    for k in &production {
-                        let _ = self.record(
-                            &terminal,
-                            k,
-                            Mode::Run,
-                            "ms dev: start",
-                            version,
-                            ReceiptResult::Denied,
-                            None,
-                        );
-                    }
-                    return none(resp);
-                }
+        let mut shown = vec![
+            "ms".to_owned(),
+            "dev".into(),
+            "--project".into(),
+            record.slug.clone(),
+            "--root".into(),
+            record.root.clone(),
+            "--swap".into(),
+        ];
+        shown.extend(swapped.iter().cloned());
+        shown.push("--env".into());
+        shown.extend(wanted.iter().map(|(v, k)| format!("{v}={k}")));
+        shown.push("--production".into());
+        shown.extend(production.iter().map(|k| k.as_str().to_owned()));
+        shown.push("--other-websites".into());
+        shown.push("allowed".into());
+        shown.push("--".into());
+        shown.extend(argv.iter().cloned());
+        let req = ApprovalRequest {
+            session: terminal.clone(),
+            key: daemon_key(),
+            tier: Tier::Production,
+            argv_hash: ms_rules::argv_hash(&shown),
+            argv_display: shown,
+            cwd: cwd.clone(),
+            effect: Some(format!(
+                "until it exits, this command may use {} key(s) of project {} through morsec ({} production), gets {} value(s) in its environment, and may reach other websites",
+                swapped.len(),
+                record.slug,
+                production.len(),
+                wanted.len()
+            )),
+        };
+        let approval = match self.approve_exact(&req) {
+            Ok(t) => t,
+            Err(resp) => {
+                let _ = self.record(
+                    &terminal,
+                    &daemon_key(),
+                    Mode::Run,
+                    &format!("ms dev: project {} start", record.slug),
+                    snap.version,
+                    ReceiptResult::Denied,
+                    None,
+                );
+                return none(resp);
             }
         };
-        if self.is_stopped() || self.stops.load(std::sync::atomic::Ordering::SeqCst) != stops_seen {
-            return none(reply_err(
-                ErrorCode::Denied,
-                "morsec: ms stop ran while ms dev waited for approval, so it did not start",
-            ));
-        }
+        let approved_unix_ms = super::now_ms();
 
-        // Run-mode values for the child's environment (SPEC D-3).
+        // Run-mode values (SPEC D-3). Review R1: only for keys whose rule is still exactly what
+        // the person saw; R9: receipts carry the rules version in force now.
         let rules = self.rules();
-        let mut notes = Vec::new();
-        let wanted = run_env(&record, &rules, &cwd, &mut notes);
+        let version = rules.version;
         let mut names = Vec::new();
         let mut values = Vec::new();
         let target = format!(
@@ -396,53 +501,51 @@ impl Daemon {
             ms_projects::record::printable(argv0)
         );
         for (var, key) in &wanted {
-            let tier = rules.keys.get(key).map(|r| r.tier);
-            if tier == Some(Tier::Production) && approval.is_none() {
+            let now = rules.keys.get(key);
+            if rules.tampered || now != snap.keys.get(key) {
                 notes.push(format!(
-                    "{var} was not set: its key became production after the approval was asked"
+                    "{var} was not set: the rule of {key} changed while the approval was asked"
                 ));
                 continue;
             }
-            match self.vault.read_with(key, |v| SecretBytes::new(v.to_vec())) {
-                Ok(v) => {
-                    let receipt = match (&approval, tier) {
-                        (Some(t), Some(Tier::Production)) => {
-                            self.record_approved(&dev, key, Mode::Run, &target, version, t)
-                        }
-                        _ => self.record(
-                            &dev,
-                            key,
-                            Mode::Run,
-                            &target,
-                            version,
-                            ReceiptResult::Allowed,
-                            None,
-                        ),
-                    };
-                    // A value whose use can't be recorded is not handed out.
-                    if let Err(e) = receipt {
-                        tracing::error!(error = %e, "could not record an ms dev value");
-                        notes.push(format!(
-                            "{var} was not set: the receipt could not be written"
-                        ));
-                        continue;
-                    }
-                    names.push(var.clone());
-                    values.push(v);
+            let value = match self.vault.read_with(key, |v| SecretBytes::new(v.to_vec())) {
+                Ok(v) => v,
+                Err(e) => {
+                    notes.push(format!("{var} was not set: {key} can't be read ({e})"));
+                    continue;
                 }
-                Err(e) => notes.push(format!("{var} was not set: {key} can't be read ({e})")),
+            };
+            // Review R4: a frame can't be empty or larger than the IPC limit.
+            if value.expose().is_empty() || value.expose().len() > ms_ipc::MAX_FRAME {
+                notes.push(format!(
+                    "{var} was not set: the value of {key} is empty or too large"
+                ));
+                continue;
             }
+            let receipt = if now.is_some_and(|r| r.tier == Tier::Production) {
+                self.record_approved(&dev, key, Mode::Run, &target, version, &approval)
+            } else {
+                self.record(
+                    &dev,
+                    key,
+                    Mode::Run,
+                    &target,
+                    version,
+                    ReceiptResult::Allowed,
+                    None,
+                )
+            };
+            // A value whose use can't be recorded is not handed out.
+            if let Err(e) = receipt {
+                tracing::error!(error = %e, "could not record an ms dev value");
+                notes.push(format!(
+                    "{var} was not set: the receipt could not be written"
+                ));
+                continue;
+            }
+            names.push(var.clone());
+            values.push(value);
         }
-        let swapped: Vec<String> = keys
-            .iter()
-            .filter(|k| {
-                rules
-                    .keys
-                    .get(*k)
-                    .is_some_and(|r| r.mode == Mode::Swap && !r.allows_nothing())
-            })
-            .map(|k| k.as_str().to_owned())
-            .collect();
 
         let (id, credential) = match (hex_random(8), hex_random(32)) {
             (Ok(i), Ok(c)) => (i, format!("{}{c}", ms_session::DEV_PROXY_USER_PREFIX)),
@@ -455,13 +558,20 @@ impl Daemon {
         };
         {
             let mut m = lock(&self.dev.0);
+            // Review R2: under the session lock, so ms stop (which sets the flag, then clears
+            // the sessions under this lock) either is seen here or clears this one.
+            if self.is_stopped()
+                || self.stops.load(std::sync::atomic::Ordering::SeqCst) != stops_seen
+            {
+                return none(reply_err(
+                    ErrorCode::Denied,
+                    "morsec: ms stop ran while ms dev waited for approval, so it did not start",
+                ));
+            }
             // One session per ms dev process: a second DevStart replaces the first.
             m.retain(|_, d| d.session != dev);
-            if m.len() >= MAX_DEV_SESSIONS {
-                return none(reply_err(
-                    ErrorCode::Busy,
-                    format!("morsec: {MAX_DEV_SESSIONS} ms dev sessions are running already"),
-                ));
+            if full(&m) {
+                return busy();
             }
             m.insert(
                 credential.clone(),
@@ -471,22 +581,19 @@ impl Daemon {
                     slug: record.slug.clone(),
                     keys,
                     production,
+                    binding: ms_approve::Binding::of(&req),
                     approval: approval.clone(),
+                    approved_unix_ms,
                 },
             );
         }
-        if let Err(e) = self.record(
+        if let Err(e) = self.record_approved(
             &dev,
             &daemon_key(),
             Mode::Run,
             &format!("ms dev: project {} started", record.slug),
             version,
-            if approval.is_some() {
-                ReceiptResult::Approved
-            } else {
-                ReceiptResult::Allowed
-            },
-            None,
+            &approval,
         ) {
             tracing::error!(error = %e, "could not record ms dev start");
         }

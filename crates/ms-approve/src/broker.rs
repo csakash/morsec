@@ -236,6 +236,16 @@ impl HumanApprover {
         self.tokens.verify(t, b, now_ms())
     }
 
+    /// True while `t` is a token for `b` that this broker issued, unexpired and not revoked
+    /// (`ms stop` rotates the key), whether or not a once token was already used. Uses nothing
+    /// up. For a grant that rides on an approval already verified once (L34 `ms dev`).
+    pub fn is_live(&self, t: &ApprovalToken, b: &Binding) -> bool {
+        matches!(
+            self.tokens.check(t, b, now_ms()),
+            Ok(_) | Err(TokenError::Used)
+        )
+    }
+
     /// `ms stop`: drop every session grant and invalidate every token issued so far. A request
     /// waiting for a person is denied.
     pub fn revoke_all(&self) -> std::io::Result<()> {
@@ -399,6 +409,26 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    // protects=L34 SPEC D-B: a run's token stays live after its one use until it expires or
+    // ms stop revokes every token, and never for another request; fails_when=a revoked or
+    // mismatched token counts as live; no_claim=msd's TTL cap (daemon dev tests)
+    #[test]
+    fn is_live_after_use_until_revoked() {
+        let (a, _) = approver(FakeAuthenticator::approve());
+        let (h, p) = ask_bg(&a, req("select 1"), Duration::from_secs(10));
+        a.decide(&p.id, true, Scope::Once).unwrap();
+        let ApprovalOutcome::Approved(t) = h.join().unwrap() else {
+            panic!("not approved")
+        };
+        let b = Binding::of(&req("select 1"));
+        assert!(a.is_live(&t, &b));
+        assert_eq!(a.verify(&t, &b), Ok(Scope::Once));
+        assert!(a.is_live(&t, &b), "used, still unexpired and unrevoked");
+        assert!(!a.is_live(&t, &Binding::of(&req("select 2"))));
+        a.revoke_all().unwrap();
+        assert!(!a.is_live(&t, &b), "ms stop revokes it");
     }
 
     // protects=AUTH-3 end to end in the approver: a person approves with Touch ID, the token is

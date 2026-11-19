@@ -302,12 +302,38 @@ impl Daemon {
             return reply_err(ErrorCode::Invalid, e.to_string());
         }
 
-        // One approval for the whole set, bound to the hash of its canonical TOML.
+        // L34 review S2: a key in the record decides what `ms dev` hands out and which keys a
+        // dev session may use, so adopting a key that already allows something (one the stored
+        // record didn't list: made by hand, or by another tool) needs the person too. Keys that
+        // still allow nothing are harmless to list; re-saving the same keys asks nothing.
+        let earlier: BTreeSet<KeyName> = file
+            .get(&record.slug)
+            .map(|p| p.keys().into_iter().collect())
+            .unwrap_or_default();
+        let adopted: Vec<KeyName> = record
+            .keys()
+            .into_iter()
+            .filter(|k| !earlier.contains(k) && !proposed.keys.contains_key(k))
+            .filter(|k| {
+                current
+                    .keys
+                    .get(k)
+                    .is_some_and(|r| !ms_projects::save::is_fresh(r))
+            })
+            .collect();
+
+        // One approval for the whole set, bound to the hash of its canonical TOML and to the
+        // adopted keys.
         let stops_seen = self.stops.load(std::sync::atomic::Ordering::SeqCst);
-        let token = if proposed.keys.is_empty() {
+        let token = if proposed.keys.is_empty() && adopted.is_empty() {
             None
         } else {
-            let argv = ms_projects::save::approval_argv(&record, &proposed);
+            let mut argv = ms_projects::save::approval_argv(&record, &proposed);
+            argv.extend(
+                adopted
+                    .iter()
+                    .map(|k| format!("{k} joins the project (its rule already allows something)")),
+            );
             let req = ApprovalRequest {
                 session: session.clone(),
                 key: daemon_key(),
@@ -316,9 +342,10 @@ impl Daemon {
                 argv_display: argv,
                 cwd: PathBuf::from(&record.root),
                 effect: Some(format!(
-                    "{} new key(s) of project {} may reach the services listed",
+                    "{} new key(s) of project {} may reach the services listed; {} existing key(s) join it",
                     proposed.keys.len(),
-                    record.slug
+                    record.slug,
+                    adopted.len()
                 )),
             };
             match self.approve_exact(&req) {

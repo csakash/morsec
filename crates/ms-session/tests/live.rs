@@ -153,6 +153,27 @@ fn s(v: &[&str]) -> Vec<String> {
 // Tests
 // ---------------------------------------------------------------------------------------------
 
+// protects=L34 D-A: a process started under a Seatbelt profile (`sandbox-exec`, as agents'
+// command sandboxes are) is reported sandboxed, so msd can refuse it;
+// fails_when=the sandboxed child reads as not sandboxed; no_claim=App Sandbox apps, or that this
+// test process is unsandboxed (the gate may itself run in one; then only the child is checked)
+fn sandboxed_process_is_detected() {
+    if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").exists() {
+        eprintln!("skipped: no sandbox-exec");
+        return;
+    }
+    let mut child = Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", "(version 1)(allow default)", "/bin/sleep", "5"])
+        .spawn()
+        .unwrap();
+    // sandbox-exec applies the profile, then execs sleep in the same process.
+    std::thread::sleep(Duration::from_millis(500));
+    let got = ms_session::is_sandboxed(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(matches!(got, Ok(true)), "{got:?}");
+}
+
 // protects=live process reads (pid, ppid, start time, name); fails_when=the platform layer
 // returns wrong fields for a real process; no_claim=other users' processes
 fn reads_this_process() {
@@ -389,6 +410,10 @@ fn main() -> ExitCode {
     let filter: Option<&String> = args.iter().skip(1).find(|a| !a.starts_with('-'));
     let tests: &[(&str, fn())] = &[
         ("reads_this_process", reads_this_process),
+        (
+            "sandboxed_process_is_detected",
+            sandboxed_process_is_detected,
+        ),
         (
             "nested_fake_agents_resolve_to_the_outermost",
             nested_fake_agents_resolve_to_the_outermost,

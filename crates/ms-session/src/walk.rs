@@ -52,6 +52,26 @@ pub fn agent_kind(name: &str) -> Option<AgentKind> {
     }
 }
 
+/// The agent a program path belongs to by where agents install themselves (L34 `ms dev`), for
+/// binaries whose own name says nothing: Claude Code's native build lives at
+/// `~/.local/share/claude/versions/<version>`, npm installs keep the package path. A check on
+/// paths only: the session walk still goes by process name, so such a binary started by its
+/// versioned path is not an agent session there (SPEC residual).
+pub fn agent_install_path(path: &str) -> Option<AgentKind> {
+    const KNOWN: [(&str, AgentKind); 6] = [
+        ("/claude/versions/", AgentKind::ClaudeCode),
+        ("/@anthropic-ai/claude-code/", AgentKind::ClaudeCode),
+        ("/@openai/codex/", AgentKind::Codex),
+        ("/codex/bin/", AgentKind::Codex),
+        ("/@google/gemini-cli/", AgentKind::GeminiCli),
+        ("/cursor-agent/", AgentKind::Cursor),
+    ];
+    KNOWN
+        .into_iter()
+        .find(|(p, _)| path.contains(p))
+        .map(|(_, k)| k)
+}
+
 /// Maps a PID to its [`Caller`] using a [`ProcessTable`].
 #[derive(Debug, Clone, Default)]
 pub struct Resolver<T> {
@@ -441,6 +461,36 @@ mod tests {
             r.within(90, 60, 70, 40),
             Err(SessionError::Unreadable { pid: 80, .. })
         ));
+    }
+
+    // protects=L34 N2 agents found by install path (native versioned Claude Code, npm packages);
+    // fails_when=a versioned claude binary or an agent npm package path is not recognised, or an
+    // ordinary path is; no_claim=custom install locations
+    #[test]
+    fn install_paths() {
+        for (p, k) in [
+            (
+                "/Users/a/.local/share/claude/versions/2.0.5",
+                AgentKind::ClaudeCode,
+            ),
+            (
+                "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                AgentKind::ClaudeCode,
+            ),
+            (
+                "/usr/local/lib/node_modules/@openai/codex/bin/codex.js",
+                AgentKind::Codex,
+            ),
+            (
+                "/x/node_modules/@google/gemini-cli/dist/index.js",
+                AgentKind::GeminiCli,
+            ),
+        ] {
+            assert_eq!(agent_install_path(p), Some(k), "{p}");
+        }
+        for p in ["/usr/bin/node", "/Users/a/code/claude-notes/run.sh", ""] {
+            assert_eq!(agent_install_path(p), None, "{p}");
+        }
     }
 
     // protects=exact name matching; fails_when=host apps or lookalikes classify as agents;

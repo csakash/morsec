@@ -1,4 +1,5 @@
-//! The only `unsafe` in this crate: `sysctl(KERN_PROC_PID)` and four libproc calls on macOS.
+//! The only `unsafe` in this crate: `sysctl(KERN_PROC_PID)`, four libproc calls and
+//! `sandbox_check` on macOS.
 //!
 //! Each function passes an owned, correctly sized buffer to the kernel and returns owned Rust
 //! values. Nothing here keeps a pointer past the call, and nothing parses kernel structs whose
@@ -184,4 +185,31 @@ pub(crate) fn socket_info(pid: u32, fd: i32) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(buf)
+}
+
+// `sandbox_check` from libsystem_sandbox (part of libSystem, linked by default). Declared by
+// hand: `libc` doesn't export it. It is variadic in the header; the call below passes no
+// variadic arguments, which is valid with `SANDBOX_FILTER_NONE`.
+unsafe extern "C" {
+    fn sandbox_check(
+        pid: libc::pid_t,
+        operation: *const libc::c_char,
+        filter: libc::c_int,
+        ...
+    ) -> libc::c_int;
+}
+
+/// `sandbox_check(pid, NULL, SANDBOX_FILTER_NONE)`: whether `pid` runs inside an App Sandbox or
+/// Seatbelt profile (`sandbox-exec`, an agent's command sandbox). An error (no such process)
+/// comes back as `Err`.
+pub(crate) fn is_sandboxed(pid: u32) -> io::Result<bool> {
+    let cpid = pid_arg(pid)?;
+    // SAFETY: `operation` is null and the filter type is SANDBOX_FILTER_NONE (0), for which the
+    // function reads no further arguments; nothing is written through any pointer.
+    let r = unsafe { sandbox_check(cpid, std::ptr::null(), 0) };
+    match r {
+        0 => Ok(false),
+        r if r > 0 => Ok(true),
+        _ => Err(io::Error::last_os_error()),
+    }
 }

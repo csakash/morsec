@@ -156,6 +156,8 @@ pub struct Daemon {
     dash_last_open: Mutex<Option<std::time::Instant>>,
     /// Running `ms dev` sessions (L34), memory only.
     dev: dev::DevSessions,
+    /// Is this PID sandboxed (L34 review D-A)? `ms_session::is_sandboxed`, failing closed.
+    sandbox_probe: Mutex<fn(u32) -> bool>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -348,6 +350,7 @@ impl Daemon {
             dash_receipts: Mutex::new(None),
             dash_last_open: Mutex::new(None),
             dev: dev::DevSessions::default(),
+            sandbox_probe: Mutex::new(|pid| ms_session::is_sandboxed(pid).unwrap_or(true)),
             stops: std::sync::atomic::AtomicU64::new(0),
         }))
     }
@@ -1615,6 +1618,7 @@ mod tests {
         )
         .unwrap();
         d.set_approval_timeout(Duration::from_millis(300));
+        d.set_sandbox_probe(|_| false);
         H {
             d,
             auth,
