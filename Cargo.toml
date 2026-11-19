@@ -19,6 +19,7 @@ members = [
     "crates/ms-scan",
     "crates/ms-fuzz",
     "crates/ms-projects",
+    "crates/ms-dash",
     "tests/e2e",
 ]
 
@@ -60,6 +61,7 @@ ms-mcp = { path = "crates/ms-mcp" }
 ms-scan = { path = "crates/ms-scan" }
 ms-fuzz = { path = "crates/ms-fuzz" }
 ms-projects = { path = "crates/ms-projects" }
+ms-dash = { path = "crates/ms-dash" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
 serde = { version = "1", features = ["derive"] }

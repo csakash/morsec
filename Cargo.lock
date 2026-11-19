@@ -787,6 +787,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-dash"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ms-approve",
+ "ms-core",
+ "ms-ipc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ms-e2e"
 version = "0.1.0"
 dependencies = [
