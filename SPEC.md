@@ -93,7 +93,7 @@ so it can be reviewed on its own.
 7. **Headers on every response** (including errors, 404 and refusals): the CSP of design §6.2.5,
    `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`,
    `X-Content-Type-Options: nosniff`, `Cross-Origin-Opener-Policy: same-origin`,
-   `Cross-Origin-Resource-Policy: same-origin`.
+   `Cross-Origin-Resource-Policy: same-origin`. (A request hyper itself can't parse gets hyper's bare 400 with no body; nothing of ours is served on it.)
 8. **Rate limit.** 20 requests/s per session (token bucket, burst 20); over it, 429. Unauthenticated
    requests share one 20 req/s bucket (D-10).
 9. **Screens (read-only).** Home (on/stopped, pending approval with the command to answer it,
@@ -124,17 +124,17 @@ so it can be reviewed on its own.
 |---|---|
 | 1 | `crates/ms-dash/tests/http.rs::dash_open_reports_bound_port`, `crates/ms-dash/tests/http.rs::dash_open_fails_when_range_is_full`, `crates/ms-cli/tests/dashboard.rs::dashboard_opens_the_port_msd_bound` |
 | 2 | `crates/ms-dash/tests/http.rs::dash_closes_when_idle`, `crates/ms-dash/tests/http.rs::dash_shutdown_drops_sessions` |
-| 3 | `crates/ms-cli/tests/dashboard.rs::dash_refuses_agent_process_tree` (real fake-agent `claude` running `curl`), `crates/msd/src/dash.rs::conn_check_refuses_agent_other_uid_and_unknown`, `crates/msd/src/dash.rs::refused_connection_writes_blocked_receipt`, `crates/ms-dash/tests/http.rs::refused_connection_gets_no_bytes` |
+| 3 | `crates/ms-cli/tests/dashboard.rs::dash_refuses_agent_process_tree` (real fake-agent `claude` running `curl`), `crates/msd/src/dash.rs::conn_check_refuses_agent_other_uid_and_unknown`, `crates/msd/src/daemon.rs::refused_connection_writes_blocked_receipt`, `crates/ms-dash/tests/http.rs::refused_connection_gets_no_bytes` |
 | 4 | `crates/msd/src/daemon.rs::dash_open_refused_in_agent_session`, `crates/ms-dash/tests/http.rs::launch_token_single_use`, `crates/ms-dash/tests/http.rs::launch_token_expires` |
 | 5 | `crates/ms-dash/tests/http.rs::session_cookie_attributes`, `crates/ms-dash/tests/http.rs::launch_token_single_use` |
 | 6 | `crates/ms-dash/tests/http.rs::dash_rejects_foreign_host_header`, `crates/ms-dash/tests/http.rs::dash_rejects_cross_origin_post`, `crates/ms-dash/tests/http.rs::api_needs_cookie_and_csrf`, `crates/ms-dash/tests/http.rs::body_limit_and_methods` |
 | 7 | `crates/ms-dash/tests/http.rs::dash_csp_on_every_response` |
 | 8 | `crates/ms-dash/tests/http.rs::rate_limited_per_session` |
-| 9 | `crates/ms-dash/tests/http.rs::api_views_round_trip`, `crates/msd/src/daemon/dash_data.rs::dashboard_views_from_records`, `crates/ms-dash/src/assets.rs::no_value_action_controls`; browser pass (PROOF, screenshots) |
-| 10 | `crates/msd/src/daemon/dash_data.rs::dashboard_never_serves_a_canary`, `crates/ms-cli/tests/dashboard.rs::dashboard_end_to_end` (real `ms init` of a fixture with canary values, every API route fetched with curl from outside the agent tree) |
+| 9 | `crates/ms-dash/tests/http.rs::api_views_round_trip`, `crates/msd/src/daemon.rs::dashboard_views_from_records`, `crates/ms-dash/src/assets.rs::no_value_action_controls`; browser pass (PROOF, screenshots) |
+| 10 | `crates/msd/src/daemon.rs::dashboard_never_serves_a_canary`, `crates/ms-cli/tests/dashboard.rs::dashboard_end_to_end` (real `ms init` of a fixture with canary values, every API route fetched with curl from outside the agent tree) |
 | 11 | `crates/ms-dash/src/assets.rs::dash_assets_have_no_html_sinks` |
 | 12 | `crates/ms-dash/src/assets.rs::dash_assets_have_no_external_urls` |
-| 13 | `crates/ms-cli/tests/dashboard.rs::dashboard_opens_the_port_msd_bound`, `crates/ms-cli/tests/dashboard.rs::dash_open_refused_in_agent_session_cli` |
+| 13 | `crates/ms-cli/tests/dashboard.rs::dashboard_opens_the_port_msd_bound`, `crates/ms-cli/tests/dashboard.rs::dash_refuses_agent_process_tree` (its `ms dashboard` part), `crates/ms-cli/src/dashboard.rs::url_keeps_token_in_fragment`, `crates/ms-cli/tests/dashboard.rs::dashboard_end_to_end` (`ms init` prints `Dashboard  ms dashboard` with `--no-open`) |
 | 14 | `crates/ms-cli/src/main.rs::dash_parity_covers_every_subcommand`, `crates/ms-dash/src/parity.rs::parity_routes_exist` |
 | 15 | `scripts/threat_model_check.py` (gate), ARI-42 scan (gate) |
 
