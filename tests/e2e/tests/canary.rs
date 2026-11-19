@@ -1355,7 +1355,8 @@ fn tls_upstream(hosts: &[&str]) -> (u16, String, Arc<Mutex<Vec<u8>>>) {
 // the CA variable ms dev sets; no Node 24 in the gate) calls a fake api.stripe.com over HTTPS
 // with an ms:// ref and the upstream receives the real canary in the bound header; the child gets
 // the run-mode database URL in its environment; the credential from a process that left the
-// tree (double fork) is refused while the session runs, and from anywhere once ms dev exited; no
+// tree (double fork) is refused while the session runs, the session's end is recorded when the
+// command exits, and the credential is refused from anywhere afterwards; no
 // canary, in any encoding ms-scan knows, is in ms dev's output, msd's log, the receipts, the
 // state directory or msd's IPC replies; fails_when=the swap doesn't happen, the value appears in
 // any of those places, or a copied credential works outside the tree; no_claim=Node's own proxy
@@ -1444,6 +1445,16 @@ exit 3"#
     let stolen = std::fs::read_to_string(w.dir.path().join("dev.stolen")).unwrap_or_default();
     assert!(stolen.starts_with("403"), "outside the tree: {stolen:?}");
 
+    // Review R5: the session really ended when the command exited: ms dev's DevEnd left its
+    // receipt (a refusal from outside the tree, below, would hold even for a live session).
+    let ended = World::files_under(&w.dir.path().join("state/receipts"))
+        .into_iter()
+        .flat_map(|(_, b)| b)
+        .collect::<Vec<u8>>();
+    assert!(
+        String::from_utf8_lossy(&ended).contains("ms dev: project shop ended (the command exited)"),
+        "no end receipt"
+    );
     // Once ms dev exited, its credential is refused from anywhere.
     let proxy = std::fs::read_to_string(w.dir.path().join("dev.proxy")).unwrap();
     let proxy = proxy.trim();
