@@ -6,7 +6,7 @@ use std::time::Duration;
 use ms_core::{Error, KeyMeta, KeyName, Result, SecretBytes};
 use tokio::net::UnixStream;
 
-use crate::frame::{read_frame, write_frame};
+use crate::frame::{read_frame, read_secret_frame, write_frame};
 use crate::peer_verify::PeerIdentity;
 use crate::protocol::{OutStream, RequestBody, ResponseBody, decode, encode};
 use tokio::io::AsyncReadExt;
@@ -86,6 +86,35 @@ impl Client {
         }
         let id = self.send(&body).await?;
         self.receive(id, timeout).await
+    }
+
+    /// Sends a request whose reply may be followed by raw value frames (L34 `DevStart`), waiting
+    /// up to `timeout` for the reply. After a `DevStarted`, reads one value per name in its `env`
+    /// straight into [`SecretBytes`]; any other reply comes back with no values.
+    pub async fn request_with_values(
+        &mut self,
+        body: RequestBody,
+        timeout: Duration,
+    ) -> Result<(ResponseBody, Vec<SecretBytes>)> {
+        if !body.returns_values() {
+            return Err(Error::Protocol(
+                "request_with_values needs a DevStart request".into(),
+            ));
+        }
+        let id = self.send(&body).await?;
+        let reply = self.receive(id, timeout).await?;
+        let n = match &reply {
+            ResponseBody::DevStarted { env, .. } => env.len(),
+            _ => 0,
+        };
+        let mut values = Vec::with_capacity(n);
+        for _ in 0..n {
+            let v = tokio::time::timeout(RESPONSE_TIMEOUT, read_secret_frame(&mut self.stream))
+                .await
+                .map_err(|_| Error::Protocol("the daemon stopped sending values".into()))??;
+            values.push(v);
+        }
+        Ok((reply, values))
     }
 
     /// Stores a key. The value goes in its own raw frame and never through serde.

@@ -189,6 +189,21 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         view: Option<String>,
     },
+    /// Start an `ms dev` session (L34) for the user's own command. Refused inside an agent
+    /// session, while stopped, for an agent binary and outside every project root. One Touch ID
+    /// when a key of the project is production. Answered with [`ResponseBody::DevStarted`],
+    /// whose run-mode values follow as raw frames ([`RequestBody::returns_values`]).
+    DevStart {
+        /// The command `ms dev` will run (shown on the approval sheet; `argv[0]` is checked).
+        argv: Vec<String>,
+        /// The working directory; must be inside a recorded project root.
+        cwd: PathBuf,
+    },
+    /// End an `ms dev` session (L34). Only the `ms dev` process that started it may.
+    DevEnd {
+        /// The session id from `DevStarted`.
+        session: String,
+    },
 }
 
 /// What an approval covers (L11, PRD §7.2).
@@ -233,6 +248,13 @@ impl RequestBody {
         matches!(self, RequestBody::PutKey { .. })
     }
 
+    /// True when raw value frames may follow this request's reply (L34 `DevStart`): one per name
+    /// in [`ResponseBody::DevStarted`]'s `env`, none for any other reply. The values never go
+    /// through serde.
+    pub fn returns_values(&self) -> bool {
+        matches!(self, RequestBody::DevStart { .. })
+    }
+
     /// The loop that implements this request, for `not_implemented` answers.
     pub fn owner_loop(&self) -> &'static str {
         match self {
@@ -256,6 +278,7 @@ impl RequestBody {
             | RequestBody::ProjectList
             | RequestBody::ProjectGet { .. } => "L31 guided-init",
             RequestBody::DashOpen { .. } => "L32 dash-core",
+            RequestBody::DevStart { .. } | RequestBody::DevEnd { .. } => "L34 ms-dev",
         }
     }
 }
@@ -558,6 +581,33 @@ pub enum ResponseBody {
         port: u16,
         /// msd handed the sign-in URL to the browser (false without a GUI session).
         opened: bool,
+    },
+    /// An `ms dev` session started (`DevStart`, L34). Names only: the value of each variable in
+    /// `env` follows this frame as its own raw frame, in order.
+    DevStarted {
+        /// Session id, for `DevEnd` and receipts.
+        session: String,
+        /// The proxy username for the child's `HTTPS_PROXY`. Useless outside the `ms dev`
+        /// process tree: msd checks the tree of every connection that presents it.
+        credential: String,
+        /// The swap proxy's loopback port.
+        proxy_port: u16,
+        /// The project's slug.
+        project: String,
+        /// The project's canonical root.
+        root: String,
+        /// The proxy CA certificate (PEM, public), when a host is bound.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ca_pem: Option<String>,
+        /// Run-mode variables whose values follow, in order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<String>,
+        /// Keys of the project the proxy swaps for this session.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        swapped: Vec<String>,
+        /// Things to show the user (skipped variables and why).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notes: Vec<String>,
     },
 }
 

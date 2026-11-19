@@ -1,10 +1,11 @@
 //! IPC between `ms`, the shim, `ms mcp` and `msd`.
 //!
 //! Frames are a 4-byte big-endian length followed by UTF-8 JSON, at most [`MAX_FRAME`] bytes.
-//! Messages are `{"v":1,"id":<u64>,"body":{...}}`. There is deliberately no request that returns
-//! a secret value, and [`ms_core::SecretBytes`] has no `Serialize`, so no message can carry one.
-//! `PutKey` sends its value in a separate raw frame that the server reads straight into
-//! `SecretBytes`.
+//! Messages are `{"v":1,"id":<u64>,"body":{...}}`. [`ms_core::SecretBytes`] has no `Serialize`,
+//! so no message can carry a secret value. `PutKey` sends its value in a separate raw frame that
+//! the server reads straight into `SecretBytes`. The one reply followed by values is `DevStarted`
+//! (L34 `ms dev`, refused inside agent sessions): the run-mode values of the caller's project
+//! follow it as raw frames, one per variable name it lists, read straight into `SecretBytes`.
 
 pub mod client;
 pub mod frame;

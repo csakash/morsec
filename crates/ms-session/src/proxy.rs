@@ -28,6 +28,20 @@ pub fn proxy_user_for(agent: &AgentKind) -> Option<&'static str> {
     }
 }
 
+/// Prefix of an `ms dev` proxy username (L34): `ms-dev-` followed by 64 lowercase hex characters
+/// (32 random bytes msd made for one dev session). No agent's username starts with it.
+pub const DEV_PROXY_USER_PREFIX: &str = "ms-dev-";
+
+/// True when `user` has the shape of an `ms dev` credential. Shape only: msd still looks it up
+/// and checks the process tree (an unknown or copied credential gets nothing).
+pub fn is_dev_proxy_user(user: &str) -> bool {
+    user.strip_prefix(DEV_PROXY_USER_PREFIX).is_some_and(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 fn describe(c: &Caller) -> String {
     match c {
         Caller::Agent(s) => format!("{:?} session {}", s.agent, s.pid),
@@ -97,6 +111,25 @@ mod tests {
             !e.contains('\n') && !e.contains('\u{1b}') && !e.contains('\u{7}'),
             "{e}"
         );
+    }
+
+    // protects=L34 the dev credential shape never overlaps an agent username; fails_when=an agent
+    // name or a malformed token passes as a dev credential; no_claim=that the shape authenticates
+    // anything (msd checks the registry and the process tree)
+    #[test]
+    fn dev_user_shape() {
+        let ok = format!("{DEV_PROXY_USER_PREFIX}{}", "ab".repeat(32));
+        assert!(is_dev_proxy_user(&ok));
+        assert_eq!(agent_for_proxy_user(&ok), None);
+        for bad in [
+            "claude-code".to_string(),
+            DEV_PROXY_USER_PREFIX.to_string(),
+            format!("{DEV_PROXY_USER_PREFIX}{}", "AB".repeat(32)),
+            format!("{DEV_PROXY_USER_PREFIX}{}", "ab".repeat(31)),
+            format!("{DEV_PROXY_USER_PREFIX}{}g", "ab".repeat(31)),
+        ] {
+            assert!(!is_dev_proxy_user(&bad), "{bad}");
+        }
     }
 
     // protects=connector and cross-check agree on names; fails_when=the two maps drift;

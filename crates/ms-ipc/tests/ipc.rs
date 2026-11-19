@@ -853,3 +853,137 @@ fn doctor_probe_old_wire_form_parses() {
         }
     );
 }
+
+/// L34: answers `DevStart` with names and values; `bad` pairs one name with two values.
+struct DevHandler {
+    bad: bool,
+}
+
+fn dev_started(env: Vec<String>) -> ResponseBody {
+    ResponseBody::DevStarted {
+        session: "s1".into(),
+        credential: format!("ms-dev-{}", "ab".repeat(32)),
+        proxy_port: 1,
+        project: "shop".into(),
+        root: "/x/shop".into(),
+        ca_pem: None,
+        env,
+        swapped: Vec::new(),
+        notes: Vec::new(),
+    }
+}
+
+impl Handler for DevHandler {
+    async fn handle(
+        &self,
+        _peer: &PeerInfo,
+        _request: RequestBody,
+        _value: Option<SecretBytes>,
+    ) -> ResponseBody {
+        ResponseBody::status("test", "0", "test")
+    }
+
+    async fn handle_with_values(
+        &self,
+        _peer: &PeerInfo,
+        _request: RequestBody,
+        _value: Option<SecretBytes>,
+    ) -> (ResponseBody, Vec<SecretBytes>) {
+        let v = || SecretBytes::new(CANARY.as_bytes().to_vec());
+        if self.bad {
+            (dev_started(vec!["DATABASE_URL".into()]), vec![v(), v()])
+        } else {
+            (
+                dev_started(vec!["DATABASE_URL".into(), "REDIS_URL".into()]),
+                vec![v(), SecretBytes::new(b"redis://x".to_vec())],
+            )
+        }
+    }
+}
+
+async fn serve_dev(bad: bool) -> (PathBuf, oneshot::Sender<()>, tempfile::TempDir) {
+    let dir = tmpdir();
+    let path = dir.path().join("sub/msd.sock");
+    let server = Server::bind(&path).unwrap();
+    let check = Arc::new(SameUid {
+        uid: server.owner_uid(),
+    });
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        server
+            .serve(Arc::new(DevHandler { bad }), check, async {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (path, tx, dir)
+}
+
+fn dev_start() -> RequestBody {
+    RequestBody::DevStart {
+        argv: vec!["npm".into(), "run".into(), "dev".into()],
+        cwd: "/x/shop".into(),
+    }
+}
+
+// protects=L34 D-3 run-mode values travel only as raw frames after a DevStarted naming them, in
+// order; the JSON reply never holds a value; a reply whose name count differs from the values is
+// replaced by an error and no value is sent; request_with_values refuses other requests;
+// fails_when=a value shows up in a JSON frame, values are misaligned with names, or a mismatched
+// reply still sends values; no_claim=which values msd chooses (msd daemon::dev tests)
+#[tokio::test]
+async fn values_follow_dev_started_as_raw_frames() {
+    let (path, stop, _d) = serve_dev(false).await;
+    let mut c = Client::connect(&path).await.unwrap();
+    let (reply, values) = c
+        .request_with_values(dev_start(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(matches!(&reply, ResponseBody::DevStarted { env, .. } if env.len() == 2));
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].expose(), CANARY.as_bytes());
+    assert_eq!(values[1].expose(), b"redis://x");
+    assert!(
+        c.request_with_values(RequestBody::Status, Duration::from_secs(5))
+            .await
+            .is_err()
+    );
+
+    // On the wire: the JSON frame holds names only; the values are the next raw frames.
+    let mut s = raw(&path).await;
+    write_frame(&mut s, &encode(7, &dev_start()).unwrap())
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut s))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&first).contains(CANARY));
+    assert!(String::from_utf8_lossy(&first).contains("DATABASE_URL"));
+    let v = read_frame(&mut s).await.unwrap().unwrap();
+    assert_eq!(v, CANARY.as_bytes());
+    let _ = stop.send(());
+
+    let (path, stop, _d) = serve_dev(true).await;
+    let mut s = raw(&path).await;
+    write_frame(&mut s, &encode(8, &dev_start()).unwrap())
+        .await
+        .unwrap();
+    let e = read_response(&mut s).await.unwrap();
+    assert!(
+        matches!(
+            e.body,
+            ResponseBody::Error {
+                code: ErrorCode::Internal,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    // Nothing follows the error (the connection waits for the next request, so a short read
+    // times out rather than delivering a value).
+    let more = tokio::time::timeout(Duration::from_millis(300), read_frame(&mut s)).await;
+    assert!(more.is_err(), "a value followed a refused reply: {more:?}");
+    let _ = stop.send(());
+}

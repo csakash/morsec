@@ -214,6 +214,7 @@ fn kind(r: &ResponseBody) -> &'static str {
         ResponseBody::Project { .. } => "project",
         ResponseBody::Error { .. } => "error",
         ResponseBody::Dash { .. } => "dashboard",
+        ResponseBody::DevStarted { .. } => "dev started",
     }
 }
 
