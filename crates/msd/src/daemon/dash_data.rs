@@ -29,6 +29,8 @@ use super::{Daemon, lock, mode_str, now_ms, reply_err, tier_str};
 /// Rows Activity shows when the page asks for no limit, and the most it may ask for.
 const DEFAULT_ROWS: usize = 200;
 const MAX_ROWS: usize = 1000;
+/// Shortest gap between two browser tabs `DashOpen` opens (fix round 2, F2).
+const DASH_OPEN_GAP: std::time::Duration = std::time::Duration::from_secs(3);
 /// Uses shown on the Secret screen.
 const SECRET_USES: usize = 20;
 
@@ -146,8 +148,18 @@ impl Daemon {
                 "morsec: that is not a project name. List them with: ms projects",
             );
         }
+        // At most one tab per DASH_OPEN_GAP, and none while the last sign-in link is unused and
+        // valid: a detached process looping DashOpen can't flood the browser with tabs or push
+        // the real tab's CSRF tokens out (fix round 2, F2). The browser already has a link.
+        let mut last = lock(&self.dash_last_open);
+        if let Some((port, pending)) = dash.pending()
+            && (pending || last.is_some_and(|t| t.elapsed() < DASH_OPEN_GAP))
+        {
+            return ResponseBody::Dash { port, opened: true };
+        }
         match dash.open() {
             Ok(o) => {
+                *last = Some(std::time::Instant::now());
                 let opened = opener(&o.url(view));
                 ResponseBody::Dash {
                     port: o.port,

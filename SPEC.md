@@ -63,7 +63,7 @@ so it can be reviewed on its own.
   fetch (`Sec-Fetch-Site`), a stale tab's CSRF token, a missing session and a rate limit get a log
   line only (reviews R1, S4): every caller at that point passed the process check. Log lines are
   written once per caller and reason per minute, then as a count (review R3: msd's log is not
-  rotated).
+  rotated); every caller outside an agent session shares one log key whatever its PID (F1).
 - **D-10 Unauthenticated surface.** Without a session only `GET /`, `/dash.css`, `/dash.js`,
   `/favicon.svg` (static, no data) and `POST /api/session` are served; they share one 20 req/s
   bucket, and so do cookie-less API requests before their 401 (review R3). Everything else under
@@ -85,7 +85,10 @@ so it can be reviewed on its own.
   `ms dashboard`, `ms status --open` and `ms init` only send `DashOpen` and print the port. Test
   hook: `msd --test-open-to FILE` appends the URL to FILE instead; refused unless the build is a
   debug build and the vault is the memory vault, and the file writer is not compiled into release
-  builds. The view is checked in msd (`project/<a-z0-9->`).
+  builds. The view is checked in msd (`project/<a-z0-9->`). Fix round 2 (F2): msd opens no new
+  tab while the last sign-in link is unused and valid, and at most one every 3 s; it then answers
+  `opened: true` with the same port, so a looping caller can't flood the browser or push the real
+  tab's CSRF tokens out.
 - **D-13 Activity and receipt reads (reviews R2, R8, S6).** An Activity key filter that is not a
   valid key name matches nothing; any other filter error shows under the form, which stays
   usable. msd reads the receipt files for the dashboard once per new record (a cache keyed by the
@@ -153,11 +156,11 @@ so it can be reviewed on its own.
 | 1 | `crates/ms-dash/tests/http.rs::dash_open_reports_bound_port`, `crates/ms-dash/tests/http.rs::dash_open_fails_when_range_is_full`, `crates/ms-cli/tests/dashboard.rs::dashboard_opens_the_port_msd_bound` |
 | 2 | `crates/ms-dash/tests/http.rs::dash_closes_when_idle`, `crates/ms-dash/tests/http.rs::dash_shutdown_drops_sessions`, `crates/ms-dash/tests/http.rs::dash_closes_when_idle` (a held keep-alive connection closes too) |
 | 3 | `crates/ms-cli/tests/dashboard.rs::dash_refuses_agent_process_tree` (real fake-agent `claude` running `curl`), `crates/msd/src/dash.rs::conn_check_refuses_agent_other_uid_and_unknown`, `crates/msd/src/daemon.rs::refused_connection_writes_blocked_receipt`, `crates/ms-dash/tests/http.rs::refused_connection_gets_no_bytes` |
-| 4 | `crates/msd/src/daemon.rs::dash_open_refused_in_agent_session`, `crates/ms-dash/tests/http.rs::launch_token_single_use`, `crates/ms-dash/tests/http.rs::launch_token_expires`, `crates/msd/src/daemon.rs::dash_open_never_returns_token`, `crates/ms-cli/tests/dashboard.rs::detached_process_gets_no_token`, `crates/msd/src/open.rs::test_open_to_needs_the_memory_vault` |
+| 4 | `crates/msd/src/daemon.rs::dash_open_refused_in_agent_session`, `crates/ms-dash/tests/http.rs::launch_token_single_use`, `crates/ms-dash/tests/http.rs::launch_token_expires`, `crates/msd/src/daemon.rs::dash_open_never_returns_token`, `crates/ms-cli/tests/dashboard.rs::detached_process_gets_no_token`, `crates/msd/src/open.rs::test_open_to_needs_the_memory_vault`, `crates/msd/src/daemon.rs::dash_open_is_rate_limited` |
 | 5 | `crates/ms-dash/tests/http.rs::session_cookie_attributes`, `crates/ms-dash/tests/http.rs::launch_token_single_use`, `crates/ms-dash/tests/http.rs::second_open_keeps_the_first_tab`, `crates/ms-dash/src/auth.rs::second_sign_in_joins_the_session` |
 | 6 | `crates/ms-dash/tests/http.rs::dash_rejects_foreign_host_header`, `crates/ms-dash/tests/http.rs::dash_rejects_cross_origin_post`, `crates/ms-dash/tests/http.rs::api_needs_cookie_and_csrf`, `crates/ms-dash/tests/http.rs::body_limit_and_methods`, `crates/ms-dash/tests/http.rs::slow_body_times_out` |
 | 7 | `crates/ms-dash/tests/http.rs::dash_csp_on_every_response` |
-| 8 | `crates/ms-dash/tests/http.rs::rate_limited_per_session`, `crates/ms-dash/src/auth.rs::refusal_throttle`, `crates/ms-dash/src/auth.rs::refusal_log_is_rate_limited` |
+| 8 | `crates/ms-dash/tests/http.rs::rate_limited_per_session`, `crates/ms-dash/src/auth.rs::refusal_throttle`, `crates/ms-dash/src/auth.rs::refusal_log_is_rate_limited`, `crates/ms-dash/src/auth.rs::log_key_groups_non_agent_pids` |
 | 9 | `crates/ms-dash/tests/http.rs::api_views_round_trip`, `crates/msd/src/daemon.rs::dashboard_views_from_records`, `crates/ms-dash/src/assets.rs::no_value_action_controls`; browser pass (PROOF, screenshots) |
 | 10 | `crates/msd/src/daemon.rs::dashboard_never_serves_a_canary`, `crates/ms-cli/tests/dashboard.rs::dashboard_end_to_end` (real `ms init` of a fixture with canary values, every API route fetched with curl from outside the agent tree) |
 | 11 | `crates/ms-dash/src/assets.rs::dash_assets_have_no_html_sinks` |

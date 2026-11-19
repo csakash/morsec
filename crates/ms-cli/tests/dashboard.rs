@@ -361,8 +361,10 @@ fn dashboard_opens_the_port_msd_bound() {
     );
 
     // A project name opens its page.
-    let (code, out) = fx.outside(&base, r#""$MS" dashboard shop"#);
+    // The first link is used, and msd opens at most one tab every 3 s (fix round 2, F2).
+    let (code, out) = fx.outside(&base, r#"sleep 3.2; "$MS" dashboard shop"#);
     assert_eq!(code, 0, "{out}");
+    assert_eq!(fx.opened().len(), 2, "a second tab after the gap");
     let (port2, _, view) = parse_url(&fx.url());
     assert_eq!(port2, port, "the listener is reused");
     assert_eq!(view.as_deref(), Some("project/shop"));

@@ -151,6 +151,8 @@ pub struct Daemon {
     /// The receipts the dashboard last read, keyed by the store's next sequence number; the lock
     /// also lets one dashboard request read the files at a time (reviews R8, S6).
     dash_receipts: Mutex<Option<(u64, Arc<Vec<ms_receipts::StoredRecord>>)>>,
+    /// When `DashOpen` last opened a browser tab (fix round 2, F2).
+    dash_last_open: Mutex<Option<std::time::Instant>>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -341,6 +343,7 @@ impl Daemon {
             dash: std::sync::OnceLock::new(),
             last_scan: Mutex::new(None),
             dash_receipts: Mutex::new(None),
+            dash_last_open: Mutex::new(None),
             stops: std::sync::atomic::AtomicU64::new(0),
         }))
     }
@@ -2938,6 +2941,50 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    // protects=fix round 2 F2: a process looping DashOpen opens no second tab while the last
+    // sign-in link is unused, nor within 3 s of the last tab, and gets the same port back, so it
+    // can neither flood the browser nor push the real tab's CSRF tokens out; once the link is
+    // used and the gap has passed a new tab opens; fails_when=a second tab opens inside either
+    // limit; no_claim=-
+    #[test]
+    fn dash_open_is_rate_limited() {
+        use std::io::{Read, Write};
+        let h = fresh();
+        let (_rt, opened) = with_dash(&h, allow_all());
+        let port = match dash_open(&h, None) {
+            ResponseBody::Dash { port, opened: true } => port,
+            other => panic!("{other:?}"),
+        };
+        for _ in 0..10 {
+            assert!(matches!(
+                dash_open(&h, None),
+                ResponseBody::Dash { port: p, opened: true } if p == port
+            ));
+        }
+        assert_eq!(lock(&opened).len(), 1, "the link is unused: no second tab");
+        // The browser signs in with the link.
+        let token = lock(&opened)[0].split("#t=").nth(1).unwrap().to_owned();
+        let body = format!("{{\"token\":\"{token}\"}}");
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(
+            format!(
+                "POST /api/session HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut got = String::new();
+        let _ = c.read_to_string(&mut got);
+        assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+        let _ = dash_open(&h, None);
+        assert_eq!(lock(&opened).len(), 1, "within 3 s of the last tab");
+        std::thread::sleep(Duration::from_millis(3200));
+        let _ = dash_open(&h, None);
+        assert_eq!(lock(&opened).len(), 2, "after the gap");
     }
 
     // protects=SPEC D-12 and security review S1: the launch token is handed to the browser
