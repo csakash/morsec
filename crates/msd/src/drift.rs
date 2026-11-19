@@ -88,6 +88,22 @@ pub fn changed(seen: &mut [(PathBuf, Option<String>)]) -> Vec<PathBuf> {
     out
 }
 
+/// Whether a change of `path` to fingerprint `fp` is one msd made itself (L35 SPEC D-8,
+/// T-111): only the exact fingerprint msd recorded, and only once (it is forgotten).
+pub fn skip_own(
+    own: &mut Vec<(PathBuf, Option<String>)>,
+    path: &Path,
+    fp: &Option<String>,
+) -> bool {
+    match own.iter().position(|(p, f)| p == path && f == fp) {
+        Some(i) => {
+            own.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Polls until `shutdown`.
 pub async fn watch_loop(d: Arc<Daemon>, home: PathBuf, mut shutdown: watch::Receiver<bool>) {
     let mut seen: Vec<(PathBuf, Option<String>)> = watched(&home)
@@ -118,11 +134,15 @@ pub async fn watch_loop(d: Arc<Daemon>, home: PathBuf, mut shutdown: watch::Rece
             }
         };
         for p in checked {
-            tracing::warn!(path = %p.display(), "connector settings changed");
             let fingerprint = seen
                 .iter()
                 .find(|(q, _)| *q == p)
                 .and_then(|(_, f)| f.clone());
+            // msd's own dashboard connect or disconnect wrote exactly this (L35 SPEC D-8).
+            if d.take_own_write(&p, &fingerprint) {
+                continue;
+            }
+            tracing::warn!(path = %p.display(), "connector settings changed");
             d.alert(
                 crate::daemon::AlertKind::SettingsChanged {
                     path: p.clone(),
@@ -203,5 +223,35 @@ mod tests {
             assert_ne!(first, second, "an edit to an unreadable file");
         }
         std::fs::set_permissions(&q, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // protects=L35 SPEC D-8 / T-111: msd's own dashboard write of a watched file raises no
+    // alert, once and only for the exact content it wrote; a later edit (another fingerprint) or
+    // the same content written again later alerts as before; fails_when=msd's record hides an
+    // agent's edit; no_claim=the 10 s poll timing
+    #[test]
+    fn own_writes_are_not_drift() {
+        let d = tempfile::tempdir().unwrap();
+        let files = watched(d.path());
+        std::fs::create_dir_all(files[0].parent().unwrap()).unwrap();
+        std::fs::write(&files[0], b"{}").unwrap();
+        let mut seen: Vec<_> = files.iter().map(|p| (p.clone(), fingerprint(p))).collect();
+        // msd writes and records what it wrote.
+        std::fs::write(&files[0], br#"{"sandbox":{}}"#).unwrap();
+        let mut own = vec![(files[0].clone(), fingerprint(&files[0]))];
+        let changed1 = changed(&mut seen);
+        assert_eq!(changed1, [files[0].clone()]);
+        assert!(skip_own(&mut own, &files[0], &fingerprint(&files[0])));
+        assert!(own.is_empty());
+        // Someone else edits: not skipped.
+        std::fs::write(&files[0], br#"{"sandbox":{"enabled":false}}"#).unwrap();
+        assert_eq!(changed(&mut seen), [files[0].clone()]);
+        assert!(!skip_own(&mut own, &files[0], &fingerprint(&files[0])));
+        // A recorded write that is then edited before the poll: not skipped either.
+        std::fs::write(&files[0], b"{}").unwrap();
+        own.push((files[0].clone(), fingerprint(&files[0])));
+        std::fs::write(&files[0], br#"{"x":1}"#).unwrap();
+        assert_eq!(changed(&mut seen), [files[0].clone()]);
+        assert!(!skip_own(&mut own, &files[0], &fingerprint(&files[0])));
     }
 }

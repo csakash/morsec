@@ -21,6 +21,7 @@ use ms_vault::{Listing, Vault, VaultExt};
 use tokio::sync::watch;
 
 pub mod dash_actions;
+mod dash_connect;
 mod dash_data;
 pub mod dev;
 mod mcp;

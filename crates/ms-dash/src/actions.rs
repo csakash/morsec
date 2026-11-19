@@ -63,6 +63,18 @@ pub enum Action {
     UndoKey,
     /// `POST /api/projects/{slug}/undo`.
     UndoProject,
+    /// `POST /api/agents/{agent}/connect/preview` (L35).
+    ConnectPreview,
+    /// `POST /api/agents/{agent}/connect` (L35): Touch ID.
+    Connect,
+    /// `POST /api/agents/{agent}/disconnect/preview` (L35).
+    DisconnectPreview,
+    /// `POST /api/agents/{agent}/disconnect` (L35): Touch ID.
+    Disconnect,
+    /// `POST /api/projects/preview` (L35).
+    ProjectPreview,
+    /// `POST /api/projects/add` (L35): Touch ID.
+    ProjectAdd,
 }
 
 impl Action {
@@ -84,6 +96,12 @@ impl Action {
             Action::AddKey => "add key",
             Action::Delete => "delete key",
             Action::UndoKey | Action::UndoProject => "undo",
+            Action::ConnectPreview => "connect preview",
+            Action::Connect => "connect",
+            Action::DisconnectPreview => "disconnect preview",
+            Action::Disconnect => "disconnect",
+            Action::ProjectPreview => "add project preview",
+            Action::ProjectAdd => "add project",
         }
     }
 
@@ -105,6 +123,12 @@ impl Action {
                 | Action::Delete
                 | Action::UndoKey
                 | Action::UndoProject
+                | Action::ConnectPreview
+                | Action::Connect
+                | Action::DisconnectPreview
+                | Action::Disconnect
+                | Action::ProjectPreview
+                | Action::ProjectAdd
         )
     }
 }
@@ -129,6 +153,18 @@ pub const ACTION_ROUTES: &[(&str, Action)] = &[
     ("/api/keys/{key}/delete", Action::Delete),
     ("/api/keys/{key}/undo", Action::UndoKey),
     ("/api/projects/{slug}/undo", Action::UndoProject),
+    (
+        "/api/agents/{agent}/connect/preview",
+        Action::ConnectPreview,
+    ),
+    ("/api/agents/{agent}/connect", Action::Connect),
+    (
+        "/api/agents/{agent}/disconnect/preview",
+        Action::DisconnectPreview,
+    ),
+    ("/api/agents/{agent}/disconnect", Action::Disconnect),
+    ("/api/projects/preview", Action::ProjectPreview),
+    ("/api/projects/add", Action::ProjectAdd),
 ];
 
 /// The route for `path` and its one parameter (raw, still percent-encoded), if any.
@@ -163,6 +199,18 @@ pub fn valid_slug(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// An agent the dashboard can connect: `claude-code` or `codex` (L35).
+pub fn valid_agent(s: &str) -> bool {
+    matches!(s, "claude-code" | "codex")
+}
+
+/// A plan digest: 64 lowercase hex digits (L35).
+pub fn valid_plan(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// An approval or warning id: 1 to 64 of `A-Za-z0-9-`.
 pub fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -193,6 +241,8 @@ pub enum ActionCode {
     Refused,
     /// Something msd needs is not reachable (the pasteboard without a GUI session).
     Unavailable,
+    /// What the person was shown changed since (a plan digest no longer matches, L35).
+    Changed,
     /// msd failed.
     Internal,
 }
@@ -206,6 +256,7 @@ impl ActionCode {
             | ActionCode::Stopped
             | ActionCode::Referenced
             | ActionCode::NotText
+            | ActionCode::Changed
             | ActionCode::Gone => 409,
             ActionCode::RateLimited => 429,
             ActionCode::Invalid => 400,
@@ -304,6 +355,18 @@ pub enum RuleEdit {
     RemoveFolder(String),
     /// `test` or `production`.
     SetTier(TierArg),
+    /// One exact host HTTPS git may use the key for (adds the host too). L35.
+    AddGitHost(String),
+    /// A git host the rule names (the host itself stays). L35.
+    RemoveGitHost(String),
+    /// A variable a run key may be put in. L35.
+    AddEnv(String),
+    /// A variable the rule names. L35.
+    RemoveEnv(String),
+    /// A known_hosts line (ed25519) for SSH git. L35.
+    AddSshHostKey(String),
+    /// A host key the rule names. L35.
+    RemoveSshHostKey(String),
 }
 
 /// A tier as the page sends it.
@@ -384,6 +447,129 @@ pub struct PathCheck {
     pub command: Option<String>,
 }
 
+/// One changed line of an agent settings file, redacted (L35 SPEC D-1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PlanLineView {
+    /// `+` or `-`.
+    pub sign: String,
+    /// 1-based line number.
+    pub n: usize,
+    /// The line, with values morsec didn't write shown as `…`.
+    pub text: String,
+}
+
+/// One file a connect or disconnect touches.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PlanFileView {
+    /// The file (`~/…`).
+    pub path: String,
+    /// `create`, `change`, `remove`, or for morsec's own files `write`, `keep`, `drop`.
+    pub verb: String,
+    /// Changed lines (settings files only).
+    pub lines: Vec<PlanLineView>,
+    /// Too large to show line by line.
+    pub too_large: bool,
+}
+
+/// A connect or disconnect, before it happens (L35 SPEC D-1). No value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AgentPlanView {
+    /// `claude-code` or `codex`.
+    pub agent: String,
+    /// `connect` or `disconnect`.
+    pub action: String,
+    /// The digest the apply must send back.
+    pub plan: String,
+    /// Already connected (or not connected): nothing would change.
+    pub nothing_to_do: bool,
+    /// Files, in write order.
+    pub files: Vec<PlanFileView>,
+    /// Things to know.
+    pub notes: Vec<String>,
+}
+
+/// One env file Add project would import (L35 SPEC D-11). No value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProjectFileView {
+    /// Relative to the project folder.
+    pub path: String,
+    /// Lines that would get a ref.
+    pub secrets: usize,
+    /// New keys.
+    pub new_keys: usize,
+    /// Lines that reuse another line's key (same value).
+    pub reused: usize,
+    /// Why it can't be imported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One key Add project would create or adopt, and what it may do.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProjectKeyView {
+    /// The key.
+    pub key: String,
+    /// The service it was recognised as.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Hosts it may reach once set up.
+    pub reaches: Vec<String>,
+    /// Folders its commands may run in.
+    pub runs_in: Vec<String>,
+    /// `website` or `command` when it would allow nothing yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs: Option<String>,
+}
+
+/// Add project's preview: the folder check, then what setup would do. No value, no masked value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProjectPreviewView {
+    /// The folder can be set up.
+    pub ok: bool,
+    /// Why not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The terminal command, as a fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The digest the add must send back.
+    pub plan: String,
+    /// Project name.
+    pub slug: String,
+    /// Display name.
+    pub display: String,
+    /// The canonical folder.
+    pub root: String,
+    /// It already is a project (a re-scan).
+    pub existing: bool,
+    /// Env files.
+    pub files: Vec<ProjectFileView>,
+    /// Keys and what they may do.
+    pub keys: Vec<ProjectKeyView>,
+    /// Keys written into code (reported, never imported).
+    pub findings: usize,
+    /// Why the walk stopped early.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_early: Option<String>,
+    /// Files too large to read.
+    pub too_large: Vec<String>,
+    /// Nothing new to import.
+    pub nothing_to_do: bool,
+}
+
+/// What Add project did: the `ms init` summary rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProjectAddView {
+    /// For people.
+    pub message: String,
+    /// Project name.
+    pub slug: String,
+    /// (label, text) rows, as `ms init` prints them.
+    pub rows: Vec<(String, String)>,
+    /// Something did not go through (a file skipped, the rules not approved).
+    pub partial: bool,
+}
+
 /// One restored or skipped line of an Undo (no value).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct UndoLineView {
@@ -452,6 +638,51 @@ pub trait DashActions: Send + Sync + 'static {
         project: Option<&str>,
         key: Option<&KeyName>,
     ) -> Result<UndoView, ActionError>;
+    /// Connect or disconnect `agent`, before it happens (L35): the redacted changes and the plan
+    /// digest. No mutation, no Touch ID.
+    fn agent_preview(
+        &self,
+        _a: &Actor,
+        _agent: &str,
+        _disconnect: bool,
+    ) -> Result<AgentPlanView, ActionError> {
+        Err(ActionError::new(
+            ActionCode::Unavailable,
+            "morsec: not available",
+        ))
+    }
+    /// Connect or disconnect `agent` as previewed with digest `plan`: Touch ID.
+    fn agent_apply(
+        &self,
+        _a: &Actor,
+        _agent: &str,
+        _disconnect: bool,
+        _plan: &str,
+    ) -> ActionResult {
+        Err(ActionError::new(
+            ActionCode::Unavailable,
+            "morsec: not available",
+        ))
+    }
+    /// Add project's preview (L35): the folder check, then what setup would do. Reads only.
+    fn project_preview(&self, _a: &Actor, _path: &str) -> Result<ProjectPreviewView, ActionError> {
+        Err(ActionError::new(
+            ActionCode::Unavailable,
+            "morsec: not available",
+        ))
+    }
+    /// Sets the folder up as previewed with digest `plan`: Touch ID.
+    fn project_add(
+        &self,
+        _a: &Actor,
+        _path: &str,
+        _plan: &str,
+    ) -> Result<ProjectAddView, ActionError> {
+        Err(ActionError::new(
+            ActionCode::Unavailable,
+            "morsec: not available",
+        ))
+    }
     /// A `blocked` receipt for an action the envelope refused before msd saw it (rate limit,
     /// missing `Sec-Fetch-Site`, bad input). Called at most 30 times a minute per session.
     fn refused(&self, a: &Actor, action: Action, key: Option<&KeyName>, why: &str);

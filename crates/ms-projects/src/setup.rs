@@ -166,9 +166,19 @@ impl Prepared {
             .sum()
     }
 
-    /// Nothing to import or adopt.
+    /// Nothing to import, and no ref to adopt that the earlier record doesn't already list.
     pub fn nothing_to_do(&self) -> bool {
-        self.rewrites() == 0 && self.adopted.iter().all(Vec::is_empty)
+        let known: Vec<KeyName> = self
+            .previous
+            .as_ref()
+            .map(ProjectRecord::keys)
+            .unwrap_or_default();
+        self.rewrites() == 0
+            && self
+                .adopted
+                .iter()
+                .flatten()
+                .all(|a| known.contains(&a.key))
     }
 }
 

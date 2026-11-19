@@ -3,8 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ms_connect::claude::diff::{Line, changed_lines, significant};
-use ms_connect::codex::tedit::redact_line;
 use ms_connect::codex::{self, CodexConnector, McpRef, Options, Paths};
 use ms_connect::{ConnectCfg, Connector};
 
@@ -42,23 +40,10 @@ pub(crate) fn list_status() -> &'static str {
 /// Prints the changed lines of `config.toml`, with values morsec didn't write shown as "…"
 /// (SPEC D9).
 fn show_config(path: &Path, before: Option<&str>, after: Option<&str>, safe: &[String]) {
-    let is_safe = |s: &str| safe.iter().any(|x| x == s);
-    let verb = match (before, after) {
-        (None, Some(_)) => "create",
-        (Some(_), None) => "remove",
-        _ => "change",
-    };
-    say(&format!("{verb} {}:", path.display()));
-    match changed_lines(before.unwrap_or(""), after.unwrap_or("")) {
-        Some(lines) => {
-            for l in significant(lines) {
-                match l {
-                    Line::Removed(n, t) => say(&format!("  -{n:>4} {}", redact_line(t, &is_safe))),
-                    Line::Added(n, t) => say(&format!("  +{n:>4} {}", redact_line(t, &is_safe))),
-                }
-            }
-        }
-        None => say("  (too large to show line by line)"),
+    let f =
+        ms_connect::view::settings_file(path, before, after, ms_connect::view::Syntax::Toml, safe);
+    for l in ms_connect::view::terminal_lines(&f) {
+        say(&l);
     }
 }
 

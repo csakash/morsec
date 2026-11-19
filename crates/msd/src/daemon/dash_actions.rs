@@ -349,6 +349,8 @@ pub struct ActState {
     /// Tests: the next save of the project records by Undo fails.
     #[cfg(test)]
     pub(crate) fail_next_records_save: AtomicBool,
+    /// Connect, Disconnect and Add project's state (L35).
+    pub(crate) conn: super::dash_connect::ConnectState,
     /// Tests: the transcript folders a scan reads (never the real home).
     #[cfg(test)]
     pub(crate) scan_roots: Mutex<Option<Vec<PathBuf>>>,
@@ -510,7 +512,13 @@ impl Daemon {
     }
 
     /// The receipt for an action msd refused, then the error.
-    fn refuse(&self, a: &Actor, key: &KeyName, what: &str, e: ActionError) -> ActionError {
+    pub(crate) fn refuse(
+        &self,
+        a: &Actor,
+        key: &KeyName,
+        what: &str,
+        e: ActionError,
+    ) -> ActionError {
         let result = match e.code {
             ActionCode::TouchIdFailed => ReceiptResult::Denied,
             ActionCode::Stopped => ReceiptResult::Blocked(Reason::Stopped),
@@ -524,6 +532,7 @@ impl Daemon {
                 ActionCode::NotText => "not text".into(),
                 ActionCode::Invalid => "invalid".into(),
                 ActionCode::Unavailable => "unavailable".into(),
+                ActionCode::Changed => "changed since the preview".into(),
                 _ => "failed".into(),
             }),
         };
@@ -1472,6 +1481,18 @@ fn to_edit(e: &RuleEdit) -> Result<ms_rules::edit::Edit, String> {
         RuleEdit::AddFolder(f) => Edit::AddRoot(folder(f)?),
         RuleEdit::RemoveFolder(f) => Edit::RemoveRoot(PathBuf::from(f.trim())),
         RuleEdit::SetTier(t) => Edit::SetTier((*t).into()),
+        RuleEdit::AddGitHost(h) => Edit::AddGitHost(h.trim().to_owned()),
+        RuleEdit::RemoveGitHost(h) => Edit::RemoveGitHost(h.trim().to_owned()),
+        // The checks `ms rules --add-env` makes, in the same order (L35 SPEC D-15).
+        RuleEdit::AddEnv(n) => {
+            let n = n.trim();
+            ms_rules::validate_env_name(n).map_err(|e| format!("morsec: {e}"))?;
+            ms_run::input::check_key_carrier(n)?;
+            Edit::AddEnv(n.to_owned())
+        }
+        RuleEdit::RemoveEnv(n) => Edit::RemoveEnv(n.trim().to_owned()),
+        RuleEdit::AddSshHostKey(k) => Edit::AddSshHostKey(k.trim().to_owned()),
+        RuleEdit::RemoveSshHostKey(k) => Edit::RemoveSshHostKey(k.trim().to_owned()),
     })
 }
 
@@ -1496,6 +1517,12 @@ fn describe(e: &RuleEdit) -> String {
             "be a {} key (test keys never ask before each use)",
             tier_str((*t).into())
         ),
+        RuleEdit::AddGitHost(h) => format!("be used by git over HTTPS at {}", i(h.trim())),
+        RuleEdit::RemoveGitHost(h) => format!("no longer be used by git at {}", i(h.trim())),
+        RuleEdit::AddEnv(n) => format!("be put in the variable {}", i(n.trim())),
+        RuleEdit::RemoveEnv(n) => format!("no longer be put in {}", i(n.trim())),
+        RuleEdit::AddSshHostKey(k) => format!("sign for the SSH server with key {}", i(k.trim())),
+        RuleEdit::RemoveSshHostKey(_) => "trust one SSH server less".into(),
     }
 }
 
@@ -1594,6 +1621,32 @@ impl DashActions for DashSource {
         key: Option<&KeyName>,
     ) -> Result<UndoView, ActionError> {
         self.daemon()?.dash_undo(a, project, key)
+    }
+    fn agent_preview(
+        &self,
+        _a: &Actor,
+        agent: &str,
+        disconnect: bool,
+    ) -> Result<ms_dash::actions::AgentPlanView, ActionError> {
+        self.daemon()?.dash_agent_preview(agent, disconnect)
+    }
+    fn agent_apply(&self, a: &Actor, agent: &str, disconnect: bool, plan: &str) -> ActionResult {
+        self.daemon()?.dash_agent_apply(a, agent, disconnect, plan)
+    }
+    fn project_preview(
+        &self,
+        a: &Actor,
+        path: &str,
+    ) -> Result<ms_dash::actions::ProjectPreviewView, ActionError> {
+        self.daemon()?.dash_project_preview(a, path)
+    }
+    fn project_add(
+        &self,
+        a: &Actor,
+        path: &str,
+        plan: &str,
+    ) -> Result<ms_dash::actions::ProjectAddView, ActionError> {
+        self.daemon()?.dash_project_add(a, path, plan)
     }
     fn refused(&self, a: &Actor, action: Action, key: Option<&KeyName>, why: &str) {
         if let Ok(d) = self.daemon() {
@@ -2047,6 +2100,72 @@ mod tests {
                 .unwrap_err();
         assert_eq!(e.code, ActionCode::Stopped);
         assert_eq!(h.auth.reasons().len(), 1, "no sheet while stopped");
+    }
+
+    // protects=L35 SPEC D-15, criterion 10: git hosts, variables and SSH host keys are edited
+    // from the dashboard with ms rules' validation: adding needs Touch ID (named in the sheet),
+    // removing none, a refused variable answers ms rules' own message, and a bad host key is
+    // invalid; fails_when=a loosening skips the sheet or the dashboard accepts what ms rules
+    // refuses; no_claim=mint scopes (no CLI edit, shown read-only)
+    #[test]
+    fn rules_edit_git_env_ssh() {
+        const PIN: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIPtd2fa6erUsRui9x7T64boFCGFRwuEig/mwpm4LdTO7";
+        let h = fresh();
+        h.put("gh/token", Tier::Test);
+        let gh = k("gh/token");
+        h.d.dash_rules(&actor(), &gh, &RuleEdit::AddGitHost("github.com".into()))
+            .unwrap();
+        assert_eq!(h.d.rules().keys[&gh].git_hosts, ["github.com"]);
+        assert!(h.auth.reasons()[0].contains("git over HTTPS at github.com"));
+        h.d.dash_rules(&actor(), &gh, &RuleEdit::RemoveGitHost("github.com".into()))
+            .unwrap();
+        assert!(h.d.rules().keys[&gh].git_hosts.is_empty());
+        assert_eq!(h.auth.reasons().len(), 1, "removing asks nothing");
+
+        let run = k("deploy/key");
+        let meta = KeyMeta {
+            name: run.clone(),
+            mode: Mode::Run,
+            tier: Tier::Test,
+            created_unix_ms: 1,
+        };
+        assert!(matches!(
+            h.d.put_key_as(
+                &actor().session,
+                run.clone(),
+                meta,
+                ms_core::SecretBytes::new(b"x".to_vec()),
+                "t"
+            ),
+            ResponseBody::Ok { .. }
+        ));
+        h.d.dash_rules(&actor(), &run, &RuleEdit::AddEnv("DEPLOY_TOKEN".into()))
+            .unwrap();
+        assert_eq!(h.d.rules().keys[&run].env, ["DEPLOY_TOKEN"]);
+        let e =
+            h.d.dash_rules(&actor(), &run, &RuleEdit::AddEnv("LD_PRELOAD".into()))
+                .unwrap_err();
+        assert_eq!(e.code, ActionCode::Invalid);
+        assert_eq!(
+            e.message,
+            ms_run::input::check_key_carrier("LD_PRELOAD").unwrap_err()
+        );
+        let line = format!("git.example ssh-ed25519 {PIN}");
+        h.d.dash_rules(&actor(), &run, &RuleEdit::AddSshHostKey(line.clone()))
+            .unwrap();
+        assert_eq!(h.d.rules().keys[&run].ssh_host_keys.len(), 1);
+        let bad =
+            h.d.dash_rules(&actor(), &run, &RuleEdit::AddSshHostKey("not a key".into()))
+                .unwrap_err();
+        assert_eq!(bad.code, ActionCode::Invalid);
+        let before = h.auth.reasons().len();
+        h.d.dash_rules(&actor(), &run, &RuleEdit::RemoveSshHostKey(line))
+            .unwrap();
+        h.d.dash_rules(&actor(), &run, &RuleEdit::RemoveEnv("DEPLOY_TOKEN".into()))
+            .unwrap();
+        assert_eq!(h.auth.reasons().len(), before);
+        let r = h.d.rules().keys[&run].clone();
+        assert!(r.env.is_empty() && r.ssh_host_keys.is_empty());
     }
 
     // protects=SPEC D-14, criterion 8: tightening (a host removed, test → production) is saved
