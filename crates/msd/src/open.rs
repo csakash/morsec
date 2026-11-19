@@ -134,4 +134,15 @@ mod tests {
         assert!(opener(Some(f), true).is_ok());
         assert!(opener(None, false).is_ok());
     }
+
+    // protects=the LaunchServices call itself links and runs: a URL whose scheme no app handles
+    // comes back as an error (no crash, no browser); fails_when=the FFI is wrong (crash) or an
+    // unhandled URL reports success; no_claim=that a real http URL opens a browser (manual: run
+    // ms dashboard)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_services_reports_failure() {
+        let e = ls::open("morsec-test-no-such-scheme-7f3a9c://x").unwrap_err();
+        assert!(e.contains("LaunchServices answered"), "{e}");
+    }
 }
