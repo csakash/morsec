@@ -442,6 +442,9 @@ Where the build chose within the decisions above, or departed from their letter:
   clear in between; Undo takes the records lock only after the approval, re-checks the records
   and deletes keys only after the records are saved; one msd lock covers every check-then-write
   of a value.
+- **B-10 IPC:** `PendingApproval` gains an optional `admin` field, written only when true, so
+  agent requests read as before; an older `ms approve` (its struct denies unknown fields) can't
+  read an admin request from this msd. `ms` and `msd` ship together, so this is additive.
 - **B-8 Activity's "other" agent** is any session that is none of Claude Code, Codex,
   Terminal, Dashboard and ms dev.
 

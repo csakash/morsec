@@ -94,6 +94,7 @@ impl Action {
         matches!(
             self,
             Action::Approve
+                | Action::Dismiss
                 | Action::Start
                 | Action::Rules
                 | Action::ScanRun

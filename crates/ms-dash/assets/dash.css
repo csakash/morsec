@@ -64,7 +64,7 @@ h1 { font: italic 400 clamp(var(--t-5), 6.4vw, var(--t-7))/1.02 var(--f-serif); 
 h2 { font: italic 400 var(--t-4)/1.15 var(--f-serif); margin: var(--s-7) 0 var(--s-3); letter-spacing: -0.01em; }
 h3 { font: italic 400 var(--t-3)/1.2 var(--f-serif); }
 p { margin: 0 0 var(--s-2); max-width: 72ch; text-wrap: pretty; }
-code, .mono { font-family: var(--f-mono); font-size: .92em; overflow-wrap: anywhere; }
+code, .mono { font-family: var(--f-mono); font-size: .92em; overflow-wrap: break-word; }
 .ref { font-family: var(--f-mono); color: var(--signal); }
 h1.keyname { font: 500 clamp(var(--t-3), 4vw, var(--t-5))/1.15 var(--f-mono); color: var(--ink); letter-spacing: -0.01em; overflow-wrap: anywhere; }
 .num, time, td.n, .count { font-variant-numeric: tabular-nums; }
@@ -145,7 +145,7 @@ details[open] > summary::before { content: "\25BE"; }
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); gap: 0; margin-top: var(--s-6); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
 .cards > *, .stats > *, .row > *, .state > *, .actions > * { min-width: 0; }
 .card { border: 1px solid var(--faint); padding: var(--s-5); display: flex; flex-direction: column; gap: var(--s-2); }
-.card .root { color: var(--muted); font-family: var(--f-mono); font-size: 13px; overflow-wrap: anywhere; }
+.card .root { color: var(--muted); font-family: var(--f-mono); font-size: 13px; overflow-wrap: break-word; }
 .card .open { margin-top: auto; padding-top: var(--s-2); }
 .stat {
   display: flex; flex-direction: column; gap: var(--s-2); padding: var(--s-4) var(--s-4) var(--s-4) 0;
@@ -166,13 +166,13 @@ details[open] > summary::before { content: "\25BE"; }
 .copyline { display: flex; flex-wrap: wrap; gap: var(--s-2); align-items: stretch; margin-top: var(--s-2); }
 .copyline > .muted { align-self: center; }
 ul.plain { list-style: none; padding: 0; margin: var(--s-2) 0 0; }
-ul.plain li { padding: var(--s-2) 0; border-top: 1px solid var(--faint); overflow-wrap: anywhere; min-width: 0; }
+ul.plain li { padding: var(--s-2) 0; border-top: 1px solid var(--faint); overflow-wrap: break-word; min-width: 0; }
 ul.plain li:first-child { border-top: 0; }
 ol.argv { margin: var(--s-2) 0 0; padding: 0; list-style: none; font-family: var(--f-mono); font-size: 13px; }
 ol.argv li { overflow-wrap: anywhere; padding: 2px 0; }
 dl.kv { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: var(--s-2) var(--s-5); margin: var(--s-4) 0 0; }
 dl.kv dt { color: var(--muted); }
-dl.kv dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+dl.kv dd { margin: 0; overflow-wrap: break-word; min-width: 0; }
 .checks li::before { content: "\2713  "; color: var(--signal); }
 .checks li.bad::before { content: "\2715  "; color: var(--deny); }
 
@@ -204,7 +204,8 @@ td .mono, td .ref, td code { overflow-wrap: normal; word-break: normal; }
 .btn.quiet { border-color: transparent; color: var(--ink-2); text-decoration: underline; text-underline-offset: 4px; padding-left: 0; padding-right: 0; min-width: 0; }
 .rowacts a, .rowacts .lnk { min-height: 0; min-width: 0; padding: 0; line-height: inherit; vertical-align: baseline; }
 .confirmrow td { border-bottom: 1px solid var(--rule); }
-.section h3, .section > h3.section { margin: var(--s-5) 0 var(--s-2); }
+.section h3, .section > h3.section { margin: var(--s-5) 0 var(--s-3); }
+.box.focus + .box, .box.warn + .box { border-top: 0; }
 .lnk { background: none; border: 0; padding: 0 var(--s-1); min-height: var(--tap); min-width: var(--tap); color: var(--ink-2); font: inherit; font-size: 14px; text-decoration: underline; text-underline-offset: 4px; cursor: pointer; }
 .btn:disabled, .btn[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
 .actions { display: flex; flex-wrap: wrap; gap: var(--s-2); margin-top: var(--s-3); align-items: center; }
@@ -261,7 +262,8 @@ input.mono { font-family: var(--f-mono); }
   table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: 100%; }
   table.stack tr { border-bottom: 1px solid var(--rule); padding: var(--s-2) 0; }
   table.stack td { display: grid; grid-template-columns: minmax(0, 7.5em) minmax(0, 1fr); gap: var(--s-3); border: 0; padding: var(--s-1) 0; }
-  td .mono, td .ref, td code, .root, .ref { overflow-wrap: anywhere; }
+  /* paths and refs break only after "/" (V5); a row of its own for the Undo confirm (G3) */
+  .confirmrow td { display: block; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .stat:nth-child(3) { border-left: 0; padding-left: 0; }
   .stat:nth-child(n+3) { border-top: 1px solid var(--faint); }

@@ -444,11 +444,8 @@ impl Daemon {
                         .iter()
                         .map(|a| ms_approve::render::quoted(a))
                         .collect(),
-                    cwd: if r.cwd.as_os_str().is_empty() {
-                        String::new()
-                    } else {
-                        ms_approve::render::quoted(&r.cwd.to_string_lossy())
-                    },
+                    // Inert, without quotes (V6).
+                    cwd: ms_approve::render::inert(&r.cwd.to_string_lossy()),
                     effect: r.effect.as_deref().map(ms_approve::render::quoted),
                     expires_unix_ms: p.expires_unix_ms,
                     deciding,
@@ -509,7 +506,22 @@ impl Daemon {
                         adds.push(format!("the command {}", inert(&cmd.to_string())));
                     }
                 }
-                // Everything that can loosen a rule is named (re-review F3).
+                // Everything that can loosen a rule is named (re-review F3). With no rule yet,
+                // everything in the new one is new (N8).
+                if let Some(c) = cur.as_ref().filter(|c| c.mode != n.mode) {
+                    adds.push(format!(
+                        "a change from {} to {}",
+                        mode_str(c.mode),
+                        mode_str(n.mode)
+                    ));
+                }
+                if cur.is_none() {
+                    adds.push(format!("{} tier", tier_str(n.tier)));
+                    adds.push(format!("approvals that last {} s", n.session_ttl_secs));
+                    if !n.read_only {
+                        adds.push("write access".to_owned());
+                    }
+                }
                 for root in &n.roots {
                     if !cur.as_ref().is_some_and(|c| c.roots.contains(root)) {
                         adds.push(format!("the folder {}", inert(&root.display().to_string())));

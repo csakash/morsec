@@ -19,6 +19,8 @@ entries. Move the entries from Unreleased into it when you bump the version.
 - New commands with the same effect in Terminal: `ms set <key>` replaces a value, `ms rm <key>`
   deletes a key and its rule, `ms undo <project> [--key <key>]` writes the values back into the
   project's `.env` files. Each asks for Touch ID and refuses inside an agent session.
+- `ms` and `msd` ship together: an older `ms approve` can't read a request from this msd that
+  morsec made for its own actions (it is marked so it can be approved once only). Update both.
 - `ms add` no longer replaces a key that exists (it never did from the CLI; a direct request to
   msd could, without asking). Replacing is `ms set`, with Touch ID.
 - `ms init` now sets up the project you run it in, in one command. In a project folder it finds

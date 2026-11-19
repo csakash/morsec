@@ -561,6 +561,7 @@ fn recheck_changes_nothing() {
 fn approving_actions_need_fetch_site() {
     for a in [
         Action::Approve,
+        Action::Dismiss,
         Action::Start,
         Action::Rules,
         Action::ScanRun,
@@ -577,7 +578,6 @@ fn approving_actions_need_fetch_site() {
     for a in [
         Action::Stop,
         Action::Deny,
-        Action::Dismiss,
         Action::Recheck,
         Action::CheckPath,
     ] {

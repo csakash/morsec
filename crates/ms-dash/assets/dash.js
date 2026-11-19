@@ -243,13 +243,20 @@
     if (nav) { location.hash = nav; return; }
     render();
   }
+  // Only one result line on a screen: a new one clears the others (V1).
+  function clearResults(except) {
+    for (const r of main.querySelectorAll('p.result, span.result')) {
+      if (r !== except) { r.textContent = ''; r.className = r.className.replace(/\b(signal|err) result\b/, '').trim(); }
+    }
+  }
   function showFlash() {
     if (!flash) return;
     const f = flash;
     flash = null;
     const target = (f.anchor && document.getElementById(f.anchor)) || main.querySelector('section');
     if (!target) return;
-    const p = txt('p', 'signal result', f.text);
+    clearResults();
+    const p = txt('p', (f.err ? 'err' : 'signal') + ' result', f.text);
     const head = target.querySelector('h2, .hero');
     if (head && head.parentNode === target) head.after(p); else target.prepend(p);
     if (f.node) p.after(f.node);
@@ -333,12 +340,14 @@
     if (touchId) announce('Confirm with Touch ID on this Mac.');
     try {
       const r = await f();
+      clearResults(out);
       out.className = 'signal result';
       out.textContent = r && r.message ? sentence(r.message) : 'Done.';
       announce(out.textContent);
       return r;
     } catch (e) {
       if (e instanceof SignedOut) { signedOut(e.message); return null; }
+      clearResults(out);
       out.className = 'err result';
       out.textContent = e && e.message ? sentence(e.message) : 'Something went wrong.';
       announce(out.textContent);
@@ -361,7 +370,9 @@
     } else {
       stateBox.replaceChildren(txt('span', 'word off', 'Stopped'), btn('Start', 'sm solid', start));
     }
-    if (stateNote) stateBox.appendChild(txt('span', (stateNote.err ? 'err' : 'signal') + ' result ask', stateNote.text));
+    // The outcome of Stop or Start shows at the top of the page, below the header, so the
+    // sticky header never grows (V2).
+    if (stateNote) { flash = { anchor: null, text: stateNote.text, node: null, nav: false, err: stateNote.err }; stateNote = null; }
   }
   function confirmStop() {
     const msg = txt('span', 'ask', 'Stop every agent’s access now?');
@@ -421,7 +432,8 @@
   function warningBox(w) {
     const b = el('div', w.dismiss ? 'box' : 'box warn');
     b.appendChild(txt('h3', null, w.title));
-    if (w.detail) b.appendChild(txt('p', null, w.detail));
+    // Paths in the detail break only after "/" (V5).
+    if (w.detail) b.appendChild(slashed(txt('p', null, ''), w.detail));
     const out = txt('p', 'muted', '');
     const acts = el('div', 'actions');
     for (const f of w.fix) {
@@ -1108,7 +1120,8 @@
     };
     if (v.running) after(2000, poll);
     out.appendChild(el('div', 'actions section', btn('Run scan', 'solid', function () {
-      run(msg, true, function () { return act('/api/scan/run'); }).then(function (r) { if (r) poll(); });
+      // The Scanning box below is the one sign it runs (V3).
+      run(msg, true, function () { return act('/api/scan/run'); }).then(function (r) { if (r) { msg.textContent = ''; msg.className = 'muted'; poll(); } });
     })));
     out.appendChild(msg);
     out.appendChild(body);

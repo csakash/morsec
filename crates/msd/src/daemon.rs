@@ -542,7 +542,7 @@ impl Daemon {
     pub fn alert(&self, kind: AlertKind, msg: impl Into<String>) {
         let msg = msg.into();
         // A condition the person dismissed doesn't come back by itself (QA P8).
-        if self.dismissed(&msg) {
+        if self.dismissed(&kind, &msg) {
             return;
         }
         let mut a = lock(&self.alerts);

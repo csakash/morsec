@@ -53,6 +53,9 @@ pub enum AlertKind {
     CaReissued {
         /// How many hosts it may sign for.
         hosts: usize,
+        /// Which certificate (a hash of it): a new one is a new occurrence, even for the same
+        /// number of hosts (re-review A1).
+        cert: String,
     },
     /// A watched agent settings file changed.
     SettingsChanged {
@@ -74,9 +77,35 @@ pub enum AlertKind {
     BindingSkipped {
         /// The key, when the text names one; the alert goes when the key does (QA P8).
         key: Option<KeyName>,
+        /// Why (each with its own fix; G2).
+        reason: SkipReason,
     },
     /// Anything else.
     Other,
+}
+
+/// Why the proxy skipped a key (G2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// A wildcard or IP host: the CA only issues for exact names.
+    WildcardHost,
+    /// Its proxy name is also another key's.
+    NameCollision,
+    /// No catalog entry says where its credential goes.
+    NoCatalog,
+}
+
+impl SkipReason {
+    /// From the text the proxy wrote.
+    pub fn of(text: &str) -> Self {
+        if text.contains("wildcard and IP hosts") {
+            SkipReason::WildcardHost
+        } else if text.contains("proxy name") {
+            SkipReason::NameCollision
+        } else {
+            SkipReason::NoCatalog
+        }
+    }
 }
 
 impl AlertKind {
@@ -113,10 +142,17 @@ impl AlertKind {
                 AlertKind::SettingsChanged { path: a, .. },
                 AlertKind::SettingsChanged { path: b, .. },
             ) => a == b,
+            // Per key and reason: one reason never replaces another (G2).
             (
-                AlertKind::BindingSkipped { key: Some(a) },
-                AlertKind::BindingSkipped { key: Some(b) },
-            ) => a == b,
+                AlertKind::BindingSkipped {
+                    key: Some(a),
+                    reason: ra,
+                },
+                AlertKind::BindingSkipped {
+                    key: Some(b),
+                    reason: rb,
+                },
+            ) => a == b && ra == rb,
             _ => false,
         }
     }
@@ -124,8 +160,28 @@ impl AlertKind {
     /// The key this alert is about, if any.
     pub fn key(&self) -> Option<&KeyName> {
         match self {
-            AlertKind::BindingSkipped { key } => key.as_ref(),
+            AlertKind::BindingSkipped { key, .. } => key.as_ref(),
             _ => None,
+        }
+    }
+
+    /// What makes this one occurrence: a dismissal suppresses exactly it, so any new
+    /// occurrence (the file changed again, another certificate) raises again (re-review A1).
+    pub fn evidence(&self, text: &str) -> String {
+        match self {
+            AlertKind::SettingsChanged { path, fingerprint } => format!(
+                "settings\0{}\0{}",
+                path.display(),
+                fingerprint.as_deref().unwrap_or("missing")
+            ),
+            AlertKind::CaReissued { hosts, cert } if !cert.is_empty() => {
+                format!("ca\0{hosts}\0{cert}")
+            }
+            AlertKind::BindingSkipped {
+                key: Some(k),
+                reason,
+            } => format!("bind\0{k}\0{reason:?}"),
+            k => format!("{}\0{text}", k.tag()),
         }
     }
 }
@@ -178,7 +234,7 @@ fn command(c: &str) -> FixView {
 pub fn warning(e: &AlertEntry) -> WarningView {
     let inert = ms_approve::render::inert;
     let (title, detail, fix) = match &e.kind {
-        AlertKind::CaReissued { hosts } => (
+        AlertKind::CaReissued { hosts, .. } => (
             "Some tools may not trust morsec yet".to_owned(),
             format!(
                 "morsec made a new certificate for {hosts} website{}. Tools that check the macOS trust store (curl, Python, Git) will refuse morsec's connections until you trust it once. Run this in a terminal: it asks for your Mac password.",
@@ -216,14 +272,28 @@ pub fn warning(e: &AlertEntry) -> WarningView {
             "Undo is off until they are fixed. Keys and rules keep working.".to_owned(),
             vec![command("ms doctor")],
         ),
-        AlertKind::BindingSkipped { key } => (
-            match key {
-                Some(k) => format!("{} isn't sent to any website yet", inert(k.as_str())),
-                None => "A key isn't sent to any website yet".to_owned(),
-            },
-            "morsec doesn't know where this key's credential goes in a request, so it doesn't swap it. Give the key its website on its page, or set the project up again.".to_owned(),
-            Vec::new(),
-        ),
+        AlertKind::BindingSkipped { key, reason } => {
+            let name = key
+                .as_ref()
+                .map_or_else(|| "A key".to_owned(), |k| inert(k.as_str()));
+            match reason {
+                SkipReason::WildcardHost => (
+                    format!("{name} has websites morsec can't swap for"),
+                    "A wildcard or IP-address website can't get morsec's certificate, so the key isn't swapped there. Bind exact host names instead (api.example.com) on the key's page.".to_owned(),
+                    Vec::new(),
+                ),
+                SkipReason::NameCollision => (
+                    format!("{name} clashes with another key's name"),
+                    "Two keys' names differ only in '/' and '-', so morsec swaps neither. Rename one of them.".to_owned(),
+                    Vec::new(),
+                ),
+                SkipReason::NoCatalog => (
+                    format!("{name} isn't sent to any website yet"),
+                    "morsec doesn't know where this key's credential goes in a request, so it doesn't swap it. Give the key its website on its page, or set the project up again.".to_owned(),
+                    Vec::new(),
+                ),
+            }
+        }
         AlertKind::Other => (
             "Something needs a look".to_owned(),
             inert(&e.text),
@@ -314,8 +384,8 @@ fn from_reply(r: ResponseBody) -> ActionResult {
 
 impl Daemon {
     /// The person dismissed an alert with this text.
-    pub(crate) fn dismissed(&self, text: &str) -> bool {
-        lock(&self.dash_acts.dismissed).contains(text)
+    pub(crate) fn dismissed(&self, kind: &AlertKind, text: &str) -> bool {
+        lock(&self.dash_acts.dismissed).contains(&kind.evidence(text))
     }
 
     /// Drops alerts about keys that no longer have a rule (QA P8).
@@ -607,7 +677,7 @@ impl Daemon {
         }
         let gone = alerts.remove(i);
         drop(alerts);
-        lock(&self.dash_acts.dismissed).insert(gone.text);
+        lock(&self.dash_acts.dismissed).insert(gone.kind.evidence(&gone.text));
         self.dash_receipt(a, &key, "dismiss warning", ReceiptResult::Allowed, None);
         Ok(ActionOk::new("Dismissed"))
     }
@@ -1669,7 +1739,10 @@ mod tests {
         let h = fresh();
         let cases = [
             (
-                AlertKind::CaReissued { hosts: 3 },
+                AlertKind::CaReissued {
+                    hosts: 3,
+                    cert: String::new(),
+                },
                 "ca",
                 "Some tools may not trust morsec yet",
             ),
@@ -1702,7 +1775,10 @@ mod tests {
                 "Project records failed their check",
             ),
             (
-                AlertKind::BindingSkipped { key: None },
+                AlertKind::BindingSkipped {
+                    key: None,
+                    reason: SkipReason::NoCatalog,
+                },
                 "skipped \u{202e}x",
                 "A key isn't sent to any website yet",
             ),
@@ -1757,8 +1833,20 @@ mod tests {
     fn status_text_unchanged() {
         let h = fresh();
         let t = "the morsec CA was issued for 2 host(s); tools that use the system trust store need it trusted again: ms init --trust";
-        h.d.alert(AlertKind::CaReissued { hosts: 2 }, t);
-        h.d.alert(AlertKind::CaReissued { hosts: 2 }, t);
+        h.d.alert(
+            AlertKind::CaReissued {
+                hosts: 2,
+                cert: String::new(),
+            },
+            t,
+        );
+        h.d.alert(
+            AlertKind::CaReissued {
+                hosts: 2,
+                cert: String::new(),
+            },
+            t,
+        );
         match h.req(RequestBody::Status) {
             ResponseBody::Status { alerts, .. } => {
                 assert_eq!(alerts.iter().filter(|a| a.as_str() == t).count(), 1);
@@ -1774,7 +1862,13 @@ mod tests {
     #[test]
     fn dismiss_only_informational() {
         let h = fresh();
-        h.d.alert(AlertKind::CaReissued { hosts: 1 }, "ca text");
+        h.d.alert(
+            AlertKind::CaReissued {
+                hosts: 1,
+                cert: String::new(),
+            },
+            "ca text",
+        );
         h.d.alert(AlertKind::ProxyDown, "the swap proxy is not running: x");
         let ws = h.d.warnings_for(&h.d.alert_texts());
         let r = h.d.dash_dismiss(&actor(), &ws[1].id).unwrap_err();
@@ -1900,7 +1994,7 @@ mod tests {
         assert_eq!(p.command[2], "\"line\\nbreak\\e[2J\"");
         assert_eq!(p.command[3].len(), long.len() + 2, "never cut");
         assert_eq!(p.command[4], "\"\"");
-        assert_eq!(p.cwd, "\"/repo\"");
+        assert_eq!(p.cwd, "/repo");
         assert_eq!(p.agent, "Claude Code");
         assert!(!p.deciding);
         let all = serde_json::to_string(&p).unwrap();
@@ -3132,9 +3226,9 @@ mod tests {
         assert!(v.once_only && !v.expand);
     }
 
-    // protects=re-review F3: a rules change waiting for the person names everything that
+    // protects=re-review F3 and N8: a rules change waiting for the person names everything that
     // loosens: folders, variables, git hosts, SSH host keys, write access, longer approvals,
-    // tier, not only websites and commands; fails_when=a loosening field is left out of the
+    // tier, a mode change, and for a key with no rule yet everything in the new one; fails_when=a loosening field is left out of the
     // summary; no_claim=-
     #[test]
     fn rules_summary_names_every_loosening() {
@@ -3174,34 +3268,127 @@ mod tests {
         ] {
             assert!(s.contains(want), "{want}: {s}");
         }
+        // N8: a mode change is named, and with no rule yet everything in the new one is new.
+        let swap = "version = 1\n[keys.\"db/run\"]\nmode = \"swap\"\ntier = \"production\"\nhosts = [\"api.example.com\"]\n";
+        let mut req2 = req.clone();
+        req2.argv_display = vec!["ms".into(), "rules".into(), "db/run".into(), swap.into()];
+        let s2 = h.d.pending_summary(&req2, true, true);
+        assert!(s2.contains("a change from run to swap"), "{s2}");
+        let fresh_toml = "version = 1\n[keys.\"new/none\"]\nmode = \"swap\"\ntier = \"test\"\nhosts = [\"api.example.com\"]\n";
+        let mut req3 = req.clone();
+        req3.key = k("new/none");
+        req3.argv_display = vec![
+            "ms".into(),
+            "rules".into(),
+            "new/none".into(),
+            fresh_toml.into(),
+        ];
+        let s3 = h.d.pending_summary(&req3, true, true);
+        for want in [
+            "api.example.com",
+            "test tier",
+            "approvals that last",
+            "write access",
+        ] {
+            assert!(s3.contains(want), "{want}: {s3}");
+        }
     }
 
-    // protects=QA P8 and P9: an alert about a key goes when the key does; a dismissed
-    // informational alert doesn't come back by itself; a newer CA alert replaces the older one
-    // instead of stacking; fails_when=a stale alert about a deleted key stays, a dismissed one
-    // returns on the next rebuild, or two CA alerts show; no_claim=-
+    // protects=QA P8, P9 and G2: an alert about a key goes when the key does; a newer CA alert
+    // replaces the older one instead of stacking; a dismissed occurrence stays dismissed when
+    // the same occurrence is raised again (the proxy rebuilds); two reasons for one key both
+    // show; fails_when=a stale alert about a deleted key stays, CA alerts stack, a rebuild brings
+    // back the same dismissed occurrence, or one reason replaces another; no_claim=new
+    // occurrences (dismissed_alert_returns_on_new_change)
     #[test]
     fn alerts_follow_their_key_and_dedupe() {
         let h = fresh();
         h.put("loose/key", Tier::Test);
         let key = k("loose/key");
+        let bind = |reason| AlertKind::BindingSkipped {
+            key: Some(key.clone()),
+            reason,
+        };
+        h.d.alert(bind(SkipReason::NoCatalog), "loose/key: no catalog entry");
         h.d.alert(
-            AlertKind::BindingSkipped {
-                key: Some(key.clone()),
-            },
-            "loose/key: no catalog entry",
+            bind(SkipReason::WildcardHost),
+            "loose/key: wildcard and IP hosts can't be swapped",
         );
-        assert_eq!(h.d.alert_texts().len(), 1);
+        assert_eq!(h.d.alert_texts().len(), 2, "one per reason");
+        let ws = h.d.warnings_for(&h.d.alert_texts());
+        assert!(
+            ws[1].detail.contains("exact host names"),
+            "{}",
+            ws[1].detail
+        );
         h.d.delete_key(&key).unwrap();
         assert!(h.d.alert_texts().is_empty(), "gone with its key");
 
-        h.d.alert(AlertKind::CaReissued { hosts: 1 }, "ca 1");
-        h.d.alert(AlertKind::CaReissued { hosts: 2 }, "ca 2");
+        let ca = |cert: &str| AlertKind::CaReissued {
+            hosts: 2,
+            cert: cert.into(),
+        };
+        h.d.alert(ca("aa"), "ca 1");
+        h.d.alert(ca("bb"), "ca 2");
         assert_eq!(h.d.alert_texts(), ["ca 2"]);
-
         let id = h.d.warnings_for(&h.d.alert_texts())[0].id.clone();
         h.d.dash_dismiss(&actor(), &id).unwrap();
-        h.d.alert(AlertKind::CaReissued { hosts: 2 }, "ca 2");
-        assert!(h.d.alert_texts().is_empty(), "dismissed stays dismissed");
+        h.d.alert(ca("bb"), "ca 2");
+        assert!(
+            h.d.alert_texts().is_empty(),
+            "the same occurrence stays dismissed"
+        );
+    }
+
+    // protects=re-review A1: a dismissal silences only that occurrence: when a dismissed agent
+    // settings file changes again, or the CA is issued again (another certificate, same number
+    // of hosts), the alert is raised again; fails_when=dismissing once silences every later
+    // change of the file (an agent could rewrite its settings unnoticed) or every later CA;
+    // no_claim=-
+    #[test]
+    fn dismissed_alert_returns_on_new_change() {
+        let h = fresh();
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("settings.json");
+        std::fs::write(&f, "{}").unwrap();
+        let raise = |h: &H| {
+            h.d.alert(
+                AlertKind::SettingsChanged {
+                    path: f.clone(),
+                    fingerprint: crate::drift::fingerprint(&f),
+                },
+                format!("{} changed", f.display()),
+            );
+        };
+        raise(&h);
+        let id = h.d.warnings_for(&h.d.alert_texts())[0].id.clone();
+        h.d.dash_dismiss(&actor(), &id).unwrap();
+        raise(&h);
+        assert!(
+            h.d.alert_texts().is_empty(),
+            "the same content stays dismissed"
+        );
+        std::fs::write(&f, "{\"env\":{\"HTTPS_PROXY\":\"\"}}").unwrap();
+        raise(&h);
+        assert_eq!(h.d.alert_texts().len(), 1, "a new change is raised again");
+
+        let ca = |cert: &str| AlertKind::CaReissued {
+            hosts: 3,
+            cert: cert.into(),
+        };
+        let t = "the morsec CA was issued for 3 host(s)";
+        h.d.alert(ca("c1"), t);
+        let id =
+            h.d.warnings_for(&h.d.alert_texts())
+                .into_iter()
+                .find(|w| w.title.contains("trust"))
+                .unwrap()
+                .id;
+        h.d.dash_dismiss(&actor(), &id).unwrap();
+        h.d.alert(ca("c2"), t);
+        assert!(
+            h.d.alert_texts().iter().any(|x| x == t),
+            "a new certificate is raised again"
+        );
     }
 }

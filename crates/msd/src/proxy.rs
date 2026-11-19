@@ -352,7 +352,10 @@ pub(crate) fn ensure_ca(d: &Daemon, hosts: &BTreeSet<String>) -> Result<Ca, Stri
         .map_err(|e| e.to_string())?;
     export_pem(d, ca.cert_pem());
     d.alert(
-        crate::daemon::AlertKind::CaReissued { hosts: hosts.len() },
+        crate::daemon::AlertKind::CaReissued {
+            hosts: hosts.len(),
+            cert: hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(ca.cert_pem().as_bytes())[..8]),
+        },
         format!(
             "the morsec CA was issued for {} host(s); tools that use the system trust store need it trusted again: ms init --trust",
             hosts.len()
@@ -439,7 +442,8 @@ pub fn build(d: &Arc<Daemon>, listen: SocketAddr) -> Result<(ProxyConfig, Deps),
         let key = s
             .split_once(':')
             .and_then(|(k, _)| ms_core::KeyName::new(k).ok());
-        d.alert(crate::daemon::AlertKind::BindingSkipped { key }, s);
+        let reason = crate::daemon::dash_actions::SkipReason::of(&s);
+        d.alert(crate::daemon::AlertKind::BindingSkipped { key, reason }, s);
     }
     let hosts: BTreeSet<String> = binds.iter().flat_map(|b| b.hosts.iter().cloned()).collect();
     let ca = Arc::new(ensure_ca(d, &hosts)?);

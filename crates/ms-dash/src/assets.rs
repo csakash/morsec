@@ -749,4 +749,34 @@ mod tests {
         assert!(DASH_CSS.contains(".box.focus { border: 1px solid var(--signal);"));
         assert!(DASH_CSS.contains("h1.keyname") && DASH_CSS.contains("overflow-wrap: anywhere; }"));
     }
+
+    // protects=L33 fix round 3 (V1, V2, V3, V5, G3): a new result clears the others; Stop and
+    // Start report in the page, not in the sticky header; Run scan shows only the Scanning box;
+    // paths break only after "/" (no overflow-wrap: anywhere but on the key heading); the Undo
+    // confirm row stacks on a phone; fails_when=any of these regresses; no_claim=the rendering
+    // (browser QA)
+    #[test]
+    fn dash_js_round_3_fixes() {
+        let c = code(DASH_JS);
+        assert!(c.contains("function clearResults("));
+        assert!(c.contains("clearResults(out);"));
+        assert!(!c.contains("stateBox.appendChild(txt('span', (stateNote.err"));
+        assert!(c.contains("msg.textContent = ''; msg.className = 'muted'; poll();"));
+        assert!(c.contains("slashed(txt('p', null, ''), w.detail)"));
+        for line in DASH_CSS
+            .lines()
+            .filter(|l| l.contains("overflow-wrap: anywhere"))
+        {
+            assert!(
+                ["h1.keyname", ".cmd", "ol.argv", ".chips", "user-select"]
+                    .iter()
+                    .any(|ok| line.contains(ok))
+                    || line
+                        .trim_start()
+                        .starts_with("padding: 0 var(--s-3); border"),
+                "{line}"
+            );
+        }
+        assert!(DASH_CSS.contains(".confirmrow td { display: block; }"));
+    }
 }
