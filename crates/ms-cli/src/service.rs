@@ -44,6 +44,17 @@ pub struct InitArgs {
     /// Don't connect the coding agents found on this Mac.
     #[arg(long)]
     no_connect: bool,
+    /// Don't open the dashboard afterwards (it never opens when output isn't a terminal).
+    #[arg(long)]
+    no_open: bool,
+}
+
+/// `ms status [--open]`
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Also open the dashboard in your browser.
+    #[arg(long)]
+    open: bool,
 }
 
 fn say(s: &str) {
@@ -88,7 +99,27 @@ pub(crate) fn status_line(resp: &ResponseBody) -> Option<String> {
     })
 }
 
-pub(crate) async fn status() -> ExitCode {
+pub(crate) async fn status(a: &StatusArgs) -> ExitCode {
+    let code = status_only().await;
+    if !a.open || code != ExitCode::SUCCESS {
+        return code;
+    }
+    // DashOpen drives its own IPC runtime, which can't start inside this one.
+    let opened = std::thread::spawn(|| crate::dashboard::open(None))
+        .join()
+        .unwrap_or_else(|_| Err("morsec: opening the dashboard failed".into()));
+    match opened {
+        Ok(port) => {
+            say(&format!(
+                "Dashboard: http://127.0.0.1:{port} (opening it now)"
+            ));
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+async fn status_only() -> ExitCode {
     match request(RequestBody::Status).await {
         Ok(resp @ ResponseBody::Status { .. }) => {
             if let Some(line) = status_line(&resp) {
@@ -684,6 +715,20 @@ pub(crate) fn init(a: &InitArgs) -> ExitCode {
     }
     for (label, text) in &rows {
         say(&format!("{label:<10} {text}"));
+    }
+    // The dashboard (L32): opened on the project's page when a person is watching; the line
+    // never holds the launch token.
+    if let Some(slug) = slug.as_deref().filter(|_| ok) {
+        use std::io::IsTerminal;
+        let text = if a.no_open || !std::io::stdout().is_terminal() {
+            "ms dashboard".to_owned()
+        } else {
+            match crate::dashboard::open(crate::dashboard::view_for(Some(slug)).as_deref()) {
+                Ok(port) => format!("http://127.0.0.1:{port}  (opening it now)"),
+                Err(e) => format!("not opened ({e}); run ms dashboard"),
+            }
+        };
+        say(&format!("{:<10} {text}", "Dashboard"));
     }
     if let Some(slug) = slug.filter(|_| ok) {
         println!();

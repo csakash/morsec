@@ -1222,7 +1222,7 @@ fn init_project_never_leaks_a_canary() {
     std::fs::write(proj.join("src/pay.ts"), &code_file).unwrap();
 
     let (code, out) = w.outside(&format!(
-        "cd '{}' && (i=0; while [ $i -lt 200 ]; do printf 'o\\n'; sleep 0.3; i=$((i+1)); done) | script -q /dev/null ms init --no-connect",
+        "cd '{}' && (i=0; while [ $i -lt 200 ]; do printf 'o\\n'; sleep 0.3; i=$((i+1)); done) | script -q /dev/null ms init --no-connect --no-open",
         proj.display()
     ));
     let out = out.replace("\r\n", "\n");

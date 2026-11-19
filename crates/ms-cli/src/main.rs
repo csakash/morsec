@@ -11,6 +11,7 @@ mod approve;
 mod brew;
 mod connect;
 mod connect_codex;
+mod dashboard;
 mod doctor;
 mod import;
 mod init_project;
@@ -73,8 +74,8 @@ enum Command {
     Start,
     /// Review and answer the request waiting for your approval (Touch ID).
     Approve(approve::ApproveArgs),
-    /// Show whether morsec is on.
-    Status,
+    /// Show whether morsec is on; --open also opens the dashboard.
+    Status(service::StatusArgs),
     /// Check that every connected agent routes through morsec.
     Doctor(doctor::DoctorArgs),
     /// Run the MCP server for an agent: your run commands as typed tools.
@@ -85,6 +86,8 @@ enum Command {
     Stats(stats::StatsArgs),
     /// The projects ms init set up; with a name, that project in full.
     Projects(projects::ProjectsArgs),
+    /// Open the local dashboard in your browser (read-only).
+    Dashboard(dashboard::DashboardArgs),
 }
 
 /// The name this binary was invoked as: `ms` or `mors` (or whatever the symlink is called).
@@ -139,7 +142,7 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     match command {
-        Command::Status => service::status().await,
+        Command::Status(a) => service::status(&a).await,
         Command::Init(a) => on_own_thread(move || service::init(&a)),
         Command::Stop => service::stop().await,
         Command::Start => service::start().await,
@@ -156,6 +159,7 @@ async fn main() -> ExitCode {
         Command::Approve(a) => on_own_thread(move || approve::run(&a)),
         Command::Doctor(a) => on_own_thread(move || doctor::run(&a)),
         Command::Projects(a) => on_own_thread(move || projects::run(&a)),
+        Command::Dashboard(a) => on_own_thread(move || dashboard::run(&a)),
     }
 }
 
@@ -172,5 +176,33 @@ mod tests {
         assert!(!safe.chars().any(|c| c.is_control()), "{safe:?}");
         assert!(!safe.contains('\u{202e}'));
         assert!(safe.starts_with("0.0.0"));
+    }
+
+    // protects=design §6.5 CLI parity: every ms subcommand has a dashboard screen or an exemption
+    // with its reason (L33-owned actions exempt as L33 until it lands); fails_when=a subcommand is
+    // added with neither; no_claim=that a screen shows everything its command does (browser pass)
+    #[test]
+    fn dash_parity_covers_every_subcommand() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let mut names: Vec<String> = cmd
+            .get_subcommands()
+            .map(|c| c.get_name().to_owned())
+            .collect();
+        assert!(names.len() >= 18, "{names:?}");
+        names.push("help".into());
+        for n in &names {
+            match ms_dash::parity::lookup(n) {
+                Some(ms_dash::parity::Parity::Screen(s)) => {
+                    assert!(ms_dash::parity::SCREENS.contains(&s), "{n}: {s}");
+                }
+                Some(ms_dash::parity::Parity::Exempt(why)) => {
+                    assert!(!why.trim().is_empty(), "{n}: empty reason");
+                }
+                None => panic!(
+                    "ms {n} has no dashboard screen and no exemption: add it to ms_dash::parity::PARITY"
+                ),
+            }
+        }
     }
 }

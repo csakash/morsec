@@ -187,7 +187,7 @@ impl Fx {
         self.outside(
             cwd,
             &format!(
-                "(i=0; while [ $i -lt 200 ]; do printf '{answer}\\n'; sleep 0.3; i=$((i+1)); done) | script -q /dev/null '{}' init --no-connect {args}",
+                "(i=0; while [ $i -lt 200 ]; do printf '{answer}\\n'; sleep 0.3; i=$((i+1)); done) | script -q /dev/null '{}' init --no-connect --no-open {args}",
                 ms.display()
             ),
         )
@@ -197,7 +197,7 @@ impl Fx {
     fn init_plain(&self, cwd: &Path, args: &str) -> (i32, String) {
         self.outside(
             cwd,
-            &format!("'{}' init --no-connect {args}", ms().display()),
+            &format!("'{}' init --no-connect --no-open {args}", ms().display()),
         )
     }
 
@@ -381,10 +381,14 @@ fn init_project_end_to_end() {
         "Needs you  1 has no known service yet: ms rules shop/session-secret --add-host <host>",
         "In code    1 key written straight into src/stripe.ts:4",
         "See everything: ms projects shop",
+        "Dashboard  ms dashboard",
     ] {
         assert!(out.contains(want), "missing {want:?}:\n{out}");
     }
-    assert!(!out.contains("dashboard"), "{out}");
+    assert!(
+        !out.contains("#t="),
+        "a launch token is never printed: {out}"
+    );
 
     assert_eq!(
         read(&root.join(".env")),

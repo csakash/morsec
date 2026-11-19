@@ -35,6 +35,8 @@ zeroize = { workspace = true }
 rustix = { version = "1", default-features = false, features = ["std", "termios", "process"] }
 
 [dev-dependencies]
+# The parity table only (dash_parity_covers_every_subcommand); ms itself links no HTTP server.
+ms-dash = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
