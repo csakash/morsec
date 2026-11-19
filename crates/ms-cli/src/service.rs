@@ -655,8 +655,8 @@ pub(crate) fn init(a: &InitArgs) -> ExitCode {
     if let Some(root) = &project {
         match crate::init_project::run(root, a.name.as_deref()) {
             Ok(rep) => {
-                ok = rep.save_error.is_none();
-                slug = Some(rep.slug.clone());
+                ok = rep.s.save_error.is_none();
+                slug = Some(rep.s.slug.clone());
                 rows.extend(crate::init_project::summary_rows(&rep, home_dir.as_deref()));
             }
             Err(e) => {

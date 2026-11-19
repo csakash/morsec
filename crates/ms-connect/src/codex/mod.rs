@@ -333,6 +333,18 @@ impl CodexConnector {
         Ok(self.read_state()?.map(|st| st.proxy_port))
     }
 
+    /// The `config.toml` the previous connect wrote, as its state records it (L35 SPEC D-5).
+    pub fn recorded_config_path(&self) -> Result<Option<PathBuf>> {
+        let Some(text) = fsio::read_text(&self.paths.state).map_err(err)? else {
+            return Ok(None);
+        };
+        let v = json::parse(&text)
+            .map_err(|e| err(format!("{} is damaged ({e})", self.paths.state.display())))?;
+        Ok(v.get("config")
+            .and_then(json::Value::as_str)
+            .map(PathBuf::from))
+    }
+
     /// The opt-in parts the previous connect used (a plain re-run keeps them: SPEC D11).
     pub fn previous_options(&self) -> Result<Options> {
         Ok(self

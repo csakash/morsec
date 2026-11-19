@@ -470,6 +470,19 @@ impl ClaudeConnector {
         Ok(self.read_state()?.map(|st| st.proxy_port))
     }
 
+    /// The settings file the previous connect wrote, as its state records it (L35 SPEC D-5).
+    /// `None` when there is no state, or an older build wrote it without the field.
+    pub fn recorded_settings_path(&self) -> Result<Option<PathBuf>> {
+        let Some(text) = fsio::read_text(&self.paths.state).map_err(err)? else {
+            return Ok(None);
+        };
+        let v = json::parse(&text)
+            .map_err(|e| err(format!("{} is damaged ({e})", self.paths.state.display())))?;
+        Ok(v.get("settings_path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from))
+    }
+
     fn read_state(&self) -> Result<Option<State>> {
         let Some(text) = fsio::read_text(&self.paths.state).map_err(err)? else {
             return Ok(None);
@@ -577,6 +590,13 @@ impl ClaudeConnector {
         let mut v = Value::object();
         v.set("version", Value::int(STATE_VERSION));
         v.set("agent", Value::str(ID));
+        // Where this connect wrote (L35 SPEC D-5): msd, which can't see a terminal's
+        // CLAUDE_CONFIG_DIR, refuses to act on a state that names another settings file. Older
+        // builds ignore the field.
+        v.set(
+            "settings_path",
+            Value::str(self.paths.settings.to_string_lossy().into_owned()),
+        );
         v.set("proxy_port", Value::int(i64::from(st.proxy_port)));
         v.set("with_mcp", Value::Bool(st.with_mcp));
         v.set("wrap", Value::Bool(st.wrap));
