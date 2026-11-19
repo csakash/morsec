@@ -20,11 +20,13 @@ use ms_session::Caller;
 use ms_vault::{Listing, Vault, VaultExt};
 use tokio::sync::watch;
 
+mod dash_data;
 mod mcp;
 mod projects;
 mod run;
 mod ssh_git;
 
+pub use dash_data::{ConnChecker, DashSource};
 pub use projects::{PROJECTS_FILE, reset_project_records};
 
 use crate::backend::{Backend, DAEMON_STATE_KEY, RULES_HMAC_KEY};
@@ -140,6 +142,17 @@ pub struct Daemon {
     me: std::sync::Weak<Daemon>,
     /// What `ms doctor --probe` runs reported, and the canaries the proxy saw (L17).
     probes: Arc<crate::doctor::Probes>,
+    /// The local dashboard (L32) and the browser opener, set once at start; tests may run
+    /// without one.
+    dash: std::sync::OnceLock<(ms_dash::Dash, crate::open::Opener)>,
+    /// The last transcript scan's report and when it finished, for the dashboard's Scan screen
+    /// (L32 SPEC D-6). Locations and key names only, never a value.
+    last_scan: Mutex<Option<(u64, ResponseBody)>>,
+    /// The receipts the dashboard last read, keyed by the store's next sequence number; the lock
+    /// also lets one dashboard request read the files at a time (reviews R8, S6).
+    dash_receipts: Mutex<Option<(u64, Arc<Vec<ms_receipts::StoredRecord>>)>>,
+    /// When `DashOpen` last opened a browser tab (fix round 2, F2).
+    dash_last_open: Mutex<Option<std::time::Instant>>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -327,6 +340,10 @@ impl Daemon {
             projects_write: Mutex::new(()),
             ca: Mutex::new(None),
             probes: Arc::default(),
+            dash: std::sync::OnceLock::new(),
+            last_scan: Mutex::new(None),
+            dash_receipts: Mutex::new(None),
+            dash_last_open: Mutex::new(None),
             stops: std::sync::atomic::AtomicU64::new(0),
         }))
     }
@@ -676,6 +693,13 @@ impl Daemon {
             }
             RequestBody::ProjectList => self.project_list(),
             RequestBody::ProjectGet { slug } => self.project_get(&slug),
+            // The launch token signs a browser in: only the user's own terminal may mint one
+            // (L32, design §6.2.2). The page is read-only, so a stopped msd still serves it.
+            RequestBody::DashOpen { .. } if in_agent => reply_err(
+                ErrorCode::Denied,
+                "morsec: the dashboard can't be opened from inside an agent session. Ask the user to run ms dashboard in their own terminal",
+            ),
+            RequestBody::DashOpen { view } => self.dash_open(view.as_deref()),
             RequestBody::DoctorProbe { nonce, report } => self.probes.handle(
                 match &caller {
                     Some(Caller::Agent(s)) => Some(s.clone()),
@@ -790,6 +814,9 @@ impl Daemon {
                 ErrorCode::Denied,
                 "morsec: morsec was stopped (ms stop) during the scan, so its result is withheld",
             );
+        }
+        if matches!(report, ResponseBody::ScanReport { .. }) {
+            *lock(&self.last_scan) = Some((now_ms(), report.clone()));
         }
         report
     }
@@ -2809,6 +2836,443 @@ mod tests {
                 .path()
                 .join(format!("{PROJECTS_FILE}.mac.old-1"))
                 .exists()
+        );
+    }
+
+    // ---- L32 dashboard -------------------------------------------------------------------------
+
+    /// A runtime and the dashboard installed on `h`, with `check` as the connection check.
+    /// The URLs the test opener was handed (the user's browser, in production).
+    type Opened = Arc<Mutex<Vec<String>>>;
+
+    fn with_dash(h: &H, check: ConnChecker) -> (tokio::runtime::Runtime, Opened) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        // Below the ephemeral range, where parallel tests' client sockets don't land.
+        let port = (0u16..)
+            .map(|i| {
+                20_000
+                    + ((std::process::id() as u16)
+                        .wrapping_mul(31)
+                        .wrapping_add(i * 97))
+                        % 25_000
+            })
+            .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+            .unwrap();
+        let opened: Opened = Arc::default();
+        let o = opened.clone();
+        let _g = rt.enter();
+        crate::dash::install_with(
+            &h.d,
+            ms_dash::DashConfig::new(port),
+            check,
+            Arc::new(move |url: &str| {
+                lock(&o).push(url.to_owned());
+                true
+            }),
+        );
+        drop(_g);
+        (rt, opened)
+    }
+
+    fn dash_open(h: &H, view: Option<&str>) -> ResponseBody {
+        h.req(RequestBody::DashOpen {
+            view: view.map(str::to_owned),
+        })
+    }
+
+    fn allow_all() -> ConnChecker {
+        Arc::new(|_, _| {
+            Ok(SessionId {
+                agent: AgentKind::Other("dashboard".into()),
+                pid: 7,
+                started_unix_ms: 1,
+            })
+        })
+    }
+
+    // protects=design §5.3, §6.2.2 and §8 (agent runs ms dashboard to get a token): DashOpen from
+    // an agent session is Denied and neither binds nor opens anything; from outside one it starts
+    // the listener, opens the browser on the port it holds, also while stopped; a bad view is
+    // Invalid; fails_when=an agent's ask binds or opens, or the terminal's doesn't;
+    // no_claim=a detached process (it is not an agent session: it gets the same answer as the
+    // terminal, which holds no token: dash_open_never_returns_token)
+    #[test]
+    fn dash_open_refused_in_agent_session() {
+        let h = fresh();
+        let r = dash_open(&h, None);
+        assert_eq!(
+            code(&r),
+            Some(ErrorCode::Internal),
+            "no dashboard installed"
+        );
+        let (_rt, opened) = with_dash(&h, allow_all());
+        let r = dash_open(h.as_(agent()), None);
+        assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
+        assert!(msg(&r).contains("agent session"), "{r:?}");
+        assert_eq!(
+            h.d.dash().unwrap().port(),
+            None,
+            "an agent's ask binds nothing"
+        );
+        assert!(lock(&opened).is_empty(), "an agent's ask opens nothing");
+        h.as_(terminal()).req(RequestBody::Stop);
+        match dash_open(&h, Some("project/shop")) {
+            ResponseBody::Dash { port, opened: true } => {
+                assert_eq!(Some(port), h.d.dash().unwrap().port());
+                assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+                let urls = lock(&opened).clone();
+                assert_eq!(urls.len(), 1);
+                assert!(
+                    urls[0].starts_with(&format!("http://127.0.0.1:{port}/#t=")),
+                    "{urls:?}"
+                );
+                assert!(urls[0].ends_with("&v=project/shop"), "{urls:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        for bad in ["project/Shop", "project/a&t=x", "projects", "../x"] {
+            assert_eq!(
+                code(&dash_open(&h, Some(bad))),
+                Some(ErrorCode::Invalid),
+                "{bad}"
+            );
+        }
+    }
+
+    // protects=fix round 2 F2: a process looping DashOpen opens no second tab while the last
+    // sign-in link is unused, nor within 3 s of the last tab, and gets the same port back, so it
+    // can neither flood the browser nor push the real tab's CSRF tokens out; once the link is
+    // used and the gap has passed a new tab opens; fails_when=a second tab opens inside either
+    // limit; no_claim=-
+    #[test]
+    fn dash_open_is_rate_limited() {
+        use std::io::{Read, Write};
+        let h = fresh();
+        let (_rt, opened) = with_dash(&h, allow_all());
+        let port = match dash_open(&h, None) {
+            ResponseBody::Dash { port, opened: true } => port,
+            other => panic!("{other:?}"),
+        };
+        for _ in 0..10 {
+            assert!(matches!(
+                dash_open(&h, None),
+                ResponseBody::Dash { port: p, opened: true } if p == port
+            ));
+        }
+        assert_eq!(lock(&opened).len(), 1, "the link is unused: no second tab");
+        // The browser signs in with the link.
+        let token = lock(&opened)[0].split("#t=").nth(1).unwrap().to_owned();
+        let body = format!("{{\"token\":\"{token}\"}}");
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(
+            format!(
+                "POST /api/session HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut got = String::new();
+        let _ = c.read_to_string(&mut got);
+        assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+        let _ = dash_open(&h, None);
+        assert_eq!(lock(&opened).len(), 1, "within 3 s of the last tab");
+        std::thread::sleep(Duration::from_millis(3200));
+        let _ = dash_open(&h, None);
+        assert_eq!(lock(&opened).len(), 2, "after the gap");
+    }
+
+    // protects=SPEC D-12 and security review S1: the launch token is handed to the browser
+    // opener only; the IPC reply to any caller outside an agent session (a detached process
+    // included) holds the port and `opened`, never the token, so the caller can't sign in;
+    // fails_when=the reply's encoding contains the token or any 64-hex string;
+    // no_claim=what the opener does with the URL (LaunchServices)
+    #[test]
+    fn dash_open_never_returns_token() {
+        let h = fresh();
+        let (_rt, opened) = with_dash(&h, allow_all());
+        // A detached process is unattributed, exactly like the user's terminal.
+        let reply = dash_open(h.as_(terminal()), None);
+        let wire = String::from_utf8(ms_ipc::protocol::encode(1, &reply).unwrap()).unwrap();
+        let url = lock(&opened)[0].clone();
+        let token = url.split("#t=").nth(1).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(!wire.contains(token), "{wire}");
+        let hex_run = wire
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .any(|w| w.len() >= 32);
+        assert!(!hex_run, "{wire}");
+        assert!(matches!(reply, ResponseBody::Dash { opened: true, .. }));
+    }
+
+    // protects=design §6.2.1 and SPEC D-9 (LOG-1, LOG-2): a connection the process check refuses
+    // gets no byte, and msd writes a blocked receipt under morsec/dashboard charged to the agent
+    // session; fails_when=the refused client reads a response, or no receipt names the session;
+    // no_claim=the OS process walk (dash.rs conn_check_* and ms-cli dashboard.rs)
+    #[test]
+    fn refused_connection_writes_blocked_receipt() {
+        use std::io::{Read, Write};
+        let h = fresh();
+        let agent_session = match agent() {
+            Caller::Agent(s) => s,
+            Caller::Unattributed { .. } => unreachable!(),
+        };
+        let s2 = agent_session.clone();
+        let (_rt, _) = with_dash(
+            &h,
+            Arc::new(move |_, _| {
+                Err(ms_dash::Refusal {
+                    session: s2.clone(),
+                    why: "a connection from an agent session".into(),
+                })
+            }),
+        );
+        let port = match dash_open(&h, None) {
+            ResponseBody::Dash { port, .. } => port,
+            other => panic!("{other:?}"),
+        };
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = c.write_all(format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes());
+        let mut got = Vec::new();
+        let _ = c.read_to_end(&mut got);
+        assert!(got.is_empty(), "{}", String::from_utf8_lossy(&got));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = h.receipts_text();
+            if text.contains("morsec/dashboard") {
+                assert!(
+                    text.contains("dashboard: a connection from an agent session"),
+                    "{text}"
+                );
+                assert!(text.contains("host_not_allowed"), "{text}");
+                assert!(text.contains("claude_code"), "{text}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no receipt: {text}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The `shop` fixture saved (approved), a key in no project, a receipt for the Stripe key and
+    /// a scan report.
+    fn dash_fixture(h: &H) {
+        let mut rec = shop(h);
+        rec.files[0].git_history_commits = Some(2);
+        rec.findings.push(ms_projects::record::FindingRecord {
+            path: "src/pay.ts".into(),
+            line: 4,
+            provider: "stripe".into(),
+            masked: "sk_live_… (40 bytes)".into(),
+        });
+        let rules = proposal(h, &rec);
+        assert!(is_ok(&h.approved(|| save(h, &rec, &rules))));
+        h.put("loose/key", Tier::Test);
+        let _ = h.swap(STRIPE_KEY, "api.stripe.com");
+        let _ = h.d.record(
+            &match agent() {
+                Caller::Agent(s) => s,
+                Caller::Unattributed { .. } => unreachable!(),
+            },
+            &KeyName::new(STRIPE_KEY).unwrap(),
+            Mode::Swap,
+            "api.stripe.com",
+            1,
+            ReceiptResult::Blocked(Reason::HostNotAllowed),
+            None,
+        );
+        *lock(&h.d.last_scan) = Some((
+            5,
+            ResponseBody::ScanReport {
+                findings: vec![ms_ipc::ScanFinding {
+                    file: "/x/t.jsonl".into(),
+                    line: 3,
+                    key: KeyName::new(STRIPE_KEY).unwrap(),
+                    encoding: "raw".into(),
+                }],
+                files_scanned: 1,
+                bytes_scanned: 10,
+                keys_checked: 5,
+                skipped_keys: Vec::new(),
+                notes: Vec::new(),
+                complete: true,
+            },
+        ));
+    }
+
+    // protects=SPEC criterion 9: the views show the project's rows (file, line, key, provider,
+    // status), code findings, git warnings, keys in no project, a key's hosts and where it is used,
+    // receipts with filters (an invalid key matching nothing; the receipt cache following new
+    // records), the last scan, and counts on Home; fails_when=a screen misses its data, misreports
+    // a status or shows stale receipts; no_claim=the page's rendering (browser pass)
+    #[test]
+    fn dashboard_views_from_records() {
+        let h = fresh();
+        dash_fixture(&h);
+        let home = h.d.dash_home().unwrap();
+        assert!(home.running);
+        assert_eq!(home.projects, 1);
+        assert_eq!(home.keys, 5);
+        assert_eq!(home.protected, 2, "{home:?}");
+        assert_eq!(
+            home.needs_website, 3,
+            "unknown, the run key with no command, the loose key"
+        );
+        assert!(home.blocked_24h >= 1);
+        assert_eq!(home.agents.len(), 2);
+
+        let ps = h.d.dash_projects_view().unwrap();
+        assert_eq!(ps.projects.len(), 1);
+        let card = &ps.projects[0];
+        assert_eq!((card.protected, card.needs_website), (2, 2));
+        assert_eq!((card.findings, card.committed_files), (1, 1));
+        assert_eq!(ps.loose.len(), 1);
+        assert_eq!(ps.loose[0].key, "loose/key");
+        assert!(!ps.loose[0].ready);
+
+        let p = h.d.dash_project("shop").unwrap();
+        assert_eq!(p.rows.len(), 4);
+        let stripe = p.rows.iter().find(|r| r.key == STRIPE_KEY).unwrap();
+        assert_eq!(stripe.status, "protected");
+        assert_eq!(stripe.provider.as_deref(), Some("stripe"));
+        assert_eq!(stripe.file, ".env");
+        assert!(stripe.last_use_unix_ms.is_some());
+        let unknown = p.rows.iter().find(|r| r.key == UNKNOWN_KEY).unwrap();
+        assert_eq!(unknown.status, "needs a website");
+        let db = p.rows.iter().find(|r| r.key == DB_KEY).unwrap();
+        assert_eq!(db.status, "needs a command");
+        assert_eq!(p.findings[0].masked, "sk_live_… (40 bytes)");
+        assert_eq!(p.committed[0].commits, 2);
+        assert_eq!(h.d.dash_project("nope").unwrap_err().status, 404);
+
+        let s = h.d.dash_secret(&KeyName::new(STRIPE_KEY).unwrap()).unwrap();
+        assert_eq!(s.hosts, ["api.stripe.com"]);
+        assert_eq!(s.used_in.len(), 1);
+        assert_eq!(s.used_in[0].var, "VAR_0");
+        assert!(s.stored && s.ready);
+        assert!(!s.uses.is_empty());
+        let db = h.d.dash_secret(&KeyName::new(DB_KEY).unwrap()).unwrap();
+        assert_eq!(db.mode.as_deref(), Some("run"));
+        assert!(!db.roots.is_empty());
+        assert_eq!(
+            h.d.dash_secret(&KeyName::new("no/such").unwrap())
+                .unwrap_err()
+                .status,
+            404
+        );
+
+        let all =
+            h.d.dash_activity(&ms_dash::api::ActivityQuery::default())
+                .unwrap();
+        assert!(all.matched >= 2);
+        let blocked =
+            h.d.dash_activity(&ms_dash::api::ActivityQuery {
+                result: Some("blocked".into()),
+                project: Some("shop".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            blocked
+                .rows
+                .iter()
+                .all(|r| r.result == "blocked" && r.key.starts_with("shop/"))
+        );
+        assert!(!blocked.rows.is_empty());
+        let bad = h.d.dash_activity(&ms_dash::api::ActivityQuery {
+            since: Some("yesterday-ish".into()),
+            ..Default::default()
+        });
+        assert_eq!(bad.unwrap_err().status, 400);
+        // An invalid key filter matches nothing instead of failing the screen (review R2).
+        let none =
+            h.d.dash_activity(&ms_dash::api::ActivityQuery {
+                key: Some("Not A Key!".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(none.matched, 0);
+        assert!(none.total > 0);
+        // The cached receipts follow new records (review R8).
+        let before = h.d.dash_activity(&Default::default()).unwrap().matched;
+        let _ = h.swap(STRIPE_KEY, "api.stripe.com");
+        let _ = h.d.record(
+            &match agent() {
+                Caller::Agent(s) => s,
+                Caller::Unattributed { .. } => unreachable!(),
+            },
+            &KeyName::new(STRIPE_KEY).unwrap(),
+            Mode::Swap,
+            "api.stripe.com",
+            1,
+            ReceiptResult::Allowed,
+            None,
+        );
+        assert_eq!(
+            h.d.dash_activity(&Default::default()).unwrap().matched,
+            before + 1
+        );
+        let (name, ctype, body) =
+            h.d.dash_export(&Default::default(), ms_dash::api::ExportFormat::Csv)
+                .unwrap();
+        assert_eq!(name, "morsec-receipts.csv");
+        assert!(ctype.starts_with("text/csv"));
+        assert!(String::from_utf8(body).unwrap().contains(STRIPE_KEY));
+        assert!(h.d.dash_verify().unwrap().ok);
+        assert!(h.d.dash_verify().unwrap().macs_checked);
+
+        let scan = h.d.dash_scan().last.unwrap();
+        assert_eq!(scan.findings[0].key, STRIPE_KEY);
+        let agents = h.d.dash_agents().unwrap();
+        assert!(
+            agents
+                .checks
+                .iter()
+                .any(|c| c.text.contains("rules verified"))
+        );
+    }
+
+    // protects=SPEC D-3 and criterion 10: no dashboard view (Home, Projects, Project, every
+    // Secret, Activity, export JSON and CSV, Verify, Agents, Scan) carries a vault value: the
+    // fixture's keys all hold the canary; fails_when=the canary appears in any serialized view;
+    // no_claim=the HTTP layer (it serializes these same views; ms-cli dashboard.rs fetches them)
+    #[test]
+    fn dashboard_never_serves_a_canary() {
+        let h = fresh();
+        dash_fixture(&h);
+        let mut out = Vec::new();
+        out.push(serde_json::to_string(&h.d.dash_home().unwrap()).unwrap());
+        out.push(serde_json::to_string(&h.d.dash_projects_view().unwrap()).unwrap());
+        out.push(serde_json::to_string(&h.d.dash_project("shop").unwrap()).unwrap());
+        for k in [STRIPE_KEY, OPENAI_KEY, DB_KEY, UNKNOWN_KEY, "loose/key"] {
+            out.push(
+                serde_json::to_string(&h.d.dash_secret(&KeyName::new(k).unwrap()).unwrap())
+                    .unwrap(),
+            );
+        }
+        out.push(serde_json::to_string(&h.d.dash_activity(&Default::default()).unwrap()).unwrap());
+        for f in [
+            ms_dash::api::ExportFormat::Json,
+            ms_dash::api::ExportFormat::Csv,
+        ] {
+            out.push(
+                String::from_utf8(h.d.dash_export(&Default::default(), f).unwrap().2).unwrap(),
+            );
+        }
+        out.push(serde_json::to_string(&h.d.dash_verify().unwrap()).unwrap());
+        out.push(serde_json::to_string(&h.d.dash_agents().unwrap()).unwrap());
+        out.push(serde_json::to_string(&h.d.dash_scan()).unwrap());
+        let all = out.join("\n");
+        assert!(all.contains(STRIPE_KEY), "the views were built");
+        assert!(!all.contains(CANARY), "a value reached a view");
+        assert!(
+            !all.contains(&CANARY[8..]),
+            "part of a value reached a view"
         );
     }
 }

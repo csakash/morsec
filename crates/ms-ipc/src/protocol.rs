@@ -180,6 +180,15 @@ pub enum RequestBody {
         /// The project's slug.
         slug: String,
     },
+    /// Start the local dashboard if it is not listening and open it in the user's browser (L32
+    /// dash-core, design §5.3 and §6.2.2). msd mints the single-use launch token and hands it to
+    /// LaunchServices itself: the token never crosses the socket (SPEC D-12). Refused inside an
+    /// agent session. Answered with [`ResponseBody::Dash`].
+    DashOpen {
+        /// The page to open on: `project/<slug>`; absent for Home. msd checks it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<String>,
+    },
 }
 
 /// What an approval covers (L11, PRD §7.2).
@@ -246,6 +255,7 @@ impl RequestBody {
             RequestBody::ProjectSave { .. }
             | RequestBody::ProjectList
             | RequestBody::ProjectGet { .. } => "L31 guided-init",
+            RequestBody::DashOpen { .. } => "L32 dash-core",
         }
     }
 }
@@ -540,6 +550,14 @@ pub enum ResponseBody {
         code: ErrorCode,
         /// Text, including the fix.
         message: String,
+    },
+    /// The dashboard is listening (`DashOpen`, L32). There is deliberately no token here: msd
+    /// opened the browser itself.
+    Dash {
+        /// The port msd holds on 127.0.0.1.
+        port: u16,
+        /// msd handed the sign-in URL to the browser (false without a GUI session).
+        opened: bool,
     },
 }
 

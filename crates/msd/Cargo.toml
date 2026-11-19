@@ -28,6 +28,8 @@ ms-scan = { workspace = true }
 ms-projects = { workspace = true }
 ms-run = { workspace = true }
 ms-mcp = { workspace = true }
+ms-dash = { workspace = true }
+ms-connect = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -37,6 +39,10 @@ hex = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# LaunchServices: msd opens the dashboard itself (L32 SPEC D-12). Already locked through ms-ipc.
+core-foundation-sys = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }

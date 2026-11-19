@@ -745,6 +745,7 @@ dependencies = [
  "ms-approve",
  "ms-connect",
  "ms-core",
+ "ms-dash",
  "ms-import",
  "ms-ipc",
  "ms-mcp",
@@ -784,6 +785,26 @@ dependencies = [
  "serde_json",
  "thiserror",
  "zeroize",
+]
+
+[[package]]
+name = "ms-dash"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ms-approve",
+ "ms-core",
+ "ms-ipc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1015,10 +1036,13 @@ name = "msd"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "core-foundation-sys",
  "hex",
  "libc",
  "ms-approve",
+ "ms-connect",
  "ms-core",
+ "ms-dash",
  "ms-import",
  "ms-ipc",
  "ms-mcp",

@@ -54,7 +54,7 @@ fn key(raw: &str) -> KeyName {
     KeyName::new(raw).unwrap_or_else(|_| unreachable!("constant key name is valid"))
 }
 
-fn targets(rule: &KeyRule) -> Vec<String> {
+pub(super) fn targets(rule: &KeyRule) -> Vec<String> {
     match rule.mode {
         Mode::Run => rule.roots.iter().map(|p| p.display().to_string()).collect(),
         _ => rule.hosts.iter().map(ToString::to_string).collect(),
@@ -98,7 +98,7 @@ impl Daemon {
 
     /// The verified records, or the `Denied` reply.
     #[allow(clippy::result_large_err)]
-    fn load_projects(&self) -> Result<(ProjectsFile, u64), ResponseBody> {
+    pub(super) fn load_projects(&self) -> Result<(ProjectsFile, u64), ResponseBody> {
         let floor = self.projects_floor().map_err(|e| {
             tracing::error!(error = %e, "project records floor unreadable");
             reply_err(ErrorCode::Denied, TAMPERED)
@@ -113,7 +113,7 @@ impl Daemon {
         }
     }
 
-    fn key_statuses(&self, record: &ProjectRecord) -> Vec<KeyStatus> {
+    pub(super) fn key_statuses(&self, record: &ProjectRecord) -> Vec<KeyStatus> {
         let stored: BTreeSet<KeyName> = self
             .scan_keys()
             .map(|l| l.keys.into_iter().map(|m| m.name).collect())

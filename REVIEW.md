@@ -11,7 +11,7 @@ here (or a lint rule) rather than paying for another review cycle.
 - Production-tier approvals are bound to the exact command and arguments shown in the prompt.
 - `ms` and `mors` must behave identically (same binary, two names).
 - Secret material never reaches `Debug`, `Display`, `tracing` or any serde type. `SecretBytes` has no `Serialize`, `Clone` or `Display` on purpose; adding one is a defect.
-- `unsafe` only with a `// SAFETY:` comment and an explicit crate-level opt-out of the workspace `unsafe_code = "deny"` lint.
+- `unsafe` only with a `// SAFETY:` comment on every block and an explicit opt-out of the workspace `unsafe_code = "deny"` lint: crate-level, or (tighter, preferred) module-level `#![allow(unsafe_code)]` in a dedicated FFI module that holds nothing else (for example `crates/msd/src/open.rs`, `crates/ms-session/src/sys/macos.rs`).
 - No new dependency unless `cargo deny` passes; no git or path dependency outside the workspace.
 - The frozen interfaces in `docs/PLAN.md` §4 (`ms-core` types and the `Vault`, `Approver`, `ReceiptSink`, `RunAdapter`, `Minter`, `Connector` traits, IPC v1) change only in a loop of their own.
 
