@@ -1036,6 +1036,7 @@ name = "msd"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "core-foundation-sys",
  "hex",
  "libc",
  "ms-approve",

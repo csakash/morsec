@@ -40,6 +40,10 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 libc = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# LaunchServices: msd opens the dashboard itself (L32 SPEC D-12). Already locked through ms-ipc.
+core-foundation-sys = "0.8"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 ms-run = { workspace = true, features = ["pg-test"] }

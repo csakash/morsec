@@ -5,13 +5,14 @@
 //! The gate is often run inside an agent session, and that is exactly what the dashboard refuses.
 //! So everything that plays "the user" runs detached from this test's process tree (reparented to
 //! PID 1), as the user's own terminal and browser would; "the agent" is a tiny C program named
-//! `claude`. `MORSEC_TEST_OPEN` (debug builds only) replaces `open(1)` with a script that saves
-//! the URL, so no browser starts.
+//! `claude`. msd opens the sign-in URL itself (SPEC D-12); `--test-open-to` (debug builds with the
+//! memory vault only) makes it append the URL to a file instead, so no browser starts and the
+//! test can play the browser.
 
-// `--test-touch-id` and `MORSEC_TEST_OPEN` exist only in debug builds.
+// `--test-touch-id` and `--test-open-to` exist only in debug builds.
 #![cfg(debug_assertions)]
 
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -112,6 +113,8 @@ impl Fx {
             .args(["--proxy-port", &free_port().to_string()])
             .args(["--dash-port", &dash_port.to_string()])
             .args(["--test-touch-id", "allow"])
+            .arg("--test-open-to")
+            .arg(base.join("opened.txt"))
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", base.join("home"))
@@ -127,17 +130,6 @@ impl Fx {
             assert!(Instant::now() < deadline, "msd never came up");
             std::thread::sleep(Duration::from_millis(20));
         }
-        // The opener: saves the URL instead of starting a browser.
-        let opener = base.join("bin/opener.sh");
-        std::fs::write(
-            &opener,
-            format!(
-                "#!/bin/sh\nprintf '%s' \"$1\" > '{}/url.txt'\n",
-                base.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
         Self {
             dir,
             dash_port,
@@ -153,7 +145,7 @@ impl Fx {
     fn env_line(&self) -> String {
         let b = self.base();
         format!(
-            "export PATH='/usr/bin:/bin' HOME='{h}' MORSEC_SOCKET='{b}/run/msd.sock' TMPDIR='{b}/tmp' LANG=C MORSEC_DEV_UNVERIFIED_DAEMON=1 MORSEC_TEST_OPEN='{b}/bin/opener.sh' MS='{ms}'",
+            "export PATH='/usr/bin:/bin' HOME='{h}' MORSEC_SOCKET='{b}/run/msd.sock' TMPDIR='{b}/tmp' LANG=C MORSEC_DEV_UNVERIFIED_DAEMON=1 MS='{ms}'",
             h = b.join("home").display(),
             b = b.display(),
             ms = ms().display()
@@ -224,8 +216,18 @@ impl Fx {
         p
     }
 
+    /// The URLs msd opened "in the browser", oldest first.
+    fn opened(&self) -> Vec<String> {
+        std::fs::read_to_string(self.base().join("opened.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The last URL msd opened.
     fn url(&self) -> String {
-        std::fs::read_to_string(self.base().join("url.txt")).unwrap_or_default()
+        self.opened().pop().unwrap_or_default()
     }
 
     fn receipts(&self) -> String {
@@ -303,11 +305,12 @@ curl -s -o /dev/null -w '%{{http_code}}' -H "$H" "http://127.0.0.1:$PORT/api/hom
     )
 }
 
-// protects=design §6.1, §8 (port squatting) and criterion 13: `ms dashboard` opens exactly the
-// port msd reports holding (msd skipped the port this test squats), on 127.0.0.1, with the token
-// only in the fragment and never printed, and that port serves the dashboard with its CSP; the
-// token signs in once; fails_when=the URL names another port or host, the token is in the path
-// or the output, or the page there is not ours; no_claim=a real browser (the browser pass)
+// protects=design §6.1, §8 (port squatting) and criterion 13: msd opens exactly the port it
+// holds (it skipped the port this test squats), on 127.0.0.1, with the token only in the
+// fragment; `ms dashboard` prints that port and never a token; the page there is ours, with its
+// CSP; the token signs in once; fails_when=the URL names another port or host, the token is in
+// the path or the CLI output, or the page there is not ours; no_claim=LaunchServices itself
+// (debug msd writes the URL to a file instead)
 #[test]
 fn dashboard_opens_the_port_msd_bound() {
     let fx = Fx::new();
@@ -321,7 +324,12 @@ fn dashboard_opens_the_port_msd_bound() {
     assert_eq!(token.len(), 64, "{url}");
     assert_eq!(view, None);
     assert!(!out.contains(&token), "the token is never printed: {out}");
-    assert!(out.contains(&format!("http://127.0.0.1:{port}")), "{out}");
+    assert!(
+        out.contains(&format!(
+            "http://127.0.0.1:{port}  (opened in your browser)"
+        )),
+        "{out}"
+    );
     let (code, out) = fx.outside(
         &base,
         &format!(
@@ -405,14 +413,14 @@ fn dash_refuses_agent_process_tree() {
     );
     assert!(out.contains("code=200"), "{out}");
     // ms dashboard inside the agent refuses before asking msd.
-    std::fs::remove_file(base.join("url.txt")).unwrap();
+    let before = fx.opened().len();
     let (_, out) = fx.outside(
         &base,
         &format!("'{}' \"$MS\" dashboard; echo \" rc=$?\"", agent.display()),
     );
     assert!(out.contains("agent session"), "{out}");
     assert!(out.contains("rc=1"), "{out}");
-    assert!(!base.join("url.txt").exists(), "an agent got a URL");
+    assert_eq!(fx.opened().len(), before, "an agent's ask opened something");
 }
 
 // protects=SPEC criteria 9, 10 and 13 end to end: after a real `ms init` of a project (values in
@@ -481,4 +489,88 @@ fn dashboard_end_to_end() {
     let project: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(api.join("project.json")).unwrap()).unwrap();
     assert_eq!(project["rows"].as_array().unwrap().len(), 3, "{project}");
+}
+
+/// Every run of 32 or more hex digits in `s`.
+fn hex_runs(s: &str) -> Vec<&str> {
+    s.split(|c: char| !c.is_ascii_hexdigit())
+        .filter(|w| w.len() >= 32)
+        .collect()
+}
+
+// protects=SPEC D-12, security review S1: a detached process (an agent's `( prog & )` child is
+// one: it is unattributed, like the user's terminal) that runs `ms dashboard` gets the port and
+// "opened", never the launch token: msd handed that to the browser; without it the process's own
+// fetches of /api/* get 401 and a guessed token 403; fails_when=the token or any 64-hex string
+// reaches its output, or it reads any API route; no_claim=a process that can read the user's
+// browser (T-69 residual)
+#[test]
+fn detached_process_gets_no_token() {
+    let fx = Fx::new();
+    let base = fx.base();
+    let (code, out) = fx.outside(
+        &base,
+        r#"OUT=$("$MS" dashboard 2>&1); echo "$OUT"
+PORT=$(echo "$OUT" | sed -n 's/.*127\.0\.0\.1:\([0-9]*\).*/\1/p' | head -1)
+H="Host: 127.0.0.1:$PORT"
+for p in home projects activity agents scan; do
+  echo "$p=$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "http://127.0.0.1:$PORT/api/$p")"
+done
+echo "session=$(curl -s -o /dev/null -w '%{http_code}' -H "$H" -H "Origin: http://127.0.0.1:$PORT" -H 'Content-Type: application/json' --data '{"token":"0000000000000000000000000000000000000000000000000000000000000000"}' "http://127.0.0.1:$PORT/api/session")""#,
+    );
+    assert_eq!(code, 0, "{out}");
+    let url = fx.url();
+    let (_, token, _) = parse_url(&url);
+    assert_eq!(token.len(), 64, "msd opened the browser: {url}");
+    assert!(!out.contains(&token), "{out}");
+    let runs: Vec<&str> = hex_runs(&out)
+        .into_iter()
+        .filter(|w| *w != "0".repeat(64))
+        .collect();
+    assert!(runs.is_empty(), "{out}");
+    for p in ["home", "projects", "activity", "agents", "scan"] {
+        assert!(out.contains(&format!("{p}=401")), "{p}: {out}");
+    }
+    assert!(out.contains("session=403"), "{out}");
+}
+
+// protects=criterion 13 and review R7: `ms status --open` prints status, then has msd open the
+// dashboard and prints its port; inside an agent session `ms status --open` and `ms init` in a
+// project refuse with the agent-session text and open nothing; fails_when=status --open doesn't
+// open, prints a token, or an agent's ask opens the dashboard; no_claim=-
+#[test]
+fn status_open_and_agent_refusals() {
+    let fx = Fx::new();
+    let base = fx.base();
+    let (code, out) = fx.outside(&base, r#""$MS" status --open"#);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("morsec on"), "{out}");
+    let (port, token, view) = parse_url(&fx.url());
+    assert_eq!(view, None);
+    assert!(
+        out.contains(&format!(
+            "Dashboard: http://127.0.0.1:{port}  (opened in your browser)"
+        )),
+        "{out}"
+    );
+    assert!(!out.contains(&token), "{out}");
+    let before = fx.opened().len();
+    let agent = fx.fake_agent();
+    let root = fx.shop();
+    let (_, out) = fx.outside(
+        &base,
+        &format!(
+            "'{a}' \"$MS\" status --open; echo \" rc=$?\"; cd '{r}' && '{a}' \"$MS\" init --no-connect; echo \" init_rc=$?\"",
+            a = agent.display(),
+            r = root.display()
+        ),
+    );
+    assert!(
+        out.contains("dashboard can't be opened from inside an agent session"),
+        "{out}"
+    );
+    assert!(out.contains("rc=1"), "{out}");
+    assert!(out.contains("not inside an agent session"), "{out}");
+    assert!(out.contains("init_rc=1"), "{out}");
+    assert_eq!(fx.opened().len(), before, "an agent's ask opened something");
 }

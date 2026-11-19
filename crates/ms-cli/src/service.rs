@@ -109,11 +109,13 @@ pub(crate) async fn status(a: &StatusArgs) -> ExitCode {
         .join()
         .unwrap_or_else(|_| Err("morsec: opening the dashboard failed".into()));
     match opened {
-        Ok(port) => {
-            say(&format!(
-                "Dashboard: http://127.0.0.1:{port} (opening it now)"
-            ));
-            ExitCode::SUCCESS
+        Ok(o) => {
+            say(&format!("Dashboard: {}", o.line()));
+            if o.opened {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         Err(e) => fail(&e),
     }
@@ -724,7 +726,7 @@ pub(crate) fn init(a: &InitArgs) -> ExitCode {
             "ms dashboard".to_owned()
         } else {
             match crate::dashboard::open(crate::dashboard::view_for(Some(slug)).as_deref()) {
-                Ok(port) => format!("http://127.0.0.1:{port}  (opening it now)"),
+                Ok(o) => o.line(),
                 Err(e) => format!("not opened ({e}); run ms dashboard"),
             }
         };

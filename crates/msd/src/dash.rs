@@ -95,19 +95,23 @@ impl<S: SocketTable, T: ProcessTable> ConnCheck<S, T> {
 }
 
 /// Builds the dashboard for `d` (not listening until the first `DashOpen`) and installs it.
-pub fn install(d: &Arc<Daemon>, cfg: DashConfig, uid: u32) {
+pub fn install(d: &Arc<Daemon>, cfg: DashConfig, uid: u32, opener: crate::open::Opener) {
     let check = Arc::new(ConnCheck::new(OsProcessTable, OsProcessTable, uid));
-    install_with(d, cfg, Arc::new(move |p, l| check.check(p, l)));
+    install_with(d, cfg, Arc::new(move |p, l| check.check(p, l)), opener);
 }
 
 /// [`install`] with another connection check (tests).
-pub fn install_with(d: &Arc<Daemon>, cfg: DashConfig, check: crate::daemon::ConnChecker) {
+pub fn install_with(
+    d: &Arc<Daemon>,
+    cfg: DashConfig,
+    check: crate::daemon::ConnChecker,
+    opener: crate::open::Opener,
+) {
     let source = DashSource::new(d, check);
-    d.set_dash(Dash::new(
-        cfg,
-        Arc::new(source),
-        tokio::runtime::Handle::current(),
-    ));
+    d.set_dash(
+        Dash::new(cfg, Arc::new(source), tokio::runtime::Handle::current()),
+        opener,
+    );
 }
 
 #[cfg(test)]

@@ -123,26 +123,37 @@ fn ready(rule: Option<&KeyRule>, tampered: bool) -> bool {
 }
 
 impl Daemon {
-    /// Installs the dashboard (once, at start).
-    pub fn set_dash(&self, dash: ms_dash::Dash) {
-        let _ = self.dash.set(dash);
+    /// Installs the dashboard and its browser opener (once, at start).
+    pub fn set_dash(&self, dash: ms_dash::Dash, opener: crate::open::Opener) {
+        let _ = self.dash.set((dash, opener));
     }
 
     /// The dashboard, when this daemon serves one.
     pub fn dash(&self) -> Option<&ms_dash::Dash> {
-        self.dash.get()
+        self.dash.get().map(|(d, _)| d)
     }
 
-    /// `DashOpen` (the caller is outside every agent session; checked by `handle`).
-    pub(super) fn dash_open(&self) -> ResponseBody {
-        let Some(dash) = self.dash.get() else {
+    /// `DashOpen` (the caller is outside every agent session; checked by `handle`). msd opens the
+    /// sign-in URL itself and answers only the port and whether it opened: the launch token never
+    /// crosses the socket (SPEC D-12, security review S1).
+    pub(super) fn dash_open(&self, view: Option<&str>) -> ResponseBody {
+        let Some((dash, opener)) = self.dash.get() else {
             return reply_err(ErrorCode::Internal, "morsec: this msd serves no dashboard");
         };
+        if view.is_some_and(|v| !ms_dash::valid_view(v)) {
+            return reply_err(
+                ErrorCode::Invalid,
+                "morsec: that is not a project name. List them with: ms projects",
+            );
+        }
         match dash.open() {
-            Ok(o) => ResponseBody::Dash {
-                port: o.port,
-                launch_token: o.token,
-            },
+            Ok(o) => {
+                let opened = opener(&o.url(view));
+                ResponseBody::Dash {
+                    port: o.port,
+                    opened,
+                }
+            }
             Err(e) => reply_err(ErrorCode::Internal, e),
         }
     }
@@ -163,9 +174,23 @@ impl Daemon {
         }
     }
 
-    fn receipts_all(&self) -> Result<Vec<StoredRecord>, ApiError> {
-        ms_receipts::read_all(self.receipts.dir())
-            .map_err(|e| ApiError::internal(format!("morsec: the receipts can't be read: {e}")))
+    /// Every receipt, read once per new record: a cache keyed by the store's next sequence
+    /// number, behind a lock so dashboard requests read the files one at a time (reviews R8, S6).
+    /// Display only: `dash_verify` always reads and checks the files themselves.
+    fn receipts_all(&self) -> Result<Arc<Vec<StoredRecord>>, ApiError> {
+        let mut cache = lock(&self.dash_receipts);
+        let seq = self.receipts.next_seq();
+        if let Some((at, records)) = cache.as_ref()
+            && *at == seq
+        {
+            return Ok(records.clone());
+        }
+        let records =
+            Arc::new(ms_receipts::read_all(self.receipts.dir()).map_err(|e| {
+                ApiError::internal(format!("morsec: the receipts can't be read: {e}"))
+            })?);
+        *cache = Some((seq, records.clone()));
+        Ok(records)
     }
 
     /// The project records, or why they can't be shown (fails closed, like `ms projects`).
@@ -259,12 +284,13 @@ impl Daemon {
             .map(|s| ms_receipts::time::parse_time(s, now))
             .transpose()
             .map_err(|e| bad_request(format!("morsec: {e}")))?;
-        let key = q
-            .key
-            .as_deref()
-            .map(KeyName::new)
-            .transpose()
-            .map_err(|e| bad_request(e.to_string()))?;
+        // A key filter that is no valid key name matches nothing (review R2), rather than an
+        // error that would replace the screen.
+        let key = match q.key.as_deref().map(KeyName::new) {
+            Some(Ok(k)) => Some(k),
+            Some(Err(_)) => return Ok((Vec::new(), self.receipts_all()?.len())),
+            None => None,
+        };
         let result = match q.result.as_deref() {
             Some(r) => Some(
                 ResultClass::parse(r)
@@ -404,7 +430,7 @@ impl Daemon {
             .collect();
         let records = self.receipts_all()?;
         let mut last_use: BTreeMap<&KeyName, u64> = BTreeMap::new();
-        for r in &records {
+        for r in records.iter() {
             if let Entry::Receipt(x) = &r.rec.entry {
                 last_use.insert(&x.key, r.rec.time_unix_ms);
             }

@@ -17,6 +17,7 @@ mod daemon;
 mod dash;
 mod doctor;
 mod drift;
+mod open;
 mod paths;
 mod proxy;
 mod scan;
@@ -98,6 +99,10 @@ struct Args {
     /// address (HOST=127.0.0.1:PORT, repeatable). Needs --test-upstream-ca.
     #[arg(long, value_name = "HOST=ADDR", hide = true)]
     test_upstream: Vec<String>,
+    /// Tests only (debug builds, with --vault memory): append the dashboard's sign-in URL to
+    /// FILE instead of opening a browser.
+    #[arg(long, value_name = "FILE", hide = true)]
+    test_open_to: Option<PathBuf>,
     /// Tests only: the CA (PEM) that verifies the test upstreams.
     #[arg(long, value_name = "FILE", hide = true)]
     test_upstream_ca: Option<PathBuf>,
@@ -403,6 +408,13 @@ async fn serve(args: Args) -> ExitCode {
         .proxy_port
         .or_else(|| args.port.and_then(|p| p.checked_add(1)))
         .unwrap_or(DEFAULT_PROXY_PORT);
+    let opener = match open::opener(args.test_open_to.clone(), b.is_memory()) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!("{e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    };
     let approvals = match approve::approver(args.test_touch_id, b.is_memory()) {
         Ok(a) => a,
         Err(e) => {
@@ -455,7 +467,7 @@ async fn serve(args: Args) -> ExitCode {
         .or_else(|| args.port.and_then(|p| p.checked_add(2)))
         .unwrap_or(ms_dash::DEFAULT_PORT);
     // Not listening until the first DashOpen (design §6.1).
-    dash::install(&d, ms_dash::DashConfig::new(dash_port), uid);
+    dash::install(&d, ms_dash::DashConfig::new(dash_port), uid, opener);
     let (stop_tx, stop_rx) = watch::channel(false);
     let proxy_task = tokio::spawn(proxy::supervise(d.clone(), stop_rx.clone(), test_hook));
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {

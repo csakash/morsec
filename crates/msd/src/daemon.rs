@@ -142,11 +142,15 @@ pub struct Daemon {
     me: std::sync::Weak<Daemon>,
     /// What `ms doctor --probe` runs reported, and the canaries the proxy saw (L17).
     probes: Arc<crate::doctor::Probes>,
-    /// The local dashboard (L32), set once at start; tests may run without one.
-    dash: std::sync::OnceLock<ms_dash::Dash>,
+    /// The local dashboard (L32) and the browser opener, set once at start; tests may run
+    /// without one.
+    dash: std::sync::OnceLock<(ms_dash::Dash, crate::open::Opener)>,
     /// The last transcript scan's report and when it finished, for the dashboard's Scan screen
     /// (L32 SPEC D-6). Locations and key names only, never a value.
     last_scan: Mutex<Option<(u64, ResponseBody)>>,
+    /// The receipts the dashboard last read, keyed by the store's next sequence number; the lock
+    /// also lets one dashboard request read the files at a time (reviews R8, S6).
+    dash_receipts: Mutex<Option<(u64, Arc<Vec<ms_receipts::StoredRecord>>)>>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -336,6 +340,7 @@ impl Daemon {
             probes: Arc::default(),
             dash: std::sync::OnceLock::new(),
             last_scan: Mutex::new(None),
+            dash_receipts: Mutex::new(None),
             stops: std::sync::atomic::AtomicU64::new(0),
         }))
     }
@@ -687,11 +692,11 @@ impl Daemon {
             RequestBody::ProjectGet { slug } => self.project_get(&slug),
             // The launch token signs a browser in: only the user's own terminal may mint one
             // (L32, design §6.2.2). The page is read-only, so a stopped msd still serves it.
-            RequestBody::DashOpen if in_agent => reply_err(
+            RequestBody::DashOpen { .. } if in_agent => reply_err(
                 ErrorCode::Denied,
                 "morsec: the dashboard can't be opened from inside an agent session. Ask the user to run ms dashboard in their own terminal",
             ),
-            RequestBody::DashOpen => self.dash_open(),
+            RequestBody::DashOpen { view } => self.dash_open(view.as_deref()),
             RequestBody::DoctorProbe { nonce, report } => self.probes.handle(
                 match &caller {
                     Some(Caller::Agent(s)) => Some(s.clone()),
@@ -2834,7 +2839,10 @@ mod tests {
     // ---- L32 dashboard -------------------------------------------------------------------------
 
     /// A runtime and the dashboard installed on `h`, with `check` as the connection check.
-    fn with_dash(h: &H, check: ConnChecker) -> tokio::runtime::Runtime {
+    /// The URLs the test opener was handed (the user's browser, in production).
+    type Opened = Arc<Mutex<Vec<String>>>;
+
+    fn with_dash(h: &H, check: ConnChecker) -> (tokio::runtime::Runtime, Opened) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -2851,10 +2859,26 @@ mod tests {
             })
             .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
             .unwrap();
+        let opened: Opened = Arc::default();
+        let o = opened.clone();
         let _g = rt.enter();
-        crate::dash::install_with(&h.d, ms_dash::DashConfig::new(port), check);
+        crate::dash::install_with(
+            &h.d,
+            ms_dash::DashConfig::new(port),
+            check,
+            Arc::new(move |url: &str| {
+                lock(&o).push(url.to_owned());
+                true
+            }),
+        );
         drop(_g);
-        rt
+        (rt, opened)
+    }
+
+    fn dash_open(h: &H, view: Option<&str>) -> ResponseBody {
+        h.req(RequestBody::DashOpen {
+            view: view.map(str::to_owned),
+        })
     }
 
     fn allow_all() -> ConnChecker {
@@ -2868,22 +2892,22 @@ mod tests {
     }
 
     // protects=design §5.3, §6.2.2 and §8 (agent runs ms dashboard to get a token): DashOpen from
-    // an agent session is Denied and mints nothing; from the user's terminal it starts the
-    // listener and returns the port it holds and a 64-hex single-use token, also while stopped;
-    // fails_when=an agent gets a token or a port, or the terminal doesn't; no_claim=a detached
-    // same-user process (it is not an agent session: T-04; it still meets the per-connection
-    // check only if it is outside every agent tree)
+    // an agent session is Denied and neither binds nor opens anything; from outside one it starts
+    // the listener, opens the browser on the port it holds, also while stopped; a bad view is
+    // Invalid; fails_when=an agent's ask binds or opens, or the terminal's doesn't;
+    // no_claim=a detached process (it is not an agent session: it gets the same answer as the
+    // terminal, which holds no token: dash_open_never_returns_token)
     #[test]
     fn dash_open_refused_in_agent_session() {
         let h = fresh();
-        let r = h.req(RequestBody::DashOpen);
+        let r = dash_open(&h, None);
         assert_eq!(
             code(&r),
             Some(ErrorCode::Internal),
             "no dashboard installed"
         );
-        let _rt = with_dash(&h, allow_all());
-        let r = h.as_(agent()).req(RequestBody::DashOpen);
+        let (_rt, opened) = with_dash(&h, allow_all());
+        let r = dash_open(h.as_(agent()), None);
         assert_eq!(code(&r), Some(ErrorCode::Denied), "{r:?}");
         assert!(msg(&r).contains("agent session"), "{r:?}");
         assert_eq!(
@@ -2891,16 +2915,52 @@ mod tests {
             None,
             "an agent's ask binds nothing"
         );
+        assert!(lock(&opened).is_empty(), "an agent's ask opens nothing");
         h.as_(terminal()).req(RequestBody::Stop);
-        match h.req(RequestBody::DashOpen) {
-            ResponseBody::Dash { port, launch_token } => {
+        match dash_open(&h, Some("project/shop")) {
+            ResponseBody::Dash { port, opened: true } => {
                 assert_eq!(Some(port), h.d.dash().unwrap().port());
-                assert_eq!(launch_token.len(), 64);
-                assert!(launch_token.chars().all(|c| c.is_ascii_hexdigit()));
                 assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+                let urls = lock(&opened).clone();
+                assert_eq!(urls.len(), 1);
+                assert!(
+                    urls[0].starts_with(&format!("http://127.0.0.1:{port}/#t=")),
+                    "{urls:?}"
+                );
+                assert!(urls[0].ends_with("&v=project/shop"), "{urls:?}");
             }
             other => panic!("{other:?}"),
         }
+        for bad in ["project/Shop", "project/a&t=x", "projects", "../x"] {
+            assert_eq!(
+                code(&dash_open(&h, Some(bad))),
+                Some(ErrorCode::Invalid),
+                "{bad}"
+            );
+        }
+    }
+
+    // protects=SPEC D-12 and security review S1: the launch token is handed to the browser
+    // opener only; the IPC reply to any caller outside an agent session (a detached process
+    // included) holds the port and `opened`, never the token, so the caller can't sign in;
+    // fails_when=the reply's encoding contains the token or any 64-hex string;
+    // no_claim=what the opener does with the URL (LaunchServices)
+    #[test]
+    fn dash_open_never_returns_token() {
+        let h = fresh();
+        let (_rt, opened) = with_dash(&h, allow_all());
+        // A detached process is unattributed, exactly like the user's terminal.
+        let reply = dash_open(h.as_(terminal()), None);
+        let wire = String::from_utf8(ms_ipc::protocol::encode(1, &reply).unwrap()).unwrap();
+        let url = lock(&opened)[0].clone();
+        let token = url.split("#t=").nth(1).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(!wire.contains(token), "{wire}");
+        let hex_run = wire
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .any(|w| w.len() >= 32);
+        assert!(!hex_run, "{wire}");
+        assert!(matches!(reply, ResponseBody::Dash { opened: true, .. }));
     }
 
     // protects=design §6.2.1 and SPEC D-9 (LOG-1, LOG-2): a connection the process check refuses
@@ -2916,7 +2976,7 @@ mod tests {
             Caller::Unattributed { .. } => unreachable!(),
         };
         let s2 = agent_session.clone();
-        let _rt = with_dash(
+        let (_rt, _) = with_dash(
             &h,
             Arc::new(move |_, _| {
                 Err(ms_dash::Refusal {
@@ -2925,7 +2985,7 @@ mod tests {
                 })
             }),
         );
-        let port = match h.req(RequestBody::DashOpen) {
+        let port = match dash_open(&h, None) {
             ResponseBody::Dash { port, .. } => port,
             other => panic!("{other:?}"),
         };
@@ -3000,8 +3060,9 @@ mod tests {
 
     // protects=SPEC criterion 9: the views show the project's rows (file, line, key, provider,
     // status), code findings, git warnings, keys in no project, a key's hosts and where it is used,
-    // receipts with filters, the last scan, and counts on Home; fails_when=a screen misses its
-    // data or misreports a status; no_claim=the page's rendering (browser pass)
+    // receipts with filters (an invalid key matching nothing; the receipt cache following new
+    // records), the last scan, and counts on Home; fails_when=a screen misses its data, misreports
+    // a status or shows stale receipts; no_claim=the page's rendering (browser pass)
     #[test]
     fn dashboard_views_from_records() {
         let h = fresh();
@@ -3081,6 +3142,34 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(bad.unwrap_err().status, 400);
+        // An invalid key filter matches nothing instead of failing the screen (review R2).
+        let none =
+            h.d.dash_activity(&ms_dash::api::ActivityQuery {
+                key: Some("Not A Key!".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(none.matched, 0);
+        assert!(none.total > 0);
+        // The cached receipts follow new records (review R8).
+        let before = h.d.dash_activity(&Default::default()).unwrap().matched;
+        let _ = h.swap(STRIPE_KEY, "api.stripe.com");
+        let _ = h.d.record(
+            &match agent() {
+                Caller::Agent(s) => s,
+                Caller::Unattributed { .. } => unreachable!(),
+            },
+            &KeyName::new(STRIPE_KEY).unwrap(),
+            Mode::Swap,
+            "api.stripe.com",
+            1,
+            ReceiptResult::Allowed,
+            None,
+        );
+        assert_eq!(
+            h.d.dash_activity(&Default::default()).unwrap().matched,
+            before + 1
+        );
         let (name, ctype, body) =
             h.d.dash_export(&Default::default(), ms_dash::api::ExportFormat::Csv)
                 .unwrap();
