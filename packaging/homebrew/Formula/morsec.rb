@@ -2,9 +2,9 @@
 class Morsec < Formula
   desc "Local secret broker: coding agents use your secrets without seeing them"
   homepage "https://github.com/csakash/morsec"
-  url "https://github.com/csakash/morsec/releases/download/v0.1.0/morsec-0.1.0-aarch64-apple-darwin.tar.gz"
-  version "0.1.0"
-  sha256 "23318ecdef22a9bee86359d3439c60e9be06faa7144722fd9358a6d3e58bfe56"
+  url "https://github.com/csakash/morsec/releases/download/v0.2.0/morsec-0.2.0-aarch64-apple-darwin.tar.gz"
+  version "0.2.0"
+  sha256 "f074680b6ec600debd8ad0f0b2b36094582f5910060e4902aace1b69a8de73dd"
 
   # Prebuilt, Developer ID signed and notarized binaries. Not built from source: the keychain
   # trusts only the signed msd (identifier cc.morsec.msd and the release team), so a local
