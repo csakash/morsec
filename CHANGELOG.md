@@ -6,15 +6,7 @@ entries. Move the entries from Unreleased into it when you bump the version.
 
 ## [Unreleased]
 
-- The dashboard connects and disconnects Claude Code and Codex, and sets up or re-scans a
-  project folder, itself. Each shows exactly what will change first (the same redacted diff
-  `ms connect` prints; the files, secrets and websites `ms init` would touch), then asks Touch ID
-  once, and does precisely what was shown or nothing. A key's page can now add and remove git
-  hosts, variables and SSH host keys.
-- Security: the git-history check `ms init` runs (and now msd, for Add project) can no longer be
-  made to run a program from a repository's own git config (a partial clone's lazy fetch).
-
-## [0.2.0] - 2026-11-19
+## [0.2.0] - 2026-11-20
 
 - The dashboard (`ms dashboard`) now looks like morsec's site, with its fonts bundled in msd
   (nothing is fetched): one ruled sheet, a numbered rail of the five screens (with what's
@@ -26,8 +18,14 @@ entries. Move the entries from Unreleased into it when you bump the version.
   after 30, and clipboard managers are told to skip it), replace or delete it, give it a website
   or a command (adding one needs Touch ID, taking one away doesn't), and undo its import. A
   project can be undone as a whole. The leak scan runs from the Scan screen; Agents re-checks
-  msd's view of your agents. Connecting an agent and setting up a project stay in Terminal: the
-  page gives the exact command to copy. Every action, done or refused, is in Activity.
+  msd's view of your agents. Every action, done or refused, is in Activity.
+- The dashboard connects and disconnects Claude Code and Codex, and sets up or re-scans a
+  project folder, itself. Each shows exactly what will change first (the same redacted diff
+  `ms connect` prints; the files, secrets and websites `ms init` would touch), then asks Touch ID
+  once, and does precisely what was shown or nothing. A key's page can now add and remove git
+  hosts, variables and SSH host keys.
+- Security: the git-history check `ms init` runs (and now msd, for Add project) can no longer be
+  made to run a program from a repository's own git config (a partial clone's lazy fetch).
 - New commands with the same effect in Terminal: `ms set <key>` replaces a value, `ms rm <key>`
   deletes a key and its rule, `ms undo <project> [--key <key>]` writes the values back into the
   project's `.env` files. Each asks for Touch ID and refuses inside an agent session.
