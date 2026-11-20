@@ -146,6 +146,13 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
       <a href="#overview">Overview</a>
       <a href="#install">Install</a>
       <a href="#quickstart">Quickstart</a>
+      <a href="#manual">Set up by hand</a>
+    </div>
+    <div class="grp"><span class="lbl m">Your projects</span>
+      <a href="#projects">Projects</a>
+      <a href="#dev">Run your app</a>
+      <a href="#dashboard">Dashboard</a>
+      <a href="#keys">Change or remove a key</a>
     </div>
     <div class="grp"><span class="lbl m">Concepts</span>
       <a href="#references">References</a>
@@ -176,7 +183,7 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
       <p class="lead">morsec lets a coding agent use your API keys, database passwords and tokens without ever seeing them. The agent holds references like <code>ms://stripe/test</code>. The values stay in your macOS keychain, and <code>msd</code>, a daemon running as you, adds them at the last moment.</p>
       <div class="figbox"><div data-hairline data-fig="hero" role="img" aria-label="An agent sends a reference; msd gets the key from the keychain and sends the value only to the bound host; a send to an unknown host is blocked"><svg viewBox="0 0 400 320"></svg></div><div class="cap"><span class="lbl">Fig. 1 — agent · morsec · bound host · unknown host</span><span class="lbl m">live</span></div></div>
       <div class="cards">
-        <a class="card" href="#quickstart"><b>Quickstart</b><span>Install, add a key, connect an agent. About five minutes.</span></a>
+        <a class="card" href="#quickstart"><b>Quickstart</b><span>Install, run <code>ms init</code> in your project, start your app. About five minutes.</span></a>
         <a class="card" href="#security"><b>Security model</b><span>What an agent running as you can try, and why it fails.</span></a>
         <a class="card" href="#claude-code"><b>{{icon:claude}}Claude Code</b><span>Terminal, desktop app and IDE.</span></a>
         <a class="card" href="#codex"><b>{{icon:openai}}Codex</b><span>CLI, app and IDE, plus MCP tools.</span></a>
@@ -203,7 +210,7 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
         </div>
         <div role="tabpanel" id="i-curl" aria-labelledby="ti-curl" hidden>
           <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>curl -fsSL https://github.com/csakash/morsec/releases/latest/download/install.sh | sh</span></span></pre></div>
-          <p>Installs into <code>~/.local/bin</code> (or <code>MORSEC_INSTALL_DIR</code>) without sudo. Before installing, it checks the checksums, their minisign signature when <code>minisign</code> is installed, each code signature and team, and notarization. Add <code>--version 0.1.0</code> to pin.</p>
+          <p>Installs into <code>~/.local/bin</code> (or <code>MORSEC_INSTALL_DIR</code>) without sudo. Before installing, it checks the checksums, their minisign signature when <code>minisign</code> is installed, each code signature and team, and notarization. Add <code>--version 0.2.0</code> to pin.</p>
         </div>
       </div>
       <div class="callout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg><p><b>Read before you run.</b> Download <code>install.sh</code>, <code>SHA256SUMS</code> and <code>SHA256SUMS.minisig</code> from the release, check them as <a href="#verify">Verify a download</a> shows, then run <code>sh install.sh</code>.</p></div>
@@ -212,18 +219,121 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
     <section id="quickstart">
       <span class="crumb lbl m">Start / Quickstart</span>
       <h2>Quickstart</h2>
-      <h3>1. Set up the vault</h3>
-      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms init</span></span></pre></div>
-      <p>Creates the vault in your login keychain, generates the local certificate authority and starts msd as a LaunchAgent. <code>ms status</code> says whether morsec is on and how many secrets it protects.</p>
-      <h3>2. Add your secrets</h3>
+      <p>One command protects a project. Run it inside the project folder, before you start an agent there.</p>
+      <h3>1. Run ms init in your project</h3>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>cd ~/code/shop</span></span><span class="ln"><span><span class="pr">$ </span>ms init</span></span></pre></div>
+      <p>The first time, it creates the vault in your login keychain, generates the local certificate authority and starts msd as a LaunchAgent. Then it protects the project:</p>
+      <ol>
+        <li>finds the secrets in the project's <code>.env</code> files (<code>.env</code>, <code>.env.production</code>, <code>apps/web/.env</code> and so on);</li>
+        <li>moves them into the vault and rewrites each line as a reference, such as <code>STRIPE_SECRET_KEY=<span class="rf">ms://shop/stripe-secret-key</span></code>;</li>
+        <li>asks you once, with Touch ID, to let the keys it recognises reach their services (Stripe keys to <code>api.stripe.com</code>, and so on);</li>
+        <li>connects Claude Code and Codex if it finds them (<code>--no-connect</code> skips this), and opens the <a href="#dashboard">dashboard</a> (<code>--no-open</code> skips that).</li>
+      </ol>
+      <p>It ends with a short summary:</p>
+      <div class="cb"><pre><span class="ln"><span>Project    shop  (~/code/shop)</span></span><span class="ln"><span>Found      14 secrets in 3 files</span></span><span class="ln"><span><span class="ok">Protected</span>  12, ready to use</span></span><span class="ln"><span><span class="no">Needs you</span>  2 have no known service yet: ms rules shop/session-secret --add-host &lt;host&gt;</span></span><span class="ln"><span><span class="no">In code</span>    1 key written straight into src/lib/stripe.ts:4 (move it into .env, then ms init)</span></span></pre></div>
+      <h3>2. Finish what it lists</h3>
+      <ul>
+        <li><b>Needs you:</b> a key morsec doesn't recognise allows nothing yet. Say where it may go with <code>ms rules &lt;key&gt; --add-host &lt;host&gt;</code>.</li>
+        <li><b>In code:</b> keys written straight into source files are reported with file and line, never changed. Move each into <code>.env</code> and run <code>ms init</code> again.</li>
+      </ul>
+      <div class="callout warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg><p><b>Values already in git history stay readable there.</b> The summary names the files that were ever committed. Rotate those keys at the provider, then store the new value with <code>ms set &lt;key&gt;</code>.</p></div>
+      <h3>3. Run your app through morsec</h3>
+      <p>Your <code>.env</code> now holds references, so start your app with <a href="#dev"><code>ms dev</code></a>. It asks for Touch ID once per run.</p>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms dev -- npm run dev</span></span></pre></div>
+      <h3>4. Start a new agent session and check</h3>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms doctor</span></span><span class="ln"><span><span class="ok">  ✓</span> msd identity verified · cc.morsec.msd · team 554MCRUAKK</span></span><span class="ln"><span><span class="ok">  ✓</span> claude-code routes through morsec</span></span></pre></div>
+      <p>The agent sees only references. When it calls a key's service, msd swaps the real key in on the way out. <code>ms log</code> shows every use.</p>
+      <div class="callout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg><p><b>New repo with no secrets yet?</b> Put the real values in a <code>.env</code> that is in <code>.gitignore</code>, then run <code>ms init</code>. Each time you add a secret, put it in <code>.env</code> and run <code>ms init</code> again; it only picks up new values. Don't paste keys into an agent's chat.</p></div>
+      <p>Run in your home folder, or with <code>--machine</code>, <code>ms init</code> only sets up this Mac. <code>ms status</code> says whether morsec is on and how many secrets it protects.</p>
+    </section>
+
+    <section id="manual">
+      <span class="crumb lbl m">Start / Set up by hand</span>
+      <h2>Set up by hand</h2>
+      <p>The same thing one key at a time, for keys that don't live in a project's <code>.env</code>, or to give an agent a run-mode key (database passwords, deploy tokens) with command rules.</p>
+      <h3>1. Add your secrets</h3>
       <p>Type one in (hidden input), or move a whole <code>.env</code> in. Import shows a review table first, then stores the values and rewrites the file with references.</p>
       <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms add stripe/test --tier test</span></span><span class="ln"><span><span class="pr">$ </span>ms import .env</span></span></pre></div>
+      <p><code>ms add</code> keys are <code>production</code> tier unless you say otherwise, and <code>ms add</code> never replaces a key that exists: that is <code>ms set</code>.</p>
       <div class="callout warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg><p><b>Values already in git history stay readable there.</b> Rotate any key that was ever committed, then import the new one.</p></div>
-      <h3>3. Say where each key may go</h3>
+      <h3>2. Say where each key may go</h3>
       <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms rules stripe/test --add-host api.stripe.com</span></span></pre></div>
-      <h3>4. Connect your agent and check</h3>
+      <h3>3. Connect your agent and check</h3>
       <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms connect claude-code --env STRIPE_API_KEY=<span class="rf">ms://stripe/test</span></span></span><span class="ln"><span><span class="pr">$ </span>ms doctor</span></span><span class="ln"><span><span class="ok">  ✓</span> msd identity verified · cc.morsec.msd · team 554MCRUAKK</span></span><span class="ln"><span><span class="ok">  ✓</span> claude-code routes through morsec</span></span></pre></div>
       <p>Start a new agent session. It sees <code>STRIPE_API_KEY=ms://stripe/test</code>. When it calls <code>api.stripe.com</code>, msd swaps the real key in on the way out.</p>
+    </section>
+
+    <section id="projects">
+      <span class="crumb lbl m">Your projects / Projects</span>
+      <h2>Projects</h2>
+      <p>A project is a folder <code>ms init</code> has set up. Its keys are named after it and the variable, so <code>STRIPE_SECRET_KEY</code> in <code>~/code/shop</code> becomes <code>shop/stripe-secret-key</code>. The same variable with a different value in another file adds that file's name (<code>shop/production/stripe-secret-key</code>), and a name already in the vault gets <code>-2</code>. <code>--name</code> picks another project name, and <code>--project &lt;path&gt;</code> sets up a folder other than the current one.</p>
+      <h3>What it reads, and what it leaves alone</h3>
+      <ul>
+        <li>Every <code>.env</code> file in the project, as deep as it goes.</li>
+        <li>Never imports <code>.env.example</code> and other example files (it only reads their variable names), and never reads <code>node_modules</code> or other dependency folders, or anything behind a symlink.</li>
+        <li>Keys written into code are reported with file and line, never changed.</li>
+        <li>An existing <code>CLAUDE.md</code> or <code>AGENTS.md</code> gets a short note telling agents to keep <code>ms://</code> references as they are. morsec never creates those files.</li>
+      </ul>
+      <p>If you say no to the Touch ID approval, the secrets are still safe in the vault and the files still hold references. Run <code>ms init</code> again to approve. Running it again later is safe: it only picks up new values.</p>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms projects</span></span><span class="ln"><span><span class="pr">$ </span>ms projects shop</span></span></pre></div>
+      <p><code>ms projects</code> lists your projects. With a name, it shows everything <code>ms init</code> did there, without values.</p>
+      <h3>Undo a project</h3>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms undo shop</span></span><span class="ln"><span><span class="pr">$ </span>ms undo shop --key shop/stripe-secret-key</span></span></pre></div>
+      <p>Writes each value back into the line <code>ms init</code> replaced, in its original quote style, and deletes the keys nothing else uses. A line you edited since is left alone and listed. It asks for Touch ID, and refuses inside an agent session.</p>
+    </section>
+
+    <section id="dev">
+      <span class="crumb lbl m">Your projects / Run your app</span>
+      <h2>Run your app with ms dev</h2>
+      <p>After <code>ms init</code>, your project's <code>.env</code> holds references, so your own dev server needs morsec to work. Run it through <code>ms dev</code>, from your own terminal:</p>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms dev -- npm run dev</span></span></pre></div>
+      <ul>
+        <li><b>HTTP APIs:</b> the command gets <code>HTTPS_PROXY</code> pointing at msd, so requests to your keys' services get the real key swapped in.</li>
+        <li><b>Database URLs and other run-mode values</b> of this project are put in the command's environment.</li>
+        <li><b>One Touch ID per run</b> (a production key asks again once its session length is up). The sheet shows the project and the command, then the keys, the variables that get values, and that the command may reach other websites. Answer it in that terminal or with <code>ms approve</code>.</li>
+        <li><b>Only that command's processes</b> can use the session, and it ends when your command exits, on <code>ms stop</code>, or when msd restarts.</li>
+        <li><b>Refused</b> inside an agent session, and for agent programs: <code>ms dev</code> won't start a coding agent. It also won't start while morsec is stopped (<code>ms start</code> first), or outside a project <code>ms init</code> set up.</li>
+      </ul>
+      <p>Node needs version 24 or later to send its requests through a proxy. <code>ms dev</code> sets <code>NODE_USE_ENV_PROXY=1</code> and warns about older versions; on an older Node, references go out unswapped and the call fails rather than leaking.</p>
+      <div class="callout warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg><p><b>Values in the environment are readable.</b> Run-mode values that <code>ms dev</code> puts in your command's environment can be read by other processes running as you, and are inherited by anything that command starts. Only run code you trust under <code>ms dev</code>.</p></div>
+    </section>
+
+    <section id="dashboard">
+      <span class="crumb lbl m">Your projects / Dashboard</span>
+      <h2>Dashboard</h2>
+      <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms dashboard</span></span><span class="ln"><span><span class="pr">$ </span>ms dashboard shop</span></span></pre></div>
+      <p>Opens a local dashboard in your browser, optionally on one project's page. msd serves it itself, on <code>127.0.0.1</code>, with its fonts bundled: nothing is fetched from the internet. <code>ms status --open</code> opens it too.</p>
+      <div class="tbl"><table>
+        <thead><tr><th>Screen</th><th>What you can do</th></tr></thead>
+        <tbody>
+          <tr><td>Home</td><td>Approve or deny the request an agent is waiting on, read each warning with its fix, stop or start morsec.</td></tr>
+          <tr><td>Projects</td><td>Set up or re-scan a project folder, undo a project. On a key's page: show or copy its value, replace or delete it, change its websites, commands, git hosts, variables and SSH host keys, and undo its import.</td></tr>
+          <tr><td>Activity</td><td>Every use and every dashboard action, done or refused.</td></tr>
+          <tr><td>Agents</td><td>Connect or disconnect Claude Code and Codex, and re-check msd's view of your agents.</td></tr>
+          <tr><td>Scan</td><td>Run the leak scan over agent transcripts.</td></tr>
+        </tbody>
+      </table></div>
+      <ul>
+        <li><b>Connecting an agent and setting up or re-scanning a project show exactly what will change first</b>, then ask for Touch ID once and do precisely that, or nothing.</li>
+        <li><b>Showing or copying a value asks for Touch ID every time.</b> A shown value hides after 15 seconds. A copied one is cleared from the clipboard after 30, and clipboard managers are told to skip it.</li>
+        <li><b>Adding a website or command to a key asks for Touch ID.</b> Taking one away doesn't.</li>
+        <li><b>Agents can't open it.</b> <code>ms dashboard</code> refuses inside an agent session, and msd refuses connections from agent processes.</li>
+        <li><b>Each opening uses a fresh link.</b> <code>ms dashboard</code> makes a single-use link that expires after 60 seconds, and the dashboard closes after a while idle.</li>
+      </ul>
+    </section>
+
+    <section id="keys">
+      <span class="crumb lbl m">Your projects / Change or remove a key</span>
+      <h2>Change or remove a key</h2>
+      <div class="tbl"><table>
+        <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>ms set &lt;key&gt;</code></td><td>Replace a value, for example after rotating it at the provider. Hidden input, or <code>--stdin</code> from a pipe.</td></tr>
+          <tr><td><code>ms rm &lt;key&gt;</code></td><td>Delete a key and its rule. Refused while a project's <code>.env</code> still refers to it, unless <code>--force</code>.</td></tr>
+          <tr><td><code>ms undo &lt;project&gt;</code></td><td>Put a project's values back into its <code>.env</code> files. <code>--key</code> limits it to one key.</td></tr>
+        </tbody>
+      </table></div>
+      <p>Each asks for Touch ID and refuses inside an agent session. The dashboard does the same from a key's page.</p>
     </section>
 
     <section id="references">
@@ -320,8 +430,14 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
       <div class="tbl"><table>
         <thead><tr><th>Command</th><th>What it does</th></tr></thead>
         <tbody>
-          <tr><td><code>ms init</code></td><td>Create the vault and start the daemon.</td></tr>
-          <tr><td><code>ms add</code></td><td>Add a secret (hidden input, or <code>--stdin</code>).</td></tr>
+          <tr><td><code>ms init</code></td><td>Set up this Mac and the project you run it in: secrets moved into the vault, <code>.env</code> rewritten with references, agents connected. <code>--machine</code> sets up the Mac only.</td></tr>
+          <tr><td><code>ms dev</code></td><td>Run your own command, such as <code>npm run dev</code>, with your project's keys working through morsec.</td></tr>
+          <tr><td><code>ms projects</code></td><td>List the projects <code>ms init</code> set up, or show one in full (no values).</td></tr>
+          <tr><td><code>ms dashboard</code></td><td>Open the local dashboard, optionally on one project.</td></tr>
+          <tr><td><code>ms add</code></td><td>Add a new secret (hidden input, or <code>--stdin</code>). Never replaces one.</td></tr>
+          <tr><td><code>ms set</code></td><td>Replace a secret's value (Touch ID).</td></tr>
+          <tr><td><code>ms rm</code></td><td>Delete a secret and its rule (Touch ID).</td></tr>
+          <tr><td><code>ms undo</code></td><td>Write a project's values back into its <code>.env</code> files and drop the keys (Touch ID).</td></tr>
           <tr><td><code>ms import</code></td><td>Move a .env into the vault and rewrite it with references.</td></tr>
           <tr><td><code>ms rules</code></td><td>Show or change a key's hosts, commands, tier and session length.</td></tr>
           <tr><td><code>ms connect</code></td><td>Set up a coding agent. <code>ms disconnect</code> removes it.</td></tr>
@@ -329,7 +445,7 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
           <tr><td><code>ms approve</code></td><td>Answer the request waiting for your approval (Touch ID).</td></tr>
           <tr><td><code>ms log</code></td><td>Show receipts. <code>--verify</code> checks the chain, <code>--export</code> for a review.</td></tr>
           <tr><td><code>ms stop</code></td><td>Revoke every grant now and kill running commands. <code>ms start</code> resumes, with Touch ID.</td></tr>
-          <tr><td><code>ms status</code></td><td>Show whether morsec is on.</td></tr>
+          <tr><td><code>ms status</code></td><td>Show whether morsec is on. <code>--open</code> also opens the dashboard.</td></tr>
           <tr><td><code>ms doctor</code></td><td>Check that every connected agent routes through morsec. <code>--live</code> checks from inside the agent.</td></tr>
           <tr><td><code>ms mcp</code></td><td>Run the MCP server for an agent.</td></tr>
           <tr><td><code>ms scan</code></td><td>Scan agent transcripts for leaked secret values.</td></tr>
@@ -351,11 +467,12 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
           <tr><td>Fake an approval</td><td>Prompts come from the real exec plan, on your terminal, with Touch ID. Callers inside an agent session can't approve.</td></tr>
           <tr><td>Pose as msd</td><td>A signed <code>ms</code> checks msd's signature and that msd alone holds the socket.</td></tr>
           <tr><td>Rewrite receipts</td><td>Hash-chained and MAC'd; <code>ms log --verify</code> finds the edit.</td></tr>
+          <tr><td>Run <code>ms dev</code>, or open the dashboard, to get values</td><td>Both refuse inside an agent session, <code>ms dev</code> refuses agent programs, and the dashboard refuses connections from agent processes. Each <code>ms dev</code> run and each value shown needs your Touch ID.</td></tr>
           <tr><td>Skip the proxy</td><td>It never had a value, so it only loses access. <code>ms doctor</code> reports the drift.</td></tr>
         </tbody>
       </table></div>
-      <div class="callout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg><p><b>Known limit.</b> In run mode, a same-user process could read a child command's environment or passfile while it runs. morsec prefers protocols that never put the value in a child (SSH agent, git credential helper) and keeps passfiles short-lived. Running children as a separate user is on the roadmap.</p></div>
-      <p>The full threat model maps 60 threats to the tests that cover them: <a href="https://github.com/csakash/morsec/blob/main/docs/threat-model.md">docs/threat-model.md</a>.</p>
+      <div class="callout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg><p><b>Known limit.</b> In run mode, a same-user process could read a child command's environment or passfile while it runs. morsec prefers protocols that never put the value in a child (SSH agent, git credential helper) and keeps passfiles short-lived. Running children as a separate user is on the roadmap. The same holds for the values <a href="#dev"><code>ms dev</code></a> puts in your app's environment.</p></div>
+      <p>The full threat model maps 110 threats to the tests that cover them: <a href="https://github.com/csakash/morsec/blob/main/docs/threat-model.md">docs/threat-model.md</a>.</p>
     </section>
 
     <section id="upgrade">
@@ -363,7 +480,7 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
       <h2>Upgrading</h2>
       <p>There is no auto-update. Upgrade with the channel you installed with, then restart msd:</p>
       <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>brew upgrade morsec          <span class="c"># or npm install -g morsec@latest, or the curl installer</span></span></span><span class="ln"><span><span class="pr">$ </span>launchctl kickstart -k gui/$(id -u)/cc.morsec.msd</span></span></pre></div>
-      <p>After a curl upgrade, also run <code>ms run --link-shims</code>. If you switch Node versions with nvm, fnm or volta, install morsec under the new one, run <code>ms init</code> and reconnect your agents.</p>
+      <p><code>ms</code> and <code>msd</code> ship together: always upgrade both and restart msd, or an older <code>ms</code> may not understand the new msd (for example <code>ms approve</code>). After a curl upgrade, also run <code>ms run --link-shims</code>. If you switch Node versions with nvm, fnm or volta, install morsec under the new one, run <code>ms init</code> and reconnect your agents.</p>
     </section>
 
     <section id="verify">
@@ -384,6 +501,10 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
           <tr><td>A request to a new host is blocked</td><td><code>ms rules &lt;key&gt; --add-host &lt;host&gt;</code>, then retry.</td></tr>
           <tr><td>The agent still sees an old value</td><td>Start a new agent session after <code>ms connect</code>.</td></tr>
           <tr><td>msd doesn't start after an upgrade</td><td><code>launchctl kickstart -k gui/$(id -u)/cc.morsec.msd</code></td></tr>
+          <tr><td><code>ms dev</code> warns about your Node version, or API calls fail with a reference in them</td><td>Use Node 24 or later. Older Node ignores <code>HTTPS_PROXY</code>, so references go out unswapped.</td></tr>
+          <tr><td><code>ms dev</code>, <code>ms set</code>, <code>ms approve</code> or <code>ms dashboard</code> says it is refused in an agent session</td><td>You're inside an agent session. Run it from your own terminal.</td></tr>
+          <tr><td><code>ms doctor</code> lists keys stored by another morsec build</td><td>The keychain lets only the build that stored a key read or delete it, typically a dev build from before you installed the release. Remove each with the command <code>ms doctor</code> prints: <code>security delete-generic-password -s cc.morsec.vault -a &lt;name&gt;</code> (it asks for your login password).</td></tr>
+          <tr><td><code>ms rm</code> is refused because a project still refers to the key</td><td><code>ms undo &lt;project&gt; --key &lt;key&gt;</code> puts the value back in the <code>.env</code> and removes the key when nothing else uses it. Or delete it anyway with <code>ms rm --force</code>.</td></tr>
         </tbody>
       </table></div>
       <div class="pager">

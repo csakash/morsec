@@ -45,7 +45,7 @@ curl -fsSL https://github.com/csakash/morsec/releases/latest/download/install.sh
 To read the installer before you run it, download `install.sh`, `SHA256SUMS` and
 `SHA256SUMS.minisig` from the [latest release](https://github.com/csakash/morsec/releases/latest).
 Check them as [packaging/VERIFY.md](../packaging/VERIFY.md) shows, then run
-`sh install.sh` (add `--version 0.1.0` to pin a version). To build from source instead, use
+`sh install.sh` (add `--version 0.2.0` to pin a version). To build from source instead, use
 `scripts/install-dev.sh` (see the README). The curl installer won't overwrite the links that
 script makes.
 
