@@ -410,7 +410,7 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
     <section id="manual">
       <span class="crumb lbl m">Start / Set up by hand</span>
       <h2>Set up by hand</h2>
-      <p>The same thing one key at a time, for keys that don't live in a project's <code>.env</code>, or for run-mode keys such as database passwords and deploy tokens.</p>
+      <p>The same thing one key at a time, for keys that don't live in a project's <code>.env</code>, or to give an agent a run-mode key (database passwords, deploy tokens) with command rules.</p>
       <h3>1. Add your secrets</h3>
       <p>Type one in (hidden input), or move a whole <code>.env</code> in. Import shows a review table first, then stores the values and rewrites the file with references.</p>
       <div class="cb"><pre><span class="ln"><span><span class="pr">$ </span>ms add stripe/test --tier test</span></span><span class="ln"><span><span class="pr">$ </span>ms import .env</span></span></pre></div>
@@ -426,11 +426,11 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
     <section id="projects">
       <span class="crumb lbl m">Your projects / Projects</span>
       <h2>Projects</h2>
-      <p>A project is a folder <code>ms init</code> has set up. Its keys are named after it and the variable, so <code>STRIPE_SECRET_KEY</code> in <code>~/code/shop</code> becomes <code>shop/stripe-secret-key</code>. <code>--name</code> picks another project name, and <code>--project &lt;path&gt;</code> sets up a folder other than the current one.</p>
+      <p>A project is a folder <code>ms init</code> has set up. Its keys are named after it and the variable, so <code>STRIPE_SECRET_KEY</code> in <code>~/code/shop</code> becomes <code>shop/stripe-secret-key</code>. The same variable with a different value in another file adds that file's name (<code>shop/production/stripe-secret-key</code>), and a name already in the vault gets <code>-2</code>. <code>--name</code> picks another project name, and <code>--project &lt;path&gt;</code> sets up a folder other than the current one.</p>
       <h3>What it reads, and what it leaves alone</h3>
       <ul>
         <li>Every <code>.env</code> file in the project, as deep as it goes.</li>
-        <li>Never <code>.env.example</code>, <code>node_modules</code> or other dependency folders, or anything behind a symlink.</li>
+        <li>Never imports <code>.env.example</code> and other example files (it only reads their variable names), and never reads <code>node_modules</code> or other dependency folders, or anything behind a symlink.</li>
         <li>Keys written into code are reported with file and line, never changed.</li>
         <li>An existing <code>CLAUDE.md</code> or <code>AGENTS.md</code> gets a short note telling agents to keep <code>ms://</code> references as they are. morsec never creates those files.</li>
       </ul>
@@ -450,9 +450,9 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
       <ul>
         <li><b>HTTP APIs:</b> the command gets <code>HTTPS_PROXY</code> pointing at msd, so requests to your keys' services get the real key swapped in.</li>
         <li><b>Database URLs and other run-mode values</b> of this project are put in the command's environment.</li>
-        <li><b>One Touch ID per run.</b> The sheet shows the command first, then the keys, the variables that get values, and that the command may reach other websites. Answer it in that terminal or with <code>ms approve</code>.</li>
+        <li><b>One Touch ID per run</b> (a production key asks again once its session length is up). The sheet shows the project and the command, then the keys, the variables that get values, and that the command may reach other websites. Answer it in that terminal or with <code>ms approve</code>.</li>
         <li><b>Only that command's processes</b> can use the session, and it ends when your command exits, on <code>ms stop</code>, or when msd restarts.</li>
-        <li><b>Refused</b> inside an agent session, and for agent programs: <code>ms dev</code> won't start a coding agent.</li>
+        <li><b>Refused</b> inside an agent session, and for agent programs: <code>ms dev</code> won't start a coding agent. It also won't start while morsec is stopped (<code>ms start</code> first), or outside a project <code>ms init</code> set up.</li>
       </ul>
       <p>Node needs version 24 or later to send its requests through a proxy. <code>ms dev</code> sets <code>NODE_USE_ENV_PROXY=1</code> and warns about older versions; on an older Node, references go out unswapped and the call fails rather than leaking.</p>
       <div class="callout warn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg><p><b>Values in the environment are readable.</b> Run-mode values that <code>ms dev</code> puts in your command's environment can be read by other processes running as you, and are inherited by anything that command starts. Only run code you trust under <code>ms dev</code>.</p></div>
@@ -474,7 +474,7 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
         </tbody>
       </table></div>
       <ul>
-        <li><b>Each change shows exactly what will change first</b>, then asks for Touch ID once and does precisely that, or nothing.</li>
+        <li><b>Connecting an agent and setting up or re-scanning a project show exactly what will change first</b>, then ask for Touch ID once and do precisely that, or nothing.</li>
         <li><b>Showing or copying a value asks for Touch ID every time.</b> A shown value hides after 15 seconds. A copied one is cleared from the clipboard after 30, and clipboard managers are told to skip it.</li>
         <li><b>Adding a website or command to a key asks for Touch ID.</b> Taking one away doesn't.</li>
         <li><b>Agents can't open it.</b> <code>ms dashboard</code> refuses inside an agent session, and msd refuses connections from agent processes.</li>
@@ -664,7 +664,7 @@ article a { text-underline-offset: 3px; text-decoration-thickness: 1px; }
           <tr><td><code>ms dev</code> warns about your Node version, or API calls fail with a reference in them</td><td>Use Node 24 or later. Older Node ignores <code>HTTPS_PROXY</code>, so references go out unswapped.</td></tr>
           <tr><td><code>ms dev</code>, <code>ms set</code>, <code>ms approve</code> or <code>ms dashboard</code> says it is refused in an agent session</td><td>You're inside an agent session. Run it from your own terminal.</td></tr>
           <tr><td><code>ms doctor</code> lists keys stored by another morsec build</td><td>The keychain lets only the build that stored a key read or delete it, typically a dev build from before you installed the release. Remove each with the command <code>ms doctor</code> prints: <code>security delete-generic-password -s cc.morsec.vault -a &lt;name&gt;</code> (it asks for your login password).</td></tr>
-          <tr><td><code>ms rm</code> is refused because a project still refers to the key</td><td><code>ms undo &lt;project&gt; --key &lt;key&gt;</code> puts the value back in the <code>.env</code> first, or use <code>ms rm --force</code>.</td></tr>
+          <tr><td><code>ms rm</code> is refused because a project still refers to the key</td><td><code>ms undo &lt;project&gt; --key &lt;key&gt;</code> puts the value back in the <code>.env</code> and removes the key when nothing else uses it. Or delete it anyway with <code>ms rm --force</code>.</td></tr>
         </tbody>
       </table></div>
       <div class="pager">
