@@ -19,6 +19,9 @@ entries. Move the entries from Unreleased into it when you bump the version.
   or a command (adding one needs Touch ID, taking one away doesn't), and undo its import. A
   project can be undone as a whole. The leak scan runs from the Scan screen; Agents re-checks
   msd's view of your agents. Every action, done or refused, is in Activity.
+- New commands with the same effect in Terminal: `ms set <key>` replaces a value, `ms rm <key>`
+  deletes a key and its rule, `ms undo <project> [--key <key>]` writes the values back into the
+  project's `.env` files. Each asks for Touch ID and refuses inside an agent session.
 - The dashboard connects and disconnects Claude Code and Codex, and sets up or re-scans a
   project folder, itself. Each shows exactly what will change first (the same redacted diff
   `ms connect` prints; the files, secrets and websites `ms init` would touch), then asks Touch ID
@@ -26,9 +29,6 @@ entries. Move the entries from Unreleased into it when you bump the version.
   hosts, variables and SSH host keys.
 - Security: the git-history check `ms init` runs (and now msd, for Add project) can no longer be
   made to run a program from a repository's own git config (a partial clone's lazy fetch).
-- New commands with the same effect in Terminal: `ms set <key>` replaces a value, `ms rm <key>`
-  deletes a key and its rule, `ms undo <project> [--key <key>]` writes the values back into the
-  project's `.env` files. Each asks for Touch ID and refuses inside an agent session.
 - `ms` and `msd` ship together: an older `ms approve` can't read a request from this msd that
   morsec made for its own actions (it is marked so it can be approved once only). Update both.
 - `ms add` no longer replaces a key that exists (it never did from the CLI; a direct request to
